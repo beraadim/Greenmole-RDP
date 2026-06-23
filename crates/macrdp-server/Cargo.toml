@@ -14,6 +14,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+time.workspace = true
 ironrdp-server = { version = "0.10", features = ["helper"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

@@ -4,24 +4,34 @@ use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use std::fs;
 use std::path::{Path, PathBuf};
+use time::{Duration, OffsetDateTime};
 
 use crate::config::config_dir;
 
-/// Generate a self-signed certificate and write PEM files
-pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
+const CERT_VALIDITY_DAYS: i64 = 365;
+
+fn self_signed_cert_params() -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
     dn.push(rcgen::DnType::CommonName, "macrdp");
     dn.push(rcgen::DnType::OrganizationName, "macrdp");
     params.distinguished_name = dn;
 
-    params.not_after = rcgen::date_time_ymd(2027, 3, 24);
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - Duration::minutes(5);
+    params.not_after = now + Duration::days(CERT_VALIDITY_DAYS);
 
     params.subject_alt_names = vec![
         rcgen::SanType::DnsName("localhost".try_into()?),
         rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
     ];
 
+    Ok(params)
+}
+
+/// Generate a self-signed certificate and write PEM files
+pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
+    let params = self_signed_cert_params()?;
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
 
@@ -96,5 +106,15 @@ mod tests {
         assert_eq!(c, cert_path);
         assert_eq!(k, key_path);
         assert!(cert_path.exists());
+    }
+
+    #[test]
+    fn test_generated_cert_uses_relative_validity_window() {
+        let params = self_signed_cert_params().unwrap();
+        let validity = params.not_after - params.not_before;
+
+        assert!(validity >= Duration::days(CERT_VALIDITY_DAYS - 1));
+        assert!(validity <= Duration::days(CERT_VALIDITY_DAYS + 1));
+        assert!(params.not_after > OffsetDateTime::now_utc());
     }
 }

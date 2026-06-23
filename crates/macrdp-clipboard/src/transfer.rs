@@ -12,13 +12,20 @@ enum RequestKind {
     Data,
 }
 
-type StreamMapping = (u32, RequestKind);
+const FILE_TRANSFER_CHUNK_SIZE: u32 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct StreamMapping {
+    file_index: u32,
+    kind: RequestKind,
+}
 
 pub struct FileTransferManager {
     local_files: Vec<PathBuf>,
     incoming_descriptors: Vec<FileDescriptor>,
     incoming_data: HashMap<u32, Vec<u8>>,
     incoming_complete: HashSet<u32>,
+    incoming_failed: HashSet<u32>,
     stream_to_index: HashMap<u32, StreamMapping>,
     temp_dir: PathBuf,
     max_file_size: u64,
@@ -34,6 +41,7 @@ impl FileTransferManager {
             incoming_descriptors: Vec::new(),
             incoming_data: HashMap::new(),
             incoming_complete: HashSet::new(),
+            incoming_failed: HashSet::new(),
             stream_to_index: HashMap::new(),
             temp_dir,
             max_file_size,
@@ -113,6 +121,7 @@ impl FileTransferManager {
     pub fn set_incoming_descriptors(&mut self, descriptors: Vec<FileDescriptor>) {
         self.incoming_data.clear();
         self.incoming_complete.clear();
+        self.incoming_failed.clear();
         self.stream_to_index.clear();
         self.incoming_descriptors = descriptors;
     }
@@ -124,7 +133,7 @@ impl FileTransferManager {
             let size_stream = self.next_stream_id;
             self.next_stream_id += 1;
             self.stream_to_index
-                .insert(size_stream, (index as u32, RequestKind::Size));
+                .insert(size_stream, StreamMapping { file_index: index as u32, kind: RequestKind::Size });
 
             requests.push(FileContentsRequest {
                 stream_id: size_stream,
@@ -135,20 +144,46 @@ impl FileTransferManager {
                 data_id: None,
             });
 
-            let data_stream = self.next_stream_id;
-            self.next_stream_id += 1;
-            self.stream_to_index
-                .insert(data_stream, (index as u32, RequestKind::Data));
+            let Some(size) = desc.file_size else {
+                tracing::warn!(index, name = desc.name, "Skipping incoming file with unknown size");
+                self.incoming_failed.insert(index as u32);
+                continue;
+            };
 
-            let size = desc.file_size.unwrap_or(0) as u32;
-            requests.push(FileContentsRequest {
-                stream_id: data_stream,
-                index: index as u32,
-                flags: FileContentsFlags::DATA,
-                position: 0,
-                requested_size: size,
-                data_id: None,
-            });
+            if size > self.max_file_size {
+                tracing::warn!(
+                    index,
+                    name = desc.name,
+                    size,
+                    max = self.max_file_size,
+                    "Skipping incoming file that exceeds configured size limit"
+                );
+                self.incoming_failed.insert(index as u32);
+                continue;
+            }
+
+            let mut position = 0u64;
+            while position < size {
+                let remaining = size - position;
+                let requested_size = remaining.min(FILE_TRANSFER_CHUNK_SIZE as u64) as u32;
+                let data_stream = self.next_stream_id;
+                self.next_stream_id += 1;
+                self.stream_to_index.insert(
+                    data_stream,
+                    StreamMapping { file_index: index as u32, kind: RequestKind::Data },
+                );
+
+                requests.push(FileContentsRequest {
+                    stream_id: data_stream,
+                    index: index as u32,
+                    flags: FileContentsFlags::DATA,
+                    position,
+                    requested_size,
+                    data_id: None,
+                });
+
+                position += requested_size as u64;
+            }
         }
 
         requests
@@ -156,12 +191,18 @@ impl FileTransferManager {
 
     pub fn handle_contents_response(&mut self, response: &FileContentsResponse<'_>) {
         let stream_id = response.stream_id();
-        let Some(&(file_index, kind)) = self.stream_to_index.get(&stream_id) else {
+        let Some(&mapping) = self.stream_to_index.get(&stream_id) else {
             tracing::warn!(stream_id, "Unknown stream_id in file contents response");
             return;
         };
+        let file_index = mapping.file_index;
+        let kind = mapping.kind;
 
         if kind == RequestKind::Size {
+            return;
+        }
+
+        if self.incoming_failed.contains(&file_index) {
             return;
         }
 
@@ -171,23 +212,50 @@ impl FileTransferManager {
             return;
         }
 
+        let Some(desc) = self.incoming_descriptors.get(file_index as usize) else {
+            tracing::warn!(file_index, "Missing descriptor for incoming file data");
+            self.incoming_failed.insert(file_index);
+            return;
+        };
+        let expected = desc.file_size.unwrap_or(0) as usize;
+        let current = self.incoming_data.get(&file_index).map_or(0, |d| d.len());
+
+        if current >= expected && expected > 0 {
+            self.incoming_complete.insert(file_index);
+            return;
+        }
+
+        let incoming_total = current.saturating_add(data.len());
+        if incoming_total > expected || incoming_total > self.max_file_size as usize {
+            tracing::warn!(
+                file_index,
+                expected,
+                current,
+                chunk = data.len(),
+                max = self.max_file_size,
+                "Rejecting incoming file data that exceeds declared or configured limits"
+            );
+            self.incoming_data.remove(&file_index);
+            self.incoming_complete.remove(&file_index);
+            self.incoming_failed.insert(file_index);
+            return;
+        }
+
         self.incoming_data
             .entry(file_index)
             .or_default()
             .extend_from_slice(data);
 
-        if let Some(desc) = self.incoming_descriptors.get(file_index as usize) {
-            let expected = desc.file_size.unwrap_or(0) as usize;
-            let received = self.incoming_data.get(&file_index).map_or(0, |d| d.len());
-            if received >= expected {
-                self.incoming_complete.insert(file_index);
-            }
+        let received = self.incoming_data.get(&file_index).map_or(0, |d| d.len());
+        if received == expected {
+            self.incoming_complete.insert(file_index);
         }
     }
 
     pub fn all_incoming_complete(&self) -> bool {
         !self.incoming_descriptors.is_empty()
-            && self.incoming_complete.len() == self.incoming_descriptors.len()
+            && self.incoming_complete.len() + self.incoming_failed.len()
+                == self.incoming_descriptors.len()
     }
 
     pub fn flush_incoming_files(&mut self) -> Vec<PathBuf> {
@@ -217,6 +285,7 @@ impl FileTransferManager {
 
         self.incoming_descriptors.clear();
         self.incoming_complete.clear();
+        self.incoming_failed.clear();
         self.stream_to_index.clear();
         paths
     }
@@ -229,6 +298,7 @@ impl FileTransferManager {
         self.locked = false;
         self.incoming_data.clear();
         self.incoming_complete.clear();
+        self.incoming_failed.clear();
         self.stream_to_index.clear();
     }
 
@@ -237,6 +307,7 @@ impl FileTransferManager {
         self.incoming_descriptors.clear();
         self.incoming_data.clear();
         self.incoming_complete.clear();
+        self.incoming_failed.clear();
         self.stream_to_index.clear();
     }
 }
@@ -395,6 +466,70 @@ mod tests {
         mgr.unlock();
         assert!(!mgr.locked);
         assert!(mgr.incoming_data.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn incoming_requests_are_chunked() {
+        let dir = temp_dir("chunked");
+        let mut mgr = FileTransferManager::new(dir.clone(), 1024 * 1024);
+
+        mgr.set_incoming_descriptors(vec![FileDescriptor {
+            name: "big.bin".to_string(),
+            file_size: Some((FILE_TRANSFER_CHUNK_SIZE as u64) + 10),
+            attributes: None,
+            last_write_time: None,
+        }]);
+
+        let requests = mgr.generate_contents_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].flags.contains(FileContentsFlags::SIZE));
+        assert_eq!(requests[1].requested_size, FILE_TRANSFER_CHUNK_SIZE);
+        assert_eq!(requests[2].requested_size, 10);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_incoming_file_is_rejected_before_transfer() {
+        let dir = temp_dir("oversized");
+        let mut mgr = FileTransferManager::new(dir.clone(), 100);
+
+        mgr.set_incoming_descriptors(vec![FileDescriptor {
+            name: "big.bin".to_string(),
+            file_size: Some(101),
+            attributes: None,
+            last_write_time: None,
+        }]);
+
+        let requests = mgr.generate_contents_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(mgr.all_incoming_complete());
+        assert!(mgr.flush_incoming_files().is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_incoming_chunk_is_rejected() {
+        let dir = temp_dir("overflow");
+        let mut mgr = FileTransferManager::new(dir.clone(), 5);
+
+        mgr.set_incoming_descriptors(vec![FileDescriptor {
+            name: "a.txt".to_string(),
+            file_size: Some(5),
+            attributes: None,
+            last_write_time: None,
+        }]);
+        let requests = mgr.generate_contents_requests();
+        let data_stream = requests[1].stream_id;
+
+        let resp = FileContentsResponse::new_data_response(data_stream, b"abcdef".to_vec());
+        mgr.handle_contents_response(&resp);
+
+        assert!(mgr.all_incoming_complete());
+        assert!(mgr.flush_incoming_files().is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }
