@@ -12,7 +12,8 @@ port = 13389
 # ─── Authentication ────────────────────────────────────────────────────────────
 
 # RDP login credentials (NLA/Hybrid/CredSSP)
-# Both fields are optional — if omitted, any credentials are accepted
+# Both fields are optional — if omitted, macrdp generates temporary credentials
+# and prints them on startup.
 username = "admin"
 password = "123456"
 
