@@ -22,10 +22,10 @@ use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
-/// Validation mode for Guacamole/FreeRDP compatibility: send uncompressed
-/// updates outside StartFrame/EndFrame so the client applies each surface
-/// command immediately instead of batching until EndFrame.
-const USE_FRAME_BOUNDARIES_FOR_UNCOMPRESSED: bool = false;
+/// Guacamole/FreeRDP interop is more reliable when uncompressed surface
+/// updates follow the normal StartFrame/EndFrame sequence instead of relying
+/// on immediate application of standalone surface commands.
+const USE_FRAME_BOUNDARIES_FOR_UNCOMPRESSED: bool = true;
 
 /// Wrapper to make raw PDU bytes usable as DvcMessage
 pub struct RawGfxPdu(pub Vec<u8>);
@@ -145,46 +145,46 @@ fn describe_capability(cap: &CapabilitySet) -> CapabilitySelection {
                 avc444: false,
             }
         }
-        CapabilitySet::V10_7 { .. } => CapabilitySelection {
+        CapabilitySet::V8_1 { .. } => CapabilitySelection {
             rank: 7,
             avc420: false,
             avc444: false,
         },
-        CapabilitySet::V10_6 { .. } | CapabilitySet::V10_6Err { .. } => CapabilitySelection {
+        // For non-AVC sessions prefer the most conservative capability set
+        // that still keeps us on the graphics pipeline. Newer 10.x non-AVC
+        // confirmations black-screened with Guacamole in testing.
+        CapabilitySet::V10_1 => CapabilitySelection {
             rank: 6,
             avc420: false,
             avc444: false,
         },
-        CapabilitySet::V10_5 { .. } | CapabilitySet::V10_4 { .. } => CapabilitySelection {
+        CapabilitySet::V8 { .. } => CapabilitySelection {
             rank: 5,
             avc420: false,
             avc444: false,
         },
-        CapabilitySet::V10_3 { .. } => CapabilitySelection {
+        CapabilitySet::V10_2 { .. } | CapabilitySet::V10 { .. } => CapabilitySelection {
             rank: 4,
             avc420: false,
             avc444: false,
         },
-        CapabilitySet::V10_2 { .. } | CapabilitySet::V10 { .. } => CapabilitySelection {
+        CapabilitySet::V10_3 { .. } => CapabilitySelection {
             rank: 3,
             avc420: false,
             avc444: false,
         },
-        CapabilitySet::V10_1 => CapabilitySelection {
-            rank: 3,
-            avc420: false,
-            avc444: false,
-        },
-        CapabilitySet::V8_1 { .. } => CapabilitySelection {
+        CapabilitySet::V10_5 { .. } | CapabilitySet::V10_4 { .. } => CapabilitySelection {
             rank: 2,
             avc420: false,
             avc444: false,
         },
-        CapabilitySet::V8 { .. } => CapabilitySelection {
-            rank: 1,
-            avc420: false,
-            avc444: false,
-        },
+        CapabilitySet::V10_7 { .. } | CapabilitySet::V10_6 { .. } | CapabilitySet::V10_6Err { .. } => {
+            CapabilitySelection {
+                rank: 1,
+                avc420: false,
+                avc444: false,
+            }
+        }
         CapabilitySet::Unknown(_) => CapabilitySelection {
             rank: 0,
             avc420: false,
@@ -925,7 +925,8 @@ impl DvcServerProcessor for GfxHandler {}
 mod tests {
     use super::{choose_confirmed_capability, CapabilitySelection};
     use ironrdp_pdu::rdp::vc::dvc::gfx::{
-        CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet,
+        CapabilitiesV10Flags, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags,
+        CapabilitySet,
     };
 
     #[test]
@@ -990,7 +991,34 @@ mod tests {
         assert_eq!(
             selection,
             CapabilitySelection {
-                rank: 3,
+                rank: 6,
+                avc420: false,
+                avc444: false,
+            }
+        );
+    }
+
+    #[test]
+    fn prefers_v81_over_newer_non_avc_caps_for_compatibility() {
+        let caps = vec![
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::THIN_CLIENT,
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::AVC_DISABLED,
+            },
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::AVC_DISABLED,
+            },
+        ];
+
+        let (confirmed, selection) = choose_confirmed_capability(&caps);
+
+        assert!(matches!(confirmed, CapabilitySet::V8_1 { .. }));
+        assert_eq!(
+            selection,
+            CapabilitySelection {
+                rank: 7,
                 avc420: false,
                 avc444: false,
             }
