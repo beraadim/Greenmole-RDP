@@ -138,11 +138,6 @@ fn describe_capability(cap: &CapabilitySet) -> CapabilitySelection {
                 avc444: true,
             }
         }
-        CapabilitySet::V10_1 => CapabilitySelection {
-            rank: 12,
-            avc420: true,
-            avc444: true,
-        },
         CapabilitySet::V8_1 { flags } if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) => {
             CapabilitySelection {
                 rank: 11,
@@ -171,6 +166,11 @@ fn describe_capability(cap: &CapabilitySet) -> CapabilitySelection {
             avc444: false,
         },
         CapabilitySet::V10_2 { .. } | CapabilitySet::V10 { .. } => CapabilitySelection {
+            rank: 3,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V10_1 => CapabilitySelection {
             rank: 3,
             avc420: false,
             avc444: false,
@@ -950,6 +950,48 @@ mod tests {
             CapabilitySelection {
                 rank: 11,
                 avc420: true,
+                avc444: false,
+            }
+        );
+    }
+
+    #[test]
+    fn does_not_treat_v10_1_as_explicit_avc_support() {
+        let caps = vec![CapabilitySet::V10_1];
+
+        let (confirmed, selection) = choose_confirmed_capability(&caps);
+
+        assert!(matches!(confirmed, CapabilitySet::V10_1));
+        assert_eq!(
+            selection,
+            CapabilitySelection {
+                rank: 3,
+                avc420: false,
+                avc444: false,
+            }
+        );
+    }
+
+    #[test]
+    fn respects_explicit_avc_disable_from_newer_caps() {
+        let caps = vec![
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::THIN_CLIENT,
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::THIN_CLIENT,
+            },
+            CapabilitySet::V10_1,
+        ];
+
+        let (confirmed, selection) = choose_confirmed_capability(&caps);
+
+        assert!(matches!(confirmed, CapabilitySet::V10_1));
+        assert_eq!(
+            selection,
+            CapabilitySelection {
+                rank: 3,
+                avc420: false,
                 avc444: false,
             }
         );
