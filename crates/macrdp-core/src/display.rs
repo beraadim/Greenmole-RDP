@@ -15,6 +15,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,173 @@ const DIRTY_RECT_VALIDATION_TILE: u32 = 96;
 /// When enabled, negotiated GFX sessions stay on uncompressed updates only,
 /// preferring dirty rects and falling back to full-frame uncompressed.
 const DEFAULT_FORCE_FULL_FRAME_UNCOMPRESSED_GFX: bool = false;
+static SESSION_AUDIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPathKind {
+    GfxAvc,
+    GfxUncompressed,
+    Bitmap,
+}
+
+impl SessionPathKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GfxAvc => "gfx-avc",
+            Self::GfxUncompressed => "gfx-uncompressed",
+            Self::Bitmap => "bitmap",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionAudit {
+    session_id: u64,
+    started_at: Instant,
+    peer_addr: Option<String>,
+    first_path: Option<SessionPathKind>,
+    current_path: Option<SessionPathKind>,
+    path_switches: u32,
+    fallback_reason: Option<&'static str>,
+    avc_frames: u64,
+    avc_bytes: u64,
+    avc_encode_ms_total: f64,
+    avc_encode_ms_max: f64,
+    uncompressed_frames: u64,
+    uncompressed_bytes: u64,
+    bitmap_frames: u64,
+    bitmap_bytes: u64,
+    max_dirty_rects: usize,
+    max_dirty_pixels: u32,
+}
+
+impl SessionAudit {
+    fn new(peer_addr: Option<String>) -> Self {
+        Self {
+            session_id: SESSION_AUDIT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            started_at: Instant::now(),
+            peer_addr,
+            first_path: None,
+            current_path: None,
+            path_switches: 0,
+            fallback_reason: None,
+            avc_frames: 0,
+            avc_bytes: 0,
+            avc_encode_ms_total: 0.0,
+            avc_encode_ms_max: 0.0,
+            uncompressed_frames: 0,
+            uncompressed_bytes: 0,
+            bitmap_frames: 0,
+            bitmap_bytes: 0,
+            max_dirty_rects: 0,
+            max_dirty_pixels: 0,
+        }
+    }
+
+    fn note_fallback_reason(&mut self, reason: &'static str) {
+        if self.fallback_reason != Some(reason) {
+            self.fallback_reason = Some(reason);
+            tracing::warn!(
+                "SESSION_AUDIT fallback-reason session_id={} reason={} elapsed_ms={}",
+                self.session_id,
+                reason,
+                self.started_at.elapsed().as_millis() as u64
+            );
+        }
+    }
+
+    fn record(
+        &mut self,
+        path: SessionPathKind,
+        bytes_sent: u32,
+        encode_ms: Option<f64>,
+        dirty_rects: usize,
+        dirty_pixels: u32,
+        detail: &'static str,
+    ) {
+        if self.first_path.is_none() {
+            self.first_path = Some(path);
+        }
+        if self.current_path != Some(path) {
+            if let Some(previous) = self.current_path {
+                self.path_switches = self.path_switches.saturating_add(1);
+                tracing::info!(
+                    "SESSION_AUDIT path-switch session_id={} from={} to={} detail={} elapsed_ms={}",
+                    self.session_id,
+                    previous.as_str(),
+                    path.as_str(),
+                    detail,
+                    self.started_at.elapsed().as_millis() as u64
+                );
+            } else {
+                tracing::info!(
+                    "SESSION_AUDIT path-start session_id={} path={} detail={} elapsed_ms={}",
+                    self.session_id,
+                    path.as_str(),
+                    detail,
+                    self.started_at.elapsed().as_millis() as u64
+                );
+            }
+            self.current_path = Some(path);
+        }
+
+        self.max_dirty_rects = self.max_dirty_rects.max(dirty_rects);
+        self.max_dirty_pixels = self.max_dirty_pixels.max(dirty_pixels);
+
+        match path {
+            SessionPathKind::GfxAvc => {
+                self.avc_frames = self.avc_frames.saturating_add(1);
+                self.avc_bytes = self.avc_bytes.saturating_add(bytes_sent as u64);
+                if let Some(encode_ms) = encode_ms {
+                    self.avc_encode_ms_total += encode_ms;
+                    self.avc_encode_ms_max = self.avc_encode_ms_max.max(encode_ms);
+                }
+            }
+            SessionPathKind::GfxUncompressed => {
+                self.uncompressed_frames = self.uncompressed_frames.saturating_add(1);
+                self.uncompressed_bytes = self.uncompressed_bytes.saturating_add(bytes_sent as u64);
+            }
+            SessionPathKind::Bitmap => {
+                self.bitmap_frames = self.bitmap_frames.saturating_add(1);
+                self.bitmap_bytes = self.bitmap_bytes.saturating_add(bytes_sent as u64);
+            }
+        }
+    }
+
+    fn log_summary(&self) {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        let total_frames = self.avc_frames + self.uncompressed_frames + self.bitmap_frames;
+        let total_bytes = self.avc_bytes + self.uncompressed_bytes + self.bitmap_bytes;
+        let avc_avg_encode_ms = if self.avc_frames > 0 {
+            self.avc_encode_ms_total / self.avc_frames as f64
+        } else {
+            0.0
+        };
+
+        tracing::info!(
+            "SESSION_AUDIT summary session_id={} peer={} duration_ms={} total_frames={} total_bytes={} first_path={} final_path={} path_switches={} avc_frames={} avc_bytes={} avc_avg_encode_ms={:.2} avc_max_encode_ms={:.2} uncompressed_frames={} uncompressed_bytes={} bitmap_frames={} bitmap_bytes={} max_dirty_rects={} max_dirty_pixels={} fallback_reason={}",
+            self.session_id,
+            self.peer_addr.as_deref().unwrap_or("unknown"),
+            elapsed_ms,
+            total_frames,
+            total_bytes,
+            self.first_path.map(SessionPathKind::as_str).unwrap_or("none"),
+            self.current_path.map(SessionPathKind::as_str).unwrap_or("none"),
+            self.path_switches,
+            self.avc_frames,
+            self.avc_bytes,
+            avc_avg_encode_ms,
+            self.avc_encode_ms_max,
+            self.uncompressed_frames,
+            self.uncompressed_bytes,
+            self.bitmap_frames,
+            self.bitmap_bytes,
+            self.max_dirty_rects,
+            self.max_dirty_pixels,
+            self.fallback_reason.unwrap_or("none")
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClampedRect {
@@ -697,6 +865,7 @@ impl RdpServerDisplay for MacDisplay {
             logged_gfx_avc_mode: false,
             logged_bitmap_mode: false,
             perf_stats: self.perf_stats.clone(),
+            session_audit: SessionAudit::new(peer_addr.map(|ip| ip.to_string())),
         }))
     }
 }
@@ -775,6 +944,8 @@ struct MacDisplayUpdates {
     logged_bitmap_mode: bool,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
+    /// Per-session transport-path audit for post-run log analysis.
+    session_audit: SessionAudit,
 }
 
 #[async_trait::async_trait]
@@ -783,6 +954,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         loop {
             if let Some(bitmap) = self.pending_bitmap_updates.pop_front() {
                 self.record_bitmap_update_metrics(bitmap.data.len() as u32);
+                self.record_bitmap_audit(&bitmap, "queued-bitmap-region");
                 return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
             }
 
@@ -1101,6 +1273,61 @@ impl MacDisplayUpdates {
         }
     }
 
+    fn record_uncompressed_audit(
+        &mut self,
+        rects: &[UncompressedRect],
+        dirty_pixels: u32,
+        detail: &'static str,
+    ) {
+        let total_bytes = rects.iter().map(|rect| rect.pixel_data.len() as u32).sum();
+        self.session_audit.record(
+            SessionPathKind::GfxUncompressed,
+            total_bytes,
+            None,
+            rects.len(),
+            dirty_pixels,
+            detail,
+        );
+    }
+
+    fn record_avc_audit(
+        &mut self,
+        bytes_sent: u32,
+        encode_ms: f64,
+        dirty_rects: usize,
+        dirty_pixels: u32,
+        detail: &'static str,
+    ) {
+        self.session_audit.record(
+            SessionPathKind::GfxAvc,
+            bytes_sent,
+            Some(encode_ms),
+            dirty_rects,
+            dirty_pixels,
+            detail,
+        );
+    }
+
+    fn record_bitmap_audit(&mut self, bitmap: &BitmapUpdate, detail: &'static str) {
+        let dirty_pixels = if bitmap.dirty_rects.is_empty() {
+            bitmap.width.get() as u32 * bitmap.height.get() as u32
+        } else {
+            bitmap
+                .dirty_rects
+                .iter()
+                .map(|rect| (rect.width * rect.height) as u32)
+                .sum()
+        };
+        self.session_audit.record(
+            SessionPathKind::Bitmap,
+            bitmap.data.len() as u32,
+            None,
+            bitmap.dirty_rects.len(),
+            dirty_pixels,
+            detail,
+        );
+    }
+
     fn suppress_duplicate_bitmap_updates(
         &mut self,
         updates: Vec<BitmapUpdate>,
@@ -1337,6 +1564,13 @@ impl MacDisplayUpdates {
                         is_keyframe,
                     );
                 }
+                self.record_avc_audit(
+                    encoded.data.len() as u32,
+                    encode_ms,
+                    0,
+                    0,
+                    "gfx-avc-pipelined-collect",
+                );
                 self.apply_adaptive_decision();
 
                 if is_keyframe {
@@ -1430,6 +1664,8 @@ impl MacDisplayUpdates {
                 self.logged_gfx_avc_mode = false;
                 self.logged_gfx_uncompressed_mode = false;
                 self.logged_bitmap_mode = false;
+                self.session_audit
+                    .note_fallback_reason("avc-no-ack-bitmap-fallback");
                 tracing::warn!(
                     sent_avc_frames = state.frame_id,
                     pending_acks = state.pending_acks,
@@ -1514,6 +1750,11 @@ impl MacDisplayUpdates {
                         display_frame = self.display_frame_count,
                         total_bytes,
                         "Display: sending initial full-frame GFX seed"
+                    );
+                    self.record_uncompressed_audit(
+                        &rects,
+                        frame.width as u32 * frame.height as u32,
+                        "gfx-seed-full-frame",
                     );
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
@@ -1736,6 +1977,15 @@ impl MacDisplayUpdates {
                         },
                         "Display: sending uncompressed GFX update (validation mode)"
                     );
+                    self.record_uncompressed_audit(
+                        &rects,
+                        total_area,
+                        if use_dirty_rects {
+                            "gfx-validation-dirty-rects"
+                        } else {
+                            "gfx-validation-full-frame"
+                        },
+                    );
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
                             rects,
@@ -1827,6 +2077,11 @@ impl MacDisplayUpdates {
                             total_bytes,
                             "Display: sending GFX uncompressed dirty rects"
                         );
+                        self.record_uncompressed_audit(
+                            &rects,
+                            total_area,
+                            "gfx-uncompressed-dirty-rects",
+                        );
                         return Ok(Some(DisplayUpdate::GfxUncompressed(
                             GfxUncompressedUpdate {
                                 rects,
@@ -1900,6 +2155,11 @@ impl MacDisplayUpdates {
                         display_frame = self.display_frame_count,
                         total_bytes,
                         "Display: sending full-frame uncompressed GFX update"
+                    );
+                    self.record_uncompressed_audit(
+                        &rects,
+                        frame.width as u32 * frame.height as u32,
+                        "gfx-uncompressed-full-frame",
                     );
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
@@ -2083,6 +2343,17 @@ impl MacDisplayUpdates {
                                         is_keyframe,
                                     );
                                 }
+                                self.record_avc_audit(
+                                    encoded.data.len() as u32,
+                                    encode_ms,
+                                    frame.dirty_rects.len(),
+                                    frame
+                                        .dirty_rects
+                                        .iter()
+                                        .map(|rect| rect.width * rect.height)
+                                        .sum(),
+                                    "gfx-avc-zero-copy",
+                                );
                                 self.apply_adaptive_decision();
                                 let frame_interval_ms =
                                     1000.0 / self.capture_config.frame_rate as f64;
@@ -2229,6 +2500,17 @@ impl MacDisplayUpdates {
                                     is_keyframe,
                                 );
                             }
+                            self.record_avc_audit(
+                                total_bytes as u32,
+                                encode_ms,
+                                frame.dirty_rects.len(),
+                                frame
+                                    .dirty_rects
+                                    .iter()
+                                    .map(|rect| rect.width * rect.height)
+                                    .sum(),
+                                "gfx-avc-bgra-pixel-buffer",
+                            );
                             self.apply_adaptive_decision();
                             let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                             if encode_ms > frame_interval_ms * 0.8 {
@@ -2314,6 +2596,17 @@ impl MacDisplayUpdates {
                                             is_keyframe,
                                         );
                                     }
+                                    self.record_avc_audit(
+                                        total_bytes as u32,
+                                        encode_ms,
+                                        frame.dirty_rects.len(),
+                                        frame
+                                            .dirty_rects
+                                            .iter()
+                                            .map(|rect| rect.width * rect.height)
+                                            .sum(),
+                                        "gfx-avc444",
+                                    );
                                     self.apply_adaptive_decision();
                                     let frame_interval_ms =
                                         1000.0 / self.capture_config.frame_rate as f64;
@@ -2388,6 +2681,17 @@ impl MacDisplayUpdates {
                                         is_keyframe,
                                     );
                                 }
+                                self.record_avc_audit(
+                                    encoded.data.len() as u32,
+                                    encode_ms,
+                                    frame.dirty_rects.len(),
+                                    frame
+                                        .dirty_rects
+                                        .iter()
+                                        .map(|rect| rect.width * rect.height)
+                                        .sum(),
+                                    "gfx-avc420",
+                                );
                                 self.apply_adaptive_decision();
                                 let frame_interval_ms =
                                     1000.0 / self.capture_config.frame_rate as f64;
@@ -2614,11 +2918,25 @@ impl MacDisplayUpdates {
 
             if let Some(bitmap) = updates.into_iter().next() {
                 self.record_bitmap_update_metrics(bitmap.data.len() as u32);
+                self.record_bitmap_audit(
+                    &bitmap,
+                    if emitted_full_frame {
+                        "bitmap-full-frame"
+                    } else {
+                        "bitmap-dirty-region"
+                    },
+                );
                 return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
             }
         }
 
         Ok(Some(self.fallback_pointer_update()))
+    }
+}
+
+impl Drop for MacDisplayUpdates {
+    fn drop(&mut self) {
+        self.session_audit.log_summary();
     }
 }
 
