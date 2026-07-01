@@ -75,7 +75,7 @@ export APPLE_SIGNING_IDENTITY := $(SIGN_IDENTITY)
 # 完整发布：全优化编译 + 自动签名 + 打包 dmg
 release:
 	@echo "=== 完整发布构建 (签名: $(SIGN_IDENTITY)) ==="
-	cd macrdp-ui && MACRDP_CLI_PROFILE=release npm run tauri -- build
+	cd macrdp-ui && BUNDLE_ID=$(BUNDLE_ID) MACRDP_CLI_PROFILE=release ./build.sh
 	@echo ""
 	@echo "=== 构建完成 ==="
 	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
@@ -83,10 +83,10 @@ release:
 # 快速发布：关闭优化 + 自动签名 + 打包 dmg
 release-fast:
 	@echo "=== 快速发布构建 (签名: $(SIGN_IDENTITY)) ==="
-	cd macrdp-ui && MACRDP_CLI_PROFILE=debug npm run tauri -- build
+	cd macrdp-ui && BUNDLE_ID=$(BUNDLE_ID) MACRDP_CLI_PROFILE=debug ./build.sh
 	@echo ""
 	@echo "=== 构建完成 ==="
-	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
+	@ls -lh macrdp-ui/src-tauri/target/debug/bundle/dmg/*.dmg
 
 # === 全局 ===
 

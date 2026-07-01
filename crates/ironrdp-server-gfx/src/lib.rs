@@ -3,6 +3,7 @@
 #![allow(clippy::arithmetic_side_effects)] // TODO: should we enable this lint back?
 
 pub use ironrdp_cliprdr::pdu::OwnedFileContentsResponse;
+pub use ironrdp_graphics::diff::Rect as DiffRect;
 pub use {tokio, tokio_rustls};
 
 mod macros;

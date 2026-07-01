@@ -22,6 +22,10 @@ use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+/// Validation mode for Guacamole/FreeRDP compatibility: send uncompressed
+/// updates outside StartFrame/EndFrame so the client applies each surface
+/// command immediately instead of batching until EndFrame.
+const USE_FRAME_BOUNDARIES_FOR_UNCOMPRESSED: bool = false;
 
 /// Wrapper to make raw PDU bytes usable as DvcMessage
 pub struct RawGfxPdu(pub Vec<u8>);
@@ -137,6 +141,8 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 /// Shared state between GfxHandler and the server
 #[derive(Debug)]
 pub struct GfxState {
+    /// Whether this connection negotiated the GFX/DVC path at all.
+    pub session_uses_gfx: bool,
     pub channel_id: Option<u32>,
     pub surface_created: bool,
     pub caps_confirmed: bool,
@@ -184,11 +190,26 @@ pub struct GfxState {
     pub encoder_pref: Option<String>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
     pub chroma_mode: Option<String>,
+    /// Whether to force negotiated GFX sessions into uncompressed validation mode.
+    pub gfx_validation_mode: bool,
+    /// Session-local escape hatch when a client negotiates AVC but never
+    /// acknowledges any GFX frames. This keeps broken clients such as some
+    /// Guacamole builds from getting stuck on a stale image.
+    pub avc_fallback_to_uncompressed: bool,
+    /// Session-local escape hatch to abandon GFX entirely and return to
+    /// classic bitmap updates when negotiated GFX proves incompatible.
+    pub bitmap_fallback_mode: bool,
 }
 
 impl GfxState {
-    pub fn new(width: u16, height: u16, avc444_enabled: bool) -> Self {
+    pub fn new(
+        width: u16,
+        height: u16,
+        avc444_enabled: bool,
+        gfx_validation_mode: bool,
+    ) -> Self {
         Self {
+            session_uses_gfx: false,
             channel_id: None,
             surface_created: false,
             caps_confirmed: false,
@@ -218,6 +239,9 @@ impl GfxState {
             resolution: None,
             encoder_pref: None,
             chroma_mode: None,
+            gfx_validation_mode,
+            avc_fallback_to_uncompressed: false,
+            bitmap_fallback_mode: false,
         }
     }
 
@@ -283,8 +307,12 @@ impl GfxState {
         (base_bitrate as f32 * self.network_quality) as u32
     }
 
+    pub fn has_gfx_channel(&self) -> bool {
+        self.channel_id.is_some() && self.caps_confirmed
+    }
+
     pub fn is_ready(&self) -> bool {
-        self.channel_id.is_some() && self.avc420_supported && self.caps_confirmed
+        self.has_gfx_channel() && self.avc420_supported
     }
 }
 
@@ -298,6 +326,14 @@ impl_as_any!(GfxHandler);
 impl GfxHandler {
     pub fn new(state: Arc<Mutex<GfxState>>) -> Self {
         Self { state }
+    }
+
+    fn bgra_to_xrgb_bytes(src: &[u8]) -> Vec<u8> {
+        let mut out = src.to_vec();
+        for px in out.chunks_exact_mut(4) {
+            px[3] = 0;
+        }
+        out
     }
 
     /// Create a single ZGFX-wrapped buffer containing all GFX PDUs for an H.264 frame.
@@ -505,8 +541,8 @@ impl GfxHandler {
 
             if let Ok(data) = encode_vec(&ServerPdu::CreateSurface(CreateSurfacePdu {
                 surface_id: 0,
-                width: update.width,
-                height: update.height,
+                width: state.width,
+                height: state.height,
                 pixel_format: GfxPixelFormat::XRgb,
             })) {
                 raw_pdus.extend_from_slice(&data);
@@ -521,27 +557,52 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
-            info!("GFX surface created (uncompressed): {}x{}", update.width, update.height);
+            info!(
+                "GFX surface created (uncompressed): {}x{}",
+                state.width, state.height
+            );
         }
 
-        let frame_id = state.next_frame_id();
+        let frame_id = if USE_FRAME_BOUNDARIES_FOR_UNCOMPRESSED {
+            Some(state.next_frame_id())
+        } else {
+            None
+        };
 
-        // StartFrame
-        if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
-            timestamp: Timestamp {
-                milliseconds: 0,
-                seconds: 0,
-                minutes: 0,
-                hours: 0,
-            },
-            frame_id,
-        })) {
-            raw_pdus.extend_from_slice(&data);
+        if let Some(frame_id) = frame_id {
+            if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
+                timestamp: Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id,
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
         }
 
         // WireToSurface1 per dirty rect with Codec1Type::Uncompressed
         let mut total_bytes = 0usize;
         for rect in &update.rects {
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+
+            let rect_bytes = rect.pixel_data.len();
+            info!(
+                x = rect.x,
+                y = rect.y,
+                width = rect.width,
+                height = rect.height,
+                bytes = rect_bytes,
+                expected_bytes = u32::from(rect.width) * u32::from(rect.height) * 4,
+                "GFX uncompressed rect"
+            );
+
+            let bitmap_data = Self::bgra_to_xrgb_bytes(&rect.pixel_data);
+
             if let Ok(data) = encode_vec(&ServerPdu::WireToSurface1(WireToSurface1Pdu {
                 surface_id: 0,
                 codec_id: Codec1Type::Uncompressed,
@@ -552,20 +613,21 @@ impl GfxHandler {
                     right: rect.x + rect.width,
                     bottom: rect.y + rect.height,
                 },
-                bitmap_data: rect.pixel_data.to_vec(),
+                bitmap_data,
             })) {
                 total_bytes += rect.pixel_data.len();
                 raw_pdus.extend_from_slice(&data);
             }
         }
 
-        // EndFrame
-        if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
-            raw_pdus.extend_from_slice(&data);
+        if let Some(frame_id) = frame_id {
+            if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
+                raw_pdus.extend_from_slice(&data);
+            }
         }
 
         debug!(
-            frame_id,
+            frame_id = frame_id.unwrap_or(0),
             rects = update.rects.len(),
             raw_bytes = total_bytes,
             "GFX uncompressed frame PDU created",
@@ -681,9 +743,17 @@ impl DvcProcessor for GfxHandler {
                 });
 
                 info!(
+                    confirmed_cap = ?confirmed,
                     avc420 = state.avc420_supported,
                     avc444_client = state.avc444_supported,
                     avc444_enabled = state.avc444_enabled,
+                    effective_mode = if state.avc444_supported && state.avc444_enabled {
+                        "gfx-avc444"
+                    } else if state.avc420_supported {
+                        "gfx-avc420"
+                    } else {
+                        "gfx-uncompressed-only"
+                    },
                     "GFX capabilities negotiated"
                 );
 

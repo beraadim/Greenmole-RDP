@@ -85,6 +85,8 @@ pub async fn stop_server(
         status.running = false;
         status.state = "stopped".to_string();
         status.uptime_secs = 0;
+        status.port = None;
+        status.bind_address = None;
     }
     let _ = app.emit(
         "server-status",
@@ -125,6 +127,16 @@ pub async fn get_server_status(
 pub async fn get_metrics(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
+    // If we have a live handle, refresh from it so polling fallback works even
+    // if an event update was missed.
+    {
+        let guard = state.server_handle.lock().await;
+        if let Some(ref handle) = *guard {
+            let live_metrics = handle.metrics();
+            let mut metrics = state.metrics.lock().await;
+            *metrics = live_metrics;
+        }
+    }
     let metrics = state.metrics.lock().await.clone();
     serde_json::to_value(&metrics).map_err(|e| e.to_string())
 }
@@ -167,6 +179,19 @@ pub async fn set_config(
         restart
     };
 
+    if key == "log_level" {
+        let level = {
+            let config = state.ui_config.lock().await;
+            config.log_level.clone()
+        };
+        let filter = format!("macrdp_ui={level},macrdp_core={level},{level}");
+        state
+            .log_reload
+            .reload(tracing_subscriber::EnvFilter::new(&filter))
+            .map_err(|e| format!("failed to reload log level: {e}"))?;
+        tracing::info!(%level, "Reloaded tracing filter");
+    }
+
     // Hot-update: push changes to running server
     {
         let guard = state.server_handle.lock().await;
@@ -180,6 +205,7 @@ pub async fn set_config(
                 "resolution" | "hidpi_scale" => handle.update_config(macrdp_core::ConfigUpdate::Resolution(config.resolution.clone())),
                 "encoder" => handle.update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
                 "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(config.chroma_mode.clone())),
+                "gfx_validation_mode" => handle.update_config(macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode)),
                 "username" | "password" => handle.update_config(macrdp_core::ConfigUpdate::Credentials {
                     username: config.username.clone(),
                     password: config.password.clone(),

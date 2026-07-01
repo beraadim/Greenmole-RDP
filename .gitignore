@@ -30,6 +30,7 @@ tls/
 # Node / Frontend build artifacts
 node_modules/
 macrdp-ui/dist/
+macrdp-ui/*.dmg
 # Misc
 *.git.bak/
 **/.git.bak/

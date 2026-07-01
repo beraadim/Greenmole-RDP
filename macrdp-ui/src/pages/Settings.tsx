@@ -17,12 +17,12 @@ import { SettingRow } from "../components/SettingRow";
 import { useTheme } from "../contexts/ThemeContext";
 
 const categories = [
-  { id: "rdp", label: "RDP 服务" },
-  { id: "network", label: "网络" },
-  { id: "security", label: "安全" },
-  { id: "display", label: "显示" },
-  { id: "audio", label: "音频" },
-  { id: "general", label: "通用" },
+  { id: "rdp", label: "RDP Service" },
+  { id: "network", label: "Network" },
+  { id: "security", label: "Security" },
+  { id: "display", label: "Display" },
+  { id: "audio", label: "Audio" },
+  { id: "general", label: "General" },
 ] as const;
 
 type CategoryId = (typeof categories)[number]["id"];
@@ -61,7 +61,7 @@ function Settings() {
   if (!config) {
     return (
       <div className="flex items-center justify-center py-20 text-sm text-text-muted">
-        加载配置中...
+        Loading configuration...
       </div>
     );
   }
@@ -96,7 +96,7 @@ function Settings() {
             <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
             <AlertDescription className="flex items-center justify-between">
               <span className="text-yellow-800 dark:text-yellow-300 text-xs">
-                部分配置需重启服务后生效
+                Some settings take effect after restarting the service
               </span>
               <Button
                 variant="ghost"
@@ -111,8 +111,8 @@ function Settings() {
         )}
 
         {activeCategory === "rdp" && (
-          <CategorySection title="RDP 服务">
-            <SettingRow label="编码器">
+          <CategorySection title="RDP Service">
+            <SettingRow label="Encoder">
               <Select
                 value={config.encoder}
                 onValueChange={(v) => updateConfig("encoder", v)}
@@ -121,13 +121,13 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="software">软件编码</SelectItem>
-                  <SelectItem value="hardware">硬件加速</SelectItem>
+                  <SelectItem value="software">Software encoding</SelectItem>
+                  <SelectItem value="hardware">Hardware acceleration</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>
 
-            <SettingRow label="比特率">
+            <SettingRow label="Bitrate">
               <Select
                 value={String(config.bitrate_mbps)}
                 onValueChange={(v) => updateConfig("bitrate_mbps", Number(v))}
@@ -145,7 +145,7 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="帧率">
+            <SettingRow label="Frame rate">
               <Select
                 value={String(config.frame_rate)}
                 onValueChange={(v) => updateConfig("frame_rate", Number(v))}
@@ -161,7 +161,7 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="色度模式">
+            <SettingRow label="Chroma mode">
               <Select
                 value={config.chroma_mode}
                 onValueChange={(v) => updateConfig("chroma_mode", v)}
@@ -179,8 +179,8 @@ function Settings() {
         )}
 
         {activeCategory === "network" && (
-          <CategorySection title="网络">
-            <SettingRow label="端口" description="重启服务生效">
+          <CategorySection title="Network">
+            <SettingRow label="Port" description="Requires service restart">
               <Input
                 type="number"
                 value={config.port}
@@ -189,7 +189,7 @@ function Settings() {
               />
             </SettingRow>
 
-            <SettingRow label="绑定地址" description="重启服务生效">
+            <SettingRow label="Bind address" description="Requires service restart">
               <Input
                 type="text"
                 value={config.bind_address}
@@ -204,7 +204,7 @@ function Settings() {
               />
             </SettingRow>
 
-            <SettingRow label="最大连接数" description="重启服务生效">
+            <SettingRow label="Max connections" description="Requires service restart">
               <Input
                 type="number"
                 value={config.max_connections}
@@ -215,7 +215,7 @@ function Settings() {
               />
             </SettingRow>
 
-            <SettingRow label="空闲超时 (秒)" description="重启服务生效">
+            <SettingRow label="Idle timeout (seconds)" description="Requires service restart">
               <Input
                 type="number"
                 value={config.idle_timeout_secs}
@@ -229,8 +229,8 @@ function Settings() {
         )}
 
         {activeCategory === "security" && (
-          <CategorySection title="安全">
-            <SettingRow label="用户名">
+          <CategorySection title="Security">
+            <SettingRow label="Username">
               <Input
                 type="text"
                 value={config.username}
@@ -244,7 +244,7 @@ function Settings() {
               />
             </SettingRow>
 
-            <SettingRow label="密码">
+            <SettingRow label="Password">
               <Input
                 type="password"
                 value={config.password}
@@ -261,8 +261,8 @@ function Settings() {
         )}
 
         {activeCategory === "display" && (
-          <CategorySection title="显示">
-            <SettingRow label="分辨率" description="新连接生效，Auto 跟随屏幕">
+          <CategorySection title="Display">
+            <SettingRow label="Resolution" description="Applies to new connections; Auto follows the screen">
               <Select
                 value={config.resolution || "auto"}
                 onValueChange={(v) => updateConfig("resolution", v)}
@@ -291,7 +291,7 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="显示光标" description="在采集画面中渲染系统光标">
+            <SettingRow label="Show cursor" description="Render the system cursor in the captured output">
               <Switch
                 checked={config.show_cursor}
                 onCheckedChange={(checked) => updateConfig("show_cursor", checked)}
@@ -301,16 +301,16 @@ function Settings() {
         )}
 
         {activeCategory === "audio" && (
-          <CategorySection title="音频">
+          <CategorySection title="Audio">
             <div className="flex items-center justify-center py-10 text-xs text-text-muted">
-              音频配置尚未开放
+              Audio settings are not available yet
             </div>
           </CategorySection>
         )}
 
         {activeCategory === "general" && (
-          <CategorySection title="通用">
-            <SettingRow label="日志级别">
+          <CategorySection title="General">
+            <SettingRow label="Log level">
               <Select
                 value={config.log_level}
                 onValueChange={(v) => updateConfig("log_level", v)}
@@ -328,14 +328,14 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="开机自启" description="登录时自动启动服务">
+            <SettingRow label="Start at login" description="Start the service automatically when you sign in">
               <Switch
                 checked={config.autostart}
                 onCheckedChange={handleAutostart}
               />
             </SettingRow>
 
-            <SettingRow label="主题">
+            <SettingRow label="Theme">
               <Select
                 value={theme}
                 onValueChange={(v) => {
@@ -346,9 +346,9 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="system">跟随系统</SelectItem>
-                  <SelectItem value="light">浅色</SelectItem>
-                  <SelectItem value="dark">深色</SelectItem>
+                  <SelectItem value="system">Follow system</SelectItem>
+                  <SelectItem value="light">Light</SelectItem>
+                  <SelectItem value="dark">Dark</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>

@@ -1,24 +1,45 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-BUNDLE_ID="com.macrdp.app"
+BUNDLE_ID="${BUNDLE_ID:-com.macrdp.app}"
+PROFILE="${MACRDP_CLI_PROFILE:-release}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_BUNDLE="$SCRIPT_DIR/src-tauri/target/release/bundle/macos/macrdp.app"
 
-echo "==> Building macrdp-ui..."
+case "$PROFILE" in
+  release)
+    TARGET_DIR="release"
+    TAURI_ARGS=(--no-sign)
+    ;;
+  debug)
+    TARGET_DIR="debug"
+    TAURI_ARGS=(--debug --no-sign)
+    ;;
+  *)
+    echo "Unsupported MACRDP_CLI_PROFILE: $PROFILE" >&2
+    exit 1
+    ;;
+esac
+
+APP_BUNDLE="$SCRIPT_DIR/src-tauri/target/$TARGET_DIR/bundle/macos/macrdp.app"
+DMG_PATH="$SCRIPT_DIR/src-tauri/target/$TARGET_DIR/bundle/dmg/macrdp_0.1.0_aarch64.dmg"
+APP_BIN="$SCRIPT_DIR/src-tauri/target/$TARGET_DIR/macrdp-ui"
+
+echo "==> Building macrdp-ui (profile: $PROFILE)..."
 cd "$SCRIPT_DIR"
-npm run tauri build -- --no-bundle 2>/dev/null || cargo build --release --manifest-path src-tauri/Cargo.toml
+npm run tauri build -- "${TAURI_ARGS[@]}"
 
-# Bundle if needed
-if command -v cargo-tauri &>/dev/null; then
-    cd "$SCRIPT_DIR"
-    npm run tauri build 2>/dev/null || true
-fi
-
-# Re-sign .app with stable identifier (preserves TCC permissions across rebuilds)
 if [ -d "$APP_BUNDLE" ]; then
-    echo "==> Re-signing $APP_BUNDLE with identifier $BUNDLE_ID"
-    codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_BUNDLE"
+    if [ -f "$APP_BIN" ]; then
+        echo "==> Refreshing bundled binary from $APP_BIN"
+        cp "$APP_BIN" "$APP_BUNDLE/Contents/MacOS/macrdp-ui"
+    fi
+
+    echo "==> Bundling Swift Concurrency runtime into $APP_BUNDLE"
+    BUNDLE_ID="$BUNDLE_ID" "$SCRIPT_DIR/fix-swift-runtime.sh" "$APP_BUNDLE"
+
+    echo "==> Repacking DMG at $DMG_PATH"
+    "$SCRIPT_DIR/repack-dmg.sh" "$APP_BUNDLE" "$DMG_PATH"
+
     echo "==> Done. Identifier:"
     codesign -d --verbose=1 "$APP_BUNDLE" 2>&1 | grep Identifier
 else

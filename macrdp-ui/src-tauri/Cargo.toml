@@ -11,11 +11,11 @@ edition = "2021"
 description = "macrdp GUI — Tauri v2 desktop application"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.5.6", features = [] }
 
 [dependencies]
 macrdp-core = { path = "../../crates/macrdp-core" }
-tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri = { version = "=2.10.1", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +34,7 @@ name = "macrdp_ui"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [profile.release]
-opt-level = 0
-lto = false
-codegen-units = 16
+opt-level = 3
+lto = "thin"
+codegen-units = 8
 strip = false

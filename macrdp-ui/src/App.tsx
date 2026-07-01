@@ -40,7 +40,7 @@ function MainLayout() {
   if (!initialized) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-bg">
-        <span className="text-sm text-text-muted">加载中...</span>
+        <span className="text-sm text-text-muted">Loading...</span>
       </div>
     );
   }

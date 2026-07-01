@@ -104,8 +104,12 @@ impl FileTransferManager {
                 }
             }
         } else if request.flags.contains(FileContentsFlags::DATA) {
-            match read_file_range(path, request.position, request.requested_size, self.max_file_size)
-            {
+            match read_file_range(
+                path,
+                request.position,
+                request.requested_size,
+                self.max_file_size,
+            ) {
                 Ok(data) => FileContentsResponse::new_data_response(stream_id, data),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "Failed to read file range");
@@ -132,8 +136,13 @@ impl FileTransferManager {
         for (index, desc) in self.incoming_descriptors.iter().enumerate() {
             let size_stream = self.next_stream_id;
             self.next_stream_id += 1;
-            self.stream_to_index
-                .insert(size_stream, StreamMapping { file_index: index as u32, kind: RequestKind::Size });
+            self.stream_to_index.insert(
+                size_stream,
+                StreamMapping {
+                    file_index: index as u32,
+                    kind: RequestKind::Size,
+                },
+            );
 
             requests.push(FileContentsRequest {
                 stream_id: size_stream,
@@ -145,7 +154,11 @@ impl FileTransferManager {
             });
 
             let Some(size) = desc.file_size else {
-                tracing::warn!(index, name = desc.name, "Skipping incoming file with unknown size");
+                tracing::warn!(
+                    index,
+                    name = desc.name,
+                    "Skipping incoming file with unknown size"
+                );
                 self.incoming_failed.insert(index as u32);
                 continue;
             };
@@ -170,7 +183,10 @@ impl FileTransferManager {
                 self.next_stream_id += 1;
                 self.stream_to_index.insert(
                     data_stream,
-                    StreamMapping { file_index: index as u32, kind: RequestKind::Data },
+                    StreamMapping {
+                        file_index: index as u32,
+                        kind: RequestKind::Data,
+                    },
                 );
 
                 requests.push(FileContentsRequest {
@@ -208,7 +224,11 @@ impl FileTransferManager {
 
         let data = response.data();
         if data.is_empty() {
-            tracing::warn!(stream_id, file_index, "Empty data in file contents response");
+            tracing::warn!(
+                stream_id,
+                file_index,
+                "Empty data in file contents response"
+            );
             return;
         }
 
@@ -264,7 +284,9 @@ impl FileTransferManager {
         for (index, desc) in self.incoming_descriptors.iter().enumerate() {
             let index = index as u32;
             if let Some(data) = self.incoming_data.remove(&index) {
-                if desc.name.contains("..") || desc.name.starts_with('/') || desc.name.starts_with('\\')
+                if desc.name.contains("..")
+                    || desc.name.starts_with('/')
+                    || desc.name.starts_with('\\')
                 {
                     tracing::warn!(name = desc.name, "Rejected file with suspicious path");
                     continue;

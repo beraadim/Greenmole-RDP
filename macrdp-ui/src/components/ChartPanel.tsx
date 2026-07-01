@@ -14,7 +14,7 @@ export function ChartPanel({
   value,
   valueColor,
   empty,
-  emptyText = "等待数据...",
+  emptyText = "Waiting for data...",
   children,
 }: ChartPanelProps) {
   return (

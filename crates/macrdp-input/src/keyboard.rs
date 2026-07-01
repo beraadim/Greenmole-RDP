@@ -7,10 +7,22 @@ use crate::keymap::scancode_to_keycode;
 pub struct KeyboardInjector;
 
 impl KeyboardInjector {
+    const TRANSIENT_MODIFIERS: &'static [(u8, bool)] = &[
+        (0x2A, false), // Left Shift
+        (0x36, false), // Right Shift
+        (0x1D, false), // Left Ctrl
+        (0x1D, true),  // Right Ctrl
+        (0x38, false), // Left Alt / Command mapping
+        (0x38, true),  // Right Alt / Command mapping
+        (0x5B, true),  // Left Win / Option mapping
+        (0x5C, true),  // Right Win / Option mapping
+    ];
+
     pub fn new() -> Result<Self> {
         // Verify we can create an event source (permission check)
-        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission"))?;
+        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+            anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
+        })?;
         Ok(Self)
     }
 
@@ -35,6 +47,19 @@ impl KeyboardInjector {
 
         event.post(CGEventTapLocation::HID);
         tracing::trace!(scancode, keycode, pressed, "Keyboard event injected");
+        Ok(())
+    }
+
+    pub fn tap_key(&self, scancode: u8, extended: bool) -> Result<()> {
+        self.inject_key(scancode, extended, true)?;
+        self.inject_key(scancode, extended, false)
+    }
+
+    pub fn release_transient_modifiers(&self) -> Result<()> {
+        for (scancode, extended) in Self::TRANSIENT_MODIFIERS {
+            self.inject_key(*scancode, *extended, false)?;
+        }
+
         Ok(())
     }
 

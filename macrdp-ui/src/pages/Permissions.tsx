@@ -6,19 +6,19 @@ import type { PermissionStatus } from "../lib/types";
 const permissionDefs = [
   {
     key: "screen_capture" as keyof PermissionStatus,
-    name: "屏幕录制",
+    name: "Screen Recording",
     pane: "screen_capture",
     icon: Monitor,
   },
   {
     key: "accessibility" as keyof PermissionStatus,
-    name: "辅助功能",
+    name: "Accessibility",
     pane: "accessibility",
     icon: MousePointer2,
   },
   {
     key: "microphone" as keyof PermissionStatus,
-    name: "麦克风",
+    name: "Microphone",
     pane: "microphone",
     icon: Mic,
   },
@@ -44,13 +44,13 @@ function Permissions() {
 
   return (
     <div className="flex flex-col gap-3 p-4">
-      <h1 className="text-base font-semibold text-text">权限</h1>
+      <h1 className="text-base font-semibold text-text">Permissions</h1>
 
       {allGranted && (
         <div className="flex items-center gap-2 rounded-[8px] border border-green/20 bg-green/10 p-3">
           <Check size={16} className="flex-shrink-0 text-green" />
           <span className="text-xs font-medium text-green">
-            所有权限已就绪
+            All permissions are ready
           </span>
         </div>
       )}
@@ -71,7 +71,7 @@ function Permissions() {
                     {def.name}
                   </div>
                   <div className="text-[11px] text-text-muted">
-                    {granted ? "已授权" : "未授权"}
+                    {granted ? "Granted" : "Not granted"}
                   </div>
                 </div>
               </div>
@@ -83,7 +83,7 @@ function Permissions() {
                     onClick={() => api.openSystemPreferences(def.pane)}
                     className="rounded-md bg-orange/15 px-2.5 py-1 text-[11px] font-medium text-orange transition-colors hover:bg-orange/25"
                   >
-                    前往系统设置
+                    Open System Settings
                   </button>
                 )}
               </div>

@@ -14,7 +14,7 @@ import type { UiConfig } from "../lib/types";
 
 function Dashboard() {
   const status = useServerStatus();
-  const { metrics, stale } = useMetrics();
+  const { metrics, stale, error } = useMetrics();
   const connections = useConnections();
   const [loading, setLoading] = useState(false);
   const [config, setConfig] = useState<UiConfig | null>(null);
@@ -26,7 +26,7 @@ function Dashboard() {
   const encodeHistory = useMetricHistory(
     metricsAvailable ? metrics.encode_ms : null
   );
-  const port = config?.port ?? 3389;
+  const port = status.port ?? config?.port ?? 3389;
 
   useEffect(() => {
     api.getConfig().then(setConfig).catch(console.error);
@@ -34,7 +34,7 @@ function Dashboard() {
 
   // Clear loading when backend state actually changes
   useEffect(() => {
-    if (loading && (status.state === "running" || status.state === "error")) {
+    if (loading && (status.state === "running" || status.state.startsWith("error"))) {
       setLoading(false);
     }
     if (loading && status.state === "stopped" && !status.running) {
@@ -83,27 +83,28 @@ function Dashboard() {
         loading={loading}
         port={port}
         uptimeSeconds={status.uptime_secs}
+        errorMessage={status.state.startsWith("error:") ? status.state : undefined}
         onStart={handleStart}
         onStop={handleStop}
       />
 
       <div className="flex gap-3">
         <ChartPanel
-          title="网络速度 (Mbps)"
+          title="Network throughput (Mbps)"
           value={avgBitrate != null ? `${avgBitrate} Mbps` : undefined}
           valueColor="var(--color-green)"
           empty={chartsEmpty}
-          emptyText="等待数据..."
+          emptyText="Waiting for data..."
         >
           <AreaChart data={bitrateHistory} color="var(--color-green)" />
         </ChartPanel>
 
         <ChartPanel
-          title="编码延迟 (ms)"
+          title="Encode latency (ms)"
           value={avgEncode != null ? `${avgEncode} ms` : undefined}
           valueColor="var(--color-orange)"
           empty={chartsEmpty}
-          emptyText="等待数据..."
+          emptyText="Waiting for data..."
         >
           <AreaChart data={encodeHistory} color="var(--color-orange)" />
         </ChartPanel>
@@ -123,21 +124,27 @@ function Dashboard() {
         />
         <MetricCard
           value={metricsAvailable ? metrics.encode_ms : null}
-          label="ms 编码"
+          label="Encode ms"
           color="orange"
           formatter={(v) => v.toFixed(1)}
         />
         <MetricCard
           value={metricsAvailable ? connections.length : null}
-          label="连接"
+          label="Connections"
           color="purple"
         />
       </div>
 
+      {status.running && !metricsAvailable && error && (
+        <div className="bg-card rounded-[8px] px-3 py-2 text-[11px] text-orange">
+          Metrics fetch error: {error}
+        </div>
+      )}
+
       <div className="bg-card rounded-[8px] p-3">
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[11px] text-text-muted font-medium">
-            活跃连接
+            Active connections
           </span>
           <span className="text-accent bg-accent/10 rounded-full px-2 text-[10px]">
             {connections.length}
@@ -153,7 +160,7 @@ function Dashboard() {
             ))}
           </div>
         ) : (
-          <EmptyState message="暂无活跃连接" />
+          <EmptyState message="No active connections" />
         )}
       </div>
     </div>

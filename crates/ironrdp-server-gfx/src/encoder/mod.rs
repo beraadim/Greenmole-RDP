@@ -202,6 +202,40 @@ impl UpdateEncoder {
     fn bitmap_diffs(&mut self, bitmap: &BitmapUpdate) -> Vec<Rect> {
         // TODO: we may want to make it optional for servers that already provide damaged regions
         const USE_DIFFS: bool = true;
+        const MAX_HINT_RECTS: usize = 24;
+        const MAX_HINT_AREA_NUM: u64 = 3;
+        const MAX_HINT_AREA_DEN: u64 = 4;
+
+        if !bitmap.dirty_rects.is_empty() {
+            let mut hints = normalize_bitmap_hints(bitmap);
+            if hints.is_empty() {
+                return vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width: bitmap.width.get().into(),
+                    height: bitmap.height.get().into(),
+                }];
+            }
+
+            merge_nearby_rects(&mut hints);
+
+            let full_area = u64::from(bitmap.width.get()) * u64::from(bitmap.height.get());
+            let hinted_area: u64 = hints
+                .iter()
+                .map(|rect| rect.width as u64 * rect.height as u64)
+                .sum();
+
+            if hints.len() > MAX_HINT_RECTS || hinted_area * MAX_HINT_AREA_DEN >= full_area * MAX_HINT_AREA_NUM {
+                return vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width: bitmap.width.get().into(),
+                    height: bitmap.height.get().into(),
+                }];
+            }
+
+            return hints;
+        }
 
         if let Some(Framebuffer {
             data,
@@ -263,6 +297,83 @@ impl UpdateEncoder {
 
         result
     }
+}
+
+fn normalize_bitmap_hints(bitmap: &BitmapUpdate) -> Vec<Rect> {
+    let bitmap_x = usize::from(bitmap.x);
+    let bitmap_y = usize::from(bitmap.y);
+    let bitmap_right = bitmap_x + usize::from(bitmap.width.get());
+    let bitmap_bottom = bitmap_y + usize::from(bitmap.height.get());
+
+    bitmap
+        .dirty_rects
+        .iter()
+        .filter(|rect| rect.width > 0 && rect.height > 0)
+        .filter_map(|rect| {
+            let left = rect.x.max(bitmap_x);
+            let top = rect.y.max(bitmap_y);
+            let right = rect.x.saturating_add(rect.width).min(bitmap_right);
+            let bottom = rect.y.saturating_add(rect.height).min(bitmap_bottom);
+
+            if right <= left || bottom <= top {
+                return None;
+            }
+
+            Some(Rect {
+                x: left - bitmap_x,
+                y: top - bitmap_y,
+                width: right - left,
+                height: bottom - top,
+            })
+        })
+        .collect()
+}
+
+fn merge_nearby_rects(rects: &mut Vec<Rect>) {
+    const MERGE_GAP: usize = 24;
+
+    let mut idx = 0;
+    while idx < rects.len() {
+        let mut next = idx + 1;
+        while next < rects.len() {
+            if let Some(merged) = merge_rects(rects[idx].clone(), rects[next].clone(), MERGE_GAP) {
+                rects[idx] = merged;
+                rects.swap_remove(next);
+            } else {
+                next += 1;
+            }
+        }
+        idx += 1;
+    }
+}
+
+fn merge_rects(a: Rect, b: Rect, gap: usize) -> Option<Rect> {
+    let a_left = a.x;
+    let a_top = a.y;
+    let a_right = a.x.saturating_add(a.width);
+    let a_bottom = a.y.saturating_add(a.height);
+    let b_left = b.x;
+    let b_top = b.y;
+    let b_right = b.x.saturating_add(b.width);
+    let b_bottom = b.y.saturating_add(b.height);
+
+    let separated_horizontally = a_right.saturating_add(gap) < b_left || b_right.saturating_add(gap) < a_left;
+    let separated_vertically = a_bottom.saturating_add(gap) < b_top || b_bottom.saturating_add(gap) < a_top;
+    if separated_horizontally || separated_vertically {
+        return None;
+    }
+
+    let left = a_left.min(b_left);
+    let top = a_top.min(b_top);
+    let right = a_right.max(b_right);
+    let bottom = a_bottom.max(b_bottom);
+
+    Some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 #[derive(Debug, Default)]

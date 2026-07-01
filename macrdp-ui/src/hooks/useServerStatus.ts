@@ -10,7 +10,8 @@ export function useServerStatus() {
     running: false,
     state: "stopped",
     uptime_secs: 0,
-    pid: null,
+    port: null,
+    bind_address: null,
   });
   const mountedRef = useRef(true);
 

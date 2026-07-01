@@ -9,6 +9,7 @@ const POLL_INTERVAL = 3000; // 3s fallback polling
 export function useMetrics() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [stale, setStale] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const mountedRef = useRef(true);
 
@@ -26,11 +27,14 @@ export function useMetrics() {
         if (mountedRef.current && m) {
           setMetrics(m);
           setStale(false);
+          setError(null);
           resetStaleTimer();
         }
       })
-      .catch(() => {
-        // Server not running or no metrics yet — ignore
+      .catch((err: unknown) => {
+        if (mountedRef.current) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
       });
   }, [resetStaleTimer]);
 
@@ -45,6 +49,7 @@ export function useMetrics() {
       if (mountedRef.current) {
         setMetrics(event.payload);
         setStale(false);
+        setError(null);
         resetStaleTimer();
       }
     });
@@ -60,5 +65,5 @@ export function useMetrics() {
     };
   }, [fetch, resetStaleTimer]);
 
-  return { metrics, stale };
+  return { metrics, stale, error };
 }

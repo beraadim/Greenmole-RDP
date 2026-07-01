@@ -24,9 +24,12 @@ pub fn run() {
     eprintln!("Log file: {} (level: {})", log_path.display(), log_level);
 
     use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::reload;
     use tracing_subscriber::util::SubscriberInitExt;
+    let (filter_layer, log_reload) =
+        reload::Layer::new(tracing_subscriber::EnvFilter::new(&filter));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(&filter))
+        .with(filter_layer)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(macrdp_core::LogBridgeLayer::new())
         .init();
@@ -44,11 +47,11 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
 
             // Initialize application state
-            state::init_app_state(&handle)?;
+            state::init_app_state(&handle, log_reload.clone())?;
 
             // Request permissions proactively on startup (non-blocking)
             std::thread::spawn(|| {

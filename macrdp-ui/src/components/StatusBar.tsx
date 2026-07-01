@@ -2,7 +2,7 @@ import { useRef, useCallback } from "react";
 import { Play, Square, Loader2 } from "lucide-react";
 
 interface StatusBarProps {
-  state: "running" | "starting" | "stopped" | "error";
+  state: string;
   loading?: boolean;
   port?: number;
   uptimeSeconds?: number;
@@ -20,28 +20,28 @@ function formatUptime(seconds: number): string {
 }
 
 const statusConfig: Record<
-  StatusBarProps["state"],
+  "running" | "starting" | "stopped" | "error",
   { dotClass: string; glowColor: string; label: string }
 > = {
   running: {
     dotClass: "bg-green",
     glowColor: "0 0 6px var(--color-green)",
-    label: "运行中",
+    label: "Running",
   },
   starting: {
     dotClass: "bg-yellow",
     glowColor: "0 0 6px var(--color-yellow)",
-    label: "启动中...",
+    label: "Starting...",
   },
   stopped: {
     dotClass: "bg-text-muted",
     glowColor: "none",
-    label: "已停止",
+    label: "Stopped",
   },
   error: {
     dotClass: "bg-red",
     glowColor: "0 0 6px var(--color-red)",
-    label: "错误",
+    label: "Error",
   },
 };
 
@@ -56,10 +56,16 @@ function StatusBar({
   onStart,
   onStop,
 }: StatusBarProps) {
-  const config = statusConfig[state];
-  const isError = state === "error";
-  const isLoading = loading || state === "starting";
-  const showStop = state === "running" || state === "starting" || (loading && state !== "stopped");
+  const normalizedState = state.startsWith("error")
+    ? "error"
+    : (state as "running" | "starting" | "stopped" | "error");
+  const config = statusConfig[normalizedState] ?? statusConfig.stopped;
+  const isError = normalizedState === "error";
+  const isLoading = loading || normalizedState === "starting";
+  const showStop =
+    normalizedState === "running" ||
+    normalizedState === "starting" ||
+    (loading && normalizedState !== "stopped");
   const buttonsDisabled = isLoading;
   const lastClickRef = useRef(0);
 
@@ -113,7 +119,7 @@ function StatusBar({
             ) : (
               <Square className="h-3 w-3" />
             )}
-            {isLoading ? "处理中..." : "停止"}
+            {isLoading ? "Working..." : "Stop"}
           </button>
         ) : (
           <button
@@ -126,7 +132,7 @@ function StatusBar({
             ) : (
               <Play className="h-3 w-3" />
             )}
-            {isLoading ? "处理中..." : "启动"}
+            {isLoading ? "Working..." : "Start"}
           </button>
         )}
       </div>

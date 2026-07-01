@@ -24,9 +24,7 @@ fn swift_lib_candidates() -> Vec<PathBuf> {
                 candidates.push(PathBuf::from(format!(
                     "{dev_path}/usr/lib/swift-5.5/macosx"
                 )));
-                candidates.push(PathBuf::from(format!(
-                    "{dev_path}/usr/lib/swift/macosx"
-                )));
+                candidates.push(PathBuf::from(format!("{dev_path}/usr/lib/swift/macosx")));
             } else {
                 // Full Xcode installation
                 candidates.push(PathBuf::from(format!(

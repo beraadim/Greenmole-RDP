@@ -12,14 +12,15 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
 /// - "auto": detect display scale and multiply logical resolution
 /// - "WxH" (e.g. "3840x2160"): use directly
 /// - legacy numeric scale (e.g. "2"): multiply logical resolution by scale factor
-pub fn resolve_resolution(
-    res_mode: &str,
-    logical_w: u16,
-    logical_h: u16,
-) -> (u16, u16) {
+pub fn resolve_resolution(res_mode: &str, logical_w: u16, logical_h: u16) -> (u16, u16) {
     if res_mode == "auto" {
         let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
-        tracing::info!(scale, logical_w, logical_h, "Resolution auto: display scale");
+        tracing::info!(
+            scale,
+            logical_w,
+            logical_h,
+            "Resolution auto: display scale"
+        );
         (logical_w * scale as u16, logical_h * scale as u16)
     } else if let Some((w, h)) = parse_resolution(res_mode) {
         tracing::info!(w, h, "Resolution: explicit WxH");
@@ -28,10 +29,22 @@ pub fn resolve_resolution(
         // Legacy hidpi_scale: 1, 2, 3, 4 → multiply logical resolution
         let scale = scale.max(1).min(4);
         let (w, h) = (logical_w as u32 * scale, logical_h as u32 * scale);
-        tracing::info!(scale, w, h, logical_w, logical_h, "Resolution: legacy hidpi_scale → {}x{}", w, h);
+        tracing::info!(
+            scale,
+            w,
+            h,
+            logical_w,
+            logical_h,
+            "Resolution: legacy hidpi_scale → {}x{}",
+            w,
+            h
+        );
         (w as u16, h as u16)
     } else {
-        tracing::warn!(res_mode, "Resolution: unrecognized value, using logical resolution");
+        tracing::warn!(
+            res_mode,
+            "Resolution: unrecognized value, using logical resolution"
+        );
         (logical_w, logical_h)
     }
 }
@@ -53,16 +66,41 @@ use crate::config::ServerConfig;
 use crate::permissions;
 use crate::tls;
 
+fn sanitize_f64(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn sanitize_f32(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricsSnapshot {
+    last_sample_at: Option<Instant>,
+    last_bytes_sent: u64,
+}
+
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
     port: u16,
+    bind_addr: SocketAddr,
     started_at: Instant,
+    fps: u32,
     gfx_state: Arc<Mutex<GfxState>>,
     shutdown_notify: Arc<Notify>,
     stopped: AtomicBool,
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
+    metrics_snapshot: Mutex<MetricsSnapshot>,
     config_tx: tokio::sync::mpsc::UnboundedSender<ConfigUpdate>,
 }
 
@@ -79,12 +117,16 @@ impl ServerHandle {
                 running: false,
                 state: "stopped".to_string(),
                 uptime_secs: 0,
+                port: Some(self.port),
+                bind_address: Some(self.bind_addr.ip().to_string()),
             }
         } else {
             ServerStatus {
                 running: true,
                 state: "running".to_string(),
                 uptime_secs: self.started_at.elapsed().as_secs(),
+                port: Some(self.port),
+                bind_address: Some(self.bind_addr.ip().to_string()),
             }
         }
     }
@@ -92,20 +134,39 @@ impl ServerHandle {
     /// Current performance metrics.
     pub fn metrics(&self) -> Metrics {
         let gfx = self.gfx_state.lock().unwrap();
-        let net_ms = (gfx.rtt_ewma_ms - gfx.last_encode_ms).max(0.0);
+        let now = Instant::now();
+        let mut snapshot = self.metrics_snapshot.lock().unwrap();
+        let bitrate_kbps = if let Some(last_sample_at) = snapshot.last_sample_at {
+            let elapsed = now.duration_since(last_sample_at).as_secs_f64();
+            if elapsed > 0.0 {
+                let delta_bytes = gfx
+                    .total_bytes_sent
+                    .saturating_sub(snapshot.last_bytes_sent);
+                ((delta_bytes as f64 * 8.0) / elapsed / 1000.0).round() as u64
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        snapshot.last_sample_at = Some(now);
+        snapshot.last_bytes_sent = gfx.total_bytes_sent;
+        let rtt_ms = sanitize_f64(gfx.rtt_ewma_ms);
+        let encode_ms = sanitize_f64(gfx.last_encode_ms);
+        let net_ms = sanitize_f64((rtt_ms - encode_ms).max(0.0));
         Metrics {
-            fps: 0, // Actual FPS comes from config/runtime
-            bitrate_kbps: 0,
-            rtt_ms: gfx.rtt_ewma_ms,
+            fps: self.fps,
+            bitrate_kbps,
+            rtt_ms,
             bytes_sent: gfx.total_bytes_sent,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            encode_ms: gfx.last_encode_ms,
+            encode_ms,
             net_ms,
             last_frame_bytes: gfx.last_frame_bytes,
-            network_quality: gfx.network_quality,
+            network_quality: sanitize_f32(gfx.network_quality),
             pending_acks: gfx.pending_acks,
         }
     }
@@ -171,7 +232,8 @@ struct ServerThreadArgs {
 /// Returns the successfully bound TcpListener and the actual port.
 fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, u16)> {
     for offset in 0..100u16 {
-        let port = preferred_port.checked_add(offset)
+        let port = preferred_port
+            .checked_add(offset)
             .context("Port number overflow")?;
         let bind_addr = format!("{addr}:{port}");
         match TcpListener::bind(&bind_addr) {
@@ -214,6 +276,8 @@ pub async fn start_server(
         running: true,
         state: "starting".to_string(),
         uptime_secs: 0,
+        port: None,
+        bind_address: None,
     });
 
     // Check and request permissions
@@ -237,7 +301,11 @@ pub async fn start_server(
     };
     let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
         Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
+            tracing::info!(
+                width = w,
+                height = h,
+                "CG logical display size (CGEvent coordinate space)"
+            );
             (w as u16, h as u16)
         }
         Err(e) => {
@@ -264,6 +332,7 @@ pub async fn start_server(
     };
     let encoder_pref = macrdp_encode::EncoderPreference::from_str_opt(config.encoder.as_deref());
     let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
+    let gfx_validation_mode = config.gfx_validation_mode.unwrap_or(false);
 
     // Resolution
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
@@ -274,9 +343,15 @@ pub async fn start_server(
     let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
 
     // GFX state (shared between server thread and metrics task)
-    let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
+    let gfx_state = Arc::new(Mutex::new(GfxState::new(
+        width,
+        height,
+        mode_444,
+        gfx_validation_mode,
+    )));
 
-    let (listener, port) = find_available_port("0.0.0.0", config.port)?;
+    let bind_host = config.bind_address.as_deref().unwrap_or("0.0.0.0");
+    let (listener, port) = find_available_port(bind_host, config.port)?;
     let bind_addr = listener.local_addr()?;
     // Drop listener so the RDP server can rebind the same port.
     // IronRDP's RdpServer::with_addr() binds its own socket; we cannot pass
@@ -336,7 +411,9 @@ pub async fn start_server(
             let delta_bytes = bytes_sent.saturating_sub(prev_bytes_sent);
             prev_bytes_sent = bytes_sent;
             let bitrate_kbps = delta_bytes * 8 / 1000;
-            let net_ms = (rtt_ms - encode_ms).max(0.0);
+            let rtt_ms = sanitize_f64(rtt_ms);
+            let encode_ms = sanitize_f64(encode_ms);
+            let net_ms = sanitize_f64((rtt_ms - encode_ms).max(0.0));
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -350,7 +427,7 @@ pub async fn start_server(
                 encode_ms,
                 net_ms,
                 last_frame_bytes,
-                network_quality,
+                network_quality: sanitize_f32(network_quality),
                 pending_acks,
             });
         }
@@ -358,12 +435,15 @@ pub async fn start_server(
 
     let handle = Arc::new(ServerHandle {
         port,
+        bind_addr,
         started_at: Instant::now(),
+        fps,
         gfx_state,
         shutdown_notify,
         stopped: AtomicBool::new(false),
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
+        metrics_snapshot: Mutex::new(MetricsSnapshot::default()),
         config_tx,
     });
 
@@ -372,6 +452,8 @@ pub async fn start_server(
         running: true,
         state: "running".to_string(),
         uptime_secs: 0,
+        port: Some(port),
+        bind_address: Some(bind_addr.ip().to_string()),
     });
 
     Ok(handle)
@@ -403,6 +485,8 @@ fn run_server_thread(args: ServerThreadArgs) {
                     running: false,
                     state: format!("error: {e}"),
                     uptime_secs: 0,
+                    port: Some(args.bind_addr.port()),
+                    bind_address: Some(args.bind_addr.ip().to_string()),
                 });
                 return;
             }
@@ -415,6 +499,8 @@ fn run_server_thread(args: ServerThreadArgs) {
                     running: false,
                     state: format!("error: {e}"),
                     uptime_secs: 0,
+                    port: Some(args.bind_addr.port()),
+                    bind_address: Some(args.bind_addr.ip().to_string()),
                 });
                 return;
             }
@@ -449,7 +535,10 @@ fn run_server_thread(args: ServerThreadArgs) {
                     .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                     .join("macrdp")
                     .join("clipboard");
-                Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir, args.config.clipboard.max_file_size_mb)))
+                Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(
+                    temp_dir,
+                    args.config.clipboard.max_file_size_mb,
+                )))
             } else {
                 None
             };
@@ -546,7 +635,10 @@ fn run_server_thread(args: ServerThreadArgs) {
                         tracing::info!(%level, "Hot-update: log_level");
                     }
                     ConfigUpdate::ShowCursor(show) => {
-                        tracing::info!(show_cursor = show, "Hot-update: show_cursor (next connection)");
+                        tracing::info!(
+                            show_cursor = show,
+                            "Hot-update: show_cursor (next connection)"
+                        );
                         gfx_for_config.lock().unwrap().show_cursor = Some(show);
                     }
                     ConfigUpdate::Resolution(res) => {
@@ -562,10 +654,21 @@ fn run_server_thread(args: ServerThreadArgs) {
                         tracing::info!(%mode, avc444, "Hot-update: chroma_mode (next connection)");
                         gfx_for_config.lock().unwrap().chroma_mode = Some(mode);
                     }
+                    ConfigUpdate::GfxValidationMode(enabled) => {
+                        tracing::info!(
+                            gfx_validation_mode = enabled,
+                            "Hot-update: gfx validation mode"
+                        );
+                        gfx_for_config.lock().unwrap().gfx_validation_mode = enabled;
+                    }
                     ConfigUpdate::Credentials { username, password } => {
                         tracing::info!(%username, "Hot-update: credentials");
                         let _ = ev_sender.send(ironrdp_server::ServerEvent::SetCredentials(
-                            ironrdp_server::Credentials { username, password, domain: None }
+                            ironrdp_server::Credentials {
+                                username,
+                                password,
+                                domain: None,
+                            },
                         ));
                     }
                 }
@@ -580,6 +683,8 @@ fn run_server_thread(args: ServerThreadArgs) {
                         running: false,
                         state: format!("error: {e}"),
                         uptime_secs: 0,
+                        port: Some(args.bind_addr.port()),
+                        bind_address: Some(args.bind_addr.ip().to_string()),
                     });
                 }
             }

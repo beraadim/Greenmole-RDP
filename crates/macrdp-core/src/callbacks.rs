@@ -8,6 +8,8 @@ pub struct ServerStatus {
     pub running: bool,
     pub state: String,
     pub uptime_secs: u64,
+    pub port: Option<u16>,
+    pub bind_address: Option<String>,
 }
 
 impl Default for ServerStatus {
@@ -16,6 +18,8 @@ impl Default for ServerStatus {
             running: false,
             state: "stopped".to_string(),
             uptime_secs: 0,
+            port: None,
+            bind_address: None,
         }
     }
 }
@@ -95,6 +99,7 @@ pub enum ConfigUpdate {
     Resolution(String),
     Encoder(String),
     ChromaMode(String),
+    GfxValidationMode(bool),
     Credentials { username: String, password: String },
 }
 

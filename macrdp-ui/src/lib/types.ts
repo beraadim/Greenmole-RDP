@@ -1,8 +1,9 @@
 export interface ServerStatus {
   running: boolean;
-  state: "stopped" | "running" | "starting" | "error";
+  state: string;
   uptime_secs: number;
-  pid: number | null;
+  port?: number | null;
+  bind_address?: string | null;
 }
 
 export interface Metrics {

@@ -287,7 +287,7 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
-            gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false))),
+            gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false, false))),
             gfx_enabled: true,
         }
     }
@@ -330,21 +330,21 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpsndServer::new(backend));
         }
 
-        let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let mut dvc = dvc::DrdynvcServer::new()
-            .with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
-            })
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
-
-        // Only register GFX channel if GFX frame sending is enabled
+        // Keep non-GFX sessions on the plain RDP path. Guacamole in particular
+        // is more reliable here if we avoid advertising unrelated DVC features.
         if self.gfx_enabled {
+            let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
+            let mut dvc = dvc::DrdynvcServer::new()
+                .with_dynamic_channel(AInputHandler {
+                    handler: Arc::clone(&self.handler),
+                })
+                .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+
             let gfx_handler = GfxHandler::new(Arc::clone(&self.gfx_state));
             dvc = dvc.with_dynamic_channel(gfx_handler);
             debug!("GFX channel registered");
+            acceptor.attach_static_channel(dvc);
         }
-
-        acceptor.attach_static_channel(dvc);
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
@@ -358,7 +358,8 @@ impl RdpServer {
             let h = gs.height;
             let avc444_enabled = gs.avc444_enabled;
             let res = gs.resolution.take();
-            *gs = GfxState::new(w, h, avc444_enabled);
+            let gfx_validation_mode = gs.gfx_validation_mode;
+            *gs = GfxState::new(w, h, avc444_enabled, gfx_validation_mode);
             gs.peer_addr = peer_ip;
             res
         };
@@ -855,13 +856,21 @@ impl RdpServer {
             }
         };
 
-        let state = tokio::select!(
-            state = dispatch_pdu => state,
-            state = dispatch_display => state,
-            state = dispatch_events => state,
+        let (source, state) = tokio::select!(
+            state = dispatch_pdu => ("pdu", state),
+            state = dispatch_display => ("display", state),
+            state = dispatch_events => ("events", state),
         );
 
-        debug!("End of client loop: {state:?}");
+        match &state {
+            Ok(run_state) => {
+                info!(source, ?run_state, "Client loop ended");
+            }
+            Err(error) => {
+                warn!(source, error = format!("{error:#}"), "Client loop failed");
+            }
+        }
+
         state
     }
 
@@ -889,6 +898,17 @@ impl RdpServer {
         }
 
         self.static_channels = result.static_channels;
+        {
+            let mut gfx_state = self.gfx_state.lock().unwrap();
+            gfx_state.bitmap_fallback_mode = false;
+            gfx_state.avc_fallback_to_uncompressed = false;
+            gfx_state.session_uses_gfx =
+                self.get_channel_id_by_type::<dvc::DrdynvcServer>().is_some();
+            info!(
+                session_uses_gfx = gfx_state.session_uses_gfx,
+                "Connection graphics path negotiated"
+            );
+        }
         if !result.reactivation {
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");

@@ -14,21 +14,21 @@ import ThemeToggle from "./ThemeToggle";
 
 const navGroups = [
   {
-    label: "服务",
-    items: [{ path: "/", icon: Monitor, label: "控制台" }],
+    label: "Service",
+    items: [{ path: "/", icon: Monitor, label: "Dashboard" }],
   },
   {
-    label: "配置",
+    label: "Configuration",
     items: [
-      { path: "/settings", icon: Settings, label: "设置" },
-      { path: "/permissions", icon: Shield, label: "权限" },
+      { path: "/settings", icon: Settings, label: "Settings" },
+      { path: "/permissions", icon: Shield, label: "Permissions" },
     ],
   },
   {
-    label: "诊断",
+    label: "Diagnostics",
     items: [
-      { path: "/logs", icon: FileText, label: "日志" },
-      { path: "/statistics", icon: Activity, label: "统计" },
+      { path: "/logs", icon: FileText, label: "Logs" },
+      { path: "/statistics", icon: Activity, label: "Statistics" },
     ],
   },
 ];
@@ -107,7 +107,7 @@ function Sidebar() {
           }`}
         >
           <Info size={16} />
-          <span>关于</span>
+          <span>About</span>
         </Link>
         <div className="mt-2 flex items-center px-2">
           <ThemeToggle />

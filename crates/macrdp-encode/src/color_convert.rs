@@ -15,8 +15,8 @@ use std::ffi::c_void;
 #[repr(C)]
 struct VImageBuffer {
     data: *mut c_void,
-    height: usize,   // vImagePixelCount
-    width: usize,    // vImagePixelCount
+    height: usize,    // vImagePixelCount
+    width: usize,     // vImagePixelCount
     row_bytes: usize, // size_t
 }
 
@@ -53,7 +53,7 @@ struct VImageARGBToYpCbCrMatrix {
 // Format constants from vImage_Types.h enum values.
 const KV_IMAGE_ARGB8888: u32 = 0;
 const KV_IMAGE_420YP8_CB8_CR8: u32 = 3; // I420 (planar Cb + Cr)  — 'y420'/'f420'
-const KV_IMAGE_420YP8_CBCR8: u32 = 4;   // NV12 (interleaved CbCr) — '420v'/'420f'
+const KV_IMAGE_420YP8_CBCR8: u32 = 4; // NV12 (interleaved CbCr) — '420v'/'420f'
 
 // vImage processing flags
 const KV_IMAGE_NO_FLAGS: u32 = 0;
@@ -271,27 +271,40 @@ impl VImageConverter {
         Ok(())
     }
 
-    /// Convert BGRA to NV12 (separate Y plane + interleaved CbCr plane).
+    /// Convert BGRA to NV12 (separate Y plane + interleaved CbCr plane)
+    /// using caller-provided output row strides.
     ///
-    /// `y_out` must be at least `width * height` bytes.
-    /// `uv_out` must be at least `width * height / 2` bytes (interleaved CbCr pairs).
+    /// `y_out` must be at least `y_stride * height` bytes.
+    /// `uv_out` must be at least `uv_stride * (height / 2)` bytes.
     /// Width and height must both be even.
-    pub fn bgra_to_nv12(
+    pub fn bgra_to_nv12_with_strides(
         &self,
         bgra: &[u8],
         width: u32,
         height: u32,
         stride: usize,
+        y_stride: usize,
+        uv_stride: usize,
         y_out: &mut [u8],
         uv_out: &mut [u8],
     ) -> Result<(), String> {
         let w = width as usize;
         let h = height as usize;
-        let y_size = w * h;
-        let uv_size = w * (h / 2); // interleaved CbCr: (w/2) samples * 2 bytes = w bytes per row, h/2 rows
+        let y_size = y_stride * h;
+        let uv_size = uv_stride * (h / 2);
 
         if w % 2 != 0 || h % 2 != 0 {
             return Err(format!("width ({w}) and height ({h}) must both be even"));
+        }
+        if y_stride < w {
+            return Err(format!(
+                "Y stride too small: need at least {w}, got {y_stride}"
+            ));
+        }
+        if uv_stride < w {
+            return Err(format!(
+                "UV stride too small: need at least {w}, got {uv_stride}"
+            ));
         }
         if bgra.len() < (h - 1) * stride + w * 4 {
             return Err(format!(
@@ -326,13 +339,13 @@ impl VImageConverter {
             data: y_out.as_mut_ptr() as *mut c_void,
             height: h,
             width: w,
-            row_bytes: w,
+            row_bytes: y_stride,
         };
         let cbcr_buf = VImageBuffer {
             data: uv_out.as_mut_ptr() as *mut c_void,
             height: h / 2,
             width: w / 2,
-            row_bytes: w, // interleaved CbCr: 2 bytes per sample, w/2 samples = w bytes per row
+            row_bytes: uv_stride,
         };
 
         let err = unsafe {
@@ -352,6 +365,24 @@ impl VImageConverter {
         }
 
         Ok(())
+    }
+
+    /// Convert BGRA to tightly packed NV12 (separate Y plane + interleaved CbCr plane).
+    ///
+    /// `y_out` must be at least `width * height` bytes.
+    /// `uv_out` must be at least `width * height / 2` bytes (interleaved CbCr pairs).
+    /// Width and height must both be even.
+    pub fn bgra_to_nv12(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+        y_out: &mut [u8],
+        uv_out: &mut [u8],
+    ) -> Result<(), String> {
+        let w = width as usize;
+        self.bgra_to_nv12_with_strides(bgra, width, height, stride, w, w, y_out, uv_out)
     }
 }
 
@@ -375,10 +406,10 @@ mod tests {
         for row in 0..h as usize {
             for col in 0..w as usize {
                 let px = row * stride + col * 4;
-                bgra[px] = (col * 4).min(255) as u8;       // B
-                bgra[px + 1] = (row * 4).min(255) as u8;   // G
+                bgra[px] = (col * 4).min(255) as u8; // B
+                bgra[px + 1] = (row * 4).min(255) as u8; // G
                 bgra[px + 2] = ((row + col) * 2).min(255) as u8; // R
-                bgra[px + 3] = 255;                         // A
+                bgra[px + 3] = 255; // A
             }
         }
 
@@ -428,7 +459,7 @@ mod tests {
         // Uniform gray: BGRA = (128, 128, 128, 255)
         let mut bgra = vec![0u8; stride * h as usize];
         for i in 0..(w * h) as usize {
-            bgra[i * 4] = 128;     // B
+            bgra[i * 4] = 128; // B
             bgra[i * 4 + 1] = 128; // G
             bgra[i * 4 + 2] = 128; // R
             bgra[i * 4 + 3] = 255; // A
@@ -468,6 +499,73 @@ mod tests {
     }
 
     #[test]
+    fn test_vimage_bgra_to_nv12_with_padded_output_strides() {
+        let converter = VImageConverter::new().expect("VImageConverter::new failed");
+
+        let (w, h): (u32, u32) = (8, 4);
+        let stride = w as usize * 4;
+        let mut bgra = vec![0u8; stride * h as usize];
+        for i in 0..(w * h) as usize {
+            bgra[i * 4] = 128;
+            bgra[i * 4 + 1] = 128;
+            bgra[i * 4 + 2] = 128;
+            bgra[i * 4 + 3] = 255;
+        }
+
+        let y_stride = w as usize + 8;
+        let uv_stride = w as usize + 8;
+        let mut y_out = vec![0xCD; y_stride * h as usize];
+        let mut uv_out = vec![0xEF; uv_stride * (h as usize / 2)];
+
+        converter
+            .bgra_to_nv12_with_strides(
+                &bgra,
+                w,
+                h,
+                stride,
+                y_stride,
+                uv_stride,
+                &mut y_out,
+                &mut uv_out,
+            )
+            .expect("bgra_to_nv12_with_strides failed");
+
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let y = y_out[row * y_stride + col];
+                assert!(
+                    (y as i32 - 128).unsigned_abs() <= 2,
+                    "Y[{row},{col}] = {y}, expected ~128 for uniform gray"
+                );
+            }
+            for col in w as usize..y_stride {
+                assert_eq!(
+                    y_out[row * y_stride + col],
+                    0xCD,
+                    "Y padding byte was modified"
+                );
+            }
+        }
+
+        for row in 0..(h as usize / 2) {
+            for col in 0..w as usize {
+                let uv = uv_out[row * uv_stride + col];
+                assert!(
+                    (uv as i32 - 128).unsigned_abs() <= 2,
+                    "UV[{row},{col}] = {uv}, expected ~128 for uniform gray"
+                );
+            }
+            for col in w as usize..uv_stride {
+                assert_eq!(
+                    uv_out[row * uv_stride + col],
+                    0xEF,
+                    "UV padding byte was modified"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_vimage_bgra_to_i420_size_validation() {
         let converter = VImageConverter::new().expect("VImageConverter::new failed");
 
@@ -479,10 +577,7 @@ mod tests {
         let mut yuv_too_small = vec![0u8; 100]; // way too small for 64x64
 
         let result = converter.bgra_to_i420(&bgra, w, h, stride, &mut yuv_too_small);
-        assert!(
-            result.is_err(),
-            "Should fail with too-small output buffer"
-        );
+        assert!(result.is_err(), "Should fail with too-small output buffer");
         let err_msg = result.unwrap_err();
         assert!(
             err_msg.contains("too small"),

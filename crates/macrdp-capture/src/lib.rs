@@ -1,15 +1,18 @@
 //! macOS screen capture via ScreenCaptureKit
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
-use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
 use tokio::sync::mpsc;
+
+static UNEXPECTED_BGRA_LAYOUT_WARNINGS: AtomicU64 = AtomicU64::new(0);
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
@@ -53,6 +56,9 @@ pub enum CapturePixelFormat {
 pub enum FrameData {
     /// BGRA raw bytes copied from CVPixelBuffer (existing behavior)
     Raw(Bytes),
+    /// IOSurface-backed CVPixelBuffer containing BGRA pixels.
+    /// Kept zero-copy until a downstream consumer explicitly locks and reads it.
+    BgraPixelBuffer(SafePixelBuffer),
     /// IOSurface-backed CVPixelBuffer — zero copy, passed directly to VideoToolbox
     PixelBuffer(SafePixelBuffer),
 }
@@ -62,7 +68,7 @@ impl FrameData {
     pub fn as_bgra_bytes(&self) -> Option<&[u8]> {
         match self {
             FrameData::Raw(bytes) => Some(bytes),
-            FrameData::PixelBuffer(_) => None,
+            FrameData::BgraPixelBuffer(_) | FrameData::PixelBuffer(_) => None,
         }
     }
 }
@@ -82,7 +88,7 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub data: FrameData,
-    /// Bytes per row (valid for FrameData::Raw only)
+    /// Bytes per row for BGRA-backed frames. Zero for NV12 PixelBuffer mode.
     pub stride: usize,
     pub timestamp_us: u64,
     /// Regions that changed since the last frame.
@@ -115,6 +121,10 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: SCStream,
     frame_rx: mpsc::Receiver<CaptureEvent>,
+    config: CaptureConfig,
+    actual_width: u32,
+    actual_height: u32,
+    captures_audio: bool,
 }
 
 struct VideoOutputHandler {
@@ -149,7 +159,9 @@ impl SCStreamOutputTrait for AudioOutputHandler {
             return;
         }
 
-        let Some(audio_buffer_list) = sample.audio_buffer_list() else { return };
+        let Some(audio_buffer_list) = sample.audio_buffer_list() else {
+            return;
+        };
 
         let timestamp = sample.presentation_timestamp();
         let timestamp_ms = if timestamp.timescale > 0 {
@@ -187,9 +199,7 @@ impl SCStreamOutputTrait for AudioOutputHandler {
                 .filter_map(|i| audio_buffer_list.get(i))
                 .map(|buf| {
                     let raw = buf.data();
-                    unsafe {
-                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4)
-                    }
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4) }
                 })
                 .collect();
 
@@ -223,6 +233,30 @@ impl SCStreamOutputTrait for AudioOutputHandler {
     }
 }
 
+fn build_stream_config(
+    width: u32,
+    height: u32,
+    config: &CaptureConfig,
+    captures_audio: bool,
+) -> SCStreamConfiguration {
+    let frame_interval = CMTime::new(1, config.frame_rate as i32);
+
+    SCStreamConfiguration::new()
+        .with_width(width)
+        .with_height(height)
+        .with_scales_to_fit(true)
+        .with_minimum_frame_interval(&frame_interval)
+        .with_pixel_format(match config.pixel_format {
+            CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
+            CapturePixelFormat::Bgra => PixelFormat::BGRA,
+        })
+        .with_shows_cursor(config.show_cursor)
+        .with_captures_audio(captures_audio)
+        .with_sample_rate(AudioSampleRate::Rate48000)
+        .with_channel_count(AudioChannelCount::Stereo)
+        .with_excludes_current_process_audio(true)
+}
+
 fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
@@ -241,15 +275,37 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     }
 
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
+    let pixel_format = unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer.as_ptr()) };
 
-    let guard = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY).ok()?;
+    let width = pixel_buffer.width() as u32;
+    let height = pixel_buffer.height() as u32;
+    let stride = unsafe { CVPixelBufferGetBytesPerRow(pixel_buffer.as_ptr()) };
+    let raw_len = unsafe { CVPixelBufferGetDataSize(pixel_buffer.as_ptr()) };
 
-    let width = guard.width() as u32;
-    let height = guard.height() as u32;
-    let stride = guard.bytes_per_row();
-    let pixels = guard.as_slice();
+    if width == 0 || height == 0 {
+        return None;
+    }
 
-    if width == 0 || height == 0 || pixels.is_empty() {
+    let min_stride = width as usize * 4;
+    let required_len = (height as usize)
+        .saturating_sub(1)
+        .saturating_mul(stride)
+        .saturating_add(min_stride);
+    if pixel_format != K_CV_PIXEL_FORMAT_32BGRA || stride < min_stride || raw_len < required_len {
+        let warn_count = UNEXPECTED_BGRA_LAYOUT_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if warn_count <= 3 || warn_count % 60 == 0 {
+            tracing::warn!(
+                warning_count = warn_count,
+                width,
+                height,
+                stride,
+                raw_len,
+                min_stride,
+                required_len,
+                pixel_format = format_pixel_format(pixel_format),
+                "ScreenCaptureKit returned a non-BGRA or invalid BGRA frame in BGRA mode — dropping frame early"
+            );
+        }
         return None;
     }
 
@@ -268,7 +324,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         })
         .collect::<Vec<_>>();
 
-    let data = Bytes::copy_from_slice(pixels);
+    let safe_buf = unsafe { SafePixelBuffer::from_raw(pixel_buffer.as_ptr()) };
 
     let t = sample.presentation_timestamp();
     let timestamp_us = if t.timescale > 0 {
@@ -280,7 +336,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     Some(CaptureEvent::Frame(CapturedFrame {
         width,
         height,
-        data: FrameData::Raw(data),
+        data: FrameData::BgraPixelBuffer(safe_buf),
         stride,
         timestamp_us,
         dirty_rects,
@@ -355,19 +411,24 @@ pub fn detect_display_scale() -> Result<u32> {
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
-    let display = content.displays().into_iter().next()
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
+    let display = content
+        .displays()
+        .into_iter()
+        .next()
         .context("No display found")?;
     let logical_w = display.width();
-    let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
+    let scale = if logical_w > 0 {
+        physical_w / logical_w
+    } else {
+        1
+    };
     Ok(scale.max(1))
 }
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
     let display = content
         .displays()
         .into_iter()
@@ -427,23 +488,9 @@ impl ScreenCapturer {
             .with_excluding_windows(&[])
             .build();
 
-        let frame_interval = CMTime::new(1, config.frame_rate as i32);
-
         let captures_audio = audio_tx.is_some();
-        let stream_config = SCStreamConfiguration::new()
-            .with_width(actual_width)
-            .with_height(actual_height)
-            .with_scales_to_fit(true)
-            .with_minimum_frame_interval(&frame_interval)
-            .with_pixel_format(match config.pixel_format {
-                CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
-                CapturePixelFormat::Bgra => PixelFormat::BGRA,
-            })
-            .with_shows_cursor(config.show_cursor)
-            .with_captures_audio(captures_audio)
-            .with_sample_rate(AudioSampleRate::Rate48000)
-            .with_channel_count(AudioChannelCount::Stereo)
-            .with_excludes_current_process_audio(true);
+        let stream_config =
+            build_stream_config(actual_width, actual_height, &config, captures_audio);
 
         // Channel for capture events: buffer 2 entries to allow for jitter
         let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
@@ -479,6 +526,10 @@ impl ScreenCapturer {
         Ok(Self {
             stream,
             frame_rx,
+            config,
+            actual_width,
+            actual_height,
+            captures_audio,
         })
     }
 
@@ -494,17 +545,25 @@ impl ScreenCapturer {
 
     /// Update capture frame rate at runtime.
     /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
-    pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        use screencapturekit::cm::CMTime;
-        use screencapturekit::prelude::SCStreamConfiguration;
-
-        let interval = CMTime::new(1, fps as i32);
-        let mut config = SCStreamConfiguration::new();
-        config.set_minimum_frame_interval(&interval);
+    pub fn set_frame_rate(&mut self, fps: u32) -> anyhow::Result<()> {
+        self.config.frame_rate = fps;
+        let config = build_stream_config(
+            self.actual_width,
+            self.actual_height,
+            &self.config,
+            self.captures_audio,
+        );
         self.stream
             .update_configuration(&config)
             .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
-        tracing::info!(fps, "Capture frame rate updated");
+        tracing::info!(
+            fps,
+            width = self.actual_width,
+            height = self.actual_height,
+            pixel_format = ?self.config.pixel_format,
+            audio = self.captures_audio,
+            "Capture frame rate updated"
+        );
         Ok(())
     }
 }
@@ -523,7 +582,11 @@ impl CgFallbackCapturer {
     /// Create a fallback capturer for the main display
     pub fn new(config: &CaptureConfig) -> Self {
         let display_id = core_graphics::display::CGDisplay::main().id;
-        let fps = if config.frame_rate > 0 { config.frame_rate } else { 30 };
+        let fps = if config.frame_rate > 0 {
+            config.frame_rate
+        } else {
+            30
+        };
         Self {
             display_id,
             width: config.width,
@@ -544,8 +607,11 @@ impl CgFallbackCapturer {
         let raw = data.bytes().to_vec();
 
         Some(CapturedFrame {
-            width: if self.width > 0 { self.width } else { w },
-            height: if self.height > 0 { self.height } else { h },
+            // Report the actual captured image size. The encoder/display path can
+            // pad or scale from a smaller fallback frame, but lying about the
+            // visible dimensions causes BGRA out-of-bounds reads downstream.
+            width: w,
+            height: h,
             data: FrameData::Raw(Bytes::from(raw)),
             stride: bpr,
             timestamp_us: std::time::SystemTime::now()
@@ -572,13 +638,28 @@ extern "C" {
     fn CVPixelBufferRelease(pixel_buffer: *mut c_void);
     fn CVPixelBufferLockBaseAddress(pixel_buffer: *mut c_void, flags: u64) -> i32;
     fn CVPixelBufferUnlockBaseAddress(pixel_buffer: *mut c_void, flags: u64) -> i32;
+    fn CVPixelBufferGetBaseAddress(pixel_buffer: *mut c_void) -> *mut u8;
+    fn CVPixelBufferGetBytesPerRow(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetDataSize(pixel_buffer: *mut c_void) -> usize;
     fn CVPixelBufferGetBaseAddressOfPlane(pixel_buffer: *mut c_void, plane: usize) -> *mut u8;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
 }
 
 /// kCVPixelBufferLock_ReadOnly
 const CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 0x0000_0001;
+const K_CV_PIXEL_FORMAT_32BGRA: u32 = 0x42475241; // 'BGRA'
+
+fn format_pixel_format(pixel_format: u32) -> String {
+    let bytes = pixel_format.to_be_bytes();
+    let printable = bytes.iter().all(|b| matches!(*b, 0x20..=0x7e));
+    if printable {
+        format!("{} (0x{pixel_format:08x})", String::from_utf8_lossy(&bytes))
+    } else {
+        format!("0x{pixel_format:08x}")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // NV12PlaneData — extracted Y and UV plane data from an NV12 pixel buffer
@@ -653,6 +734,31 @@ impl SafePixelBuffer {
         Self { ptr: self.ptr }
     }
 
+    /// Lock a BGRA pixel buffer read-only and expose its visible bytes to a closure.
+    ///
+    /// Returns `None` if the lock fails, the buffer is not BGRA, or the layout is invalid.
+    pub fn with_locked_bgra<R>(
+        &self,
+        width: u32,
+        height: u32,
+        f: impl FnOnce(&[u8], usize) -> R,
+    ) -> Option<R> {
+        unsafe {
+            let status = CVPixelBufferLockBaseAddress(self.ptr, CV_PIXEL_BUFFER_LOCK_READ_ONLY);
+            if status != 0 {
+                tracing::warn!(status, "CVPixelBufferLockBaseAddress failed");
+                return None;
+            }
+
+            let result = self
+                .read_locked_bgra(width, height)
+                .map(|(pixels, stride)| f(pixels, stride));
+
+            CVPixelBufferUnlockBaseAddress(self.ptr, CV_PIXEL_BUFFER_LOCK_READ_ONLY);
+            result
+        }
+    }
+
     /// Lock the pixel buffer, copy NV12 plane data out, and unlock.
     ///
     /// This is the software-encoding path: we lock the buffer read-only,
@@ -676,6 +782,44 @@ impl SafePixelBuffer {
 
             result
         }
+    }
+
+    unsafe fn read_locked_bgra(&self, width: u32, height: u32) -> Option<(&[u8], usize)> {
+        let pixel_format = CVPixelBufferGetPixelFormatType(self.ptr);
+        let stride = CVPixelBufferGetBytesPerRow(self.ptr);
+        let raw_len = CVPixelBufferGetDataSize(self.ptr);
+        let pixels = CVPixelBufferGetBaseAddress(self.ptr);
+
+        if pixels.is_null() || width == 0 || height == 0 {
+            return None;
+        }
+
+        let min_stride = width as usize * 4;
+        let required_len = (height as usize)
+            .saturating_sub(1)
+            .saturating_mul(stride)
+            .saturating_add(min_stride);
+
+        if pixel_format != K_CV_PIXEL_FORMAT_32BGRA || stride < min_stride || raw_len < required_len
+        {
+            let warn_count = UNEXPECTED_BGRA_LAYOUT_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+            if warn_count <= 3 || warn_count % 60 == 0 {
+                tracing::warn!(
+                    warning_count = warn_count,
+                    width,
+                    height,
+                    stride,
+                    raw_len,
+                    min_stride,
+                    required_len,
+                    pixel_format = format_pixel_format(pixel_format),
+                    "SafePixelBuffer BGRA lock returned a non-BGRA or invalid layout"
+                );
+            }
+            return None;
+        }
+
+        Some((std::slice::from_raw_parts(pixels, required_len), stride))
     }
 
     /// Read Y and UV planes while the buffer is locked.

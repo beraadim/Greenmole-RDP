@@ -24,7 +24,7 @@ const statusDotColor: Record<string, string> = {
 
 function Popover() {
   const status = useServerStatus();
-  const { metrics, stale } = useMetrics();
+  const { metrics, stale, error } = useMetrics();
   const connections = useConnections();
   const [toggling, setToggling] = useState(false);
 
@@ -46,7 +46,7 @@ function Popover() {
   };
 
   const handleQuit = () => {
-    if (window.confirm("确定退出 macrdp？")) {
+    if (window.confirm("Quit macrdp?")) {
       api.quitApp();
     }
   };
@@ -85,7 +85,7 @@ function Popover() {
               variant="ghost"
               size="icon-xs"
               onClick={handleShowMain}
-              title="设置"
+              title="Settings"
             >
               <Settings className="h-3.5 w-3.5" />
             </Button>
@@ -93,7 +93,7 @@ function Popover() {
               variant="destructive"
               size="icon-xs"
               onClick={handleQuit}
-              title="退出"
+              title="Quit"
             >
               <LogOut className="h-3.5 w-3.5" />
             </Button>
@@ -126,30 +126,36 @@ function Popover() {
             <span className="text-sm font-semibold text-foreground">
               {metricsAvailable ? metrics.encode_ms : "--"}
             </span>
-            <span className="text-[10px] text-muted-foreground">编码</span>
+            <span className="text-[10px] text-muted-foreground">Encode</span>
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">
               {metricsAvailable ? metrics.net_ms : "--"}
             </span>
-            <span className="text-[10px] text-muted-foreground">网络</span>
+            <span className="text-[10px] text-muted-foreground">Network</span>
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">
               {metricsAvailable ? formatBytes(metrics.bytes_sent) : "--"}
             </span>
-            <span className="text-[10px] text-muted-foreground">流量</span>
+            <span className="text-[10px] text-muted-foreground">Traffic</span>
           </div>
         </div>
+
+        {status.running && !metricsAvailable && error && (
+          <div className="rounded-md bg-orange/10 px-2 py-1 text-[10px] text-orange">
+            Metrics fetch error: {error}
+          </div>
+        )}
 
         {/* Connection list */}
         <div>
           <div className="mb-1.5 text-xs text-muted-foreground">
-            连接 ({connections.length})
+            Connections ({connections.length})
           </div>
           {connections.length === 0 ? (
             <div className="text-center text-xs text-muted-foreground py-2">
-              暂无连接
+              No connections
             </div>
           ) : (
             <div className="space-y-1">
@@ -184,7 +190,7 @@ function Popover() {
                   onClick={handleShowMain}
                   className="w-full text-center text-xs text-primary hover:underline py-0.5"
                 >
-                  +{extraCount} 更多
+                  +{extraCount} more
                 </button>
               )}
             </div>
@@ -203,9 +209,9 @@ function Popover() {
             className="w-full"
           >
             {status.running ? (
-              <><Square className="h-3 w-3" /> 停止</>
+              <><Square className="h-3 w-3" /> Stop</>
             ) : (
-              <><Play className="h-3 w-3" /> 启动</>
+              <><Play className="h-3 w-3" /> Start</>
             )}
           </Button>
           <Button
@@ -214,7 +220,7 @@ function Popover() {
             className="w-full"
           >
             <Monitor className="h-3 w-3" />
-            主窗口
+            Main window
           </Button>
           <Button
             variant="outline"
@@ -223,7 +229,7 @@ function Popover() {
             className="w-full"
           >
             <FileText className="h-3 w-3" />
-            日志
+            Logs
           </Button>
         </div>
       </div>

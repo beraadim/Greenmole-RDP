@@ -5,6 +5,9 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tauri::Manager;
 use tokio::sync::Mutex;
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::reload;
+use tracing_subscriber::Registry;
 
 use macrdp_core::ServerHandle;
 
@@ -25,6 +28,7 @@ pub struct Connection {
 
 /// Shared handle to the running server. `None` when the server is stopped.
 pub type SharedServerHandle = Arc<Mutex<Option<Arc<ServerHandle>>>>;
+pub type LogReloadHandle = reload::Handle<EnvFilter, Registry>;
 
 /// Application-wide shared state.
 pub struct AppState {
@@ -34,10 +38,11 @@ pub struct AppState {
     pub logs: Mutex<VecDeque<LogEntry>>,
     pub server_handle: SharedServerHandle,
     pub ui_config: Mutex<UiConfig>,
+    pub log_reload: LogReloadHandle,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(log_reload: LogReloadHandle) -> Self {
         Self {
             status: Mutex::new(ServerStatus::default()),
             metrics: Mutex::new(Metrics::default()),
@@ -45,6 +50,7 @@ impl AppState {
             logs: Mutex::new(VecDeque::new()),
             server_handle: Arc::new(Mutex::new(None)),
             ui_config: Mutex::new(UiConfig::load().unwrap_or_default()),
+            log_reload,
         }
     }
 }
@@ -52,8 +58,9 @@ impl AppState {
 /// Initialize application state and register it with the Tauri app.
 pub fn init_app_state(
     handle: &AppHandle,
+    log_reload: LogReloadHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(AppState::new());
+    let state = Arc::new(AppState::new(log_reload));
     handle.manage(state);
     Ok(())
 }

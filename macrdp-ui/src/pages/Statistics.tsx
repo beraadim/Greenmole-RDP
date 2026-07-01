@@ -61,7 +61,7 @@ function Statistics() {
     () =>
       trafficStats.map((d) => {
         const dt = new Date(d.date);
-        const label = dt.toLocaleDateString("zh-CN", {
+        const label = dt.toLocaleDateString("en-GB", {
           month: "2-digit",
           day: "2-digit",
         });
@@ -73,7 +73,7 @@ function Statistics() {
   const formatDateTime = (dateStr: string) => {
     try {
       const d = new Date(dateStr);
-      return d.toLocaleString("zh-CN", {
+      return d.toLocaleString("en-GB", {
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
@@ -96,19 +96,19 @@ function Statistics() {
     <div className="flex flex-col gap-3 p-4 overflow-y-auto">
       {/* 1. Header + time range toggle */}
       <div className="flex items-center justify-between">
-        <h1 className="text-base font-semibold">统计</h1>
+        <h1 className="text-base font-semibold">Statistics</h1>
         <div className="flex gap-1">
           <button
             className={`${pillBase} ${days === 7 ? pillActive : pillDefault}`}
             onClick={() => setDays(7)}
           >
-            7天
+            7 days
           </button>
           <button
             className={`${pillBase} ${days === 30 ? pillActive : pillDefault}`}
             onClick={() => setDays(30)}
           >
-            30天
+            30 days
           </button>
         </div>
       </div>
@@ -117,18 +117,18 @@ function Statistics() {
       <div className="flex gap-2">
         <MetricCard
           value={totalConnections}
-          label="总连接数"
+          label="Total connections"
           color="blue"
         />
         <MetricCard
           value={totalTraffic}
-          label="总流量"
+          label="Total traffic"
           color="green"
           formatter={formatBytes}
         />
         <MetricCard
           value={avgSessionDuration}
-          label="平均会话时长"
+          label="Average session length"
           color="orange"
           formatter={formatDuration}
         />
@@ -136,9 +136,9 @@ function Statistics() {
 
       {/* 3. Traffic trend chart */}
       <ChartPanel
-        title="流量趋势"
+        title="Traffic trend"
         empty={chartData.length === 0}
-        emptyText="暂无流量数据"
+        emptyText="No traffic data yet"
       >
         <BarChart data={chartData} color="var(--color-accent)" />
       </ChartPanel>
@@ -146,16 +146,16 @@ function Statistics() {
       {/* 4. Connection history table */}
       <div className="bg-card rounded-[8px] p-3">
         {history.length === 0 && page === 0 ? (
-          <EmptyState message="暂无连接记录" />
+          <EmptyState message="No connection history yet" />
         ) : (
           <>
             <table className="w-full">
               <thead>
                 <tr className="text-[10px] text-text-muted font-medium">
-                  <th className="text-left pb-2">用户</th>
-                  <th className="text-left pb-2">时间</th>
-                  <th className="text-left pb-2">时长</th>
-                  <th className="text-right pb-2">流量</th>
+                  <th className="text-left pb-2">User</th>
+                  <th className="text-left pb-2">Time</th>
+                  <th className="text-left pb-2">Duration</th>
+                  <th className="text-right pb-2">Traffic</th>
                 </tr>
               </thead>
               <tbody>
@@ -176,7 +176,7 @@ function Statistics() {
             {/* Pagination */}
             <div className="mt-2 flex items-center justify-between">
               <span className="text-[10px] text-text-muted">
-                第 {page + 1} 页
+                Page {page + 1}
               </span>
               <div className="flex gap-1.5">
                 <button
@@ -185,14 +185,14 @@ function Statistics() {
                   onClick={() => fetchHistory(page - 1)}
                 >
                   <ChevronLeft className="h-3 w-3" />
-                  上一页
+                  Previous
                 </button>
                 <button
                   className="text-[10px] text-text-muted disabled:opacity-30 flex items-center gap-0.5"
                   disabled={!hasMore}
                   onClick={() => fetchHistory(page + 1)}
                 >
-                  下一页
+                  Next
                   <ChevronRight className="h-3 w-3" />
                 </button>
               </div>

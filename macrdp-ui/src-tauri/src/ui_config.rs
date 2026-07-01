@@ -15,6 +15,7 @@ pub struct UiConfig {
     pub bitrate_mbps: u32,
     pub encoder: String,
     pub chroma_mode: String,
+    pub gfx_validation_mode: bool,
     pub bind_address: String,
     pub max_connections: u32,
     pub idle_timeout_secs: u64,
@@ -42,6 +43,7 @@ impl Default for UiConfig {
             bitrate_mbps: 50,
             encoder: "auto".to_string(),
             chroma_mode: "avc420".to_string(),
+            gfx_validation_mode: false,
             bind_address: "0.0.0.0".to_string(),
             max_connections: 3,
             idle_timeout_secs: 1800,
@@ -132,6 +134,11 @@ impl UiConfig {
                     .ok_or("chroma_mode must be a string")?
                     .to_string();
             }
+            "gfx_validation_mode" => {
+                self.gfx_validation_mode = value
+                    .as_bool()
+                    .ok_or("gfx_validation_mode must be a boolean")?;
+            }
             "bind_address" => {
                 self.bind_address = value
                     .as_str()
@@ -207,6 +214,7 @@ impl UiConfig {
     pub fn to_server_config(&self) -> macrdp_core::ServerConfig {
         macrdp_core::ServerConfig {
             port: self.port,
+            bind_address: Some(self.bind_address.clone()),
             frame_rate: self.frame_rate,
             width: 0,  // auto-detect
             height: 0, // auto-detect
@@ -223,6 +231,7 @@ impl UiConfig {
             quality: None,
             encoder: Some(self.encoder.clone()),
             chroma_mode: Some(self.chroma_mode.clone()),
+            gfx_validation_mode: Some(self.gfx_validation_mode),
             resolution: Some(self.resolution.clone()),
             show_cursor: Some(self.show_cursor),
             bitrate_mbps: Some(self.bitrate_mbps),

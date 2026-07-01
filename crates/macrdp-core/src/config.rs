@@ -46,6 +46,8 @@ impl Default for ClipboardConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub port: u16,
+    /// Address to bind the RDP listener to (default: 0.0.0.0)
+    pub bind_address: Option<String>,
     pub frame_rate: u32,
     /// Resolution width (0 = auto-detect from display)
     pub width: u32,
@@ -64,6 +66,9 @@ pub struct ServerConfig {
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,
+    /// Force negotiated GFX sessions to stay on uncompressed updates only.
+    /// Intended for Guacamole compatibility validation; default is false.
+    pub gfx_validation_mode: Option<bool>,
     /// Resolution: "auto", or "WxH" like "3840x2160" (default: "auto")
     #[serde(alias = "hidpi_scale")]
     pub resolution: Option<String>,
@@ -83,6 +88,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 3389,
+            bind_address: None,
             frame_rate: 60,
             width: 0,
             height: 0,
@@ -95,6 +101,7 @@ impl Default for ServerConfig {
             quality: None,
             encoder: None,
             chroma_mode: None,
+            gfx_validation_mode: None,
             resolution: None,
             show_cursor: None,
             bitrate_mbps: None,
@@ -161,6 +168,7 @@ mod tests {
     fn test_default_config() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3389);
+        assert_eq!(config.bind_address, None);
         assert_eq!(config.frame_rate, 60);
         assert!(config.username.is_none());
     }
@@ -169,12 +177,14 @@ mod tests {
     fn test_parse_toml_config() {
         let toml_str = r#"
             port = 13389
+            bind_address = "127.0.0.1"
             frame_rate = 120
             username = "admin"
             password = "secret"
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.port, 13389);
+        assert_eq!(config.bind_address.as_deref(), Some("127.0.0.1"));
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
     }

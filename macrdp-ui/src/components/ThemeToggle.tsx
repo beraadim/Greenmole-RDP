@@ -8,7 +8,7 @@ import {
 } from "./ui/tooltip";
 
 const modes = ["light", "dark", "system"] as const;
-const labels = { system: "跟随系统", light: "浅色模式", dark: "深色模式" };
+const labels = { system: "Follow system", light: "Light mode", dark: "Dark mode" };
 const icons = { system: Monitor, light: Sun, dark: Moon };
 
 export default function ThemeToggle() {

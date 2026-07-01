@@ -3,7 +3,7 @@ use core::num::{NonZeroU16, NonZeroUsize};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
-use ironrdp_graphics::diff;
+use ironrdp_graphics::diff::Rect;
 use ironrdp_pdu::pointer::PointerPositionAttribute;
 use tracing::{debug, warn};
 
@@ -174,7 +174,7 @@ impl Framebuffer {
         }
     }
 
-    pub(crate) fn update_diffs(&mut self, bitmap: &BitmapUpdate, diffs: &[diff::Rect]) {
+    pub(crate) fn update_diffs(&mut self, bitmap: &BitmapUpdate, diffs: &[Rect]) {
         diffs
             .iter()
             .filter_map(|diff| {
@@ -203,6 +203,9 @@ pub struct BitmapUpdate {
     pub format: PixelFormat,
     pub data: Bytes,
     pub stride: NonZeroUsize,
+    /// Optional damage hints in absolute framebuffer coordinates.
+    /// Empty means the encoder should derive diffs on its own.
+    pub dirty_rects: Vec<Rect>,
 }
 
 impl BitmapUpdate {
@@ -257,6 +260,7 @@ impl BitmapUpdate {
                 format: self.format,
                 data: self.data.slice(start..end),
                 stride: self.stride,
+                dirty_rects: Vec::new(),
             })
         }
     }
@@ -271,6 +275,7 @@ impl core::fmt::Debug for BitmapUpdate {
             .field("height", &self.height)
             .field("format", &self.format)
             .field("stride", &self.stride)
+            .field("dirty_rects", &self.dirty_rects.len())
             .finish()
     }
 }
@@ -383,6 +388,7 @@ mod tests {
             format: fmt,
             data: data.into(),
             stride,
+            dirty_rects: Vec::new(),
         };
         let diffs = vec![Rect::new(2, 3, 4, 5)];
         fb.update_diffs(&update, &diffs);
