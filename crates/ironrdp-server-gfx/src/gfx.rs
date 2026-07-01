@@ -86,6 +86,138 @@ fn wrap_zgfx(data: &[u8]) -> Vec<u8> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CapabilitySelection {
+    rank: u8,
+    avc420: bool,
+    avc444: bool,
+}
+
+fn describe_capability(cap: &CapabilitySet) -> CapabilitySelection {
+    match cap {
+        CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
+            CapabilitySelection {
+                rank: 17,
+                avc420: true,
+                avc444: true,
+            }
+        }
+        CapabilitySet::V10_6 { flags } | CapabilitySet::V10_6Err { flags }
+            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
+        {
+            CapabilitySelection {
+                rank: 16,
+                avc420: true,
+                avc444: true,
+            }
+        }
+        CapabilitySet::V10_5 { flags } | CapabilitySet::V10_4 { flags }
+            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
+        {
+            CapabilitySelection {
+                rank: 15,
+                avc420: true,
+                avc444: true,
+            }
+        }
+        CapabilitySet::V10_3 { flags }
+            if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
+        {
+            CapabilitySelection {
+                rank: 14,
+                avc420: true,
+                avc444: true,
+            }
+        }
+        CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
+            if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
+        {
+            CapabilitySelection {
+                rank: 13,
+                avc420: true,
+                avc444: true,
+            }
+        }
+        CapabilitySet::V10_1 => CapabilitySelection {
+            rank: 12,
+            avc420: true,
+            avc444: true,
+        },
+        CapabilitySet::V8_1 { flags } if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) => {
+            CapabilitySelection {
+                rank: 11,
+                avc420: true,
+                avc444: false,
+            }
+        }
+        CapabilitySet::V10_7 { .. } => CapabilitySelection {
+            rank: 7,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V10_6 { .. } | CapabilitySet::V10_6Err { .. } => CapabilitySelection {
+            rank: 6,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V10_5 { .. } | CapabilitySet::V10_4 { .. } => CapabilitySelection {
+            rank: 5,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V10_3 { .. } => CapabilitySelection {
+            rank: 4,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V10_2 { .. } | CapabilitySet::V10 { .. } => CapabilitySelection {
+            rank: 3,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V8_1 { .. } => CapabilitySelection {
+            rank: 2,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::V8 { .. } => CapabilitySelection {
+            rank: 1,
+            avc420: false,
+            avc444: false,
+        },
+        CapabilitySet::Unknown(_) => CapabilitySelection {
+            rank: 0,
+            avc420: false,
+            avc444: false,
+        },
+    }
+}
+
+fn choose_confirmed_capability(cap_sets: &[CapabilitySet]) -> (CapabilitySet, CapabilitySelection) {
+    let mut best = None;
+
+    for cap in cap_sets {
+        let selection = describe_capability(cap);
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_selection)| selection > *best_selection)
+        {
+            best = Some((cap.clone(), selection));
+        }
+    }
+
+    best.unwrap_or((
+        CapabilitySet::V8 {
+            flags: ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags::empty(),
+        },
+        CapabilitySelection {
+            rank: 0,
+            avc420: false,
+            avc444: false,
+        },
+    ))
+}
+
 /// Unwrap ZGFX segmented data from client. Returns None if not ZGFX-wrapped.
 fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
@@ -681,66 +813,18 @@ impl DvcProcessor for GfxHandler {
                     return Ok(Vec::new());
                 }
 
-                let mut best_cap = None;
+                let (confirmed, selection) = choose_confirmed_capability(cap_sets);
+                state.avc420_supported = selection.avc420;
+                state.avc444_supported = selection.avc444;
 
-                for cap in cap_sets {
-                    match cap {
-                        CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            best_cap = Some(cap.clone());
-                            break;
-                        }
-                        CapabilitySet::V10_6 { flags } | CapabilitySet::V10_6Err { flags }
-                            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            best_cap = Some(cap.clone());
-                        }
-                        CapabilitySet::V10_5 { flags } | CapabilitySet::V10_4 { flags }
-                            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_3 { flags }
-                            if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
-                            if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_1 => {
-                            // V10_1 has no AVC_DISABLED flag — always supports AVC
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V8_1 { flags }
-                            if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            // V8.1 only supports AVC420, not AVC444
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        _ => {
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                    }
-                }
-
-                let confirmed = best_cap.unwrap_or(CapabilitySet::V8 {
-                    flags: ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags::empty(),
-                });
+                debug!(
+                    offered_caps = ?cap_sets,
+                    selected_cap = ?confirmed,
+                    selected_rank = selection.rank,
+                    selected_avc420 = selection.avc420,
+                    selected_avc444 = selection.avc444,
+                    "GFX capability selection"
+                );
 
                 info!(
                     confirmed_cap = ?confirmed,
@@ -771,7 +855,17 @@ impl DvcProcessor for GfxHandler {
 
             ClientPdu::FrameAcknowledge(ack) => {
                 let mut state = self.state.lock().unwrap();
+                let had_send_time = state.frame_send_times.contains_key(&ack.frame_id);
                 state.ack_frame(ack.frame_id);
+
+                debug!(
+                    ack_frame_id = ack.frame_id,
+                    tracked = had_send_time,
+                    pending_acks = state.pending_acks,
+                    last_ack_frame = state.last_ack_frame,
+                    rtt_ewma_ms = state.rtt_ewma_ms,
+                    "GFX frame acknowledged"
+                );
 
                 // Log stats every 60 acked frames (~1 second at 60fps)
                 if ack.frame_id % 60 == 0 {
@@ -826,3 +920,38 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_confirmed_capability, CapabilitySelection};
+    use ironrdp_pdu::rdp::vc::dvc::gfx::{
+        CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet,
+    };
+
+    #[test]
+    fn prefers_avc_capability_over_plain_v8_when_both_are_offered() {
+        let caps = vec![
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::THIN_CLIENT,
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+        ];
+
+        let (confirmed, selection) = choose_confirmed_capability(&caps);
+
+        assert!(matches!(
+            confirmed,
+            CapabilitySet::V8_1 { flags } if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED)
+        ));
+        assert_eq!(
+            selection,
+            CapabilitySelection {
+                rank: 11,
+                avc420: true,
+                avc444: false,
+            }
+        );
+    }
+}

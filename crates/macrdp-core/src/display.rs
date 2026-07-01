@@ -1652,6 +1652,9 @@ impl MacDisplayUpdates {
                 let oldest_pending_ms = oldest_pending_age
                     .map(|age| age.as_millis() as u64)
                     .unwrap_or(0);
+                let sent_avc_frames = state.frame_id;
+                let pending_acks = state.pending_acks;
+                let last_ack_frame = state.last_ack_frame;
                 state.bitmap_fallback_mode = true;
                 state.avc_fallback_to_uncompressed = false;
                 state.surface_created = false;
@@ -1667,8 +1670,9 @@ impl MacDisplayUpdates {
                 self.session_audit
                     .note_fallback_reason("avc-no-ack-bitmap-fallback");
                 tracing::warn!(
-                    sent_avc_frames = state.frame_id,
-                    pending_acks = state.pending_acks,
+                    sent_avc_frames,
+                    pending_acks,
+                    last_ack_frame,
                     oldest_pending_ms,
                     "GFX AVC negotiated but client never acknowledged a frame; abandoning GFX and falling back to classic bitmap updates for this session"
                 );
