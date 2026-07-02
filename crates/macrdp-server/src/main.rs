@@ -170,7 +170,12 @@ async fn main() -> Result<()> {
     );
 
     // Create shared GFX state
-    let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
+    let gfx_state = Arc::new(Mutex::new(GfxState::new(
+        width,
+        height,
+        mode_444,
+        false,
+    )));
 
     // Create input handler with coordinate mapper
     let input_handler = MacInputHandler::new(coord_mapper.clone());

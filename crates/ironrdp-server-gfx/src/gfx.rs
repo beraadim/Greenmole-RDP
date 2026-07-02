@@ -218,6 +218,15 @@ fn choose_confirmed_capability(cap_sets: &[CapabilitySet]) -> (CapabilitySet, Ca
     ))
 }
 
+fn should_prefer_bitmap_fallback(selection: CapabilitySelection) -> bool {
+    // Guacamole/FreeRDP sessions that negotiate GFX but do not explicitly
+    // advertise AVC support have black-screened on the uncompressed-only path
+    // in live testing. Those clients still render the classic bitmap path, so
+    // pivot there immediately instead of waiting for an AVC failure that will
+    // never arrive in non-AVC sessions.
+    !selection.avc420
+}
+
 /// Unwrap ZGFX segmented data from client. Returns None if not ZGFX-wrapped.
 fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
@@ -816,6 +825,8 @@ impl DvcProcessor for GfxHandler {
                 let (confirmed, selection) = choose_confirmed_capability(cap_sets);
                 state.avc420_supported = selection.avc420;
                 state.avc444_supported = selection.avc444;
+                state.bitmap_fallback_mode = should_prefer_bitmap_fallback(selection);
+                state.avc_fallback_to_uncompressed = false;
 
                 debug!(
                     offered_caps = ?cap_sets,
@@ -823,6 +834,7 @@ impl DvcProcessor for GfxHandler {
                     selected_rank = selection.rank,
                     selected_avc420 = selection.avc420,
                     selected_avc444 = selection.avc444,
+                    bitmap_fallback_mode = state.bitmap_fallback_mode,
                     "GFX capability selection"
                 );
 
@@ -831,7 +843,10 @@ impl DvcProcessor for GfxHandler {
                     avc420 = state.avc420_supported,
                     avc444_client = state.avc444_supported,
                     avc444_enabled = state.avc444_enabled,
-                    effective_mode = if state.avc444_supported && state.avc444_enabled {
+                    bitmap_fallback_mode = state.bitmap_fallback_mode,
+                    effective_mode = if state.bitmap_fallback_mode {
+                        "bitmap-fallback-preferred"
+                    } else if state.avc444_supported && state.avc444_enabled {
                         "gfx-avc444"
                     } else if state.avc420_supported {
                         "gfx-avc420"
@@ -842,10 +857,18 @@ impl DvcProcessor for GfxHandler {
                 );
 
                 // Send CapabilitiesConfirm from the DVC handler so it goes through
-                // DrdynvcServer's proper encoding path. Bitmaps are suppressed once
-                // GFX channel is open, so no bitmap/GFX mixing will occur.
+                // DrdynvcServer's proper encoding path. Some clients still need
+                // session-local fallback to classic bitmap updates even after GFX
+                // negotiation succeeds.
                 state.confirmed_cap = Some(confirmed.clone());
                 state.caps_confirmed = true;
+
+                if state.bitmap_fallback_mode {
+                    info!(
+                        confirmed_cap = ?confirmed,
+                        "GFX negotiated without explicit AVC support; preferring classic bitmap updates for client compatibility"
+                    );
+                }
 
                 let confirm_pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(confirmed));
                 let msg = make_dvc_message(&confirm_pdu)?;
@@ -923,7 +946,9 @@ impl DvcServerProcessor for GfxHandler {}
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_confirmed_capability, CapabilitySelection};
+    use super::{
+        choose_confirmed_capability, should_prefer_bitmap_fallback, CapabilitySelection,
+    };
     use ironrdp_pdu::rdp::vc::dvc::gfx::{
         CapabilitiesV10Flags, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags,
         CapabilitySet,
@@ -966,11 +991,12 @@ mod tests {
         assert_eq!(
             selection,
             CapabilitySelection {
-                rank: 3,
+                rank: 6,
                 avc420: false,
                 avc444: false,
             }
         );
+        assert!(should_prefer_bitmap_fallback(selection));
     }
 
     #[test]
@@ -996,6 +1022,7 @@ mod tests {
                 avc444: false,
             }
         );
+        assert!(should_prefer_bitmap_fallback(selection));
     }
 
     #[test]
@@ -1023,5 +1050,17 @@ mod tests {
                 avc444: false,
             }
         );
+        assert!(should_prefer_bitmap_fallback(selection));
+    }
+
+    #[test]
+    fn keeps_avc_sessions_on_gfx_path() {
+        let caps = vec![CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED,
+        }];
+
+        let (_, selection) = choose_confirmed_capability(&caps);
+
+        assert!(!should_prefer_bitmap_fallback(selection));
     }
 }
