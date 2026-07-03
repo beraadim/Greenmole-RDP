@@ -342,12 +342,24 @@ fn fingerprint_cursor_shape(shape: &CursorShape) -> u64 {
 }
 
 fn cursor_shape_to_pointer(shape: CursorShape) -> ironrdp_server::RGBAPointer {
+    let width = usize::from(shape.width);
+    let height = usize::from(shape.height);
+    let mut data = Vec::with_capacity(shape.rgba.len());
+
+    // RDP 32bpp pointer XOR data is stored as bottom-up BGRA, while the
+    // decoded macOS cursor image arrives as top-down RGBA.
+    for row in shape.rgba.chunks_exact(width * 4).rev().take(height) {
+        for pixel in row.chunks_exact(4) {
+            data.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+    }
+
     ironrdp_server::RGBAPointer {
         width: shape.width,
         height: shape.height,
         hot_x: shape.hot_x,
         hot_y: shape.hot_y,
-        data: shape.rgba,
+        data,
     }
 }
 
@@ -3523,19 +3535,28 @@ mod tests {
     #[test]
     fn converts_cursor_shape_to_rgba_pointer() {
         let shape = CursorShape {
-            width: 32,
-            height: 24,
+            width: 2,
+            height: 2,
             hot_x: 5,
             hot_y: 7,
-            rgba: vec![1, 2, 3, 4],
+            rgba: vec![
+                1, 2, 3, 4, 10, 20, 30, 40, // top row RGBA
+                50, 60, 70, 80, 90, 100, 110, 120, // bottom row RGBA
+            ],
         };
 
         let pointer = cursor_shape_to_pointer(shape);
-        assert_eq!(pointer.width, 32);
-        assert_eq!(pointer.height, 24);
+        assert_eq!(pointer.width, 2);
+        assert_eq!(pointer.height, 2);
         assert_eq!(pointer.hot_x, 5);
         assert_eq!(pointer.hot_y, 7);
-        assert_eq!(pointer.data, vec![1, 2, 3, 4]);
+        assert_eq!(
+            pointer.data,
+            vec![
+                70, 60, 50, 80, 110, 100, 90, 120, // bottom row, converted to BGRA
+                3, 2, 1, 4, 30, 20, 10, 40, // top row, converted to BGRA
+            ]
+        );
     }
 
     #[test]
