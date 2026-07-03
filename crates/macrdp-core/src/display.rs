@@ -772,10 +772,15 @@ impl RdpServerDisplay for MacDisplay {
             (gfx.session_uses_gfx, gfx.is_ready())
         };
 
+        let configured_frame_rate = {
+            let gfx = self.gfx_state.lock().unwrap();
+            gfx.target_frame_rate.unwrap_or(self.frame_rate).max(1)
+        };
+
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
-            frame_rate: self.frame_rate,
+            frame_rate: configured_frame_rate,
             // Start GFX sessions in BGRA so we can guarantee one visible full-frame
             // seed before switching into the NV12/pipelined hardware path.
             pixel_format: if session_uses_gfx {
@@ -809,7 +814,7 @@ impl RdpServerDisplay for MacDisplay {
         let encoder = macrdp_encode::create_encoder(
             self.width as u32,
             self.height as u32,
-            self.frame_rate as f32,
+            configured_frame_rate as f32,
             self.quality,
             self.encoder_pref,
             self.mode_444,
@@ -829,6 +834,7 @@ impl RdpServerDisplay for MacDisplay {
             .map(|ip| NetworkQuality::from_ip(is_private_ip(ip)))
             .unwrap_or(NetworkQuality::from_ip(false));
         let initial_fps = capture_config.frame_rate;
+        self.gfx_state.lock().unwrap().applied_frame_rate = Some(initial_fps.max(1));
         let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
         Ok(Box::new(MacDisplayUpdates {
@@ -1098,10 +1104,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                 enc.set_bitrate(self.bitrate_ctrl.current_bitrate());
                             }
                             let target_fps = self.bitrate_ctrl.target_fps();
-                            if self.last_applied_fps != target_fps {
-                                let _ = self.capturer.set_frame_rate(target_fps);
-                                self.last_applied_fps = target_fps;
-                            }
+                            self.apply_capture_fps(target_fps, "idle-recovery");
                         }
                         self.idle_frame_count = 0;
                         f
@@ -1261,13 +1264,6 @@ impl MacDisplayUpdates {
     }
 
     fn record_bitmap_update_metrics(&mut self, bytes_sent: u32) {
-        {
-            let mut st = self.gfx_state.lock().unwrap();
-            st.last_encode_ms = 0.0;
-            st.last_frame_bytes = bytes_sent;
-            st.total_bytes_sent = st.total_bytes_sent.saturating_add(bytes_sent as u64);
-        }
-
         if let Some(ps) = &self.perf_stats {
             ps.lock().unwrap().record_frame(0.0, bytes_sent, false);
         }
@@ -1362,6 +1358,45 @@ impl MacDisplayUpdates {
         } else {
             CapturePixelFormat::Bgra
         }
+    }
+
+    fn apply_capture_fps(&mut self, requested_fps: u32, reason: &'static str) {
+        let target_fps = requested_fps.max(1);
+        if target_fps == self.last_applied_fps {
+            return;
+        }
+
+        if let Err(e) = self.capturer.set_frame_rate(target_fps) {
+            tracing::warn!("Failed to update frame rate: {e}");
+            return;
+        }
+
+        self.last_applied_fps = target_fps;
+        self.capture_config.frame_rate = target_fps;
+        self.gfx_state.lock().unwrap().applied_frame_rate = Some(target_fps);
+        tracing::info!(
+            requested_fps,
+            applied_fps = target_fps,
+            reason,
+            "Capture frame rate updated"
+        );
+    }
+
+    fn sync_runtime_frame_rate_override(&mut self) {
+        let configured_fps = self
+            .gfx_state
+            .lock()
+            .unwrap()
+            .target_frame_rate
+            .unwrap_or(self.bitrate_ctrl.target_fps())
+            .max(1);
+
+        if configured_fps == self.bitrate_ctrl.target_fps() {
+            return;
+        }
+
+        self.bitrate_ctrl.set_target_fps(configured_fps);
+        self.apply_capture_fps(configured_fps, "config-hot-update");
     }
 
     async fn refresh_capture_transport_if_needed(&mut self) -> Result<()> {
@@ -1511,16 +1546,13 @@ impl MacDisplayUpdates {
         }
 
         if decision.fps != self.last_applied_fps {
-            if let Err(e) = self.capturer.set_frame_rate(decision.fps) {
-                tracing::warn!("Failed to update frame rate: {e}");
-            } else {
-                self.last_applied_fps = decision.fps;
-                tracing::info!(
-                    fps = decision.fps,
-                    bitrate_mbps = decision.bitrate_bps as f64 / 1_000_000.0,
-                    "Adaptive: fps/bitrate updated"
-                );
-            }
+            self.apply_capture_fps(decision.fps, "adaptive");
+            tracing::info!(
+                requested_fps = decision.fps,
+                applied_fps = decision.fps,
+                bitrate_mbps = decision.bitrate_bps as f64 / 1_000_000.0,
+                "Adaptive: fps/bitrate updated"
+            );
         }
     }
 
@@ -1692,6 +1724,7 @@ impl MacDisplayUpdates {
         if request_bitmap_fallback_full_frames {
             self.request_full_bitmap_updates(BITMAP_FORCED_FULL_UPDATES_AFTER_GFX_FALLBACK);
         }
+        self.sync_runtime_frame_rate_override();
 
         if gfx_channel_ready {
             if self.needs_full_gfx_seed {
@@ -2940,6 +2973,7 @@ impl MacDisplayUpdates {
 
 impl Drop for MacDisplayUpdates {
     fn drop(&mut self) {
+        self.session_audit.bitmap_bytes = self.gfx_state.lock().unwrap().bitmap_wire_bytes;
         self.session_audit.log_summary();
     }
 }

@@ -312,6 +312,8 @@ pub struct GfxState {
     pub last_frame_bytes: u32,
     /// Total bytes sent
     pub total_bytes_sent: u64,
+    /// Total compressed fast-path bytes sent for classic bitmap updates.
+    pub bitmap_wire_bytes: u64,
     /// Time of first frame sent
     pub start_time: Option<std::time::Instant>,
     /// Client peer IP address (set after TCP connection is established)
@@ -323,6 +325,10 @@ pub struct GfxState {
     last_frame_time: Option<std::time::Instant>,
     /// Hot-updatable: target bitrate override (set via ConfigUpdate)
     pub target_bitrate: Option<u32>,
+    /// Hot-updatable: frame rate override (set via ConfigUpdate).
+    pub target_frame_rate: Option<u32>,
+    /// Currently applied capture frame rate after hot updates/adaptation.
+    pub applied_frame_rate: Option<u32>,
     /// Hot-updatable: show cursor flag (set via ConfigUpdate)
     pub show_cursor: Option<bool>,
     /// Hot-updatable: resolution (set via ConfigUpdate)
@@ -369,6 +375,7 @@ impl GfxState {
             last_encode_ms: 0.0,
             last_frame_bytes: 0,
             total_bytes_sent: 0,
+            bitmap_wire_bytes: 0,
             start_time: None,
             peer_addr: None,
             bitrate_samples: Vec::new(),
@@ -376,6 +383,8 @@ impl GfxState {
             bitrate_min: f64::MAX,
             last_frame_time: None,
             target_bitrate: None,
+            target_frame_rate: None,
+            applied_frame_rate: None,
             show_cursor: None,
             resolution: None,
             encoder_pref: None,

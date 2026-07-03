@@ -261,6 +261,15 @@ enum RunState {
     DeactivationReactivation { desktop_size: DesktopSize },
 }
 
+fn is_benign_disconnect_error_text(err: &str) -> bool {
+    err.contains("reset by peer")
+        || err.contains("Broken pipe")
+        // Guacamole teardown can leave the TCP stream ending mid-PDU read,
+        // which currently bubbles up as a decode "not enough bytes" error
+        // even though the client intentionally closed the session.
+        || err.contains("not enough bytes")
+}
+
 impl RdpServer {
     pub fn new(
         opts: RdpServerOptions,
@@ -471,7 +480,7 @@ impl RdpServer {
                     drop(ev_receiver);
                     if let Err(error) = self.run_connection(stream).await {
                         let err_str = format!("{error:#}");
-                        if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
+                        if is_benign_disconnect_error_text(&err_str) {
                             warn!("Client disconnected: {err_str}");
                         } else {
                             error!(?error, "Connection error");
@@ -536,6 +545,8 @@ impl RdpServer {
         gfx_state: &Arc<std::sync::Mutex<GfxState>>,
         drdynvc_channel_id: Option<StaticChannelId>,
     ) -> Result<(RunState, UpdateEncoder)> {
+        let is_bitmap_update = matches!(&update, DisplayUpdate::Bitmap(_));
+
         if let DisplayUpdate::Resize(desktop_size) = update {
             debug!(?desktop_size, "Display resize");
             encoder.set_desktop_size(desktop_size);
@@ -611,6 +622,7 @@ impl RdpServer {
         }
 
         let mut encoder_iter = encoder.update(update);
+        let mut bytes_written = 0usize;
         loop {
             let Some(fragmenter) = encoder_iter.next().await else {
                 break;
@@ -626,7 +638,15 @@ impl RdpServer {
                     .write_all(&buffer[..len])
                     .await
                     .context("failed to write display update")?;
+                bytes_written = bytes_written.saturating_add(len);
             }
+        }
+
+        if is_bitmap_update {
+            let mut state = gfx_state.lock().unwrap();
+            state.last_frame_bytes = bytes_written as u32;
+            state.total_bytes_sent = state.total_bytes_sent.saturating_add(bytes_written as u64);
+            state.bitmap_wire_bytes = state.bitmap_wire_bytes.saturating_add(bytes_written as u64);
         }
 
         Ok((RunState::Continue, encoder))
@@ -867,7 +887,12 @@ impl RdpServer {
                 info!(source, ?run_state, "Client loop ended");
             }
             Err(error) => {
-                warn!(source, error = format!("{error:#}"), "Client loop failed");
+                let err_str = format!("{error:#}");
+                if is_benign_disconnect_error_text(&err_str) {
+                    info!(source, error = err_str, "Client loop ended after client disconnect");
+                } else {
+                    warn!(source, error = err_str, "Client loop failed");
+                }
             }
         }
 

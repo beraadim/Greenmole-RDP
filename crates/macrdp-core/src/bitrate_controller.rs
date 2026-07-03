@@ -99,6 +99,13 @@ impl BitrateController {
     pub fn target_fps(&self) -> u32 {
         self.target_fps
     }
+
+    pub fn set_target_fps(&mut self, target_fps: u32) {
+        self.target_fps = target_fps.max(1);
+        self.current_fps_tier = 0;
+        self.eval_window.clear();
+        self.last_eval_time = Instant::now();
+    }
     pub fn network_score(&self) -> f64 {
         self.network.score()
     }

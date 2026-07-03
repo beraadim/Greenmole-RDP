@@ -155,7 +155,11 @@ impl ServerHandle {
         let encode_ms = sanitize_f64(gfx.last_encode_ms);
         let net_ms = sanitize_f64((rtt_ms - encode_ms).max(0.0));
         Metrics {
-            fps: self.fps,
+            fps: gfx
+                .applied_frame_rate
+                .or(gfx.target_frame_rate)
+                .unwrap_or(self.fps)
+                .max(1),
             bitrate_kbps,
             rtt_ms,
             bytes_sent: gfx.total_bytes_sent,
@@ -624,7 +628,8 @@ fn run_server_thread(args: ServerThreadArgs) {
             while let Some(update) = config_rx.recv().await {
                 match update {
                     ConfigUpdate::FrameRate(fps) => {
-                        tracing::info!(fps, "Hot-update: frame_rate (next connection)");
+                        tracing::info!(fps, "Hot-update: frame_rate");
+                        gfx_for_config.lock().unwrap().target_frame_rate = Some(fps.max(1));
                     }
                     ConfigUpdate::BitrateKbps(kbps) => {
                         let bps = kbps * 1000;

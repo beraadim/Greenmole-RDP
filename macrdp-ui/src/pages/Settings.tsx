@@ -154,6 +154,7 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="15">15 fps</SelectItem>
                   <SelectItem value="30">30 fps</SelectItem>
                   <SelectItem value="60">60 fps</SelectItem>
                   <SelectItem value="120">120 fps</SelectItem>
