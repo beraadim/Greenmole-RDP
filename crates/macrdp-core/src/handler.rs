@@ -80,6 +80,29 @@ pub struct MacInputHandler {
     last_sync_lock_bits: Option<u8>,
     coord_mapper: MouseCoordMapper,
     client_context: ClientInputContext,
+    modifier_state: ModifierState,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ModifierState {
+    left_shift: bool,
+    right_shift: bool,
+    left_ctrl: bool,
+    right_ctrl: bool,
+    left_alt: bool,
+    right_alt: bool,
+    left_win: bool,
+    right_win: bool,
+}
+
+impl ModifierState {
+    fn shift(self) -> bool {
+        self.left_shift || self.right_shift
+    }
+
+    fn has_non_text_modifier(self) -> bool {
+        self.left_ctrl || self.right_ctrl || self.left_alt || self.left_win || self.right_win
+    }
 }
 
 impl MacInputHandler {
@@ -103,6 +126,7 @@ impl MacInputHandler {
             last_sync_lock_bits: None,
             coord_mapper,
             client_context: ClientInputContext::default(),
+            modifier_state: ModifierState::default(),
         }
     }
 
@@ -111,6 +135,50 @@ impl MacInputHandler {
         let is_non_us_layout = layout != 0 && layout != 0x0409;
         let is_guacamole = self.client_context.client_name.contains("Guacamole");
         is_non_us_layout || is_guacamole
+    }
+
+    fn use_norwegian_text_translation(&self) -> bool {
+        self.client_context.keyboard_layout == 0x0414
+            || self.client_context.client_name.contains("Guacamole")
+    }
+
+    fn translate_norwegian_text_key(&self, code: u8, extended: bool) -> Option<char> {
+        if extended || !self.use_norwegian_text_translation() {
+            return None;
+        }
+
+        if self.modifier_state.has_non_text_modifier() || self.modifier_state.right_alt {
+            return None;
+        }
+
+        let shifted = self.modifier_state.shift();
+        match (code, shifted) {
+            (0x2B, false) => Some('*'),
+            (0x2B, true) => Some('\''),
+            (0x33, false) => Some(','),
+            (0x33, true) => Some(';'),
+            (0x34, false) => Some('.'),
+            (0x34, true) => Some(':'),
+            (0x35, false) => Some('-'),
+            (0x35, true) => Some('_'),
+            (0x56, false) => Some('<'),
+            (0x56, true) => Some('>'),
+            _ => None,
+        }
+    }
+
+    fn update_modifier_state(&mut self, code: u8, extended: bool, pressed: bool) {
+        match (code, extended) {
+            (0x2A, false) => self.modifier_state.left_shift = pressed,
+            (0x36, false) => self.modifier_state.right_shift = pressed,
+            (0x1D, false) => self.modifier_state.left_ctrl = pressed,
+            (0x1D, true) => self.modifier_state.right_ctrl = pressed,
+            (0x38, false) => self.modifier_state.left_alt = pressed,
+            (0x38, true) => self.modifier_state.right_alt = pressed,
+            (0x5B, true) => self.modifier_state.left_win = pressed,
+            (0x5C, true) => self.modifier_state.right_win = pressed,
+            _ => {}
+        }
     }
 }
 
@@ -125,10 +193,19 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn keyboard(&mut self, event: KeyboardEvent) {
-        let Some(kb) = &self.keyboard else { return };
+        if self.keyboard.is_none() {
+            return;
+        }
 
         let result = match event {
             KeyboardEvent::Pressed { code, extended } => {
+                self.update_modifier_state(code, extended, true);
+                let kb = self.keyboard.as_ref().expect("keyboard checked above");
+
+                if let Some(ch) = self.translate_norwegian_text_key(code, extended) {
+                    tracing::trace!(code, translated = %ch, "Translated key press via Norwegian text path");
+                    kb.inject_unicode(ch as u16, true)
+                } else
                 if extended && code == 0x38 && self.map_right_alt_to_option() {
                     kb.inject_keycode(0x3D, true)
                 } else {
@@ -136,15 +213,32 @@ impl RdpServerInputHandler for MacInputHandler {
                 }
             }
             KeyboardEvent::Released { code, extended } => {
+                let translated = self.translate_norwegian_text_key(code, extended);
+                self.update_modifier_state(code, extended, false);
+                let kb = self.keyboard.as_ref().expect("keyboard checked above");
+
+                if let Some(ch) = translated {
+                    tracing::trace!(code, translated = %ch, "Translated key release via Norwegian text path");
+                    kb.inject_unicode(ch as u16, false)
+                } else
                 if extended && code == 0x38 && self.map_right_alt_to_option() {
                     kb.inject_keycode(0x3D, false)
                 } else {
                     kb.inject_key(code, extended, false)
                 }
             }
-            KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
-            KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
+            KeyboardEvent::UnicodePressed(ch) => self
+                .keyboard
+                .as_ref()
+                .expect("keyboard checked above")
+                .inject_unicode(ch, true),
+            KeyboardEvent::UnicodeReleased(ch) => self
+                .keyboard
+                .as_ref()
+                .expect("keyboard checked above")
+                .inject_unicode(ch, false),
             KeyboardEvent::Synchronize(flags) => {
+                let kb = self.keyboard.as_ref().expect("keyboard checked above");
                 let mut result = kb.release_transient_modifiers();
                 let sync_bits = flags.bits();
 
@@ -172,6 +266,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 }
 
                 self.last_sync_lock_bits = Some(sync_bits);
+                self.modifier_state = ModifierState::default();
                 result
             }
         };
@@ -237,5 +332,45 @@ impl RdpServerInputHandler for MacInputHandler {
         if let Err(e) = result {
             tracing::warn!("Mouse injection failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientInputContext, MacInputHandler, ModifierState, MouseCoordMapper};
+
+    fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
+        let mut handler = MacInputHandler::new(MouseCoordMapper::new(1920, 1200, 1920, 1200));
+        handler.client_context = ClientInputContext {
+            client_name: client_name.to_string(),
+            keyboard_layout,
+        };
+        handler
+    }
+
+    #[test]
+    fn guacamole_uses_norwegian_text_translation_for_comma_key() {
+        let mut handler = handler_for("Guacamole RDP", 0x0409);
+        assert_eq!(handler.translate_norwegian_text_key(0x33, false), Some(','));
+        handler.modifier_state.left_shift = true;
+        assert_eq!(handler.translate_norwegian_text_key(0x33, false), Some(';'));
+    }
+
+    #[test]
+    fn norwegian_star_key_translates_to_expected_characters() {
+        let mut handler = handler_for("Windows App", 0x0414);
+        assert_eq!(handler.translate_norwegian_text_key(0x2B, false), Some('*'));
+        handler.modifier_state.right_shift = true;
+        assert_eq!(handler.translate_norwegian_text_key(0x2B, false), Some('\''));
+    }
+
+    #[test]
+    fn translation_is_disabled_for_shortcuts() {
+        let mut handler = handler_for("Guacamole RDP", 0x0409);
+        handler.modifier_state = ModifierState {
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+        assert_eq!(handler.translate_norwegian_text_key(0x33, false), None);
     }
 }
