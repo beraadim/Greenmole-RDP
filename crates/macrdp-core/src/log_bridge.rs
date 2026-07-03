@@ -19,19 +19,46 @@ impl LogBridgeLayer {
     }
 }
 
+fn preferred_log_path() -> PathBuf {
+    if let Some(data_dir) = dirs::data_dir() {
+        return data_dir.join("macrdp").join("macrdp-logs.jsonl");
+    }
+
+    std::env::temp_dir().join("macrdp-logs.jsonl")
+}
+
 /// Initialize the log file. Call once at startup.
 pub fn init_log_file() -> PathBuf {
-    let path = std::env::temp_dir().join("macrdp-logs.jsonl");
-    // Truncate on startup
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .expect("failed to create log file");
+    let preferred = preferred_log_path();
+    let fallback = std::env::temp_dir().join("macrdp-logs.jsonl");
+
+    let (path, file) = match open_log_file(&preferred) {
+        Ok(file) => (preferred, file),
+        Err(preferred_err) => {
+            eprintln!(
+                "Failed to initialize preferred log file at {}: {preferred_err}",
+                preferred.display()
+            );
+            let file = open_log_file(&fallback).expect("failed to create fallback log file");
+            (fallback, file)
+        }
+    };
+
     let _ = LOG_FILE.set(std::sync::Mutex::new(file));
     let _ = LOG_PATH.set(path.clone());
     path
+}
+
+fn open_log_file(path: &PathBuf) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
 }
 
 /// Get the log file path (for UI to read).
