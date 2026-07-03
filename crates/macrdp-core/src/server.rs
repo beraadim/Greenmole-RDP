@@ -82,6 +82,62 @@ fn sanitize_f32(value: f32) -> f32 {
     }
 }
 
+fn derive_transport_mode(gfx: &GfxState) -> String {
+    if !gfx.session_uses_gfx {
+        return "bitmap".to_string();
+    }
+
+    if gfx.bitmap_fallback_mode {
+        return "bitmap-fallback".to_string();
+    }
+
+    if gfx.avc_fallback_to_uncompressed {
+        return "gfx-uncompressed-fallback".to_string();
+    }
+
+    if gfx.avc420_supported {
+        if gfx.avc444_supported && gfx.avc444_enabled {
+            "gfx-avc444".to_string()
+        } else {
+            "gfx-avc420".to_string()
+        }
+    } else if gfx.caps_confirmed {
+        "gfx-uncompressed".to_string()
+    } else {
+        "gfx-negotiating".to_string()
+    }
+}
+
+fn derive_encoder_mode(gfx: &GfxState, transport_mode: &str) -> String {
+    let encoder = gfx.encoder_pref.as_deref().unwrap_or("auto");
+    let chroma = gfx.chroma_mode.as_deref().unwrap_or("avc420");
+
+    match transport_mode {
+        "gfx-avc444" => format!("{encoder} / avc444"),
+        "gfx-avc420" => format!("{encoder} / avc420"),
+        "gfx-uncompressed" | "gfx-uncompressed-fallback" => {
+            format!("{encoder} / {chroma} configured, uncompressed active")
+        }
+        "bitmap" | "bitmap-fallback" => {
+            format!("{encoder} / {chroma} configured, bitmap active")
+        }
+        _ => format!("{encoder} / {chroma}"),
+    }
+}
+
+fn derive_bitrate_mode(transport_mode: &str) -> String {
+    match transport_mode {
+        "gfx-avc420" | "gfx-avc444" => "AVC target + wire throughput".to_string(),
+        "gfx-uncompressed" | "gfx-uncompressed-fallback" => {
+            "Wire throughput only (uncompressed GFX)".to_string()
+        }
+        "bitmap" | "bitmap-fallback" => {
+            "Wire throughput only (bitmap updates)".to_string()
+        }
+        _ => "Wire throughput".to_string(),
+    }
+}
+
 #[derive(Debug, Default)]
 struct MetricsSnapshot {
     last_sample_at: Option<Instant>,
@@ -154,6 +210,9 @@ impl ServerHandle {
         let rtt_ms = sanitize_f64(gfx.rtt_ewma_ms);
         let encode_ms = sanitize_f64(gfx.last_encode_ms);
         let net_ms = sanitize_f64((rtt_ms - encode_ms).max(0.0));
+        let transport_mode = derive_transport_mode(&gfx);
+        let encoder_mode = derive_encoder_mode(&gfx, &transport_mode);
+        let bitrate_mode = derive_bitrate_mode(&transport_mode);
         Metrics {
             fps: gfx
                 .applied_frame_rate
@@ -172,6 +231,9 @@ impl ServerHandle {
             last_frame_bytes: gfx.last_frame_bytes,
             network_quality: sanitize_f32(gfx.network_quality),
             pending_acks: gfx.pending_acks,
+            transport_mode,
+            encoder_mode,
+            bitrate_mode,
         }
     }
 
@@ -401,8 +463,21 @@ pub async fn start_server(
         let mut prev_bytes_sent: u64 = 0;
         loop {
             interval.tick().await;
-            let (rtt_ms, bytes_sent, encode_ms, last_frame_bytes, network_quality, pending_acks) = {
+            let (
+                rtt_ms,
+                bytes_sent,
+                encode_ms,
+                last_frame_bytes,
+                network_quality,
+                pending_acks,
+                transport_mode,
+                encoder_mode,
+                bitrate_mode,
+            ) = {
                 let gfx = metrics_gfx.lock().unwrap();
+                let transport_mode = derive_transport_mode(&gfx);
+                let encoder_mode = derive_encoder_mode(&gfx, &transport_mode);
+                let bitrate_mode = derive_bitrate_mode(&transport_mode);
                 (
                     gfx.rtt_ewma_ms,
                     gfx.total_bytes_sent,
@@ -410,6 +485,9 @@ pub async fn start_server(
                     gfx.last_frame_bytes,
                     gfx.network_quality,
                     gfx.pending_acks,
+                    transport_mode,
+                    encoder_mode,
+                    bitrate_mode,
                 )
             };
             let delta_bytes = bytes_sent.saturating_sub(prev_bytes_sent);
@@ -433,6 +511,9 @@ pub async fn start_server(
                 last_frame_bytes,
                 network_quality: sanitize_f32(network_quality),
                 pending_acks,
+                transport_mode,
+                encoder_mode,
+                bitrate_mode,
             });
         }
     });

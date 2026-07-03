@@ -18,6 +18,9 @@ export interface Metrics {
   last_frame_bytes: number;
   network_quality: number;
   pending_acks: number;
+  transport_mode: string;
+  encoder_mode: string;
+  bitrate_mode: string;
 }
 
 export interface Connection {

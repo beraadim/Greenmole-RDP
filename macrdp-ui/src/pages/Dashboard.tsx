@@ -75,6 +75,9 @@ function Dashboard() {
   const avgEncode = !chartsEmpty && encodeHistory.length > 0
     ? (encodeHistory.reduce((a, b) => a + b, 0) / encodeHistory.length).toFixed(1)
     : null;
+  const currentTransport = metricsAvailable ? metrics.transport_mode : null;
+  const currentEncoder = metricsAvailable ? metrics.encoder_mode : null;
+  const currentBitrateMode = metricsAvailable ? metrics.bitrate_mode : null;
 
   return (
     <div className="flex flex-col gap-3 p-4 overflow-y-auto">
@@ -133,6 +136,31 @@ function Dashboard() {
           label="Connections"
           color="purple"
         />
+      </div>
+
+      <div className="bg-card rounded-[8px] p-3">
+        <div className="flex items-center justify-between gap-3 mb-2">
+          <span className="text-[11px] text-text-muted font-medium">
+            Active graphics mode
+          </span>
+          <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent uppercase tracking-[0.12em]">
+            {currentTransport ?? "inactive"}
+          </span>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px]">
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Transport</div>
+            <div className="text-text">{currentTransport ?? "--"}</div>
+          </div>
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Encoding</div>
+            <div className="text-text">{currentEncoder ?? "--"}</div>
+          </div>
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Bitrate meaning</div>
+            <div className="text-text">{currentBitrateMode ?? "--"}</div>
+          </div>
+        </div>
       </div>
 
       {status.running && !metricsAvailable && error && (

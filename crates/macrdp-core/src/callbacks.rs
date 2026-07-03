@@ -44,6 +44,12 @@ pub struct Metrics {
     pub network_quality: f32,
     /// Number of GFX frames awaiting ACK from the client
     pub pending_acks: u32,
+    /// Effective transport path for the active session.
+    pub transport_mode: String,
+    /// Current encoder preference/config context.
+    pub encoder_mode: String,
+    /// Human-readable note for how bitrate should be interpreted in this mode.
+    pub bitrate_mode: String,
 }
 
 /// Connection event
