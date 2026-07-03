@@ -102,16 +102,18 @@ impl ModifierState {
     fn shift(self) -> bool {
         self.left_shift || self.right_shift
     }
-
-    fn has_non_text_modifier(self) -> bool {
-        self.left_ctrl || self.right_ctrl || self.left_alt || self.left_win || self.right_win
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextTranslation {
     Unicode(char),
     Dead(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardTranslationProfile {
+    GuacamoleUs,
+    NorwegianPhysical,
 }
 
 impl MacInputHandler {
@@ -148,23 +150,118 @@ impl MacInputHandler {
         is_non_us_layout || is_guacamole
     }
 
-    fn use_norwegian_text_translation(&self) -> bool {
-        self.client_context.keyboard_layout == 0x0414
-            || self.client_context.client_name.contains("Guacamole")
+    fn translation_profile(&self) -> Option<KeyboardTranslationProfile> {
+        if self.client_context.client_name.contains("Guacamole") {
+            Some(KeyboardTranslationProfile::GuacamoleUs)
+        } else if self.client_context.keyboard_layout == 0x0414 {
+            Some(KeyboardTranslationProfile::NorwegianPhysical)
+        } else {
+            None
+        }
     }
 
-    fn translate_norwegian_text_key(&self, code: u8, extended: bool) -> Option<TextTranslation> {
-        if extended || !self.use_norwegian_text_translation() {
-            return None;
+    fn translate_guacamole_us_text_key(&self, code: u8, shifted: bool) -> Option<TextTranslation> {
+        match (code, shifted) {
+            (0x29, false) => Some(TextTranslation::Unicode('`')),
+            (0x29, true) => Some(TextTranslation::Unicode('~')),
+            (0x02, false) => Some(TextTranslation::Unicode('1')),
+            (0x02, true) => Some(TextTranslation::Unicode('!')),
+            (0x03, false) => Some(TextTranslation::Unicode('2')),
+            (0x03, true) => Some(TextTranslation::Unicode('@')),
+            (0x04, false) => Some(TextTranslation::Unicode('3')),
+            (0x04, true) => Some(TextTranslation::Unicode('#')),
+            (0x05, false) => Some(TextTranslation::Unicode('4')),
+            (0x05, true) => Some(TextTranslation::Unicode('$')),
+            (0x06, false) => Some(TextTranslation::Unicode('5')),
+            (0x06, true) => Some(TextTranslation::Unicode('%')),
+            (0x07, false) => Some(TextTranslation::Unicode('6')),
+            (0x07, true) => Some(TextTranslation::Unicode('^')),
+            (0x08, false) => Some(TextTranslation::Unicode('7')),
+            (0x08, true) => Some(TextTranslation::Unicode('&')),
+            (0x09, false) => Some(TextTranslation::Unicode('8')),
+            (0x09, true) => Some(TextTranslation::Unicode('*')),
+            (0x0A, false) => Some(TextTranslation::Unicode('9')),
+            (0x0A, true) => Some(TextTranslation::Unicode('(')),
+            (0x0B, false) => Some(TextTranslation::Unicode('0')),
+            (0x0B, true) => Some(TextTranslation::Unicode(')')),
+            (0x0C, false) => Some(TextTranslation::Unicode('-')),
+            (0x0C, true) => Some(TextTranslation::Unicode('_')),
+            (0x0D, false) => Some(TextTranslation::Unicode('=')),
+            (0x0D, true) => Some(TextTranslation::Unicode('+')),
+            (0x10, false) => Some(TextTranslation::Unicode('q')),
+            (0x10, true) => Some(TextTranslation::Unicode('Q')),
+            (0x11, false) => Some(TextTranslation::Unicode('w')),
+            (0x11, true) => Some(TextTranslation::Unicode('W')),
+            (0x12, false) => Some(TextTranslation::Unicode('e')),
+            (0x12, true) => Some(TextTranslation::Unicode('E')),
+            (0x13, false) => Some(TextTranslation::Unicode('r')),
+            (0x13, true) => Some(TextTranslation::Unicode('R')),
+            (0x14, false) => Some(TextTranslation::Unicode('t')),
+            (0x14, true) => Some(TextTranslation::Unicode('T')),
+            (0x15, false) => Some(TextTranslation::Unicode('y')),
+            (0x15, true) => Some(TextTranslation::Unicode('Y')),
+            (0x16, false) => Some(TextTranslation::Unicode('u')),
+            (0x16, true) => Some(TextTranslation::Unicode('U')),
+            (0x17, false) => Some(TextTranslation::Unicode('i')),
+            (0x17, true) => Some(TextTranslation::Unicode('I')),
+            (0x18, false) => Some(TextTranslation::Unicode('o')),
+            (0x18, true) => Some(TextTranslation::Unicode('O')),
+            (0x19, false) => Some(TextTranslation::Unicode('p')),
+            (0x19, true) => Some(TextTranslation::Unicode('P')),
+            (0x1A, false) => Some(TextTranslation::Unicode('[')),
+            (0x1A, true) => Some(TextTranslation::Unicode('{')),
+            (0x1B, false) => Some(TextTranslation::Unicode(']')),
+            (0x1B, true) => Some(TextTranslation::Unicode('}')),
+            (0x1E, false) => Some(TextTranslation::Unicode('a')),
+            (0x1E, true) => Some(TextTranslation::Unicode('A')),
+            (0x1F, false) => Some(TextTranslation::Unicode('s')),
+            (0x1F, true) => Some(TextTranslation::Unicode('S')),
+            (0x20, false) => Some(TextTranslation::Unicode('d')),
+            (0x20, true) => Some(TextTranslation::Unicode('D')),
+            (0x21, false) => Some(TextTranslation::Unicode('f')),
+            (0x21, true) => Some(TextTranslation::Unicode('F')),
+            (0x22, false) => Some(TextTranslation::Unicode('g')),
+            (0x22, true) => Some(TextTranslation::Unicode('G')),
+            (0x23, false) => Some(TextTranslation::Unicode('h')),
+            (0x23, true) => Some(TextTranslation::Unicode('H')),
+            (0x24, false) => Some(TextTranslation::Unicode('j')),
+            (0x24, true) => Some(TextTranslation::Unicode('J')),
+            (0x25, false) => Some(TextTranslation::Unicode('k')),
+            (0x25, true) => Some(TextTranslation::Unicode('K')),
+            (0x26, false) => Some(TextTranslation::Unicode('l')),
+            (0x26, true) => Some(TextTranslation::Unicode('L')),
+            (0x27, false) => Some(TextTranslation::Unicode(';')),
+            (0x27, true) => Some(TextTranslation::Unicode(':')),
+            (0x28, false) => Some(TextTranslation::Unicode('\'')),
+            (0x28, true) => Some(TextTranslation::Unicode('"')),
+            (0x2B, false) => Some(TextTranslation::Unicode('\\')),
+            (0x2B, true) => Some(TextTranslation::Unicode('|')),
+            (0x2C, false) => Some(TextTranslation::Unicode('z')),
+            (0x2C, true) => Some(TextTranslation::Unicode('Z')),
+            (0x2D, false) => Some(TextTranslation::Unicode('x')),
+            (0x2D, true) => Some(TextTranslation::Unicode('X')),
+            (0x2E, false) => Some(TextTranslation::Unicode('c')),
+            (0x2E, true) => Some(TextTranslation::Unicode('C')),
+            (0x2F, false) => Some(TextTranslation::Unicode('v')),
+            (0x2F, true) => Some(TextTranslation::Unicode('V')),
+            (0x30, false) => Some(TextTranslation::Unicode('b')),
+            (0x30, true) => Some(TextTranslation::Unicode('B')),
+            (0x31, false) => Some(TextTranslation::Unicode('n')),
+            (0x31, true) => Some(TextTranslation::Unicode('N')),
+            (0x32, false) => Some(TextTranslation::Unicode('m')),
+            (0x32, true) => Some(TextTranslation::Unicode('M')),
+            (0x33, false) => Some(TextTranslation::Unicode(',')),
+            (0x33, true) => Some(TextTranslation::Unicode('<')),
+            (0x34, false) => Some(TextTranslation::Unicode('.')),
+            (0x34, true) => Some(TextTranslation::Unicode('>')),
+            (0x35, false) => Some(TextTranslation::Unicode('/')),
+            (0x35, true) => Some(TextTranslation::Unicode('?')),
+            (0x39, false) | (0x39, true) => Some(TextTranslation::Unicode(' ')),
+            _ => None,
         }
+    }
 
-        if self.modifier_state.has_non_text_modifier() {
-            return None;
-        }
-
-        let shifted = self.modifier_state.shift();
-        let altgr = self.modifier_state.right_alt;
-
+    fn translate_norwegian_text_key(&self, code: u8, shifted: bool, altgr: bool) -> Option<TextTranslation> {
         if altgr {
             return match code {
                 0x03 => Some(TextTranslation::Unicode('@')),
@@ -286,6 +383,32 @@ impl MacInputHandler {
         }
     }
 
+    fn translate_text_key(&self, code: u8, extended: bool) -> Option<TextTranslation> {
+        if extended {
+            return None;
+        }
+
+        let profile = self.translation_profile()?;
+        let shifted = self.modifier_state.shift();
+        let altgr = self.modifier_state.right_alt;
+        let ctrl_blocks_text = self.modifier_state.left_ctrl
+            || (self.modifier_state.right_ctrl
+                && !(matches!(profile, KeyboardTranslationProfile::NorwegianPhysical) && altgr));
+        let other_blocks_text =
+            self.modifier_state.left_alt || self.modifier_state.left_win || self.modifier_state.right_win;
+
+        if ctrl_blocks_text || other_blocks_text {
+            return None;
+        }
+
+        match profile {
+            KeyboardTranslationProfile::GuacamoleUs => self.translate_guacamole_us_text_key(code, shifted),
+            KeyboardTranslationProfile::NorwegianPhysical => {
+                self.translate_norwegian_text_key(code, shifted, altgr)
+            }
+        }
+    }
+
     fn compose_dead_key(accent: char, base: char) -> Option<char> {
         match (accent, base) {
             ('¨', 'a') => Some('ä'),
@@ -365,7 +488,7 @@ impl MacInputHandler {
     }
 
     fn handle_translated_key_press(&mut self, code: u8, extended: bool) -> Option<anyhow::Result<()>> {
-        let translation = self.translate_norwegian_text_key(code, extended)?;
+        let translation = self.translate_text_key(code, extended)?;
         let kb = self.keyboard.as_ref().expect("keyboard checked above");
 
         let mut emitted = Vec::new();
@@ -454,7 +577,7 @@ impl RdpServerInputHandler for MacInputHandler {
             KeyboardEvent::Pressed { code, extended } => {
                 self.update_modifier_state(code, extended, true);
 
-                if extended && code == 0x38 && self.use_norwegian_text_translation() {
+                if extended && code == 0x38 && self.translation_profile().is_some() {
                     Ok(())
                 } else if let Some(result) = self.handle_translated_key_press(code, extended) {
                     result
@@ -472,7 +595,7 @@ impl RdpServerInputHandler for MacInputHandler {
 
                 if let Some(chars) = self.translated_key_releases.remove(&(code, extended)) {
                     Self::inject_unicode_sequence(kb, &chars, false)
-                } else if extended && code == 0x38 && self.use_norwegian_text_translation() {
+                } else if extended && code == 0x38 && self.translation_profile().is_some() {
                     Ok(())
                 } else if extended && code == 0x38 && self.map_right_alt_to_option() {
                     kb.inject_keycode(0x3D, false)
@@ -593,7 +716,8 @@ impl RdpServerInputHandler for MacInputHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientInputContext, MacInputHandler, ModifierState, MouseCoordMapper, TextTranslation,
+        ClientInputContext, KeyboardTranslationProfile, MacInputHandler, ModifierState,
+        MouseCoordMapper, TextTranslation,
     };
 
     fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
@@ -609,13 +733,17 @@ mod tests {
     fn guacamole_uses_norwegian_text_translation_for_comma_key() {
         let mut handler = handler_for("Guacamole RDP", 0x0409);
         assert_eq!(
-            handler.translate_norwegian_text_key(0x33, false),
+            handler.translation_profile(),
+            Some(KeyboardTranslationProfile::GuacamoleUs)
+        );
+        assert_eq!(
+            handler.translate_text_key(0x33, false),
             Some(TextTranslation::Unicode(','))
         );
         handler.modifier_state.left_shift = true;
         assert_eq!(
-            handler.translate_norwegian_text_key(0x33, false),
-            Some(TextTranslation::Unicode(';'))
+            handler.translate_text_key(0x33, false),
+            Some(TextTranslation::Unicode('<'))
         );
     }
 
@@ -623,12 +751,16 @@ mod tests {
     fn norwegian_star_key_translates_to_expected_characters() {
         let mut handler = handler_for("Windows App", 0x0414);
         assert_eq!(
-            handler.translate_norwegian_text_key(0x2B, false),
+            handler.translation_profile(),
+            Some(KeyboardTranslationProfile::NorwegianPhysical)
+        );
+        assert_eq!(
+            handler.translate_text_key(0x2B, false),
             Some(TextTranslation::Unicode('\''))
         );
         handler.modifier_state.right_shift = true;
         assert_eq!(
-            handler.translate_norwegian_text_key(0x2B, false),
+            handler.translate_text_key(0x2B, false),
             Some(TextTranslation::Unicode('*'))
         );
     }
@@ -640,63 +772,96 @@ mod tests {
             left_ctrl: true,
             ..ModifierState::default()
         };
-        assert_eq!(handler.translate_norwegian_text_key(0x33, false), None);
+        assert_eq!(handler.translate_text_key(0x33, false), None);
     }
 
     #[test]
-    fn altgr_keys_translate_to_norwegian_symbols() {
-        let mut handler = handler_for("Guacamole RDP", 0x0409);
+    fn native_norwegian_altgr_keys_translate_to_symbols() {
+        let mut handler = handler_for("Windows App", 0x0414);
         handler.modifier_state.right_alt = true;
 
         assert_eq!(
-            handler.translate_norwegian_text_key(0x03, false),
+            handler.translate_text_key(0x03, false),
             Some(TextTranslation::Unicode('@'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x08, false),
+            handler.translate_text_key(0x08, false),
             Some(TextTranslation::Unicode('{'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x09, false),
+            handler.translate_text_key(0x09, false),
             Some(TextTranslation::Unicode('['))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x0A, false),
+            handler.translate_text_key(0x0A, false),
             Some(TextTranslation::Unicode(']'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x0B, false),
+            handler.translate_text_key(0x0B, false),
             Some(TextTranslation::Unicode('}'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x12, false),
+            handler.translate_text_key(0x12, false),
             Some(TextTranslation::Unicode('€'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x32, false),
+            handler.translate_text_key(0x32, false),
             Some(TextTranslation::Unicode('µ'))
         );
     }
 
     #[test]
     fn norwegian_letters_map_to_expected_glyphs() {
-        let mut handler = handler_for("Guacamole RDP", 0x0409);
+        let mut handler = handler_for("Windows App", 0x0414);
         assert_eq!(
-            handler.translate_norwegian_text_key(0x1A, false),
+            handler.translate_text_key(0x1A, false),
             Some(TextTranslation::Unicode('å'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x27, false),
+            handler.translate_text_key(0x27, false),
             Some(TextTranslation::Unicode('ø'))
         );
         assert_eq!(
-            handler.translate_norwegian_text_key(0x28, false),
+            handler.translate_text_key(0x28, false),
             Some(TextTranslation::Unicode('æ'))
         );
         handler.modifier_state.left_shift = true;
         assert_eq!(
-            handler.translate_norwegian_text_key(0x27, false),
+            handler.translate_text_key(0x27, false),
             Some(TextTranslation::Unicode('Ø'))
+        );
+    }
+
+    #[test]
+    fn guacamole_us_profile_matches_reported_symbol_positions() {
+        let mut handler = handler_for("Guacamole RDP", 0x0409);
+
+        handler.modifier_state.left_shift = true;
+        assert_eq!(handler.translate_text_key(0x0A, false), Some(TextTranslation::Unicode('(')));
+        assert_eq!(handler.translate_text_key(0x0B, false), Some(TextTranslation::Unicode(')')));
+        assert_eq!(handler.translate_text_key(0x0D, false), Some(TextTranslation::Unicode('+')));
+        assert_eq!(handler.translate_text_key(0x35, false), Some(TextTranslation::Unicode('?')));
+        assert_eq!(handler.translate_text_key(0x28, false), Some(TextTranslation::Unicode('"')));
+        assert_eq!(handler.translate_text_key(0x2B, false), Some(TextTranslation::Unicode('|')));
+        assert_eq!(handler.translate_text_key(0x33, false), Some(TextTranslation::Unicode('<')));
+
+        handler.modifier_state = ModifierState::default();
+        assert_eq!(handler.translate_text_key(0x1A, false), Some(TextTranslation::Unicode('[')));
+        assert_eq!(handler.translate_text_key(0x1B, false), Some(TextTranslation::Unicode(']')));
+        assert_eq!(handler.translate_text_key(0x0C, false), Some(TextTranslation::Unicode('-')));
+        assert_eq!(handler.translate_text_key(0x2B, false), Some(TextTranslation::Unicode('\\')));
+        assert_eq!(handler.translate_text_key(0x35, false), Some(TextTranslation::Unicode('/')));
+    }
+
+    #[test]
+    fn native_norwegian_allows_altgr_even_if_right_ctrl_is_also_set() {
+        let mut handler = handler_for("Windows App", 0x0414);
+        handler.modifier_state.right_alt = true;
+        handler.modifier_state.right_ctrl = true;
+
+        assert_eq!(
+            handler.translate_text_key(0x09, false),
+            Some(TextTranslation::Unicode('['))
         );
     }
 
