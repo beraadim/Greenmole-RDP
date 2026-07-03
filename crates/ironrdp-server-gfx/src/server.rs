@@ -34,7 +34,7 @@ use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::gfx::{GfxHandler, GfxState};
-use crate::handler::RdpServerInputHandler;
+use crate::handler::{ClientInputContext, RdpServerInputHandler};
 use crate::{builder, capabilities, SoundServerFactory};
 
 #[derive(Clone)]
@@ -910,6 +910,14 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
+
+        {
+            let mut handler = self.handler.lock().await;
+            handler.update_client_context(ClientInputContext {
+                client_name: result.client_name.clone(),
+                keyboard_layout: result.keyboard_layout,
+            });
+        }
 
         if !result.input_events.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");

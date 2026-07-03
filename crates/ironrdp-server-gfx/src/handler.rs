@@ -41,6 +41,12 @@ pub enum MouseEvent {
     RelMove { x: i32, y: i32 },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ClientInputContext {
+    pub client_name: String,
+    pub keyboard_layout: u32,
+}
+
 /// Input Event Handler for an RDP server
 ///
 /// Whenever the RDP server will receive an input event from a client, the relevant callback from
@@ -71,6 +77,7 @@ pub enum MouseEvent {
 /// }
 /// ```
 pub trait RdpServerInputHandler: Send {
+    fn update_client_context(&mut self, _context: ClientInputContext) {}
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
 }

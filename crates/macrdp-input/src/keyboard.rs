@@ -31,6 +31,16 @@ impl KeyboardInjector {
             .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
     }
 
+    pub fn inject_keycode(&self, keycode: u16, pressed: bool) -> Result<()> {
+        let source = Self::source()?;
+        let event = CGEvent::new_keyboard_event(source, keycode as CGKeyCode, pressed)
+            .map_err(|_| anyhow::anyhow!("Failed to create keyboard event"))?;
+
+        event.post(CGEventTapLocation::HID);
+        tracing::trace!(keycode, pressed, "Keyboard keycode injected");
+        Ok(())
+    }
+
     /// Inject a key press or release event
     pub fn inject_key(&self, scancode: u8, extended: bool, pressed: bool) -> Result<()> {
         let keycode = match scancode_to_keycode(scancode, extended) {
@@ -41,11 +51,7 @@ impl KeyboardInjector {
             }
         };
 
-        let source = Self::source()?;
-        let event = CGEvent::new_keyboard_event(source, keycode as CGKeyCode, pressed)
-            .map_err(|_| anyhow::anyhow!("Failed to create keyboard event"))?;
-
-        event.post(CGEventTapLocation::HID);
+        self.inject_keycode(keycode, pressed)?;
         tracing::trace!(scancode, keycode, pressed, "Keyboard event injected");
         Ok(())
     }
@@ -59,6 +65,11 @@ impl KeyboardInjector {
         for (scancode, extended) in Self::TRANSIENT_MODIFIERS {
             self.inject_key(*scancode, *extended, false)?;
         }
+
+        // Release both right-side macOS modifiers explicitly so session-specific
+        // AltGr handling cannot leave a stuck key behind after sync.
+        self.inject_keycode(0x36, false)?; // Right Command
+        self.inject_keycode(0x3D, false)?; // Right Option
 
         Ok(())
     }

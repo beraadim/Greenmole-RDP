@@ -35,6 +35,8 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     reactivation: bool,
+    client_name: String,
+    keyboard_layout: u32,
 }
 
 #[derive(Debug)]
@@ -45,6 +47,8 @@ pub struct AcceptorResult {
     pub user_channel_id: u16,
     pub io_channel_id: u16,
     pub reactivation: bool,
+    pub client_name: String,
+    pub keyboard_layout: u32,
 }
 
 impl Acceptor {
@@ -65,6 +69,8 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             reactivation: false,
+            client_name: String::new(),
+            keyboard_layout: 0,
         }
     }
 
@@ -106,6 +112,8 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             reactivation: true,
+            client_name: consumed.client_name,
+            keyboard_layout: consumed.keyboard_layout,
         })
     }
 
@@ -159,6 +167,8 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 reactivation: self.reactivation,
+                client_name: self.client_name.clone(),
+                keyboard_layout: self.keyboard_layout,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -388,6 +398,8 @@ impl Sequence for Acceptor {
                 debug!(message = ?settings_initial, "Received");
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
+                self.client_name = gcc_blocks.core.client_name.clone();
+                self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
 
                 let joined: Vec<_> = gcc_blocks

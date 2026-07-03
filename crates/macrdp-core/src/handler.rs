@@ -1,4 +1,4 @@
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{ClientInputContext, KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +79,7 @@ pub struct MacInputHandler {
     last_mouse_y: u16,
     last_sync_lock_bits: Option<u8>,
     coord_mapper: MouseCoordMapper,
+    client_context: ClientInputContext,
 }
 
 impl MacInputHandler {
@@ -101,17 +102,46 @@ impl MacInputHandler {
             last_mouse_y: 0,
             last_sync_lock_bits: None,
             coord_mapper,
+            client_context: ClientInputContext::default(),
         }
+    }
+
+    fn map_right_alt_to_option(&self) -> bool {
+        let layout = self.client_context.keyboard_layout;
+        let is_non_us_layout = layout != 0 && layout != 0x0409;
+        let is_guacamole = self.client_context.client_name.contains("Guacamole");
+        is_non_us_layout || is_guacamole
     }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
+    fn update_client_context(&mut self, context: ClientInputContext) {
+        tracing::info!(
+            client_name = context.client_name,
+            keyboard_layout = format_args!("{:#06x}", context.keyboard_layout),
+            "Updated client input context"
+        );
+        self.client_context = context;
+    }
+
     fn keyboard(&mut self, event: KeyboardEvent) {
         let Some(kb) = &self.keyboard else { return };
 
         let result = match event {
-            KeyboardEvent::Pressed { code, extended } => kb.inject_key(code, extended, true),
-            KeyboardEvent::Released { code, extended } => kb.inject_key(code, extended, false),
+            KeyboardEvent::Pressed { code, extended } => {
+                if extended && code == 0x38 && self.map_right_alt_to_option() {
+                    kb.inject_keycode(0x3D, true)
+                } else {
+                    kb.inject_key(code, extended, true)
+                }
+            }
+            KeyboardEvent::Released { code, extended } => {
+                if extended && code == 0x38 && self.map_right_alt_to_option() {
+                    kb.inject_keycode(0x3D, false)
+                } else {
+                    kb.inject_key(code, extended, false)
+                }
+            }
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
             KeyboardEvent::Synchronize(flags) => {

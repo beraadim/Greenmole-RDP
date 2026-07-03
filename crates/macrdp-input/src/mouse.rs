@@ -17,6 +17,22 @@ extern "C" {
 
 /// ScrollEventUnit::Line
 const SCROLL_UNIT_LINE: u32 = 1;
+const WINDOWS_WHEEL_DELTA: i32 = 120;
+
+fn normalize_scroll_lines(vertical: i16) -> i32 {
+    let raw = i32::from(vertical);
+    if raw == 0 {
+        return 0;
+    }
+
+    let magnitude = raw.abs();
+    if magnitude >= WINDOWS_WHEEL_DELTA {
+        let detents = (magnitude + WINDOWS_WHEEL_DELTA - 1) / WINDOWS_WHEEL_DELTA;
+        raw.signum() * detents
+    } else {
+        raw
+    }
+}
 
 pub struct MouseInjector;
 
@@ -66,12 +82,17 @@ impl MouseInjector {
     }
 
     pub fn scroll(&self, vertical: i16) -> Result<()> {
+        let normalized = normalize_scroll_lines(vertical);
+        if normalized == 0 {
+            return Ok(());
+        }
+
         unsafe {
             let event_ref = CGEventCreateScrollWheelEvent2(
                 std::ptr::null_mut(),
                 SCROLL_UNIT_LINE,
                 1,
-                vertical as i32,
+                normalized,
                 0,
                 0,
             );
@@ -81,7 +102,7 @@ impl MouseInjector {
             let event = CGEvent::from_ptr(event_ref);
             event.post(CGEventTapLocation::HID);
         }
-        tracing::trace!(vertical, "Mouse scroll");
+        tracing::trace!(vertical, normalized, "Mouse scroll");
         Ok(())
     }
 }
@@ -91,4 +112,23 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_scroll_lines;
+
+    #[test]
+    fn keeps_small_scroll_values() {
+        assert_eq!(normalize_scroll_lines(1), 1);
+        assert_eq!(normalize_scroll_lines(-3), -3);
+    }
+
+    #[test]
+    fn converts_windows_wheel_detents_to_lines() {
+        assert_eq!(normalize_scroll_lines(120), 1);
+        assert_eq!(normalize_scroll_lines(-120), -1);
+        assert_eq!(normalize_scroll_lines(240), 2);
+        assert_eq!(normalize_scroll_lines(-241), -3);
+    }
 }
