@@ -7,8 +7,8 @@ use ironrdp_server::{
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{
-    CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, Rect,
-    SafePixelBuffer, ScreenCapturer,
+    capture_current_cursor_shape, CaptureConfig, CapturePixelFormat, CapturedFrame,
+    CgFallbackCapturer, CursorShape, FrameData, Rect, SafePixelBuffer, ScreenCapturer,
 };
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::collections::hash_map::DefaultHasher;
@@ -329,6 +329,26 @@ fn fingerprint_bitmap_update(update: &BitmapUpdate) -> u64 {
     }
     update.data.as_ref().hash(&mut hasher);
     hasher.finish()
+}
+
+fn fingerprint_cursor_shape(shape: &CursorShape) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    shape.width.hash(&mut hasher);
+    shape.height.hash(&mut hasher);
+    shape.hot_x.hash(&mut hasher);
+    shape.hot_y.hash(&mut hasher);
+    shape.rgba.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cursor_shape_to_pointer(shape: CursorShape) -> ironrdp_server::RGBAPointer {
+    ironrdp_server::RGBAPointer {
+        width: shape.width,
+        height: shape.height,
+        hot_x: shape.hot_x,
+        hot_y: shape.hot_y,
+        data: shape.rgba,
+    }
 }
 
 fn should_suppress_recent_fingerprint(
@@ -851,6 +871,8 @@ impl RdpServerDisplay for MacDisplay {
             idle_frame_count: 0,
             last_idr_time: Instant::now(),
             last_frame_cache: None,
+            last_cursor_fingerprint: None,
+            next_cursor_poll_at: Instant::now(),
             last_uncompressed_rects: None,
             last_uncompressed_sent: None,
             last_full_frame_sent: None,
@@ -909,6 +931,7 @@ impl CachedFrame {
 
 /// IDR keepalive interval during idle scenes (seconds).
 const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(75);
 
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
@@ -928,6 +951,10 @@ struct MacDisplayUpdates {
     last_idr_time: Instant,
     /// Cached last frame for idle IDR re-encoding.
     last_frame_cache: Option<CachedFrame>,
+    /// Fingerprint of the last cursor shape emitted to the client.
+    last_cursor_fingerprint: Option<u64>,
+    /// Deadline for the next host cursor-shape poll.
+    next_cursor_poll_at: Instant,
     /// Last uncompressed rect set sent, used to suppress duplicate bursts.
     last_uncompressed_rects: Option<Vec<ClampedRect>>,
     /// Timestamp of the last uncompressed update emission.
@@ -986,6 +1013,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
             self.refresh_capture_transport_if_needed().await?;
 
+            if let Some(update) = self.poll_cursor_update_if_due() {
+                return Ok(Some(update));
+            }
+
             // Drain stale frames — always use the latest available frame.
             // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
             // which works at the display level (including lock screen).
@@ -1010,7 +1041,17 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     None
                 };
 
-                let event = if let Some(timeout) = idle_deadline {
+                let cursor_deadline = self.cursor_poll_timeout();
+                let (wait_timeout, timeout_should_send_idle_idr) =
+                    match (idle_deadline, cursor_deadline) {
+                        (Some(idle), Some(cursor)) if idle <= cursor => (Some(idle), true),
+                        (Some(_idle), Some(cursor)) => (Some(cursor), false),
+                        (Some(idle), None) => (Some(idle), true),
+                        (None, Some(cursor)) => (Some(cursor), false),
+                        (None, None) => (None, false),
+                    };
+
+                let event = if let Some(timeout) = wait_timeout {
                     match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
                         Ok(Some(e)) => e,
                         Ok(None) => {
@@ -1050,11 +1091,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                             continue;
                         }
                         Err(_elapsed) => {
-                            // Timeout — time to send an idle IDR keepalive
-                            if let Some(update) = self.send_idle_idr() {
-                                return Ok(Some(update));
+                            if timeout_should_send_idle_idr {
+                                // Timeout — time to send an idle IDR keepalive
+                                if let Some(update) = self.send_idle_idr() {
+                                    return Ok(Some(update));
+                                }
                             }
-                            // No encoder/GFX available — just continue waiting
+                            // Cursor poll window elapsed, or no encoder/GFX is available
+                            // for an idle keepalive. Continue the display loop.
                             continue;
                         }
                     }
@@ -1292,6 +1336,53 @@ impl MacDisplayUpdates {
                 CachedFrame::PixelBuffer(buf.clone_ref(), frame.width, frame.height)
             }
         });
+    }
+
+    fn poll_cursor_update_if_due(&mut self) -> Option<DisplayUpdate> {
+        if !self.capture_config.show_cursor {
+            self.last_cursor_fingerprint = None;
+            return None;
+        }
+
+        let now = Instant::now();
+        if now < self.next_cursor_poll_at {
+            return None;
+        }
+
+        self.next_cursor_poll_at = now + CURSOR_POLL_INTERVAL;
+
+        match capture_current_cursor_shape() {
+            Ok(Some(shape)) => {
+                let fingerprint = fingerprint_cursor_shape(&shape);
+                if self.last_cursor_fingerprint == Some(fingerprint) {
+                    return None;
+                }
+
+                self.last_cursor_fingerprint = Some(fingerprint);
+                Some(DisplayUpdate::RGBAPointer(cursor_shape_to_pointer(shape)))
+            }
+            Ok(None) => {
+                if self.last_cursor_fingerprint.take().is_some() {
+                    Some(DisplayUpdate::DefaultPointer)
+                } else {
+                    None
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "Failed to capture current cursor shape");
+                None
+            }
+        }
+    }
+
+    fn cursor_poll_timeout(&self) -> Option<Duration> {
+        if !self.capture_config.show_cursor {
+            return None;
+        }
+
+        self.next_cursor_poll_at
+            .checked_duration_since(Instant::now())
+            .or(Some(Duration::ZERO))
     }
 
     fn mark_client_may_be_stale(&mut self, reason: &'static str) {
@@ -3214,15 +3305,15 @@ impl Drop for MacDisplayUpdates {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_bgra_rect, fingerprint_bitmap_update, fingerprint_uncompressed_rects,
-        prepare_uncompressed_dirty_rects, should_fallback_from_gfx_avc_no_ack,
-        should_force_full_bitmap_update, should_suppress_recent_fingerprint,
-        should_use_nv12_capture_for_gfx, validate_dirty_rects_against_previous_bgra, ClampedRect,
-        DIRTY_RECT_VALIDATION_TILE,
+        cursor_shape_to_pointer, extract_bgra_rect, fingerprint_bitmap_update,
+        fingerprint_cursor_shape, fingerprint_uncompressed_rects, prepare_uncompressed_dirty_rects,
+        should_fallback_from_gfx_avc_no_ack, should_force_full_bitmap_update,
+        should_suppress_recent_fingerprint, should_use_nv12_capture_for_gfx,
+        validate_dirty_rects_against_previous_bgra, ClampedRect, DIRTY_RECT_VALIDATION_TILE,
     };
     use bytes::Bytes;
     use ironrdp_server::{BitmapUpdate, DiffRect, PixelFormat as RdpPixelFormat, UncompressedRect};
-    use macrdp_capture::Rect;
+    use macrdp_capture::{CursorShape, Rect};
     use std::collections::VecDeque;
     use std::num::{NonZeroU16, NonZeroUsize};
     use std::time::{Duration, Instant};
@@ -3407,6 +3498,44 @@ mod tests {
             fingerprint_bitmap_update(&mk(&[1, 2, 3, 4])),
             fingerprint_bitmap_update(&mk(&[9, 8, 7, 6]))
         );
+    }
+
+    #[test]
+    fn cursor_fingerprint_changes_when_shape_changes() {
+        let mk = |hot_x: u16, rgba: Vec<u8>| CursorShape {
+            width: 16,
+            height: 16,
+            hot_x,
+            hot_y: 3,
+            rgba,
+        };
+
+        assert_ne!(
+            fingerprint_cursor_shape(&mk(2, vec![0, 1, 2, 3])),
+            fingerprint_cursor_shape(&mk(4, vec![0, 1, 2, 3]))
+        );
+        assert_ne!(
+            fingerprint_cursor_shape(&mk(2, vec![0, 1, 2, 3])),
+            fingerprint_cursor_shape(&mk(2, vec![9, 1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn converts_cursor_shape_to_rgba_pointer() {
+        let shape = CursorShape {
+            width: 32,
+            height: 24,
+            hot_x: 5,
+            hot_y: 7,
+            rgba: vec![1, 2, 3, 4],
+        };
+
+        let pointer = cursor_shape_to_pointer(shape);
+        assert_eq!(pointer.width, 32);
+        assert_eq!(pointer.height, 24);
+        assert_eq!(pointer.hot_x, 5);
+        assert_eq!(pointer.hot_y, 7);
+        assert_eq!(pointer.data, vec![1, 2, 3, 4]);
     }
 
     #[test]

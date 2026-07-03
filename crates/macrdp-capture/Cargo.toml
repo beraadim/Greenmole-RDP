@@ -10,3 +10,7 @@ bytes.workspace = true
 tokio.workspace = true
 screencapturekit = { version = "1.5", features = ["macos_14_0"] }
 core-graphics = "0.25"
+image = { version = "0.25", default-features = false, features = ["tiff"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+objc2-app-kit = { version = "0.3", features = ["NSCursor", "NSImage"] }

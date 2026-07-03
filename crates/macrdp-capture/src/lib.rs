@@ -7,6 +7,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
+use image::ImageFormat;
+use objc2_app_kit::NSCursor;
+use objc2_foundation::{NSData, NSPoint};
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
@@ -105,6 +108,15 @@ pub struct AudioFrame {
     pub channels: u16,
     pub num_samples: usize,
     pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CursorShape {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub rgba: Vec<u8>,
 }
 
 /// Configuration for screen capture
@@ -255,6 +267,46 @@ fn build_stream_config(
         .with_sample_rate(AudioSampleRate::Rate48000)
         .with_channel_count(AudioChannelCount::Stereo)
         .with_excludes_current_process_audio(true)
+}
+
+pub fn capture_current_cursor_shape() -> Result<Option<CursorShape>> {
+    let cursor = NSCursor::currentSystemCursor().unwrap_or_else(NSCursor::currentCursor);
+    let image = cursor.image();
+    let Some(tiff) = image.TIFFRepresentation() else {
+        return Ok(None);
+    };
+
+    decode_cursor_tiff(&tiff, cursor.hotSpot())
+}
+
+fn decode_cursor_tiff(tiff: &NSData, hot_spot: NSPoint) -> Result<Option<CursorShape>> {
+    let decoded = image::load_from_memory_with_format(&tiff.to_vec(), ImageFormat::Tiff)
+        .context("Failed to decode cursor TIFF")?
+        .to_rgba8();
+
+    let width = u16::try_from(decoded.width()).context("Cursor width exceeds RDP pointer limit")?;
+    let height =
+        u16::try_from(decoded.height()).context("Cursor height exceeds RDP pointer limit")?;
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+
+    let hot_x = hot_spot
+        .x
+        .round()
+        .clamp(0.0, f64::from(width.saturating_sub(1))) as u16;
+    let hot_y = hot_spot
+        .y
+        .round()
+        .clamp(0.0, f64::from(height.saturating_sub(1))) as u16;
+
+    Ok(Some(CursorShape {
+        width,
+        height,
+        hot_x,
+        hot_y,
+        rgba: decoded.into_raw(),
+    }))
 }
 
 fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
