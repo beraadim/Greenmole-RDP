@@ -870,6 +870,7 @@ impl RdpServerDisplay for MacDisplay {
             logged_gfx_uncompressed_mode: false,
             logged_gfx_avc_mode: false,
             logged_bitmap_mode: false,
+            client_may_be_stale: false,
             perf_stats: self.perf_stats.clone(),
             session_audit: SessionAudit::new(peer_addr.map(|ip| ip.to_string())),
         }))
@@ -886,6 +887,24 @@ enum CachedFrame {
     },
     BgraPixelBuffer(SafePixelBuffer, u32, u32, usize), // buffer, width, height, stride
     PixelBuffer(SafePixelBuffer, u32, u32),            // buffer, width, height
+}
+
+impl CachedFrame {
+    fn width(&self) -> u32 {
+        match self {
+            CachedFrame::Bgra { width, .. }
+            | CachedFrame::BgraPixelBuffer(_, width, _, _)
+            | CachedFrame::PixelBuffer(_, width, _) => *width,
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            CachedFrame::Bgra { height, .. }
+            | CachedFrame::BgraPixelBuffer(_, _, height, _)
+            | CachedFrame::PixelBuffer(_, _, height) => *height,
+        }
+    }
 }
 
 /// IDR keepalive interval during idle scenes (seconds).
@@ -948,6 +967,7 @@ struct MacDisplayUpdates {
     logged_gfx_uncompressed_mode: bool,
     logged_gfx_avc_mode: bool,
     logged_bitmap_mode: bool,
+    client_may_be_stale: bool,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
     /// Per-session transport-path audit for post-run log analysis.
@@ -1110,6 +1130,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         f
                     }
                     macrdp_capture::CaptureEvent::Idle => {
+                        if self.client_may_be_stale {
+                            if let Some(update) = self.send_cached_full_frame_recovery() {
+                                return Ok(Some(update));
+                            }
+                        }
                         self.idle_frame_count += 1;
                         continue;
                     }
@@ -1249,6 +1274,40 @@ impl MacDisplayUpdates {
             self.forced_full_bitmap_updates_remaining.max(count.max(1));
     }
 
+    fn cache_latest_frame(&mut self, frame: &CapturedFrame) {
+        self.last_frame_cache = Some(match &frame.data {
+            FrameData::Raw(bytes) => CachedFrame::Bgra {
+                data: bytes.clone(),
+                width: frame.width,
+                height: frame.height,
+                stride: frame.stride,
+            },
+            FrameData::BgraPixelBuffer(buf) => CachedFrame::BgraPixelBuffer(
+                buf.clone_ref(),
+                frame.width,
+                frame.height,
+                frame.stride,
+            ),
+            FrameData::PixelBuffer(buf) => {
+                CachedFrame::PixelBuffer(buf.clone_ref(), frame.width, frame.height)
+            }
+        });
+    }
+
+    fn mark_client_may_be_stale(&mut self, reason: &'static str) {
+        if !self.client_may_be_stale {
+            tracing::debug!(reason, "Marking client state as potentially stale");
+        }
+        self.client_may_be_stale = true;
+    }
+
+    fn clear_client_stale_flag(&mut self, reason: &'static str) {
+        if self.client_may_be_stale {
+            tracing::debug!(reason, "Cleared client stale state");
+        }
+        self.client_may_be_stale = false;
+    }
+
     fn pipeline_collect_timeout(&self) -> Duration {
         let fps = self.last_applied_fps.max(1) as f64;
         let frame_ms = 1000.0 / fps;
@@ -1267,6 +1326,148 @@ impl MacDisplayUpdates {
         if let Some(ps) = &self.perf_stats {
             ps.lock().unwrap().record_frame(0.0, bytes_sent, false);
         }
+    }
+
+    fn cached_full_frame_uncompressed_update(&self) -> Option<GfxUncompressedUpdate> {
+        let cache = self.last_frame_cache.as_ref()?;
+        let full_rect = ClampedRect {
+            x: 0,
+            y: 0,
+            width: cache.width(),
+            height: cache.height(),
+        };
+        let width = cache.width() as u16;
+        let height = cache.height() as u16;
+
+        let rects = match cache {
+            CachedFrame::Bgra {
+                data,
+                stride,
+                ..
+            } => extract_bgra_rect(data, *stride, full_rect).map(|pixel_data| {
+                vec![UncompressedRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    pixel_data,
+                }]
+            }),
+            CachedFrame::BgraPixelBuffer(buf, width_u32, height_u32, _) => buf
+                .with_locked_bgra(*width_u32, *height_u32, |bgra, stride| {
+                    extract_bgra_rect(bgra, stride, full_rect).map(|pixel_data| {
+                        vec![UncompressedRect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                            pixel_data,
+                        }]
+                    })
+                })
+                .flatten(),
+            CachedFrame::PixelBuffer(_, _, _) => None,
+        }?;
+
+        Some(GfxUncompressedUpdate {
+            rects,
+            width,
+            height,
+        })
+    }
+
+    fn cached_full_frame_bitmap_update(&self) -> Option<BitmapUpdate> {
+        let cache = self.last_frame_cache.as_ref()?;
+        let width = NonZeroU16::new(cache.width() as u16)?;
+        let height = NonZeroU16::new(cache.height() as u16)?;
+
+        match cache {
+            CachedFrame::Bgra {
+                data,
+                stride,
+                ..
+            } => Some(BitmapUpdate {
+                x: 0,
+                y: 0,
+                width,
+                height,
+                format: RdpPixelFormat::BgrA32,
+                data: data.clone(),
+                stride: NonZeroUsize::new(*stride)?,
+                dirty_rects: Vec::new(),
+            }),
+            CachedFrame::BgraPixelBuffer(buf, width_u32, height_u32, _) => buf
+                .with_locked_bgra(*width_u32, *height_u32, |bgra, stride| {
+                    Some(BitmapUpdate {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                        format: RdpPixelFormat::BgrA32,
+                        data: Bytes::copy_from_slice(bgra),
+                        stride: NonZeroUsize::new(stride)?,
+                        dirty_rects: Vec::new(),
+                    })
+                })
+                .flatten(),
+            CachedFrame::PixelBuffer(_, _, _) => None,
+        }
+    }
+
+    fn send_cached_full_frame_recovery(&mut self) -> Option<DisplayUpdate> {
+        let (session_uses_gfx, gfx_channel_ready, gfx_avc_ready) = {
+            let state = self.gfx_state.lock().unwrap();
+            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_fallback_mode;
+            let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
+            let gfx_avc_ready =
+                gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
+            (session_uses_gfx, gfx_channel_ready, gfx_avc_ready)
+        };
+
+        if gfx_avc_ready {
+            if let Some(update) = self.send_idle_idr() {
+                self.clear_client_stale_flag("cached-avc-convergence");
+                return Some(update);
+            }
+        }
+
+        if gfx_channel_ready {
+            if let Some(update) = self.cached_full_frame_uncompressed_update() {
+                let total_bytes: usize = update.rects.iter().map(|rect| rect.pixel_data.len()).sum();
+                self.display_frame_count += 1;
+                {
+                    let mut st = self.gfx_state.lock().unwrap();
+                    st.last_encode_ms = 0.0;
+                    st.last_frame_bytes = total_bytes as u32;
+                }
+                self.record_uncompressed_audit(
+                    &update.rects,
+                    update.width as u32 * update.height as u32,
+                    "gfx-cached-full-frame-recovery",
+                );
+                self.last_uncompressed_rects = Some(vec![ClampedRect {
+                    x: 0,
+                    y: 0,
+                    width: update.width as u32,
+                    height: update.height as u32,
+                }]);
+                self.last_uncompressed_sent = Some(Instant::now());
+                self.last_full_frame_sent = self.last_uncompressed_sent;
+                self.clear_client_stale_flag("cached-uncompressed-convergence");
+                return Some(DisplayUpdate::GfxUncompressed(update));
+            }
+        } else if !session_uses_gfx {
+            if let Some(bitmap) = self.cached_full_frame_bitmap_update() {
+                self.record_bitmap_update_metrics(bitmap.data.len() as u32);
+                self.record_bitmap_audit(&bitmap, "bitmap-cached-full-frame-recovery");
+                self.last_full_bitmap_sent = Some(Instant::now());
+                self.needs_full_bitmap_seed = false;
+                self.clear_client_stale_flag("cached-bitmap-convergence");
+                return Some(DisplayUpdate::Bitmap(bitmap));
+            }
+        }
+
+        None
     }
 
     fn record_uncompressed_audit(
@@ -1616,6 +1817,7 @@ impl MacDisplayUpdates {
                     .take()
                     .unwrap_or((encoded.width as u16, encoded.height as u16));
                 self.pending_frame_time = None;
+                self.clear_client_stale_flag("gfx-avc-pipelined-collect");
 
                 Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                     h264_data: encoded.data,
@@ -1631,6 +1833,7 @@ impl MacDisplayUpdates {
                 self.has_pending_submit = false;
                 self.pending_visible_size = None;
                 self.pending_frame_time = None;
+                self.mark_client_may_be_stale("pipelined-empty-encode");
                 Ok(None)
             }
             None => {
@@ -1638,15 +1841,19 @@ impl MacDisplayUpdates {
                 self.has_pending_submit = false;
                 self.pending_visible_size = None;
                 self.pending_frame_time = None;
+                self.mark_client_may_be_stale("pipelined-collect-timeout");
                 Ok(None)
             }
         }
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+        self.cache_latest_frame(&frame);
+
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
             self.skip_next_frame = false;
+            self.mark_client_may_be_stale("encode-overload-skip");
             return Ok(None);
         }
 
@@ -1793,6 +2000,7 @@ impl MacDisplayUpdates {
                         frame.width as u32 * frame.height as u32,
                         "gfx-seed-full-frame",
                     );
+                    self.clear_client_stale_flag("gfx-seed-full-frame");
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
                             rects,
@@ -1810,7 +2018,8 @@ impl MacDisplayUpdates {
                 let total_area: u32 = frame.dirty_rects.iter().map(|r| r.width * r.height).sum();
                 let use_dirty_rects = !frame.dirty_rects.is_empty()
                     && total_area > 0
-                    && total_area <= UNCOMPRESSED_MAX_PIXELS;
+                    && total_area <= UNCOMPRESSED_MAX_PIXELS
+                    && !self.client_may_be_stale;
                 let rect_signature: Vec<ClampedRect>;
 
                 let rects: Vec<UncompressedRect> = if use_dirty_rects {
@@ -1871,6 +2080,7 @@ impl MacDisplayUpdates {
                             dirty_rects = frame.dirty_rects.len(),
                             "Skipping eager full-frame uncompressed fallback"
                         );
+                        self.mark_client_may_be_stale("full-frame-uncompressed-throttled");
                         return Ok(None);
                     }
 
@@ -1933,6 +2143,7 @@ impl MacDisplayUpdates {
                             },
                             "Suppressing duplicate uncompressed GFX update burst"
                         );
+                        self.mark_client_may_be_stale("duplicate-uncompressed-burst");
                         return Ok(None);
                     }
 
@@ -1952,6 +2163,7 @@ impl MacDisplayUpdates {
                             update_kind = if use_dirty_rects { "dirty-rects" } else { "full-frame" },
                             "Suppressing repeated large uncompressed GFX update with same geometry"
                         );
+                        self.mark_client_may_be_stale("large-uncompressed-geometry-repeat");
                         return Ok(None);
                     }
 
@@ -1968,6 +2180,7 @@ impl MacDisplayUpdates {
                             update_kind = if use_dirty_rects { "dirty-rects" } else { "full-frame" },
                             "Suppressing repeated large uncompressed GFX update with identical payload"
                         );
+                        self.mark_client_may_be_stale("large-uncompressed-payload-repeat");
                         return Ok(None);
                     }
 
@@ -2023,6 +2236,9 @@ impl MacDisplayUpdates {
                             "gfx-validation-full-frame"
                         },
                     );
+                    if !use_dirty_rects {
+                        self.clear_client_stale_flag("gfx-validation-full-frame");
+                    }
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
                             rects,
@@ -2044,8 +2260,9 @@ impl MacDisplayUpdates {
                     total_area > 0
                         && total_area <= UNCOMPRESSED_TINY_UI_MAX_PIXELS
                         && frame.dirty_rects.len() <= 2
+                        && !self.client_may_be_stale
                 } else {
-                    total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS
+                    total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS && !self.client_may_be_stale
                 };
 
                 if allow_uncompressed_dirty_rects {
@@ -2198,6 +2415,7 @@ impl MacDisplayUpdates {
                         frame.width as u32 * frame.height as u32,
                         "gfx-uncompressed-full-frame",
                     );
+                    self.clear_client_stale_flag("gfx-uncompressed-full-frame");
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
                             rects,
@@ -2415,6 +2633,7 @@ impl MacDisplayUpdates {
                                 if is_keyframe {
                                     self.last_idr_time = Instant::now();
                                 }
+                                self.clear_client_stale_flag("gfx-avc-zero-copy");
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
@@ -2427,6 +2646,7 @@ impl MacDisplayUpdates {
                             }
                             Ok(_) => {
                                 tracing::warn!("Zero-copy encode returned empty data");
+                                self.mark_client_may_be_stale("zero-copy-empty-encode");
                                 return Ok(None);
                             }
                             Err(e) => {
@@ -2567,9 +2787,11 @@ impl MacDisplayUpdates {
                             if is_keyframe {
                                 self.last_idr_time = Instant::now();
                             }
+                            self.clear_client_stale_flag("gfx-avc-bgra-pixel-buffer");
                             return Ok(Some(DisplayUpdate::GfxFrame(update)));
                         }
 
+                        self.mark_client_may_be_stale("bgra-pixel-buffer-empty-encode");
                         return Ok(None);
                     }
                     FrameData::Raw(bytes) => {
@@ -2655,19 +2877,20 @@ impl MacDisplayUpdates {
                                             "encode overload — skipping next frame"
                                         );
                                     }
-                                    self.last_frame_cache = Some(CachedFrame::Bgra {
-                                        data: bytes.clone(),
-                                        width: frame.width,
-                                        height: frame.height,
-                                        stride: frame.stride,
-                                    });
-                                    if is_keyframe {
-                                        self.last_idr_time = Instant::now();
-                                    }
-                                    return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                        h264_data: encoded.main_view.data,
-                                        width: frame.width as u16,
-                                        height: frame.height as u16,
+                                self.last_frame_cache = Some(CachedFrame::Bgra {
+                                    data: bytes.clone(),
+                                    width: frame.width,
+                                    height: frame.height,
+                                    stride: frame.stride,
+                                });
+                                if is_keyframe {
+                                    self.last_idr_time = Instant::now();
+                                }
+                                self.clear_client_stale_flag("gfx-avc444-raw");
+                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                                    h264_data: encoded.main_view.data,
+                                    width: frame.width as u16,
+                                    height: frame.height as u16,
                                         enc_width: encoded.main_view.width as u16,
                                         enc_height: encoded.main_view.height as u16,
                                         is_keyframe,
@@ -2764,6 +2987,7 @@ impl MacDisplayUpdates {
                                     display_frame = self.display_frame_count,
                                     "H.264 encode returned EMPTY data — frame dropped!"
                                 );
+                                self.mark_client_may_be_stale("raw-avc420-empty-encode");
                                 return Ok(None);
                             }
                             Err(e) => {
@@ -2771,6 +2995,7 @@ impl MacDisplayUpdates {
                                     display_frame = self.display_frame_count,
                                     "H.264 encode failed: {e}"
                                 );
+                                self.mark_client_may_be_stale("raw-avc420-encode-error");
                             }
                         }
                     }
@@ -2807,7 +3032,9 @@ impl MacDisplayUpdates {
             );
         }
 
-        let force_full_bitmap_reason = if self.forced_full_bitmap_updates_remaining > 0 {
+        let force_full_bitmap_reason = if self.client_may_be_stale {
+            Some("stale-recovery")
+        } else if self.forced_full_bitmap_updates_remaining > 0 {
             Some("seed")
         } else if frame.dirty_rects.is_empty() {
             Some("no-dirty-rects")
@@ -2947,6 +3174,9 @@ impl MacDisplayUpdates {
                     self.forced_full_bitmap_updates_remaining.saturating_sub(1);
             }
             if updates.is_empty() {
+                if emitted_full_frame {
+                    self.mark_client_may_be_stale("bitmap-full-frame-suppressed");
+                }
                 return Ok(None);
             }
             if updates.len() > 1 {
@@ -2963,6 +3193,9 @@ impl MacDisplayUpdates {
                         "bitmap-dirty-region"
                     },
                 );
+                if emitted_full_frame {
+                    self.clear_client_stale_flag("bitmap-full-frame");
+                }
                 return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
             }
         }
