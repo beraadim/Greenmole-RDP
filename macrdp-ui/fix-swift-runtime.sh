@@ -57,6 +57,85 @@ find_swift_lib_dir() {
   return 1
 }
 
+remove_rpath_if_present() {
+  local binary="$1"
+  local rpath="$2"
+
+  if otool -l "$binary" | awk '
+    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+    in_rpath && $1 == "path" {
+      if ($2 == target) found = 1;
+      in_rpath = 0;
+    }
+    END { exit(found ? 0 : 1) }
+  ' target="$rpath"; then
+    install_name_tool -delete_rpath "$rpath" "$binary"
+  fi
+}
+
+remove_known_swift_toolchain_rpaths() {
+  local binary="$1"
+  local -a stale_rpaths=(
+    "/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx"
+    "/Library/Developer/CommandLineTools/usr/lib/swift/macosx"
+  )
+
+  if command -v xcode-select >/dev/null 2>&1; then
+    local dev_path
+    dev_path="$(xcode-select -p 2>/dev/null || true)"
+    if [ -n "$dev_path" ]; then
+      if [[ "$dev_path" == *CommandLineTools* ]]; then
+        stale_rpaths+=(
+          "$dev_path/usr/lib/swift-5.5/macosx"
+          "$dev_path/usr/lib/swift/macosx"
+        )
+      else
+        stale_rpaths+=(
+          "$dev_path/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx"
+          "$dev_path/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx"
+        )
+      fi
+    fi
+  fi
+
+  for stale_rpath in "${stale_rpaths[@]}"; do
+    remove_rpath_if_present "$binary" "$stale_rpath"
+  done
+}
+
+verify_runtime_shape() {
+  local binary="$1"
+  local mode="$2"
+
+  if [ "$mode" = "system" ]; then
+    if otool -L "$binary" | grep -q "@rpath/$TARGET_LIB"; then
+      echo "Expected system Swift runtime, but $TARGET_LIB still uses @rpath in $binary" >&2
+      exit 1
+    fi
+  else
+    if ! otool -L "$binary" | grep -q "@rpath/$TARGET_LIB"; then
+      echo "Expected bundled Swift runtime, but $TARGET_LIB is not linked via @rpath in $binary" >&2
+      exit 1
+    fi
+    if ! otool -l "$binary" | awk '
+      $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+      in_rpath && $1 == "path" {
+        if ($2 == target) found = 1;
+        in_rpath = 0;
+      }
+      END { exit(found ? 0 : 1) }
+    ' target="$RPATH"; then
+      echo "Expected bundled Swift runtime rpath $RPATH in $binary" >&2
+      exit 1
+    fi
+  fi
+
+  if otool -l "$binary" | grep -q "/Library/Developer/CommandLineTools/usr/lib/swift"; then
+    echo "Refusing mixed Swift runtime: Command Line Tools rpath still present in $binary" >&2
+    exit 1
+  fi
+}
+
 SWIFT_LIB_DIR="$(find_swift_lib_dir)"
 SYSTEM_SWIFT_LIB="/usr/lib/swift/$TARGET_LIB"
 
@@ -80,6 +159,9 @@ else
   echo "Unsupported MACRDP_SWIFT_RUNTIME_MODE: $SWIFT_RUNTIME_MODE" >&2
   exit 1
 fi
+
+remove_known_swift_toolchain_rpaths "$APP_BIN"
+verify_runtime_shape "$APP_BIN" "$SWIFT_RUNTIME_MODE"
 
 # DMG consumers on another Mac must be able to read the full bundle even when
 # the original file owner UID does not exist there.
