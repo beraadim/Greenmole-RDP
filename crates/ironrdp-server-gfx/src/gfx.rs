@@ -457,6 +457,33 @@ impl GfxState {
         (base_bitrate as f32 * self.network_quality) as u32
     }
 
+    pub fn reset_connection_state(&mut self, session_uses_gfx: bool) {
+        self.session_uses_gfx = session_uses_gfx;
+        self.channel_id = None;
+        self.surface_created = false;
+        self.caps_confirmed = false;
+        self.confirmed_cap = None;
+        self.avc420_supported = false;
+        self.avc444_supported = false;
+        self.avc_fallback_to_uncompressed = false;
+        self.bitmap_fallback_mode = false;
+        self.frame_id = 0;
+        self.pending_acks = 0;
+        self.last_ack_frame = 0;
+        self.network_quality = 1.0;
+        self.frame_send_times.clear();
+        self.rtt_ewma_ms = 0.0;
+        self.last_encode_ms = 0.0;
+        self.last_frame_bytes = 0;
+        self.total_bytes_sent = 0;
+        self.bitmap_wire_bytes = 0;
+        self.start_time = None;
+        self.bitrate_samples.clear();
+        self.bitrate_max = 0.0;
+        self.bitrate_min = f64::MAX;
+        self.last_frame_time = None;
+    }
+
     pub fn has_gfx_channel(&self) -> bool {
         self.channel_id.is_some() && self.caps_confirmed
     }
@@ -942,12 +969,8 @@ impl DvcProcessor for GfxHandler {
     fn close(&mut self, channel_id: u32) {
         info!(channel_id, "GFX channel closed");
         let mut state = self.state.lock().unwrap();
-        state.channel_id = None;
-        state.surface_created = false;
-        state.caps_confirmed = false;
-        state.avc420_supported = false;
-        state.avc444_supported = false;
-        state.confirmed_cap = None;
+        let keep_session_uses_gfx = state.session_uses_gfx;
+        state.reset_connection_state(keep_session_uses_gfx);
     }
 }
 
@@ -956,7 +979,7 @@ impl DvcServerProcessor for GfxHandler {}
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_confirmed_capability, should_prefer_bitmap_fallback, CapabilitySelection,
+        choose_confirmed_capability, should_prefer_bitmap_fallback, CapabilitySelection, GfxState,
     };
     use ironrdp_pdu::rdp::vc::dvc::gfx::{
         CapabilitiesV10Flags, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags,
@@ -1071,5 +1094,58 @@ mod tests {
         let (_, selection) = choose_confirmed_capability(&caps);
 
         assert!(!should_prefer_bitmap_fallback(selection));
+    }
+
+    #[test]
+    fn reset_connection_state_clears_bitmap_fallback_and_ack_tracking() {
+        let mut state = GfxState::new(1920, 1080, true, false);
+        state.session_uses_gfx = true;
+        state.channel_id = Some(7);
+        state.surface_created = true;
+        state.caps_confirmed = true;
+        state.frame_id = 41;
+        state.avc420_supported = true;
+        state.avc444_supported = true;
+        state.confirmed_cap = Some(CapabilitySet::V10_1);
+        state.pending_acks = 3;
+        state.last_ack_frame = 39;
+        state.network_quality = 0.15;
+        state.frame_send_times.insert(41, std::time::Instant::now());
+        state.rtt_ewma_ms = 87.0;
+        state.last_encode_ms = 11.0;
+        state.last_frame_bytes = 123_456;
+        state.total_bytes_sent = 987_654;
+        state.bitmap_wire_bytes = 456_789;
+        state.start_time = Some(std::time::Instant::now());
+        state.peer_addr = Some(std::net::IpAddr::from([192, 168, 86, 250]));
+        state.avc_fallback_to_uncompressed = true;
+        state.bitmap_fallback_mode = true;
+
+        state.reset_connection_state(false);
+
+        assert!(!state.session_uses_gfx);
+        assert_eq!(state.channel_id, None);
+        assert!(!state.surface_created);
+        assert!(!state.caps_confirmed);
+        assert_eq!(state.frame_id, 0);
+        assert!(!state.avc420_supported);
+        assert!(!state.avc444_supported);
+        assert_eq!(state.confirmed_cap, None);
+        assert_eq!(state.pending_acks, 0);
+        assert_eq!(state.last_ack_frame, 0);
+        assert_eq!(state.network_quality, 1.0);
+        assert!(state.frame_send_times.is_empty());
+        assert_eq!(state.rtt_ewma_ms, 0.0);
+        assert_eq!(state.last_encode_ms, 0.0);
+        assert_eq!(state.last_frame_bytes, 0);
+        assert_eq!(state.total_bytes_sent, 0);
+        assert_eq!(state.bitmap_wire_bytes, 0);
+        assert_eq!(state.start_time, None);
+        assert!(!state.avc_fallback_to_uncompressed);
+        assert!(!state.bitmap_fallback_mode);
+        assert_eq!(
+            state.peer_addr,
+            Some(std::net::IpAddr::from([192, 168, 86, 250]))
+        );
     }
 }

@@ -933,10 +933,8 @@ impl RdpServer {
         self.static_channels = result.static_channels;
         {
             let mut gfx_state = self.gfx_state.lock().unwrap();
-            gfx_state.bitmap_fallback_mode = false;
-            gfx_state.avc_fallback_to_uncompressed = false;
-            gfx_state.session_uses_gfx =
-                self.get_channel_id_by_type::<dvc::DrdynvcServer>().is_some();
+            let session_uses_gfx = self.get_channel_id_by_type::<dvc::DrdynvcServer>().is_some();
+            gfx_state.reset_connection_state(session_uses_gfx);
             info!(
                 session_uses_gfx = gfx_state.session_uses_gfx,
                 "Connection graphics path negotiated"
