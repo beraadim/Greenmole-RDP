@@ -7,8 +7,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
-use image::ImageFormat;
-use objc2_app_kit::NSCursor;
+use image::{imageops::FilterType, ImageFormat, RgbaImage};
+use objc2::AnyThread;
+use objc2_app_kit::{NSBitmapImageRep, NSCursor};
 use objc2_foundation::{NSData, NSPoint};
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::*;
@@ -16,6 +17,7 @@ use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate
 use tokio::sync::mpsc;
 
 static UNEXPECTED_BGRA_LAYOUT_WARNINGS: AtomicU64 = AtomicU64::new(0);
+const MAX_RDP_CURSOR_EDGE: u16 = 32;
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
@@ -272,11 +274,21 @@ fn build_stream_config(
 pub fn capture_current_cursor_shape() -> Result<Option<CursorShape>> {
     let cursor = NSCursor::currentSystemCursor().unwrap_or_else(NSCursor::currentCursor);
     let image = cursor.image();
-    let Some(tiff) = image.TIFFRepresentation() else {
+    let Some(cg_image) = (unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) })
+    else {
         return Ok(None);
     };
 
-    decode_cursor_tiff(&tiff, cursor.hotSpot())
+    decode_cursor_cgimage(&cg_image, cursor.hotSpot())
+}
+
+fn decode_cursor_cgimage(cg_image: &objc2_core_graphics::CGImage, hot_spot: NSPoint) -> Result<Option<CursorShape>> {
+    let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), cg_image);
+    let Some(tiff) = bitmap.TIFFRepresentation() else {
+        return Ok(None);
+    };
+
+    decode_cursor_tiff(&tiff, hot_spot)
 }
 
 fn decode_cursor_tiff(tiff: &NSData, hot_spot: NSPoint) -> Result<Option<CursorShape>> {
@@ -285,8 +297,7 @@ fn decode_cursor_tiff(tiff: &NSData, hot_spot: NSPoint) -> Result<Option<CursorS
         .to_rgba8();
 
     let width = u16::try_from(decoded.width()).context("Cursor width exceeds RDP pointer limit")?;
-    let height =
-        u16::try_from(decoded.height()).context("Cursor height exceeds RDP pointer limit")?;
+    let height = u16::try_from(decoded.height()).context("Cursor height exceeds RDP pointer limit")?;
     if width == 0 || height == 0 {
         return Ok(None);
     }
@@ -300,13 +311,45 @@ fn decode_cursor_tiff(tiff: &NSData, hot_spot: NSPoint) -> Result<Option<CursorS
         .round()
         .clamp(0.0, f64::from(height.saturating_sub(1))) as u16;
 
-    Ok(Some(CursorShape {
+    Ok(Some(clamp_cursor_shape(CursorShape {
         width,
         height,
         hot_x,
         hot_y,
         rgba: decoded.into_raw(),
-    }))
+    })))
+}
+
+fn clamp_cursor_shape(shape: CursorShape) -> CursorShape {
+    if shape.width <= MAX_RDP_CURSOR_EDGE && shape.height <= MAX_RDP_CURSOR_EDGE {
+        return shape;
+    }
+
+    let old_width = u32::from(shape.width);
+    let old_height = u32::from(shape.height);
+    let scale = f32::min(
+        f32::from(MAX_RDP_CURSOR_EDGE) / old_width as f32,
+        f32::from(MAX_RDP_CURSOR_EDGE) / old_height as f32,
+    );
+    let new_width = ((old_width as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
+    let new_height = ((old_height as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
+
+    let resized = RgbaImage::from_raw(old_width, old_height, shape.rgba)
+        .expect("cursor RGBA length should match dimensions");
+    let resized = image::imageops::resize(&resized, new_width, new_height, FilterType::Triangle);
+
+    let hot_x = ((f32::from(shape.hot_x) * (new_width as f32 / old_width as f32)).round() as u16)
+        .min(new_width.saturating_sub(1) as u16);
+    let hot_y = ((f32::from(shape.hot_y) * (new_height as f32 / old_height as f32)).round() as u16)
+        .min(new_height.saturating_sub(1) as u16);
+
+    CursorShape {
+        width: new_width as u16,
+        height: new_height as u16,
+        hot_x,
+        hot_y,
+        rgba: resized.into_raw(),
+    }
 }
 
 fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
@@ -910,6 +953,32 @@ impl SafePixelBuffer {
             width: y_stride, // conservative: callers should clamp to actual width
             height: y_height,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_cursor_shape, CursorShape, MAX_RDP_CURSOR_EDGE};
+
+    #[test]
+    fn clamp_cursor_shape_resizes_oversized_cursor_and_hotspot() {
+        let shape = CursorShape {
+            width: 56,
+            height: 80,
+            hot_x: 5,
+            hot_y: 5,
+            rgba: vec![255; 56 * 80 * 4],
+        };
+
+        let resized = clamp_cursor_shape(shape);
+
+        assert!(resized.width <= MAX_RDP_CURSOR_EDGE);
+        assert!(resized.height <= MAX_RDP_CURSOR_EDGE);
+        assert_eq!(resized.width, 22);
+        assert_eq!(resized.height, 32);
+        assert_eq!(resized.hot_x, 2);
+        assert_eq!(resized.hot_y, 2);
+        assert_eq!(resized.rgba.len(), usize::from(resized.width) * usize::from(resized.height) * 4);
     }
 }
 

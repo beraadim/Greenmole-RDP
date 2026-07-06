@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:build": "tauri build --bundles app && codesign --force --sign macrdp-dev --identifier com.macrdp.app src-tauri/target/release/bundle/macos/macrdp.app",
+    "tauri:build": "./build.sh",
     "tauri:install": "npm run tauri:build && cp -R src-tauri/target/release/bundle/macos/macrdp.app /Applications/macrdp.app"
   },
   "dependencies": {

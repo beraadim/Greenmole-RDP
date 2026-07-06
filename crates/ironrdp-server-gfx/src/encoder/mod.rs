@@ -176,7 +176,7 @@ impl UpdateEncoder {
             x: ptr.hot_x,
             y: ptr.hot_y,
         };
-        let ptr = ColorPointerAttribute {
+        let color_pointer = ColorPointerAttribute {
             cache_index: 0,
             hot_spot,
             width: ptr.width,
@@ -184,7 +184,14 @@ impl UpdateEncoder {
             xor_mask: &ptr.xor_mask,
             and_mask: &ptr.and_mask,
         };
-        Ok(UpdateFragmenter::new(UpdateCode::ColorPointer, encode_vec(&ptr)?))
+        // FreeRDP shadow sends alpha cursor updates as PointerNew with 24bpp
+        // XOR data plus an AND mask, which is more broadly compatible than a
+        // bare ColorPointer fast-path update.
+        let ptr = PointerAttribute {
+            xor_bpp: 24,
+            color_pointer,
+        };
+        Ok(UpdateFragmenter::new(UpdateCode::NewPointer, encode_vec(&ptr)?))
     }
 
     fn default_pointer() -> Result<UpdateFragmenter> {
@@ -736,4 +743,42 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
     };
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_core::{decode_cursor, ReadCursor};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu};
+
+    use super::*;
+
+    #[test]
+    fn color_pointer_uses_new_pointer_fastpath_update() {
+        let pointer = ColorPointer {
+            width: 2,
+            height: 2,
+            hot_x: 3,
+            hot_y: 4,
+            xor_mask: vec![1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10],
+            and_mask: vec![0, 0, 0x80, 0],
+        };
+
+        let mut fragmenter = UpdateEncoder::color_pointer(pointer).unwrap();
+        let mut buffer = vec![0; fragmenter.size_hint()];
+        let written = fragmenter.next(&mut buffer).unwrap();
+
+        let mut cursor = ReadCursor::new(&buffer[..written]);
+        let _header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+        let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+        assert_eq!(update.update_code, UpdateCode::NewPointer);
+
+        let mut pointer_cursor = ReadCursor::new(update.data);
+        let encoded: PointerAttribute<'_> = decode_cursor(&mut pointer_cursor).unwrap();
+        assert_eq!(encoded.xor_bpp, 24);
+        assert_eq!(encoded.color_pointer.hot_spot, Point16 { x: 3, y: 4 });
+        assert_eq!(encoded.color_pointer.width, 2);
+        assert_eq!(encoded.color_pointer.height, 2);
+        assert_eq!(encoded.color_pointer.xor_mask, &[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10]);
+        assert_eq!(encoded.color_pointer.and_mask, &[0, 0, 0x80, 0]);
+    }
 }

@@ -136,10 +136,13 @@ verify_runtime_shape() {
   fi
 }
 
-SWIFT_LIB_DIR="$(find_swift_lib_dir)"
 SYSTEM_SWIFT_LIB="/usr/lib/swift/$TARGET_LIB"
 
-if [ "$SWIFT_RUNTIME_MODE" = "auto" ] && [ -f "$SYSTEM_SWIFT_LIB" ]; then
+# On current macOS releases the Swift concurrency runtime may come from the
+# dyld shared cache even when no on-disk stub exists. Prefer that system
+# install name by default so we do not load both the system runtime and a
+# manually bundled Command Line Tools copy at once.
+if [ "$SWIFT_RUNTIME_MODE" = "auto" ]; then
   SWIFT_RUNTIME_MODE="system"
 fi
 
@@ -149,6 +152,7 @@ if [ "$SWIFT_RUNTIME_MODE" = "system" ]; then
   fi
   rm -f "$FRAMEWORKS_DIR/$TARGET_LIB"
 elif [ "$SWIFT_RUNTIME_MODE" = "bundle" ] || [ "$SWIFT_RUNTIME_MODE" = "auto" ]; then
+  SWIFT_LIB_DIR="$(find_swift_lib_dir)"
   mkdir -p "$FRAMEWORKS_DIR"
   cp "$SWIFT_LIB_DIR/$TARGET_LIB" "$FRAMEWORKS_DIR/$TARGET_LIB"
 

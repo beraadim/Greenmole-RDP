@@ -13,4 +13,5 @@ core-graphics = "0.25"
 image = { version = "0.25", default-features = false, features = ["tiff"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSData"] }
-objc2-app-kit = { version = "0.3", features = ["NSCursor", "NSImage"] }
+objc2-app-kit = { version = "0.3", features = ["NSBitmapImageRep", "NSCursor", "NSGraphicsContext", "NSImage", "NSImageRep", "objc2-core-graphics"] }
+objc2-core-graphics = "0.3"

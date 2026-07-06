@@ -341,25 +341,45 @@ fn fingerprint_cursor_shape(shape: &CursorShape) -> u64 {
     hasher.finish()
 }
 
-fn cursor_shape_to_pointer(shape: CursorShape) -> ironrdp_server::RGBAPointer {
+fn cursor_shape_to_pointer(shape: CursorShape) -> ironrdp_server::ColorPointer {
     let width = usize::from(shape.width);
-    let height = usize::from(shape.height);
-    let mut data = Vec::with_capacity(shape.rgba.len());
+    let xor_stride = {
+        let stride = width * 3;
+        stride + (stride % 2)
+    };
+    let and_stride = {
+        let stride = width.div_ceil(8);
+        stride + (stride % 2)
+    };
+    let mut xor_mask = vec![0; usize::from(shape.height) * xor_stride];
+    let mut and_mask = vec![0; usize::from(shape.height) * and_stride];
 
-    // RDP 32bpp pointer XOR data is stored as bottom-up BGRA, while the
-    // decoded macOS cursor image arrives as top-down RGBA.
-    for row in shape.rgba.chunks_exact(width * 4).rev().take(height) {
-        for pixel in row.chunks_exact(4) {
-            data.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    // Match FreeRDP's alpha-cursor conversion path: 24bpp bottom-up BGR XOR
+    // data plus a 1bpp bottom-up AND mask.
+    for (dst_row, src_row) in shape.rgba.chunks_exact(width * 4).rev().enumerate() {
+        let xor_row = &mut xor_mask[dst_row * xor_stride..(dst_row + 1) * xor_stride];
+        let and_row = &mut and_mask[dst_row * and_stride..(dst_row + 1) * and_stride];
+
+        for (x, pixel) in src_row.chunks_exact(4).enumerate() {
+            let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+            let xor_offset = x * 3;
+
+            if a < 64 {
+                and_row[x / 8] |= 0x80 >> (x % 8);
+                xor_row[xor_offset..xor_offset + 3].copy_from_slice(&[0, 0, 0]);
+            } else {
+                xor_row[xor_offset..xor_offset + 3].copy_from_slice(&[b, g, r]);
+            }
         }
     }
 
-    ironrdp_server::RGBAPointer {
+    ironrdp_server::ColorPointer {
         width: shape.width,
         height: shape.height,
         hot_x: shape.hot_x,
         hot_y: shape.hot_y,
-        data,
+        and_mask,
+        xor_mask,
     }
 }
 
@@ -1351,7 +1371,9 @@ impl MacDisplayUpdates {
     }
 
     fn poll_cursor_update_if_due(&mut self) -> Option<DisplayUpdate> {
-        if !self.capture_config.show_cursor {
+        // `show_cursor` controls whether ScreenCaptureKit burns the host cursor
+        // into captured frames. When it is off, we need RDP pointer updates.
+        if self.capture_config.show_cursor {
             self.last_cursor_fingerprint = None;
             return None;
         }
@@ -1371,7 +1393,7 @@ impl MacDisplayUpdates {
                 }
 
                 self.last_cursor_fingerprint = Some(fingerprint);
-                Some(DisplayUpdate::RGBAPointer(cursor_shape_to_pointer(shape)))
+                Some(DisplayUpdate::ColorPointer(cursor_shape_to_pointer(shape)))
             }
             Ok(None) => {
                 if self.last_cursor_fingerprint.take().is_some() {
@@ -1388,7 +1410,7 @@ impl MacDisplayUpdates {
     }
 
     fn cursor_poll_timeout(&self) -> Option<Duration> {
-        if !self.capture_config.show_cursor {
+        if self.capture_config.show_cursor {
             return None;
         }
 
@@ -1419,9 +1441,9 @@ impl MacDisplayUpdates {
 
     fn fallback_pointer_update(&self) -> DisplayUpdate {
         if self.capture_config.show_cursor {
-            DisplayUpdate::DefaultPointer
-        } else {
             DisplayUpdate::HidePointer
+        } else {
+            DisplayUpdate::DefaultPointer
         }
     }
 
@@ -3533,14 +3555,14 @@ mod tests {
     }
 
     #[test]
-    fn converts_cursor_shape_to_rgba_pointer() {
+    fn converts_cursor_shape_to_color_pointer() {
         let shape = CursorShape {
             width: 2,
             height: 2,
             hot_x: 5,
             hot_y: 7,
             rgba: vec![
-                1, 2, 3, 4, 10, 20, 30, 40, // top row RGBA
+                1, 2, 3, 4, 10, 20, 30, 0, // top row RGBA
                 50, 60, 70, 80, 90, 100, 110, 120, // bottom row RGBA
             ],
         };
@@ -3551,12 +3573,13 @@ mod tests {
         assert_eq!(pointer.hot_x, 5);
         assert_eq!(pointer.hot_y, 7);
         assert_eq!(
-            pointer.data,
+            pointer.xor_mask,
             vec![
-                70, 60, 50, 80, 110, 100, 90, 120, // bottom row, converted to BGRA
-                3, 2, 1, 4, 30, 20, 10, 40, // top row, converted to BGRA
+                70, 60, 50, 110, 100, 90, // bottom row, BGR
+                0, 0, 0, 0, 0, 0, // top row, transparent pixels cleared to black
             ]
         );
+        assert_eq!(pointer.and_mask, vec![0x00, 0x00, 0xC0, 0x00]);
     }
 
     #[test]
