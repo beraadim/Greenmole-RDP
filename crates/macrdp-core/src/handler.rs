@@ -150,6 +150,13 @@ impl MacInputHandler {
         is_non_us_layout || is_guacamole
     }
 
+    fn treat_right_ctrl_as_altgr_companion(&self) -> bool {
+        matches!(
+            self.translation_profile(),
+            Some(KeyboardTranslationProfile::NorwegianPhysical)
+        )
+    }
+
     fn translation_profile(&self) -> Option<KeyboardTranslationProfile> {
         if self.client_context.client_name.contains("Guacamole") {
             Some(KeyboardTranslationProfile::GuacamoleUs)
@@ -577,7 +584,9 @@ impl RdpServerInputHandler for MacInputHandler {
             KeyboardEvent::Pressed { code, extended } => {
                 self.update_modifier_state(code, extended, true);
 
-                if extended && code == 0x38 && self.translation_profile().is_some() {
+                if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
+                    Ok(())
+                } else if extended && code == 0x38 && self.translation_profile().is_some() {
                     Ok(())
                 } else if let Some(result) = self.handle_translated_key_press(code, extended) {
                     result
@@ -595,6 +604,8 @@ impl RdpServerInputHandler for MacInputHandler {
 
                 if let Some(chars) = self.translated_key_releases.remove(&(code, extended)) {
                     Self::inject_unicode_sequence(kb, &chars, false)
+                } else if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
+                    Ok(())
                 } else if extended && code == 0x38 && self.translation_profile().is_some() {
                     Ok(())
                 } else if extended && code == 0x38 && self.map_right_alt_to_option() {
@@ -863,6 +874,15 @@ mod tests {
             handler.translate_text_key(0x09, false),
             Some(TextTranslation::Unicode('['))
         );
+    }
+
+    #[test]
+    fn native_norwegian_treats_right_ctrl_as_altgr_companion() {
+        let handler = handler_for("Windows App", 0x0414);
+        assert!(handler.treat_right_ctrl_as_altgr_companion());
+
+        let handler = handler_for("Guacamole RDP", 0x0409);
+        assert!(!handler.treat_right_ctrl_as_altgr_companion());
     }
 
     #[test]
