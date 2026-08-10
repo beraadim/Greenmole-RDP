@@ -85,6 +85,9 @@ pub enum CaptureEvent {
     Frame(CapturedFrame),
     /// Desktop is unchanged — no new pixel data.
     Idle,
+    /// ScreenCaptureKit reported that capture is temporarily unavailable,
+    /// such as when the display is blanked, suspended, or stopped.
+    Unavailable,
 }
 
 /// A captured screen frame
@@ -356,7 +359,8 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
     // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
-    // Blank/Suspended/Stopped are non-displayable states — discard silently.
+    // Blank/Suspended/Stopped mean ScreenCaptureKit has no displayable pixels
+    // for us right now, which should trigger the higher-level fallback path.
     match sample.frame_status() {
         Some(SCFrameStatus::Idle) => {
             return Some(CaptureEvent::Idle);
@@ -364,7 +368,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         Some(SCFrameStatus::Blank)
         | Some(SCFrameStatus::Suspended)
         | Some(SCFrameStatus::Stopped) => {
-            return None;
+            return Some(CaptureEvent::Unavailable);
         }
         _ => {}
     }
@@ -444,7 +448,8 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
     // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
-    // Blank/Suspended/Stopped are non-displayable states — discard silently.
+    // Blank/Suspended/Stopped mean ScreenCaptureKit has no displayable pixels
+    // for us right now, which should trigger the higher-level fallback path.
     match sample.frame_status() {
         Some(SCFrameStatus::Idle) => {
             return Some(CaptureEvent::Idle);
@@ -452,7 +457,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         Some(SCFrameStatus::Blank)
         | Some(SCFrameStatus::Suspended)
         | Some(SCFrameStatus::Stopped) => {
-            return None;
+            return Some(CaptureEvent::Unavailable);
         }
         _ => {}
     }

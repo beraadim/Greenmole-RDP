@@ -12,6 +12,7 @@ use macrdp_capture::{
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
@@ -351,30 +352,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             let event = match self.capturer.next_frame().await {
                 Some(e) => e,
                 None => {
-                    // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
-                    tracing::warn!(
-                        "SCStream stopped — switching to CoreGraphics fallback (lock screen?)"
-                    );
-                    let fallback = CgFallbackCapturer::new(&self.capture_config);
-                    loop {
-                        // Try to restore SCK (faster, has dirty rects)
-                        match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                            Ok(new_capturer) => {
-                                tracing::info!(
-                                    "SCStream recovered — switching back from CoreGraphics"
-                                );
-                                self.capturer = new_capturer;
-                                break;
-                            }
-                            Err(_) => {
-                                // SCK still unavailable — use CGDisplayCreateImage
-                                if let Some(cg_frame) = fallback.capture_frame() {
-                                    // Send this fallback frame through the normal encoding path
-                                    return self.encode_and_send(cg_frame);
-                                }
-                                tokio::time::sleep(fallback.frame_interval()).await;
-                            }
-                        }
+                    if let Some(update) = self.run_coregraphics_fallback_until_recovered().await? {
+                        return Ok(Some(update));
                     }
                     continue; // retry next_frame with restored SCK capturer
                 }
@@ -383,12 +362,19 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             let frame = match event {
                 macrdp_capture::CaptureEvent::Frame(f) => f,
                 macrdp_capture::CaptureEvent::Idle => continue,
+                macrdp_capture::CaptureEvent::Unavailable => {
+                    if let Some(update) = self.run_coregraphics_fallback_until_recovered().await? {
+                        return Ok(Some(update));
+                    }
+                    continue;
+                }
             };
             // If another frame is already buffered, skip this one and grab the newer one
             // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
                 Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue,
-                Some(macrdp_capture::CaptureEvent::Idle) => break frame,
+                Some(macrdp_capture::CaptureEvent::Idle)
+                | Some(macrdp_capture::CaptureEvent::Unavailable) => break frame,
                 None => break frame,
             }
         };
@@ -398,6 +384,51 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    async fn run_coregraphics_fallback_until_recovered(
+        &mut self,
+    ) -> Result<Option<DisplayUpdate>> {
+        tracing::warn!("SCStream unavailable — switching to CoreGraphics fallback");
+        let fallback = CgFallbackCapturer::new(&self.capture_config);
+        loop {
+            match ScreenCapturer::new(self.capture_config.clone(), None).await {
+                Ok(mut new_capturer) => {
+                    match tokio::time::timeout(Duration::from_millis(250), new_capturer.next_frame())
+                        .await
+                    {
+                        Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => {
+                            tracing::info!(
+                                "SCStream recovered with a usable frame — switching back from CoreGraphics"
+                            );
+                            self.capturer = new_capturer;
+                            return self.encode_and_send(frame);
+                        }
+                        Ok(Some(macrdp_capture::CaptureEvent::Idle)) => {
+                            tracing::info!(
+                                "SCStream recovered with idle frame flow — switching back from CoreGraphics"
+                            );
+                            self.capturer = new_capturer;
+                            return Ok(None);
+                        }
+                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable))
+                        | Ok(None)
+                        | Err(_) => {
+                            tracing::debug!(
+                                "SCStream probe still unavailable during CoreGraphics fallback"
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::debug!("SCStream probe creation failed during CoreGraphics fallback");
+                }
+            }
+            if let Some(cg_frame) = fallback.capture_frame() {
+                return self.encode_and_send(cg_frame);
+            }
+            tokio::time::sleep(fallback.frame_interval()).await;
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {

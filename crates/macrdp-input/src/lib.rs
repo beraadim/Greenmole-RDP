@@ -3,10 +3,12 @@
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
+pub mod power;
 
 pub use keyboard::KeyboardInjector;
 pub use keymap::scancode_to_keycode;
 pub use mouse::{MouseButton, MouseInjector};
+pub use power::RemoteSessionWake;
 
 // FFI for Accessibility APIs
 extern "C" {

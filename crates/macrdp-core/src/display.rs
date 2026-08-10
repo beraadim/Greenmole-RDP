@@ -1087,38 +1087,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
                         Ok(Some(e)) => e,
                         Ok(None) => {
-                            // SCK channel closed — handle below in the fallback path
-                            // Reset idle state since we're switching capture sources
-                            self.idle_frame_count = 0;
-                            self.request_full_bitmap_updates(1);
-                            // Fall through to CG fallback
-                            tracing::warn!(
-                                "SCStream stopped — switching to CoreGraphics fallback (lock screen?)"
-                            );
-                            let fallback = CgFallbackCapturer::new(&self.capture_config);
-                            loop {
-                                match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                                    Ok(new_capturer) => {
-                                        tracing::info!(
-                                            "SCStream recovered — switching back from CoreGraphics"
-                                        );
-                                        self.capturer = new_capturer;
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        if let Some(cg_frame) = fallback.capture_frame() {
-                                            match self.encode_and_send(cg_frame)? {
-                                                Some(update) => return Ok(Some(update)),
-                                                None => {
-                                                    tracing::debug!(
-                                                        "CoreGraphics fallback frame produced no display update; waiting for next frame"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        tokio::time::sleep(fallback.frame_interval()).await;
-                                    }
-                                }
+                            if let Some(update) =
+                                self.run_coregraphics_fallback_until_recovered().await?
+                            {
+                                return Ok(Some(update));
                             }
                             continue;
                         }
@@ -1138,36 +1110,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     match self.capturer.next_frame().await {
                         Some(e) => e,
                         None => {
-                            // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
-                            self.idle_frame_count = 0;
-                            self.request_full_bitmap_updates(1);
-                            tracing::warn!(
-                                "SCStream stopped — switching to CoreGraphics fallback (lock screen?)"
-                            );
-                            let fallback = CgFallbackCapturer::new(&self.capture_config);
-                            loop {
-                                match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                                    Ok(new_capturer) => {
-                                        tracing::info!(
-                                            "SCStream recovered — switching back from CoreGraphics"
-                                        );
-                                        self.capturer = new_capturer;
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        if let Some(cg_frame) = fallback.capture_frame() {
-                                            match self.encode_and_send(cg_frame)? {
-                                                Some(update) => return Ok(Some(update)),
-                                                None => {
-                                                    tracing::debug!(
-                                                        "CoreGraphics fallback frame produced no display update; waiting for next frame"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        tokio::time::sleep(fallback.frame_interval()).await;
-                                    }
-                                }
+                            if let Some(update) =
+                                self.run_coregraphics_fallback_until_recovered().await?
+                            {
+                                return Ok(Some(update));
                             }
                             continue;
                         }
@@ -1214,6 +1160,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         self.idle_frame_count += 1;
                         continue;
                     }
+                    macrdp_capture::CaptureEvent::Unavailable => {
+                        if let Some(update) =
+                            self.run_coregraphics_fallback_until_recovered().await?
+                        {
+                            return Ok(Some(update));
+                        }
+                        continue;
+                    }
                 };
 
                 // Drain buffered frames so we always encode the newest available frame.
@@ -1221,7 +1175,9 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 loop {
                     match self.capturer.try_next_frame() {
                         Some(macrdp_capture::CaptureEvent::Frame(newer)) => latest = newer,
-                        Some(macrdp_capture::CaptureEvent::Idle) | None => break,
+                        Some(macrdp_capture::CaptureEvent::Idle)
+                        | Some(macrdp_capture::CaptureEvent::Unavailable)
+                        | None => break,
                     }
                 }
                 self.refine_capture_dirty_rects(&mut latest);
@@ -1239,9 +1195,64 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             }
         }
     }
+
 }
 
 impl MacDisplayUpdates {
+    async fn run_coregraphics_fallback_until_recovered(
+        &mut self,
+    ) -> Result<Option<DisplayUpdate>> {
+        self.idle_frame_count = 0;
+        self.request_full_bitmap_updates(1);
+        tracing::warn!("SCStream unavailable — switching to CoreGraphics fallback");
+        let fallback = CgFallbackCapturer::new(&self.capture_config);
+        loop {
+            match ScreenCapturer::new(self.capture_config.clone(), None).await {
+                Ok(mut new_capturer) => {
+                    match tokio::time::timeout(Duration::from_millis(250), new_capturer.next_frame())
+                        .await
+                    {
+                        Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => {
+                            tracing::info!(
+                                "SCStream recovered with a usable frame — switching back from CoreGraphics"
+                            );
+                            self.capturer = new_capturer;
+                            return self.encode_and_send(frame);
+                        }
+                        Ok(Some(macrdp_capture::CaptureEvent::Idle)) => {
+                            tracing::info!(
+                                "SCStream recovered with idle frame flow — switching back from CoreGraphics"
+                            );
+                            self.capturer = new_capturer;
+                            return Ok(None);
+                        }
+                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable))
+                        | Ok(None)
+                        | Err(_) => {
+                            tracing::debug!(
+                                "SCStream probe still unavailable during CoreGraphics fallback"
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::debug!("SCStream probe creation failed during CoreGraphics fallback");
+                }
+            }
+            if let Some(cg_frame) = fallback.capture_frame() {
+                match self.encode_and_send(cg_frame)? {
+                    Some(update) => return Ok(Some(update)),
+                    None => {
+                        tracing::debug!(
+                            "CoreGraphics fallback frame produced no display update; waiting for next frame"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(fallback.frame_interval()).await;
+        }
+    }
+
     fn refine_capture_dirty_rects(&self, frame: &mut CapturedFrame) {
         if frame.dirty_rects.is_empty() {
             return;

@@ -1,5 +1,5 @@
 use ironrdp_server::{ClientInputContext, KeyboardEvent, MouseEvent, RdpServerInputHandler};
-use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, RemoteSessionWake};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -76,6 +76,7 @@ impl MouseCoordMapper {
 pub struct MacInputHandler {
     keyboard: Option<KeyboardInjector>,
     mouse: Option<MouseInjector>,
+    wake: Option<RemoteSessionWake>,
     last_mouse_x: u16,
     last_mouse_y: u16,
     last_sync_lock_bits: Option<u8>,
@@ -129,9 +130,19 @@ impl MacInputHandler {
             tracing::warn!("Input injection may fail — ensure Accessibility permission is granted");
         }
 
+        let mut wake = RemoteSessionWake::new()
+            .map_err(|e| tracing::warn!("Failed to initialize remote wake support: {e}"))
+            .ok();
+        if let Some(wake_session) = &mut wake {
+            if let Err(e) = wake_session.wake_display_for_session_start() {
+                tracing::warn!("Failed to wake display for new remote session: {e}");
+            }
+        }
+
         Self {
             keyboard,
             mouse,
+            wake,
             last_mouse_x: 0,
             last_mouse_y: 0,
             last_sync_lock_bits: None,
@@ -580,6 +591,12 @@ impl RdpServerInputHandler for MacInputHandler {
             return;
         }
 
+        if let Some(wake) = &mut self.wake {
+            if let Err(e) = wake.wake_display_for_input("keyboard") {
+                tracing::warn!("Failed to declare remote keyboard activity: {e}");
+            }
+        }
+
         let result = match event {
             KeyboardEvent::Pressed { code, extended } => {
                 self.update_modifier_state(code, extended, true);
@@ -667,6 +684,12 @@ impl RdpServerInputHandler for MacInputHandler {
 
     fn mouse(&mut self, event: MouseEvent) {
         let Some(m) = &self.mouse else { return };
+
+        if let Some(wake) = &mut self.wake {
+            if let Err(e) = wake.wake_display_for_input("mouse") {
+                tracing::warn!("Failed to declare remote mouse activity: {e}");
+            }
+        }
 
         let result = match event {
             MouseEvent::Move { x, y } => {
