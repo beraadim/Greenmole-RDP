@@ -40,21 +40,11 @@ impl MouseCoordMapper {
 
     pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        // ScreenCaptureKit capture uses aspect-fit scaling when the client asks
-        // for a different desktop shape. That can introduce horizontal or
-        // vertical bars inside the negotiated RDP desktop, so map against the
-        // active image rect rather than the full RDP surface.
-        let scale = (s.rdp_w / s.logical_w).min(s.rdp_h / s.logical_h);
-        let active_w = (s.logical_w * scale).max(1.0);
-        let active_h = (s.logical_h * scale).max(1.0);
-        let offset_x = ((s.rdp_w - active_w) * 0.5).max(0.0);
-        let offset_y = ((s.rdp_h - active_h) * 0.5).max(0.0);
-
-        let rel_x = ((rdp_x as f64) - offset_x).clamp(0.0, active_w);
-        let rel_y = ((rdp_y as f64) - offset_y).clamp(0.0, active_h);
-
-        let mac_x = (rel_x * s.logical_w / active_w).clamp(0.0, s.logical_w - 1.0) as u16;
-        let mac_y = (rel_y * s.logical_h / active_h).clamp(0.0, s.logical_h - 1.0) as u16;
+        // Mouse input needs to track the negotiated RDP desktop directly.
+        // The browser/RDP client already reports coordinates in that space, so
+        // subtracting synthetic letterbox margins creates a visible offset.
+        let mac_x = ((rdp_x as f64) * s.logical_w / s.rdp_w).clamp(0.0, s.logical_w - 1.0) as u16;
+        let mac_y = ((rdp_y as f64) * s.logical_h / s.rdp_h).clamp(0.0, s.logical_h - 1.0) as u16;
         (mac_x, mac_y)
     }
 
@@ -753,6 +743,13 @@ mod tests {
         ClientInputContext, KeyboardTranslationProfile, MacInputHandler, ModifierState,
         MouseCoordMapper, TextTranslation,
     };
+
+    #[test]
+    fn mouse_mapper_scales_linearly_across_resized_desktop() {
+        let mapper = MouseCoordMapper::new(1920, 1200, 2560, 1305);
+        assert_eq!(mapper.map(1280, 652), (960, 599));
+        assert_eq!(mapper.map(2559, 1304), (1919, 1199));
+    }
 
     fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
         let mut handler = MacInputHandler::new(MouseCoordMapper::new(1920, 1200, 1920, 1200));

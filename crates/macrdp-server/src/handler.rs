@@ -39,20 +39,11 @@ impl MouseCoordMapper {
 
     pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        // ScreenCaptureKit aspect-fits into the requested desktop size when
-        // aspect ratios differ. Account for the resulting bars so pointer
-        // mapping follows the visible image rather than the full RDP surface.
-        let scale = (s.rdp_w / s.logical_w).min(s.rdp_h / s.logical_h);
-        let active_w = (s.logical_w * scale).max(1.0);
-        let active_h = (s.logical_h * scale).max(1.0);
-        let offset_x = ((s.rdp_w - active_w) * 0.5).max(0.0);
-        let offset_y = ((s.rdp_h - active_h) * 0.5).max(0.0);
-
-        let rel_x = ((rdp_x as f64) - offset_x).clamp(0.0, active_w);
-        let rel_y = ((rdp_y as f64) - offset_y).clamp(0.0, active_h);
-
-        let mac_x = (rel_x * s.logical_w / active_w).clamp(0.0, s.logical_w - 1.0) as u16;
-        let mac_y = (rel_y * s.logical_h / active_h).clamp(0.0, s.logical_h - 1.0) as u16;
+        // Mouse input needs to track the negotiated RDP desktop directly.
+        // The client already reports coordinates in that space, so synthetic
+        // letterbox compensation creates a visible pointer offset.
+        let mac_x = ((rdp_x as f64) * s.logical_w / s.rdp_w).clamp(0.0, s.logical_w - 1.0) as u16;
+        let mac_y = ((rdp_y as f64) * s.logical_h / s.rdp_h).clamp(0.0, s.logical_h - 1.0) as u16;
         (mac_x, mac_y)
     }
 
