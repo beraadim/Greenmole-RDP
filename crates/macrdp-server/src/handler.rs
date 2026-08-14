@@ -1,4 +1,4 @@
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{ClientInputContext, KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, RemoteSessionWake};
 use std::sync::{Arc, Mutex};
 
@@ -88,14 +88,9 @@ impl MacInputHandler {
             tracing::warn!("Input injection may fail — ensure Accessibility permission is granted");
         }
 
-        let mut wake = RemoteSessionWake::new()
+        let wake = RemoteSessionWake::new()
             .map_err(|e| tracing::warn!("Failed to initialize remote wake support: {e}"))
             .ok();
-        if let Some(wake_session) = &mut wake {
-            if let Err(e) = wake_session.wake_display_for_session_start() {
-                tracing::warn!("Failed to wake display for new remote session: {e}");
-            }
-        }
 
         Self {
             keyboard,
@@ -109,6 +104,20 @@ impl MacInputHandler {
 }
 
 impl RdpServerInputHandler for MacInputHandler {
+    fn on_connect(&mut self, _context: ClientInputContext, _peer_addr: Option<String>) {
+        if let Some(wake) = &mut self.wake {
+            if let Err(e) = wake.wake_display_for_session_start() {
+                tracing::warn!("Failed to wake display for new remote session: {e}");
+            }
+        }
+    }
+
+    fn on_disconnect(&mut self) {
+        if let Some(wake) = &mut self.wake {
+            wake.deactivate_display_sleep_assertion();
+        }
+    }
+
     fn keyboard(&mut self, event: KeyboardEvent) {
         let Some(kb) = &self.keyboard else { return };
 

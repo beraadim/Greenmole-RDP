@@ -135,14 +135,9 @@ impl MacInputHandler {
             tracing::warn!("Input injection may fail — ensure Accessibility permission is granted");
         }
 
-        let mut wake = RemoteSessionWake::new()
+        let wake = RemoteSessionWake::new()
             .map_err(|e| tracing::warn!("Failed to initialize remote wake support: {e}"))
             .ok();
-        if let Some(wake_session) = &mut wake {
-            if let Err(e) = wake_session.wake_display_for_session_start() {
-                tracing::warn!("Failed to wake display for new remote session: {e}");
-            }
-        }
 
         Self {
             keyboard,
@@ -714,6 +709,11 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn on_connect(&mut self, context: ClientInputContext, peer_addr: Option<String>) {
+        if let Some(wake) = &mut self.wake {
+            if let Err(e) = wake.wake_display_for_session_start() {
+                tracing::warn!("Failed to wake display for new remote session: {e}");
+            }
+        }
         let mut active_connection = self.active_connection.lock().unwrap();
         *active_connection = Some(crate::callbacks::ConnectionInfo {
             client_ip: peer_addr.unwrap_or_else(|| "unknown".to_string()),
@@ -724,6 +724,9 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
+        if let Some(wake) = &mut self.wake {
+            wake.deactivate_display_sleep_assertion();
+        }
         let mut active_connection = self.active_connection.lock().unwrap();
         *active_connection = None;
         self.refresh_debug_state(Some("connection:disconnected".to_string()));

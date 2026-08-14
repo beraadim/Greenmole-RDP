@@ -45,32 +45,15 @@ pub struct RemoteSessionWake {
 
 impl RemoteSessionWake {
     pub fn new() -> Result<Self> {
-        let mut display_sleep_assertion_id = 0;
-        let assertion_type = CFString::new(DISPLAY_SLEEP_ASSERTION_TYPE);
-        let assertion_name = CFString::new(DISPLAY_SLEEP_REASON);
-        let result = unsafe {
-            IOPMAssertionCreateWithName(
-                assertion_type.as_concrete_TypeRef(),
-                K_IOPM_ASSERTION_LEVEL_ON,
-                assertion_name.as_concrete_TypeRef(),
-                &mut display_sleep_assertion_id,
-            )
-        };
-
-        if result != K_IORETURN_SUCCESS {
-            return Err(anyhow!(
-                "IOPMAssertionCreateWithName failed with IOReturn {result}"
-            ));
-        }
-
         Ok(Self {
-            display_sleep_assertion_id: Some(display_sleep_assertion_id),
+            display_sleep_assertion_id: None,
             user_activity_assertion_id: 0,
             last_user_activity: None,
         })
     }
 
     pub fn wake_display_for_session_start(&mut self) -> Result<()> {
+        self.activate_display_sleep_assertion()?;
         self.declare_user_activity("session-start", true)
     }
 
@@ -108,6 +91,42 @@ impl RemoteSessionWake {
         self.last_user_activity = Some(now);
         tracing::debug!(trigger, "Declared remote user activity for display wake");
         Ok(())
+    }
+
+    pub fn activate_display_sleep_assertion(&mut self) -> Result<()> {
+        if self.display_sleep_assertion_id.is_some() {
+            return Ok(());
+        }
+
+        let mut display_sleep_assertion_id = 0;
+        let assertion_type = CFString::new(DISPLAY_SLEEP_ASSERTION_TYPE);
+        let assertion_name = CFString::new(DISPLAY_SLEEP_REASON);
+        let result = unsafe {
+            IOPMAssertionCreateWithName(
+                assertion_type.as_concrete_TypeRef(),
+                K_IOPM_ASSERTION_LEVEL_ON,
+                assertion_name.as_concrete_TypeRef(),
+                &mut display_sleep_assertion_id,
+            )
+        };
+
+        if result != K_IORETURN_SUCCESS {
+            return Err(anyhow!(
+                "IOPMAssertionCreateWithName failed with IOReturn {result}"
+            ));
+        }
+
+        self.display_sleep_assertion_id = Some(display_sleep_assertion_id);
+        Ok(())
+    }
+
+    pub fn deactivate_display_sleep_assertion(&mut self) {
+        if let Some(assertion_id) = self.display_sleep_assertion_id.take() {
+            unsafe {
+                IOPMAssertionRelease(assertion_id);
+            }
+        }
+        self.last_user_activity = None;
     }
 }
 
