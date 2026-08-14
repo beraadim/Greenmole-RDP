@@ -179,12 +179,12 @@ impl ServerConfig {
 }
 
 /// Returns the macrdp config directory.
-/// Search order (first existing directory wins):
+/// Search order for existing `config.toml`:
 ///   1. ./  (current working directory)
 ///   2. ~/.config/macrdp  (XDG convention)
 ///   3. ~/Library/Application Support/macrdp  (macOS native)
 ///
-/// For writes (TLS cert generation etc.), uses the first writable candidate.
+/// Fallback when no config exists: native config dir -> ~/.config/macrdp -> ./.
 pub fn config_dir() -> PathBuf {
     let candidates = config_dir_candidates();
     for dir in &candidates {
@@ -192,11 +192,14 @@ pub fn config_dir() -> PathBuf {
             return dir.clone();
         }
     }
-    // No config found — return the first candidate for writes
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| PathBuf::from("."))
+
+    if let Some(native) = dirs::config_dir() {
+        return native.join("macrdp");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".config").join("macrdp");
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// All candidate config directories in priority order.

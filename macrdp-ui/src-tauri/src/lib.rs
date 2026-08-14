@@ -13,6 +13,17 @@ use tauri_plugin_autostart::MacosLauncher;
 
 use database::Database;
 
+async fn start_server_on_launch(app: tauri::AppHandle) {
+    let Some(state) = app.try_state::<Arc<state::AppState>>() else {
+        tracing::warn!("App state unavailable during launch-start");
+        return;
+    };
+
+    if let Err(err) = commands::ensure_server_running(&app, state.inner()).await {
+        tracing::error!(%err, "Automatic server start on launch failed");
+    }
+}
+
 pub fn run() {
     // Load UI config early to get log level
     let ui_config = ui_config::UiConfig::load().unwrap_or_default();
@@ -94,6 +105,11 @@ pub fn run() {
                 });
             }
 
+            let app_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                start_server_on_launch(app_handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -103,6 +119,7 @@ pub fn run() {
             commands::get_metrics,
             commands::get_connections,
             commands::get_permissions,
+            commands::get_input_debug_state,
             commands::get_config,
             commands::set_config,
             commands::get_logs,

@@ -10,7 +10,7 @@ import { ChartPanel } from "../components/ChartPanel";
 import { AreaChart } from "../components/AreaChart";
 import ConnItem from "../components/ConnItem";
 import EmptyState from "../components/EmptyState";
-import type { UiConfig } from "../lib/types";
+import type { InputDebugState, UiConfig } from "../lib/types";
 
 function Dashboard() {
   const status = useServerStatus();
@@ -18,6 +18,7 @@ function Dashboard() {
   const connections = useConnections();
   const [loading, setLoading] = useState(false);
   const [config, setConfig] = useState<UiConfig | null>(null);
+  const [inputDebug, setInputDebug] = useState<InputDebugState | null>(null);
 
   const metricsAvailable = status.running && metrics && !stale;
   const bitrateHistory = useMetricHistory(
@@ -30,6 +31,30 @@ function Dashboard() {
 
   useEffect(() => {
     api.getConfig().then(setConfig).catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const debug = await api.getInputDebugState();
+        if (!cancelled) {
+          setInputDebug(debug);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Failed to fetch input debug state:", error);
+        }
+      }
+    };
+
+    poll();
+    const interval = setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
   // Clear loading when backend state actually changes
@@ -159,6 +184,53 @@ function Dashboard() {
           <div className="rounded-[6px] bg-black/10 px-2 py-2">
             <div className="text-text-muted mb-1">Bitrate meaning</div>
             <div className="text-text">{currentBitrateMode ?? "--"}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-card rounded-[8px] p-3">
+        <div className="flex items-center justify-between gap-3 mb-2">
+          <span className="text-[11px] text-text-muted font-medium">
+            Keyboard modifiers
+          </span>
+          <span className="rounded-full bg-blue/10 px-2 py-0.5 text-[10px] text-blue uppercase tracking-[0.12em]">
+            {inputDebug?.translation_profile ?? "none"}
+          </span>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Active modifiers</div>
+            <div className="text-text">
+              {inputDebug?.active_modifiers?.length
+                ? inputDebug.active_modifiers.join(", ")
+                : "none"}
+            </div>
+          </div>
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Suppressed companions</div>
+            <div className="text-text">
+              {inputDebug?.suppressed_modifiers?.length
+                ? inputDebug.suppressed_modifiers.join(", ")
+                : "none"}
+            </div>
+          </div>
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Native host modifiers</div>
+            <div className="text-text">
+              {inputDebug?.native_modifiers?.length
+                ? `${inputDebug.native_modifiers.join(", ")} (${inputDebug.native_flags_hex})`
+                : inputDebug?.native_flags_hex ?? "none"}
+            </div>
+          </div>
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Last event</div>
+            <div className="text-text break-all">{inputDebug?.last_event ?? "--"}</div>
+          </div>
+          <div className="rounded-[6px] bg-black/10 px-2 py-2">
+            <div className="text-text-muted mb-1">Last translated key</div>
+            <div className="text-text">
+              {inputDebug?.last_translation ?? inputDebug?.pending_dead_key ?? "--"}
+            </div>
           </div>
         </div>
       </div>

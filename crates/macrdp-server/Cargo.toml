@@ -16,6 +16,7 @@ anyhow.workspace = true
 bytes.workspace = true
 time.workspace = true
 ironrdp-server = { version = "0.10", features = ["helper"] }
+ironrdp-displaycontrol = "0.5"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

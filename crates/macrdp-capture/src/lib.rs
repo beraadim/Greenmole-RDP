@@ -277,7 +277,8 @@ fn build_stream_config(
 pub fn capture_current_cursor_shape() -> Result<Option<CursorShape>> {
     let cursor = NSCursor::currentSystemCursor().unwrap_or_else(NSCursor::currentCursor);
     let image = cursor.image();
-    let Some(cg_image) = (unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) })
+    let Some(cg_image) =
+        (unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) })
     else {
         return Ok(None);
     };
@@ -285,7 +286,10 @@ pub fn capture_current_cursor_shape() -> Result<Option<CursorShape>> {
     decode_cursor_cgimage(&cg_image, cursor.hotSpot())
 }
 
-fn decode_cursor_cgimage(cg_image: &objc2_core_graphics::CGImage, hot_spot: NSPoint) -> Result<Option<CursorShape>> {
+fn decode_cursor_cgimage(
+    cg_image: &objc2_core_graphics::CGImage,
+    hot_spot: NSPoint,
+) -> Result<Option<CursorShape>> {
     let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), cg_image);
     let Some(tiff) = bitmap.TIFFRepresentation() else {
         return Ok(None);
@@ -300,7 +304,8 @@ fn decode_cursor_tiff(tiff: &NSData, hot_spot: NSPoint) -> Result<Option<CursorS
         .to_rgba8();
 
     let width = u16::try_from(decoded.width()).context("Cursor width exceeds RDP pointer limit")?;
-    let height = u16::try_from(decoded.height()).context("Cursor height exceeds RDP pointer limit")?;
+    let height =
+        u16::try_from(decoded.height()).context("Cursor height exceeds RDP pointer limit")?;
     if width == 0 || height == 0 {
         return Ok(None);
     }
@@ -334,8 +339,10 @@ fn clamp_cursor_shape(shape: CursorShape) -> CursorShape {
         f32::from(MAX_RDP_CURSOR_EDGE) / old_width as f32,
         f32::from(MAX_RDP_CURSOR_EDGE) / old_height as f32,
     );
-    let new_width = ((old_width as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
-    let new_height = ((old_height as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
+    let new_width =
+        ((old_width as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
+    let new_height =
+        ((old_height as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
 
     let resized = RgbaImage::from_raw(old_width, old_height, shape.rgba)
         .expect("cursor RGBA length should match dimensions");
@@ -506,11 +513,24 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     }))
 }
 
-/// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
-pub fn detect_display_scale() -> Result<u32> {
+/// Query the main display's physical pixel size.
+///
+/// This must be used for auto-resolution on macOS scaled modes, where the
+/// framebuffer size is often not an integer multiple of the logical size.
+pub fn detect_display_pixel_size() -> Result<(u32, u32)> {
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
-    let physical_w = main.pixels_wide() as u32;
+    let width = main.pixels_wide() as u32;
+    let height = main.pixels_high() as u32;
+    if width == 0 || height == 0 {
+        anyhow::bail!("CGDisplay returned zero pixel size");
+    }
+    Ok((width, height))
+}
+
+/// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
+pub fn detect_display_scale() -> Result<u32> {
+    let (physical_w, _) = detect_display_pixel_size()?;
     let content = SCShareableContent::get().context("Failed to get shareable content")?;
     let display = content
         .displays()
@@ -983,7 +1003,10 @@ mod tests {
         assert_eq!(resized.height, 32);
         assert_eq!(resized.hot_x, 2);
         assert_eq!(resized.hot_y, 2);
-        assert_eq!(resized.rgba.len(), usize::from(resized.width) * usize::from(resized.height) * 4);
+        assert_eq!(
+            resized.rgba.len(),
+            usize::from(resized.width) * usize::from(resized.height) * 4
+        );
     }
 }
 

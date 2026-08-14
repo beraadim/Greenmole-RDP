@@ -5,6 +5,7 @@ import type {
   Connection,
   LogEntry,
   PermissionStatus,
+  InputDebugState,
   ConnectionHistory,
   TrafficStats,
   UiConfig,
@@ -17,6 +18,7 @@ export const api = {
   getMetrics: () => invoke<Metrics>("get_metrics"),
   getConnections: () => invoke<Connection[]>("get_connections"),
   getPermissions: () => invoke<PermissionStatus>("get_permissions"),
+  getInputDebugState: () => invoke<InputDebugState>("get_input_debug_state"),
   getConfig: () => invoke<UiConfig>("get_config"),
   setConfig: (key: string, value: unknown) =>
     invoke<{ restart_required: boolean }>("set_config", { key, value }),

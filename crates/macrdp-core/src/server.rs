@@ -6,6 +6,25 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
+fn auto_resolution(logical_w: u16, logical_h: u16) -> (u16, u16) {
+    match macrdp_capture::detect_display_pixel_size() {
+        Ok((physical_w, physical_h)) => {
+            tracing::info!(
+                logical_w,
+                logical_h,
+                physical_w,
+                physical_h,
+                "Resolution auto: using physical display size"
+            );
+            (physical_w as u16, physical_h as u16)
+        }
+        Err(err) => {
+            tracing::warn!(%err, logical_w, logical_h, "Resolution auto: failed to detect physical display size, using logical");
+            (logical_w, logical_h)
+        }
+    }
+}
+
 /// Resolve resolution config value to (width, height).
 ///
 /// Supports three formats:
@@ -14,14 +33,7 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
 /// - legacy numeric scale (e.g. "2"): multiply logical resolution by scale factor
 pub fn resolve_resolution(res_mode: &str, logical_w: u16, logical_h: u16) -> (u16, u16) {
     if res_mode == "auto" {
-        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
-        tracing::info!(
-            scale,
-            logical_w,
-            logical_h,
-            "Resolution auto: display scale"
-        );
-        (logical_w * scale as u16, logical_h * scale as u16)
+        auto_resolution(logical_w, logical_h)
     } else if let Some((w, h)) = parse_resolution(res_mode) {
         tracing::info!(w, h, "Resolution: explicit WxH");
         (w as u16, h as u16)
@@ -131,10 +143,25 @@ fn derive_bitrate_mode(transport_mode: &str) -> String {
         "gfx-uncompressed" | "gfx-uncompressed-fallback" => {
             "Wire throughput only (uncompressed GFX)".to_string()
         }
-        "bitmap" | "bitmap-fallback" => {
-            "Wire throughput only (bitmap updates)".to_string()
-        }
+        "bitmap" | "bitmap-fallback" => "Wire throughput only (bitmap updates)".to_string(),
         _ => "Wire throughput".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_resolution;
+
+    #[test]
+    fn parse_resolution_accepts_valid_dimensions() {
+        assert_eq!(parse_resolution("3840x2160"), Some((3840, 2160)));
+    }
+
+    #[test]
+    fn parse_resolution_rejects_invalid_dimensions() {
+        assert_eq!(parse_resolution("bad"), None);
+        assert_eq!(parse_resolution("1920"), None);
+        assert_eq!(parse_resolution("1920xnope"), None);
     }
 }
 
@@ -151,6 +178,7 @@ pub struct ServerHandle {
     started_at: Instant,
     fps: u32,
     gfx_state: Arc<Mutex<GfxState>>,
+    input_debug_state: Arc<Mutex<InputDebugState>>,
     shutdown_notify: Arc<Notify>,
     stopped: AtomicBool,
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
@@ -237,6 +265,11 @@ impl ServerHandle {
         }
     }
 
+    /// Current keyboard/input diagnostic state.
+    pub fn input_debug_state(&self) -> InputDebugState {
+        self.input_debug_state.lock().unwrap().clone()
+    }
+
     /// Push a hot config update to the running server.
     pub fn update_config(&self, update: ConfigUpdate) {
         let _ = self.config_tx.send(update);
@@ -289,6 +322,7 @@ struct ServerThreadArgs {
     mode_444: bool,
     coord_mapper: crate::handler::MouseCoordMapper,
     gfx_state: Arc<Mutex<GfxState>>,
+    input_debug_state: Arc<Mutex<InputDebugState>>,
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
     config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
@@ -402,7 +436,6 @@ pub async fn start_server(
 
     // Resolution
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
-    let res_auto = res_mode == "auto";
     let (width, height) = resolve_resolution(res_mode, width, height);
 
     // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
@@ -415,6 +448,7 @@ pub async fn start_server(
         mode_444,
         gfx_validation_mode,
     )));
+    let input_debug_state = Arc::new(Mutex::new(InputDebugState::default()));
 
     let bind_host = config.bind_address.as_deref().unwrap_or("0.0.0.0");
     let (listener, port) = find_available_port(bind_host, config.port)?;
@@ -439,6 +473,7 @@ pub async fn start_server(
         mode_444,
         coord_mapper,
         gfx_state: Arc::clone(&gfx_state),
+        input_debug_state: Arc::clone(&input_debug_state),
         shutdown_notify: Arc::clone(&shutdown_notify),
         handler: Arc::clone(&handler),
         config_rx,
@@ -524,6 +559,7 @@ pub async fn start_server(
         started_at: Instant::now(),
         fps,
         gfx_state,
+        input_debug_state,
         shutdown_notify,
         stopped: AtomicBool::new(false),
         server_thread: Mutex::new(Some(server_thread)),
@@ -592,7 +628,10 @@ fn run_server_thread(args: ServerThreadArgs) {
         };
 
         // Create input handler (clone coord_mapper — shared with display for resize sync)
-        let input_handler = MacInputHandler::new(args.coord_mapper.clone());
+        let input_handler = MacInputHandler::new(
+            args.coord_mapper.clone(),
+            Arc::clone(&args.input_debug_state),
+        );
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
         let shared_audio_tx = if args.config.audio.enabled {

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     gfx::GfxState, BitmapUpdate, DesktopSize, DiffRect, DisplayUpdate, GfxFrameUpdate,
     GfxUncompressedUpdate, PixelFormat as RdpPixelFormat, RdpServerDisplay,
@@ -742,12 +743,9 @@ impl MacDisplay {
             base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0,
             "Base bitrate"
         );
-        let (max_w, max_h) = macrdp_capture::detect_display_scale()
-            .map(|scale| {
-                (
-                    width.max((width as u32 * scale) as u16),
-                    height.max((height as u32 * scale) as u16),
-                )
+        let (max_w, max_h) = macrdp_capture::detect_display_pixel_size()
+            .map(|(physical_w, physical_h)| {
+                (width.max(physical_w as u16), height.max(physical_h as u16))
             })
             .unwrap_or((width.max(3840), height.max(2160)));
         Self {
@@ -771,6 +769,29 @@ impl MacDisplay {
 }
 
 impl MacDisplay {
+    fn apply_layout_resize(&mut self, layout: DisplayControlMonitorLayout) {
+        let Some(primary) = layout
+            .monitors()
+            .iter()
+            .find(|monitor| monitor.is_primary())
+        else {
+            tracing::warn!("Ignoring display layout update with no primary monitor");
+            return;
+        };
+
+        let (requested_w, requested_h) = primary.dimensions();
+        let requested_w = requested_w.clamp(1, u32::from(u16::MAX)) as u16;
+        let requested_h = requested_h.clamp(1, u32::from(u16::MAX)) as u16;
+        tracing::info!(
+            requested_w,
+            requested_h,
+            monitor_count = layout.monitors().len(),
+            desktop_scale_factor = primary.desktop_scale_factor(),
+            "Applying Display Control layout update"
+        );
+        self.apply_resize(requested_w, requested_h, "display-control");
+    }
+
     fn apply_resize(&mut self, width: u16, height: u16, source: &str) {
         let w = width.min(self.max_width);
         let h = height.min(self.max_height);
@@ -803,6 +824,14 @@ impl RdpServerDisplay for MacDisplay {
             width: self.width,
             height: self.height,
         }
+    }
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        if self.fixed_resolution {
+            tracing::debug!("Ignoring Display Control layout — resolution is fixed by config");
+            return;
+        }
+        self.apply_layout_resize(layout);
     }
 
     fn request_resize(&mut self, width: u16, height: u16) {
@@ -1195,13 +1224,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             }
         }
     }
-
 }
 
 impl MacDisplayUpdates {
-    async fn run_coregraphics_fallback_until_recovered(
-        &mut self,
-    ) -> Result<Option<DisplayUpdate>> {
+    async fn run_coregraphics_fallback_until_recovered(&mut self) -> Result<Option<DisplayUpdate>> {
         self.idle_frame_count = 0;
         self.request_full_bitmap_updates(1);
         tracing::warn!("SCStream unavailable — switching to CoreGraphics fallback");
@@ -1209,8 +1235,11 @@ impl MacDisplayUpdates {
         loop {
             match ScreenCapturer::new(self.capture_config.clone(), None).await {
                 Ok(mut new_capturer) => {
-                    match tokio::time::timeout(Duration::from_millis(250), new_capturer.next_frame())
-                        .await
+                    match tokio::time::timeout(
+                        Duration::from_millis(250),
+                        new_capturer.next_frame(),
+                    )
+                    .await
                     {
                         Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => {
                             tracing::info!(
@@ -1226,9 +1255,7 @@ impl MacDisplayUpdates {
                             self.capturer = new_capturer;
                             return Ok(None);
                         }
-                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable))
-                        | Ok(None)
-                        | Err(_) => {
+                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable)) | Ok(None) | Err(_) => {
                             tracing::debug!(
                                 "SCStream probe still unavailable during CoreGraphics fallback"
                             );
@@ -1476,19 +1503,16 @@ impl MacDisplayUpdates {
         let height = cache.height() as u16;
 
         let rects = match cache {
-            CachedFrame::Bgra {
-                data,
-                stride,
-                ..
-            } => extract_bgra_rect(data, *stride, full_rect).map(|pixel_data| {
-                vec![UncompressedRect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                    pixel_data,
-                }]
-            }),
+            CachedFrame::Bgra { data, stride, .. } => extract_bgra_rect(data, *stride, full_rect)
+                .map(|pixel_data| {
+                    vec![UncompressedRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                        pixel_data,
+                    }]
+                }),
             CachedFrame::BgraPixelBuffer(buf, width_u32, height_u32, _) => buf
                 .with_locked_bgra(*width_u32, *height_u32, |bgra, stride| {
                     extract_bgra_rect(bgra, stride, full_rect).map(|pixel_data| {
@@ -1518,11 +1542,7 @@ impl MacDisplayUpdates {
         let height = NonZeroU16::new(cache.height() as u16)?;
 
         match cache {
-            CachedFrame::Bgra {
-                data,
-                stride,
-                ..
-            } => Some(BitmapUpdate {
+            CachedFrame::Bgra { data, stride, .. } => Some(BitmapUpdate {
                 x: 0,
                 y: 0,
                 width,
@@ -1569,7 +1589,8 @@ impl MacDisplayUpdates {
 
         if gfx_channel_ready {
             if let Some(update) = self.cached_full_frame_uncompressed_update() {
-                let total_bytes: usize = update.rects.iter().map(|rect| rect.pixel_data.len()).sum();
+                let total_bytes: usize =
+                    update.rects.iter().map(|rect| rect.pixel_data.len()).sum();
                 self.display_frame_count += 1;
                 {
                     let mut st = self.gfx_state.lock().unwrap();
@@ -2398,7 +2419,9 @@ impl MacDisplayUpdates {
                         && frame.dirty_rects.len() <= 2
                         && !self.client_may_be_stale
                 } else {
-                    total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS && !self.client_may_be_stale
+                    total_area > 0
+                        && total_area <= UNCOMPRESSED_MAX_PIXELS
+                        && !self.client_may_be_stale
                 };
 
                 if allow_uncompressed_dirty_rects {
@@ -3013,20 +3036,20 @@ impl MacDisplayUpdates {
                                             "encode overload — skipping next frame"
                                         );
                                     }
-                                self.last_frame_cache = Some(CachedFrame::Bgra {
-                                    data: bytes.clone(),
-                                    width: frame.width,
-                                    height: frame.height,
-                                    stride: frame.stride,
-                                });
-                                if is_keyframe {
-                                    self.last_idr_time = Instant::now();
-                                }
-                                self.clear_client_stale_flag("gfx-avc444-raw");
-                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                    h264_data: encoded.main_view.data,
-                                    width: frame.width as u16,
-                                    height: frame.height as u16,
+                                    self.last_frame_cache = Some(CachedFrame::Bgra {
+                                        data: bytes.clone(),
+                                        width: frame.width,
+                                        height: frame.height,
+                                        stride: frame.stride,
+                                    });
+                                    if is_keyframe {
+                                        self.last_idr_time = Instant::now();
+                                    }
+                                    self.clear_client_stale_flag("gfx-avc444-raw");
+                                    return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                                        h264_data: encoded.main_view.data,
+                                        width: frame.width as u16,
+                                        height: frame.height as u16,
                                         enc_width: encoded.main_view.width as u16,
                                         enc_height: encoded.main_view.height as u16,
                                         is_keyframe,

@@ -1,8 +1,12 @@
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGKeyCode};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 use crate::keymap::scancode_to_keycode;
+
+unsafe extern "C" {
+    fn CGEventSourceFlagsState(state_id: CGEventSourceStateID) -> CGEventFlags;
+}
 
 pub struct KeyboardInjector;
 
@@ -29,6 +33,11 @@ impl KeyboardInjector {
     fn source() -> Result<CGEventSource> {
         CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
+    }
+
+    fn private_source() -> Result<CGEventSource> {
+        CGEventSource::new(CGEventSourceStateID::Private)
+            .map_err(|_| anyhow::anyhow!("Failed to create private CGEventSource"))
     }
 
     pub fn inject_keycode(&self, keycode: u16, pressed: bool) -> Result<()> {
@@ -74,11 +83,55 @@ impl KeyboardInjector {
         Ok(())
     }
 
+    pub fn hard_reset_state(&self) -> Result<()> {
+        self.release_transient_modifiers()?;
+        self.inject_keycode(0x37, false)?; // Left Command
+        self.inject_keycode(0x3A, false)?; // Left Option
+        self.inject_keycode(0x3B, false)?; // Left Control
+        self.inject_keycode(0x38, false)?; // Left Shift
+        self.inject_keycode(0x3C, false)?; // Right Shift
+        self.inject_keycode(0x3E, false)?; // Right Control
+        self.inject_keycode(0x3F, false)?; // Function
+        Ok(())
+    }
+
+    pub fn current_modifier_flags(&self) -> (Vec<String>, u64) {
+        let flags = unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState) };
+        let mut names = Vec::new();
+
+        if flags.contains(CGEventFlags::CGEventFlagShift) {
+            names.push("shift".to_string());
+        }
+        if flags.contains(CGEventFlags::CGEventFlagControl) {
+            names.push("control".to_string());
+        }
+        if flags.contains(CGEventFlags::CGEventFlagAlternate) {
+            names.push("option".to_string());
+        }
+        if flags.contains(CGEventFlags::CGEventFlagCommand) {
+            names.push("command".to_string());
+        }
+        if flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
+            names.push("caps_lock".to_string());
+        }
+        if flags.contains(CGEventFlags::CGEventFlagSecondaryFn) {
+            names.push("fn".to_string());
+        }
+        if flags.contains(CGEventFlags::CGEventFlagNumericPad) {
+            names.push("numeric_pad".to_string());
+        }
+
+        (names, flags.bits())
+    }
+
     /// Inject a unicode character press/release
     pub fn inject_unicode(&self, ch: u16, pressed: bool) -> Result<()> {
-        let source = Self::source()?;
+        // Use an isolated event source here so translated text injection does
+        // not inherit or feed back into the live HID modifier state.
+        let source = Self::private_source()?;
         let event = CGEvent::new_keyboard_event(source, 0, pressed)
             .map_err(|_| anyhow::anyhow!("Failed to create unicode event"))?;
+        event.set_flags(CGEventFlags::empty());
 
         if pressed {
             event.set_string_from_utf16_unchecked(&[ch]);

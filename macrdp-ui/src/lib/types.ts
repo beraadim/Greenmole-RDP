@@ -42,6 +42,17 @@ export interface PermissionStatus {
   microphone: boolean;
 }
 
+export interface InputDebugState {
+  active_modifiers: string[];
+  suppressed_modifiers: string[];
+  native_modifiers: string[];
+  native_flags_hex: string;
+  translation_profile: string;
+  pending_dead_key: string | null;
+  last_event: string | null;
+  last_translation: string | null;
+}
+
 export interface ConnectionHistory {
   id: number;
   client_ip: string;

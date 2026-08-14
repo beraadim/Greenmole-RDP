@@ -3,6 +3,8 @@ use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, RemoteSessionWa
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::callbacks::InputDebugState;
+
 /// Maps RDP desktop coordinates to macOS logical coordinates.
 ///
 /// Completely independent of capture/encode resolution — only cares about
@@ -73,8 +75,10 @@ pub struct MacInputHandler {
     coord_mapper: MouseCoordMapper,
     client_context: ClientInputContext,
     modifier_state: ModifierState,
+    suppressed_ctrl_for_altgr: SuppressedCtrlState,
     pending_dead_key: Option<char>,
     translated_key_releases: HashMap<(u8, bool), Vec<u16>>,
+    debug_state: Arc<Mutex<InputDebugState>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -95,6 +99,12 @@ impl ModifierState {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct SuppressedCtrlState {
+    left: bool,
+    right: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextTranslation {
     Unicode(char),
@@ -108,7 +118,7 @@ enum KeyboardTranslationProfile {
 }
 
 impl MacInputHandler {
-    pub fn new(coord_mapper: MouseCoordMapper) -> Self {
+    pub fn new(coord_mapper: MouseCoordMapper, debug_state: Arc<Mutex<InputDebugState>>) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -139,8 +149,18 @@ impl MacInputHandler {
             coord_mapper,
             client_context: ClientInputContext::default(),
             modifier_state: ModifierState::default(),
+            suppressed_ctrl_for_altgr: SuppressedCtrlState::default(),
             pending_dead_key: None,
             translated_key_releases: HashMap::new(),
+            debug_state,
+        }
+    }
+
+    fn translation_profile_name(&self) -> &'static str {
+        match self.translation_profile() {
+            Some(KeyboardTranslationProfile::GuacamoleUs) => "guacamole_us",
+            Some(KeyboardTranslationProfile::NorwegianPhysical) => "norwegian_physical",
+            None => "none",
         }
     }
 
@@ -269,7 +289,12 @@ impl MacInputHandler {
         }
     }
 
-    fn translate_norwegian_text_key(&self, code: u8, shifted: bool, altgr: bool) -> Option<TextTranslation> {
+    fn translate_norwegian_text_key(
+        &self,
+        code: u8,
+        shifted: bool,
+        altgr: bool,
+    ) -> Option<TextTranslation> {
         if altgr {
             return match code {
                 0x03 => Some(TextTranslation::Unicode('@')),
@@ -402,15 +427,18 @@ impl MacInputHandler {
         let ctrl_blocks_text = self.modifier_state.left_ctrl
             || (self.modifier_state.right_ctrl
                 && !(matches!(profile, KeyboardTranslationProfile::NorwegianPhysical) && altgr));
-        let other_blocks_text =
-            self.modifier_state.left_alt || self.modifier_state.left_win || self.modifier_state.right_win;
+        let other_blocks_text = self.modifier_state.left_alt
+            || self.modifier_state.left_win
+            || self.modifier_state.right_win;
 
         if ctrl_blocks_text || other_blocks_text {
             return None;
         }
 
         match profile {
-            KeyboardTranslationProfile::GuacamoleUs => self.translate_guacamole_us_text_key(code, shifted),
+            KeyboardTranslationProfile::GuacamoleUs => {
+                self.translate_guacamole_us_text_key(code, shifted)
+            }
             KeyboardTranslationProfile::NorwegianPhysical => {
                 self.translate_norwegian_text_key(code, shifted, altgr)
             }
@@ -481,8 +509,13 @@ impl MacInputHandler {
         u16::try_from(u32::from(ch)).ok()
     }
 
-    fn inject_unicode_sequence(kb: &KeyboardInjector, chars: &[u16], pressed: bool) -> anyhow::Result<()> {
+    fn inject_unicode_sequence(
+        kb: &KeyboardInjector,
+        chars: &[u16],
+        pressed: bool,
+    ) -> anyhow::Result<()> {
         if pressed {
+            kb.hard_reset_state()?;
             for ch in chars {
                 kb.inject_unicode(*ch, true)?;
             }
@@ -490,12 +523,17 @@ impl MacInputHandler {
             for ch in chars.iter().rev() {
                 kb.inject_unicode(*ch, false)?;
             }
+            kb.hard_reset_state()?;
         }
 
         Ok(())
     }
 
-    fn handle_translated_key_press(&mut self, code: u8, extended: bool) -> Option<anyhow::Result<()>> {
+    fn handle_translated_key_press(
+        &mut self,
+        code: u8,
+        extended: bool,
+    ) -> Option<anyhow::Result<()>> {
         let translation = self.translate_text_key(code, extended)?;
         let kb = self.keyboard.as_ref().expect("keyboard checked above");
 
@@ -548,6 +586,11 @@ impl MacInputHandler {
                 .insert((code, extended), emitted);
         }
 
+        self.set_last_translation(match translation {
+            TextTranslation::Unicode(ch) => Some(ch.to_string()),
+            TextTranslation::Dead(ch) => Some(format!("dead:{ch}")),
+        });
+
         Some(result)
     }
 
@@ -564,6 +607,103 @@ impl MacInputHandler {
             _ => {}
         }
     }
+
+    fn set_last_translation(&self, translation: Option<String>) {
+        let mut debug = self.debug_state.lock().unwrap();
+        debug.last_translation = translation;
+    }
+
+    fn refresh_debug_state(&self, last_event: Option<String>) {
+        let mut active_modifiers = Vec::new();
+        if self.modifier_state.left_shift {
+            active_modifiers.push("left_shift".to_string());
+        }
+        if self.modifier_state.right_shift {
+            active_modifiers.push("right_shift".to_string());
+        }
+        if self.modifier_state.left_ctrl {
+            active_modifiers.push("left_ctrl".to_string());
+        }
+        if self.modifier_state.right_ctrl {
+            active_modifiers.push("right_ctrl".to_string());
+        }
+        if self.modifier_state.left_alt {
+            active_modifiers.push("left_alt".to_string());
+        }
+        if self.modifier_state.right_alt {
+            active_modifiers.push("right_alt".to_string());
+        }
+        if self.modifier_state.left_win {
+            active_modifiers.push("left_win".to_string());
+        }
+        if self.modifier_state.right_win {
+            active_modifiers.push("right_win".to_string());
+        }
+
+        let mut suppressed_modifiers = Vec::new();
+        if self.suppressed_ctrl_for_altgr.left {
+            suppressed_modifiers.push("left_ctrl_altgr_companion".to_string());
+        }
+        if self.suppressed_ctrl_for_altgr.right {
+            suppressed_modifiers.push("right_ctrl_altgr_companion".to_string());
+        }
+
+        let mut debug = self.debug_state.lock().unwrap();
+        debug.active_modifiers = active_modifiers;
+        debug.suppressed_modifiers = suppressed_modifiers;
+        if let Some(kb) = &self.keyboard {
+            let (native_modifiers, native_flags) = kb.current_modifier_flags();
+            debug.native_modifiers = native_modifiers;
+            debug.native_flags_hex = format!("{native_flags:#010x}");
+        } else {
+            debug.native_modifiers.clear();
+            debug.native_flags_hex = "0x00000000".to_string();
+        }
+        debug.translation_profile = self.translation_profile_name().to_string();
+        debug.pending_dead_key = self.pending_dead_key.map(|ch| ch.to_string());
+        if let Some(last_event) = last_event {
+            debug.last_event = Some(last_event);
+        }
+    }
+
+    fn clear_suppressed_altgr_ctrls(&mut self) {
+        if self.suppressed_ctrl_for_altgr.left {
+            self.modifier_state.left_ctrl = false;
+        }
+        if self.suppressed_ctrl_for_altgr.right {
+            self.modifier_state.right_ctrl = false;
+        }
+        self.suppressed_ctrl_for_altgr = SuppressedCtrlState::default();
+        if let Some(kb) = &self.keyboard {
+            if let Err(e) = kb.hard_reset_state() {
+                tracing::warn!("Failed to hard-reset keyboard state after AltGr cleanup: {e}");
+            }
+        }
+    }
+
+    fn release_ctrl_companion_if_needed(&mut self, extended: bool) -> anyhow::Result<()> {
+        let kb = self.keyboard.as_ref().expect("keyboard checked above");
+        if extended {
+            self.suppressed_ctrl_for_altgr.right = true;
+            self.modifier_state.right_ctrl = false;
+            kb.inject_key(0x1D, true, false)?;
+        } else {
+            self.suppressed_ctrl_for_altgr.left = true;
+            self.modifier_state.left_ctrl = false;
+            kb.inject_key(0x1D, false, false)?;
+        }
+        Ok(())
+    }
+
+    fn handle_norwegian_altgr_press(&mut self) -> anyhow::Result<()> {
+        if self.modifier_state.left_ctrl {
+            self.release_ctrl_companion_if_needed(false)?;
+        }
+        if self.modifier_state.right_ctrl {
+            self.release_ctrl_companion_if_needed(true)?;
+        }
+        Ok(())
+    }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
@@ -574,6 +714,10 @@ impl RdpServerInputHandler for MacInputHandler {
             "Updated client input context"
         );
         self.client_context = context;
+        self.refresh_debug_state(Some(format!(
+            "context:{}:{:#06x}",
+            self.client_context.client_name, self.client_context.keyboard_layout
+        )));
     }
 
     fn keyboard(&mut self, event: KeyboardEvent) {
@@ -587,11 +731,28 @@ impl RdpServerInputHandler for MacInputHandler {
             }
         }
 
+        let event_label = format!("{event:?}");
         let result = match event {
             KeyboardEvent::Pressed { code, extended } => {
                 self.update_modifier_state(code, extended, true);
 
-                if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
+                if extended
+                    && code == 0x38
+                    && matches!(
+                        self.translation_profile(),
+                        Some(KeyboardTranslationProfile::NorwegianPhysical)
+                    )
+                {
+                    self.handle_norwegian_altgr_press()
+                } else if code == 0x1D
+                    && matches!(
+                        self.translation_profile(),
+                        Some(KeyboardTranslationProfile::NorwegianPhysical)
+                    )
+                    && self.modifier_state.right_alt
+                {
+                    self.release_ctrl_companion_if_needed(extended)
+                } else if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
                     Ok(())
                 } else if extended && code == 0x38 && self.translation_profile().is_some() {
                     Ok(())
@@ -609,11 +770,22 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.update_modifier_state(code, extended, false);
                 let kb = self.keyboard.as_ref().expect("keyboard checked above");
 
-                if let Some(chars) = self.translated_key_releases.remove(&(code, extended)) {
+                if code == 0x1D
+                    && ((extended && self.suppressed_ctrl_for_altgr.right)
+                        || (!extended && self.suppressed_ctrl_for_altgr.left))
+                {
+                    if extended {
+                        self.suppressed_ctrl_for_altgr.right = false;
+                    } else {
+                        self.suppressed_ctrl_for_altgr.left = false;
+                    }
+                    Ok(())
+                } else if let Some(chars) = self.translated_key_releases.remove(&(code, extended)) {
                     Self::inject_unicode_sequence(kb, &chars, false)
                 } else if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
                     Ok(())
                 } else if extended && code == 0x38 && self.translation_profile().is_some() {
+                    self.clear_suppressed_altgr_ctrls();
                     Ok(())
                 } else if extended && code == 0x38 && self.map_right_alt_to_option() {
                     kb.inject_keycode(0x3D, false)
@@ -661,11 +833,14 @@ impl RdpServerInputHandler for MacInputHandler {
 
                 self.last_sync_lock_bits = Some(sync_bits);
                 self.modifier_state = ModifierState::default();
+                self.suppressed_ctrl_for_altgr = SuppressedCtrlState::default();
                 self.pending_dead_key = None;
                 self.translated_key_releases.clear();
                 result
             }
         };
+
+        self.refresh_debug_state(Some(event_label));
 
         if let Err(e) = result {
             tracing::warn!("Keyboard injection failed: {e}");
@@ -737,12 +912,27 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 }
 
+impl Drop for MacInputHandler {
+    fn drop(&mut self) {
+        if let Some(kb) = &self.keyboard {
+            if let Err(e) = kb.release_transient_modifiers() {
+                tracing::warn!("Failed to release transient modifiers on drop: {e}");
+            }
+        }
+        self.modifier_state = ModifierState::default();
+        self.suppressed_ctrl_for_altgr = SuppressedCtrlState::default();
+        self.pending_dead_key = None;
+        self.refresh_debug_state(Some("drop".to_string()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientInputContext, KeyboardTranslationProfile, MacInputHandler, ModifierState,
-        MouseCoordMapper, TextTranslation,
+        ClientInputContext, InputDebugState, KeyboardTranslationProfile, MacInputHandler,
+        ModifierState, MouseCoordMapper, TextTranslation,
     };
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn mouse_mapper_scales_linearly_across_resized_desktop() {
@@ -752,7 +942,10 @@ mod tests {
     }
 
     fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
-        let mut handler = MacInputHandler::new(MouseCoordMapper::new(1920, 1200, 1920, 1200));
+        let mut handler = MacInputHandler::new(
+            MouseCoordMapper::new(1920, 1200, 1920, 1200),
+            Arc::new(Mutex::new(InputDebugState::default())),
+        );
         handler.client_context = ClientInputContext {
             client_name: client_name.to_string(),
             keyboard_layout,
@@ -868,20 +1061,56 @@ mod tests {
         let mut handler = handler_for("Guacamole RDP", 0x0409);
 
         handler.modifier_state.left_shift = true;
-        assert_eq!(handler.translate_text_key(0x0A, false), Some(TextTranslation::Unicode('(')));
-        assert_eq!(handler.translate_text_key(0x0B, false), Some(TextTranslation::Unicode(')')));
-        assert_eq!(handler.translate_text_key(0x0D, false), Some(TextTranslation::Unicode('+')));
-        assert_eq!(handler.translate_text_key(0x35, false), Some(TextTranslation::Unicode('?')));
-        assert_eq!(handler.translate_text_key(0x28, false), Some(TextTranslation::Unicode('"')));
-        assert_eq!(handler.translate_text_key(0x2B, false), Some(TextTranslation::Unicode('|')));
-        assert_eq!(handler.translate_text_key(0x33, false), Some(TextTranslation::Unicode('<')));
+        assert_eq!(
+            handler.translate_text_key(0x0A, false),
+            Some(TextTranslation::Unicode('('))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x0B, false),
+            Some(TextTranslation::Unicode(')'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x0D, false),
+            Some(TextTranslation::Unicode('+'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x35, false),
+            Some(TextTranslation::Unicode('?'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x28, false),
+            Some(TextTranslation::Unicode('"'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x2B, false),
+            Some(TextTranslation::Unicode('|'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x33, false),
+            Some(TextTranslation::Unicode('<'))
+        );
 
         handler.modifier_state = ModifierState::default();
-        assert_eq!(handler.translate_text_key(0x1A, false), Some(TextTranslation::Unicode('[')));
-        assert_eq!(handler.translate_text_key(0x1B, false), Some(TextTranslation::Unicode(']')));
-        assert_eq!(handler.translate_text_key(0x0C, false), Some(TextTranslation::Unicode('-')));
-        assert_eq!(handler.translate_text_key(0x2B, false), Some(TextTranslation::Unicode('\\')));
-        assert_eq!(handler.translate_text_key(0x35, false), Some(TextTranslation::Unicode('/')));
+        assert_eq!(
+            handler.translate_text_key(0x1A, false),
+            Some(TextTranslation::Unicode('['))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x1B, false),
+            Some(TextTranslation::Unicode(']'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x0C, false),
+            Some(TextTranslation::Unicode('-'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x2B, false),
+            Some(TextTranslation::Unicode('\\'))
+        );
+        assert_eq!(
+            handler.translate_text_key(0x35, false),
+            Some(TextTranslation::Unicode('/'))
+        );
     }
 
     #[test]
@@ -903,6 +1132,18 @@ mod tests {
 
         let handler = handler_for("Guacamole RDP", 0x0409);
         assert!(!handler.treat_right_ctrl_as_altgr_companion());
+    }
+
+    #[test]
+    fn norwegian_altgr_press_clears_companion_ctrl_state() {
+        let mut handler = handler_for("Windows App", 0x0414);
+        handler.modifier_state.left_ctrl = true;
+        handler.modifier_state.right_alt = true;
+
+        handler.handle_norwegian_altgr_press().unwrap();
+
+        assert!(!handler.modifier_state.left_ctrl);
+        assert!(handler.suppressed_ctrl_for_altgr.left);
     }
 
     #[test]

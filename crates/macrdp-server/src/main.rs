@@ -127,9 +127,22 @@ async fn main() -> Result<()> {
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
     let res_auto = res_mode == "auto";
     let (width, height) = if res_mode == "auto" {
-        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
-        tracing::info!(scale, width, height, "Resolution auto: display scale");
-        (width * scale as u16, height * scale as u16)
+        match macrdp_capture::detect_display_pixel_size() {
+            Ok((physical_w, physical_h)) => {
+                tracing::info!(
+                    logical_w = width,
+                    logical_h = height,
+                    physical_w,
+                    physical_h,
+                    "Resolution auto: using physical display size"
+                );
+                (physical_w as u16, physical_h as u16)
+            }
+            Err(err) => {
+                tracing::warn!(%err, logical_w = width, logical_h = height, "Resolution auto: failed to detect physical display size, using logical");
+                (width, height)
+            }
+        }
     } else if let Some((w, h)) = res_mode
         .split_once('x')
         .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
@@ -170,12 +183,7 @@ async fn main() -> Result<()> {
     );
 
     // Create shared GFX state
-    let gfx_state = Arc::new(Mutex::new(GfxState::new(
-        width,
-        height,
-        mode_444,
-        false,
-    )));
+    let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444, false)));
 
     // Create input handler with coordinate mapper
     let input_handler = MacInputHandler::new(coord_mapper.clone());

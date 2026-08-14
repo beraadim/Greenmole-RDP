@@ -130,7 +130,8 @@ impl ServerConfig {
 }
 
 /// Returns the macrdp config directory.
-/// Search order: ./ -> ~/.config/macrdp -> ~/Library/Application Support/macrdp
+/// Search order for existing `config.toml`: ./ -> ~/.config/macrdp -> native config dir.
+/// Fallback when no config exists: native config dir -> ~/.config/macrdp -> ./.
 pub fn config_dir() -> PathBuf {
     let candidates = config_dir_candidates();
     for dir in &candidates {
@@ -138,10 +139,14 @@ pub fn config_dir() -> PathBuf {
             return dir.clone();
         }
     }
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| PathBuf::from("."))
+
+    if let Some(native) = dirs::config_dir() {
+        return native.join("macrdp");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".config").join("macrdp");
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn config_dir_candidates() -> Vec<PathBuf> {

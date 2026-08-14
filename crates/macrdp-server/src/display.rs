@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     gfx::GfxState, BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
     PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, UncompressedRect,
@@ -187,6 +188,53 @@ pub struct MacDisplay {
 }
 
 impl MacDisplay {
+    fn apply_resize(&mut self, width: u16, height: u16, source: &str) {
+        let w = width.min(self.max_width);
+        let h = height.min(self.max_height);
+        if w > 0 && h > 0 && (w != self.width || h != self.height) {
+            tracing::info!(
+                old_w = self.width,
+                old_h = self.height,
+                new_w = w,
+                new_h = h,
+                source,
+                "Applying resolution change"
+            );
+            self.width = w;
+            self.height = h;
+            self.base_bitrate = macrdp_encode::screen_bitrate(
+                w as u32,
+                h as u32,
+                self.frame_rate as f32,
+                self.quality,
+            );
+            self.coord_mapper.update_rdp_size(w, h);
+        }
+    }
+
+    fn apply_layout_resize(&mut self, layout: DisplayControlMonitorLayout) {
+        let Some(primary) = layout
+            .monitors()
+            .iter()
+            .find(|monitor| monitor.is_primary())
+        else {
+            tracing::warn!("Ignoring display layout update with no primary monitor");
+            return;
+        };
+
+        let (requested_w, requested_h) = primary.dimensions();
+        let requested_w = requested_w.clamp(1, u32::from(u16::MAX)) as u16;
+        let requested_h = requested_h.clamp(1, u32::from(u16::MAX)) as u16;
+        tracing::info!(
+            requested_w,
+            requested_h,
+            monitor_count = layout.monitors().len(),
+            desktop_scale_factor = primary.desktop_scale_factor(),
+            "Applying Display Control layout update"
+        );
+        self.apply_resize(requested_w, requested_h, "display-control");
+    }
+
     pub fn new(
         width: u16,
         height: u16,
@@ -211,12 +259,9 @@ impl MacDisplay {
         );
         // Max resolution: use physical display size so clients can resize freely.
         // SCK scales_to_fit handles any resolution.
-        let (max_w, max_h) = macrdp_capture::detect_display_scale()
-            .map(|scale| {
-                (
-                    width.max((width as u32 * scale) as u16),
-                    height.max((height as u32 * scale) as u16),
-                )
+        let (max_w, max_h) = macrdp_capture::detect_display_pixel_size()
+            .map(|(physical_w, physical_h)| {
+                (width.max(physical_w as u16), height.max(physical_h as u16))
             })
             .unwrap_or((width.max(3840), height.max(2160)));
         Self {
@@ -248,31 +293,20 @@ impl RdpServerDisplay for MacDisplay {
         }
     }
 
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        if self.fixed_resolution {
+            tracing::debug!("Ignoring Display Control layout — resolution is fixed by config");
+            return;
+        }
+        self.apply_layout_resize(layout);
+    }
+
     fn request_resize(&mut self, width: u16, height: u16) {
         if self.fixed_resolution {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
         }
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
-        if w > 0 && h > 0 && (w != self.width || h != self.height) {
-            tracing::info!(
-                old_w = self.width,
-                old_h = self.height,
-                new_w = w,
-                new_h = h,
-                "Adopting client-requested resolution"
-            );
-            self.width = w;
-            self.height = h;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
-                w as u32,
-                h as u32,
-                self.frame_rate as f32,
-                self.quality,
-            );
-            self.coord_mapper.update_rdp_size(w, h);
-        }
+        self.apply_resize(width, height, "client-requested");
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -384,16 +418,17 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
-    async fn run_coregraphics_fallback_until_recovered(
-        &mut self,
-    ) -> Result<Option<DisplayUpdate>> {
+    async fn run_coregraphics_fallback_until_recovered(&mut self) -> Result<Option<DisplayUpdate>> {
         tracing::warn!("SCStream unavailable — switching to CoreGraphics fallback");
         let fallback = CgFallbackCapturer::new(&self.capture_config);
         loop {
             match ScreenCapturer::new(self.capture_config.clone(), None).await {
                 Ok(mut new_capturer) => {
-                    match tokio::time::timeout(Duration::from_millis(250), new_capturer.next_frame())
-                        .await
+                    match tokio::time::timeout(
+                        Duration::from_millis(250),
+                        new_capturer.next_frame(),
+                    )
+                    .await
                     {
                         Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => {
                             tracing::info!(
@@ -409,9 +444,7 @@ impl MacDisplayUpdates {
                             self.capturer = new_capturer;
                             return Ok(None);
                         }
-                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable))
-                        | Ok(None)
-                        | Err(_) => {
+                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable)) | Ok(None) | Err(_) => {
                             tracing::debug!(
                                 "SCStream probe still unavailable during CoreGraphics fallback"
                             );

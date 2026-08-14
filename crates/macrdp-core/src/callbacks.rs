@@ -95,6 +95,19 @@ pub struct PermissionStatus {
     pub microphone: bool,
 }
 
+/// Lightweight keyboard/input diagnostics exposed to the UI.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct InputDebugState {
+    pub active_modifiers: Vec<String>,
+    pub suppressed_modifiers: Vec<String>,
+    pub native_modifiers: Vec<String>,
+    pub native_flags_hex: String,
+    pub translation_profile: String,
+    pub pending_dead_key: Option<String>,
+    pub last_event: Option<String>,
+    pub last_translation: Option<String>,
+}
+
 /// Hot-updatable configuration
 #[derive(Debug, Clone)]
 pub enum ConfigUpdate {

@@ -198,3 +198,13 @@ impl RdpServerInputHandler for MacInputHandler {
         }
     }
 }
+
+impl Drop for MacInputHandler {
+    fn drop(&mut self) {
+        if let Some(kb) = &self.keyboard {
+            if let Err(e) = kb.release_transient_modifiers() {
+                tracing::warn!("Failed to release transient modifiers on drop: {e}");
+            }
+        }
+    }
+}

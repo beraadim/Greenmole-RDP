@@ -10,6 +10,41 @@ use crate::database::Database;
 use crate::event_bridge::TauriEventBridge;
 use crate::state::AppState;
 
+pub async fn ensure_server_running(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+) -> Result<(), String> {
+    {
+        let guard = state.server_handle.lock().await;
+        if guard.is_some() {
+            tracing::info!("Server already running");
+            return Ok(());
+        }
+    }
+
+    {
+        let mut status = state.status.lock().await;
+        status.running = false;
+        status.state = "starting".to_string();
+    }
+    let _ = app.emit("server-status", &*state.status.lock().await);
+
+    let config = state.ui_config.lock().await.to_server_config();
+    let bridge = TauriEventBridge::new(app.clone());
+
+    let handle = macrdp_core::start_server(config, bridge)
+        .await
+        .map_err(|e| format!("Failed to start server: {}", e))?;
+
+    let port = handle.port();
+    tracing::info!(port, "Server started successfully");
+
+    let mut guard = state.server_handle.lock().await;
+    *guard = Some(handle);
+
+    Ok(())
+}
+
 /// Response from `set_config` indicating whether the server must be restarted.
 #[derive(Debug, Clone, Serialize)]
 pub struct SetConfigResponse {
@@ -22,41 +57,7 @@ pub async fn start_server(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     tracing::info!("start_server called");
-
-    // Check if already running
-    {
-        let guard = state.server_handle.lock().await;
-        if guard.is_some() {
-            tracing::info!("Server already running");
-            return Ok(());
-        }
-    }
-
-    // Load configuration from UI config
-    let config = state.ui_config.lock().await.to_server_config();
-
-    // Create the event bridge
-    let bridge = TauriEventBridge::new(app.clone());
-
-    // Start the server in-process
-    let handle = macrdp_core::start_server(config, bridge)
-        .await
-        .map_err(|e| format!("Failed to start server: {}", e))?;
-
-    let port = handle.port();
-    tracing::info!(port, "Server started successfully");
-
-    // Store the handle
-    {
-        let mut guard = state.server_handle.lock().await;
-        *guard = Some(handle);
-    }
-
-    // Emit status update
-    let status = state.status.lock().await.clone();
-    let _ = app.emit("server-status", &status);
-
-    Ok(())
+    ensure_server_running(&app, state.inner()).await
 }
 
 #[tauri::command]
@@ -153,6 +154,20 @@ pub async fn get_connections(
 pub fn get_permissions() -> Result<serde_json::Value, String> {
     let perms = macrdp_core::permissions::check_permissions();
     serde_json::to_value(&perms).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_input_debug_state(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let debug_state = {
+        let guard = state.server_handle.lock().await;
+        guard
+            .as_ref()
+            .map(|handle| handle.input_debug_state())
+            .unwrap_or_default()
+    };
+    serde_json::to_value(&debug_state).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
