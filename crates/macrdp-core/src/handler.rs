@@ -79,6 +79,7 @@ pub struct MacInputHandler {
     pending_dead_key: Option<char>,
     translated_key_releases: HashMap<(u8, bool), Vec<u16>>,
     debug_state: Arc<Mutex<InputDebugState>>,
+    active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -118,7 +119,11 @@ enum KeyboardTranslationProfile {
 }
 
 impl MacInputHandler {
-    pub fn new(coord_mapper: MouseCoordMapper, debug_state: Arc<Mutex<InputDebugState>>) -> Self {
+    pub fn new(
+        coord_mapper: MouseCoordMapper,
+        debug_state: Arc<Mutex<InputDebugState>>,
+        active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
+    ) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -153,6 +158,7 @@ impl MacInputHandler {
             pending_dead_key: None,
             translated_key_releases: HashMap::new(),
             debug_state,
+            active_connection,
         }
     }
 
@@ -707,6 +713,22 @@ impl MacInputHandler {
 }
 
 impl RdpServerInputHandler for MacInputHandler {
+    fn on_connect(&mut self, context: ClientInputContext, peer_addr: Option<String>) {
+        let mut active_connection = self.active_connection.lock().unwrap();
+        *active_connection = Some(crate::callbacks::ConnectionInfo {
+            client_ip: peer_addr.unwrap_or_else(|| "unknown".to_string()),
+            client_name: context.client_name,
+            connected_at: chrono::Local::now().to_rfc3339(),
+        });
+        self.refresh_debug_state(Some("connection:connected".to_string()));
+    }
+
+    fn on_disconnect(&mut self) {
+        let mut active_connection = self.active_connection.lock().unwrap();
+        *active_connection = None;
+        self.refresh_debug_state(Some("connection:disconnected".to_string()));
+    }
+
     fn update_client_context(&mut self, context: ClientInputContext) {
         tracing::info!(
             client_name = context.client_name,

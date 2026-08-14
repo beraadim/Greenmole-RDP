@@ -78,6 +78,8 @@ pub struct ClientInputContext {
 /// ```
 pub trait RdpServerInputHandler: Send {
     fn update_client_context(&mut self, _context: ClientInputContext) {}
+    fn on_connect(&mut self, _context: ClientInputContext, _peer_addr: Option<String>) {}
+    fn on_disconnect(&mut self) {}
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
 }

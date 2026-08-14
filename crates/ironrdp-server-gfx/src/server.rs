@@ -913,10 +913,19 @@ impl RdpServer {
 
         {
             let mut handler = self.handler.lock().await;
-            handler.update_client_context(ClientInputContext {
+            let context = ClientInputContext {
                 client_name: result.client_name.clone(),
                 keyboard_layout: result.keyboard_layout,
-            });
+            };
+            handler.update_client_context(context.clone());
+            handler.on_connect(
+                context,
+                self.gfx_state
+                    .lock()
+                    .unwrap()
+                    .peer_addr
+                    .map(|addr| addr.to_string()),
+            );
         }
 
         if !result.input_events.is_empty() {
@@ -1227,6 +1236,7 @@ impl RdpServer {
                     continue;
                 }
                 RunState::Disconnect => {
+                    self.handler.lock().await.on_disconnect();
                     let final_framed = unsplit_tokio_framed(reader, writer);
                     return Ok(final_framed);
                 }

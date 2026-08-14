@@ -179,6 +179,7 @@ pub struct ServerHandle {
     fps: u32,
     gfx_state: Arc<Mutex<GfxState>>,
     input_debug_state: Arc<Mutex<InputDebugState>>,
+    active_connection: Arc<Mutex<Option<ConnectionInfo>>>,
     shutdown_notify: Arc<Notify>,
     stopped: AtomicBool,
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
@@ -270,6 +271,11 @@ impl ServerHandle {
         self.input_debug_state.lock().unwrap().clone()
     }
 
+    /// Current active connection, if a client is connected.
+    pub fn active_connection(&self) -> Option<ConnectionInfo> {
+        self.active_connection.lock().unwrap().clone()
+    }
+
     /// Push a hot config update to the running server.
     pub fn update_config(&self, update: ConfigUpdate) {
         let _ = self.config_tx.send(update);
@@ -323,6 +329,7 @@ struct ServerThreadArgs {
     coord_mapper: crate::handler::MouseCoordMapper,
     gfx_state: Arc<Mutex<GfxState>>,
     input_debug_state: Arc<Mutex<InputDebugState>>,
+    active_connection: Arc<Mutex<Option<ConnectionInfo>>>,
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
     config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
@@ -449,6 +456,7 @@ pub async fn start_server(
         gfx_validation_mode,
     )));
     let input_debug_state = Arc::new(Mutex::new(InputDebugState::default()));
+    let active_connection = Arc::new(Mutex::new(None::<ConnectionInfo>));
 
     let bind_host = config.bind_address.as_deref().unwrap_or("0.0.0.0");
     let (listener, port) = find_available_port(bind_host, config.port)?;
@@ -474,6 +482,7 @@ pub async fn start_server(
         coord_mapper,
         gfx_state: Arc::clone(&gfx_state),
         input_debug_state: Arc::clone(&input_debug_state),
+        active_connection: Arc::clone(&active_connection),
         shutdown_notify: Arc::clone(&shutdown_notify),
         handler: Arc::clone(&handler),
         config_rx,
@@ -560,6 +569,7 @@ pub async fn start_server(
         fps,
         gfx_state,
         input_debug_state,
+        active_connection,
         shutdown_notify,
         stopped: AtomicBool::new(false),
         server_thread: Mutex::new(Some(server_thread)),
@@ -631,6 +641,7 @@ fn run_server_thread(args: ServerThreadArgs) {
         let input_handler = MacInputHandler::new(
             args.coord_mapper.clone(),
             Arc::clone(&args.input_debug_state),
+            Arc::clone(&args.active_connection),
         );
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory

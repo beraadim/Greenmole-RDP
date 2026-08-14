@@ -146,6 +146,27 @@ pub async fn get_metrics(
 pub async fn get_connections(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
+    let live_connections = {
+        let guard = state.server_handle.lock().await;
+        if let Some(ref handle) = *guard {
+            if let Some(connection) = handle.active_connection() {
+                vec![crate::state::Connection {
+                    client_ip: connection.client_ip,
+                    client_name: connection.client_name,
+                    connected_at: connection.connected_at,
+                    bytes_total: handle.metrics().bytes_sent,
+                }]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    };
+    {
+        let mut connections = state.connections.lock().await;
+        *connections = live_connections.clone();
+    }
     let connections = state.connections.lock().await.clone();
     serde_json::to_value(&connections).map_err(|e| e.to_string())
 }
