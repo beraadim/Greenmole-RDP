@@ -1211,12 +1211,18 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
-        loop {
-            let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
+        let mut client_connected = false;
+        let result = loop {
+            let (new_framed, result) = match ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
                 .await
-                .context("failed to accept client during finalize")?;
+                .context("failed to accept client during finalize")
+            {
+                Ok(value) => value,
+                Err(error) => break Err(error),
+            };
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
+            client_connected = true;
 
             match self.client_accepted(&mut reader, &mut writer, result).await? {
                 RunState::Continue => {
@@ -1236,12 +1242,17 @@ impl RdpServer {
                     continue;
                 }
                 RunState::Disconnect => {
-                    self.handler.lock().await.on_disconnect();
                     let final_framed = unsplit_tokio_framed(reader, writer);
-                    return Ok(final_framed);
+                    break Ok(final_framed);
                 }
             }
+        };
+
+        if client_connected {
+            self.handler.lock().await.on_disconnect();
         }
+
+        result
     }
 
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
