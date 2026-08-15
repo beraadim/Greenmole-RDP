@@ -1224,7 +1224,12 @@ impl RdpServer {
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
             client_connected = true;
 
-            match self.client_accepted(&mut reader, &mut writer, result).await? {
+            let run_state = match self.client_accepted(&mut reader, &mut writer, result).await {
+                Ok(run_state) => run_state,
+                Err(error) => break Err(error),
+            };
+
+            match run_state {
                 RunState::Continue => {
                     unreachable!();
                 }
