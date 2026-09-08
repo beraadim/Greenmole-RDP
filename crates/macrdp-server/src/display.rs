@@ -351,6 +351,7 @@ impl RdpServerDisplay for MacDisplay {
             capture_config,
             encoder,
             gfx_state: Arc::clone(&self.gfx_state),
+            coord_mapper: self.coord_mapper.clone(),
             base_bitrate: self.base_bitrate,
             mode_444: self.mode_444,
             display_frame_count: 0,
@@ -366,6 +367,7 @@ struct MacDisplayUpdates {
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     gfx_state: Arc<Mutex<GfxState>>,
+    coord_mapper: MouseCoordMapper,
     base_bitrate: u32,
     mode_444: bool,
     display_frame_count: u64,
@@ -463,6 +465,12 @@ impl MacDisplayUpdates {
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+        self.coord_mapper.update_frame_content_rect(
+            frame.width,
+            frame.height,
+            frame.content_rect.as_ref(),
+        );
+
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
             self.skip_next_frame = false;
@@ -964,6 +972,7 @@ mod tests {
             stride: 400,
             timestamp_us: 0,
             dirty_rects: vec![],
+            content_rect: None,
         };
 
         let updates = frame_to_bitmap_updates(&frame, 64);
@@ -983,6 +992,7 @@ mod tests {
             stride: 512,
             timestamp_us: 0,
             dirty_rects: vec![],
+            content_rect: None,
         };
 
         let updates = frame_to_bitmap_updates(&frame, 64);

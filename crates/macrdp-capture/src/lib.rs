@@ -47,6 +47,20 @@ pub struct Rect {
     pub height: u32,
 }
 
+/// The visible source-content rectangle within an output frame.
+///
+/// ScreenCaptureKit supplies this with each sample. It is essential for
+/// translating RDP pointer coordinates when a stream is aspect-fitted: the
+/// frame can contain padding while the actual macOS display occupies only this
+/// rectangle.
+#[derive(Clone, Debug)]
+pub struct ContentRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Pixel format for screen capture output
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CapturePixelFormat {
@@ -102,6 +116,8 @@ pub struct CapturedFrame {
     /// Regions that changed since the last frame.
     /// Empty means info unavailable — treat as full frame change.
     pub dirty_rects: Vec<Rect>,
+    /// Visible display content inside this frame. `None` means the whole frame.
+    pub content_rect: Option<ContentRect>,
 }
 
 /// Raw audio frame from ScreenCaptureKit audio callback.
@@ -430,6 +446,21 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         })
         .collect::<Vec<_>>();
 
+    let content_rect = sample.content_rect().and_then(|rect| {
+        (rect.x.is_finite()
+            && rect.y.is_finite()
+            && rect.width.is_finite()
+            && rect.height.is_finite()
+            && rect.width > 0.0
+            && rect.height > 0.0)
+            .then_some(ContentRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+    });
+
     let safe_buf = unsafe { SafePixelBuffer::from_raw(pixel_buffer.as_ptr()) };
 
     let t = sample.presentation_timestamp();
@@ -446,6 +477,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         stride,
         timestamp_us,
         dirty_rects,
+        content_rect,
     }))
 }
 
@@ -493,6 +525,21 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         })
         .collect::<Vec<_>>();
 
+    let content_rect = sample.content_rect().and_then(|rect| {
+        (rect.x.is_finite()
+            && rect.y.is_finite()
+            && rect.width.is_finite()
+            && rect.height.is_finite()
+            && rect.width > 0.0
+            && rect.height > 0.0)
+            .then_some(ContentRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+    });
+
     let t = sample.presentation_timestamp();
     let timestamp_us = if t.timescale > 0 {
         ((t.value as u128 * 1_000_000) / t.timescale as u128) as u64
@@ -510,6 +557,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         stride: 0, // Not applicable for NV12 PixelBuffer mode
         timestamp_us,
         dirty_rects,
+        content_rect,
     }))
 }
 
@@ -739,6 +787,7 @@ impl CgFallbackCapturer {
                 .unwrap_or_default()
                 .as_micros() as u64,
             dirty_rects: vec![],
+            content_rect: None,
         })
     }
 

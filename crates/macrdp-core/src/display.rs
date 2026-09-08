@@ -923,6 +923,7 @@ impl RdpServerDisplay for MacDisplay {
             capture_config,
             encoder,
             gfx_state: Arc::clone(&self.gfx_state),
+            coord_mapper: self.coord_mapper.clone(),
             encoder_pref: self.encoder_pref,
             mode_444: self.mode_444,
             shared_audio_tx: self.shared_audio_tx.clone(),
@@ -999,6 +1000,7 @@ struct MacDisplayUpdates {
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     gfx_state: Arc<Mutex<GfxState>>,
+    coord_mapper: MouseCoordMapper,
     encoder_pref: macrdp_encode::EncoderPreference,
     mode_444: bool,
     shared_audio_tx: Option<SharedAudioTx>,
@@ -2005,6 +2007,11 @@ impl MacDisplayUpdates {
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+        self.coord_mapper.update_frame_content_rect(
+            frame.width,
+            frame.height,
+            frame.content_rect.as_ref(),
+        );
         self.cache_latest_frame(&frame);
 
         // Encode overload protection: skip this frame if previous encode took too long

@@ -1,4 +1,5 @@
 use ironrdp_server::{ClientInputContext, KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use macrdp_capture::ContentRect;
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, RemoteSessionWake};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,10 @@ struct CoordState {
     logical_h: f64,
     rdp_w: f64,
     rdp_h: f64,
+    content_x: f64,
+    content_y: f64,
+    content_w: f64,
+    content_h: f64,
 }
 
 impl MouseCoordMapper {
@@ -37,16 +42,23 @@ impl MouseCoordMapper {
             logical_h: logical_h as f64,
             rdp_w: rdp_w.max(1) as f64,
             rdp_h: rdp_h.max(1) as f64,
+            content_x: 0.0,
+            content_y: 0.0,
+            content_w: rdp_w.max(1) as f64,
+            content_h: rdp_h.max(1) as f64,
         })))
     }
 
     pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        // Mouse input needs to track the negotiated RDP desktop directly.
-        // The browser/RDP client already reports coordinates in that space, so
-        // subtracting synthetic letterbox margins creates a visible offset.
-        let mac_x = ((rdp_x as f64) * s.logical_w / s.rdp_w).clamp(0.0, s.logical_w - 1.0) as u16;
-        let mac_y = ((rdp_y as f64) * s.logical_h / s.rdp_h).clamp(0.0, s.logical_h - 1.0) as u16;
+        // RDP input is in desktop coordinates, while ScreenCaptureKit can
+        // aspect-fit the source display into that desktop. Map through the
+        // frame's reported visible-content rectangle, not an inferred client
+        // profile or a guessed letterbox geometry.
+        let mac_x = ((rdp_x as f64 - s.content_x) * s.logical_w / s.content_w)
+            .clamp(0.0, s.logical_w - 1.0) as u16;
+        let mac_y = ((rdp_y as f64 - s.content_y) * s.logical_h / s.content_h)
+            .clamp(0.0, s.logical_h - 1.0) as u16;
         (mac_x, mac_y)
     }
 
@@ -54,12 +66,69 @@ impl MouseCoordMapper {
         let mut s = self.0.lock().unwrap();
         s.rdp_w = rdp_w.max(1) as f64;
         s.rdp_h = rdp_h.max(1) as f64;
+        s.content_x = 0.0;
+        s.content_y = 0.0;
+        s.content_w = s.rdp_w;
+        s.content_h = s.rdp_h;
         tracing::info!(
             new_rdp_w = rdp_w,
             new_rdp_h = rdp_h,
             logical_w = s.logical_w,
             logical_h = s.logical_h,
             "MouseCoordMapper: RDP desktop size updated"
+        );
+    }
+
+    /// Synchronize pointer mapping with ScreenCaptureKit's actual visible
+    /// source rectangle in the latest encoded frame.
+    pub fn update_frame_content_rect(
+        &self,
+        frame_w: u32,
+        frame_h: u32,
+        content_rect: Option<&ContentRect>,
+    ) {
+        let mut s = self.0.lock().unwrap();
+        let full_frame = ContentRect {
+            x: 0.0,
+            y: 0.0,
+            width: frame_w.max(1) as f64,
+            height: frame_h.max(1) as f64,
+        };
+        let rect = content_rect.unwrap_or(&full_frame);
+        if frame_w == 0
+            || frame_h == 0
+            || !rect.x.is_finite()
+            || !rect.y.is_finite()
+            || !rect.width.is_finite()
+            || !rect.height.is_finite()
+            || rect.width <= 0.0
+            || rect.height <= 0.0
+        {
+            return;
+        }
+
+        let frame_w = frame_w as f64;
+        let frame_h = frame_h as f64;
+        let x = rect.x.clamp(0.0, frame_w);
+        let y = rect.y.clamp(0.0, frame_h);
+        let width = rect.width.min(frame_w - x);
+        let height = rect.height.min(frame_h - y);
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+
+        s.content_x = x * s.rdp_w / frame_w;
+        s.content_y = y * s.rdp_h / frame_h;
+        s.content_w = width * s.rdp_w / frame_w;
+        s.content_h = height * s.rdp_h / frame_h;
+        tracing::trace!(
+            frame_w,
+            frame_h,
+            content_x = s.content_x,
+            content_y = s.content_y,
+            content_w = s.content_w,
+            content_h = s.content_h,
+            "MouseCoordMapper: frame content rectangle updated"
         );
     }
 }
@@ -966,10 +1035,27 @@ mod tests {
         assert_eq!(mapper.map(2559, 1304), (1919, 1199));
     }
 
+    #[test]
+    fn mouse_mapper_uses_reported_content_rect_for_aspect_fitted_frames() {
+        let mapper = MouseCoordMapper::new(1920, 1200, 2560, 1305);
+        let content = macrdp_capture::ContentRect {
+            x: 236.0,
+            y: 0.0,
+            width: 2088.0,
+            height: 1305.0,
+        };
+        mapper.update_frame_content_rect(2560, 1305, Some(&content));
+
+        assert_eq!(mapper.map(236, 0), (0, 0));
+        assert_eq!(mapper.map(1280, 652), (960, 599));
+        assert_eq!(mapper.map(2323, 1304), (1919, 1199));
+    }
+
     fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
         let mut handler = MacInputHandler::new(
             MouseCoordMapper::new(1920, 1200, 1920, 1200),
             Arc::new(Mutex::new(InputDebugState::default())),
+            Arc::new(Mutex::new(None::<crate::callbacks::ConnectionInfo>)),
         );
         handler.client_context = ClientInputContext {
             client_name: client_name.to_string(),
