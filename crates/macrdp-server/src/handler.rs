@@ -1,4 +1,5 @@
 use ironrdp_server::{ClientInputContext, KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use macrdp_capture::ContentRect;
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, RemoteSessionWake};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,10 @@ struct CoordState {
     logical_h: f64,
     rdp_w: f64,
     rdp_h: f64,
+    content_x: f64,
+    content_y: f64,
+    content_w: f64,
+    content_h: f64,
 }
 
 impl MouseCoordMapper {
@@ -34,16 +39,19 @@ impl MouseCoordMapper {
             logical_h: logical_h as f64,
             rdp_w: rdp_w.max(1) as f64,
             rdp_h: rdp_h.max(1) as f64,
+            content_x: 0.0,
+            content_y: 0.0,
+            content_w: rdp_w.max(1) as f64,
+            content_h: rdp_h.max(1) as f64,
         })))
     }
 
     pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        // Mouse input needs to track the negotiated RDP desktop directly.
-        // The client already reports coordinates in that space, so synthetic
-        // letterbox compensation creates a visible pointer offset.
-        let mac_x = ((rdp_x as f64) * s.logical_w / s.rdp_w).clamp(0.0, s.logical_w - 1.0) as u16;
-        let mac_y = ((rdp_y as f64) * s.logical_h / s.rdp_h).clamp(0.0, s.logical_h - 1.0) as u16;
+        let mac_x = ((rdp_x as f64 - s.content_x) * s.logical_w / s.content_w)
+            .clamp(0.0, s.logical_w - 1.0) as u16;
+        let mac_y = ((rdp_y as f64 - s.content_y) * s.logical_h / s.content_h)
+            .clamp(0.0, s.logical_h - 1.0) as u16;
         (mac_x, mac_y)
     }
 
@@ -53,6 +61,10 @@ impl MouseCoordMapper {
         let old_h = s.rdp_h;
         s.rdp_w = rdp_w.max(1) as f64;
         s.rdp_h = rdp_h.max(1) as f64;
+        s.content_x = 0.0;
+        s.content_y = 0.0;
+        s.content_w = s.rdp_w;
+        s.content_h = s.rdp_h;
         tracing::info!(
             old_rdp_w = old_w,
             old_rdp_h = old_h,
@@ -62,6 +74,48 @@ impl MouseCoordMapper {
             logical_h = s.logical_h,
             "MouseCoordMapper: RDP desktop size updated"
         );
+    }
+
+    pub fn update_frame_content_rect(
+        &self,
+        frame_w: u32,
+        frame_h: u32,
+        content_rect: Option<&ContentRect>,
+    ) {
+        let mut s = self.0.lock().unwrap();
+        let full_frame = ContentRect {
+            x: 0.0,
+            y: 0.0,
+            width: frame_w.max(1) as f64,
+            height: frame_h.max(1) as f64,
+        };
+        let rect = content_rect.unwrap_or(&full_frame);
+        if frame_w == 0
+            || frame_h == 0
+            || !rect.x.is_finite()
+            || !rect.y.is_finite()
+            || !rect.width.is_finite()
+            || !rect.height.is_finite()
+            || rect.width <= 0.0
+            || rect.height <= 0.0
+        {
+            return;
+        }
+
+        let frame_w = frame_w as f64;
+        let frame_h = frame_h as f64;
+        let x = rect.x.clamp(0.0, frame_w);
+        let y = rect.y.clamp(0.0, frame_h);
+        let width = rect.width.min(frame_w - x);
+        let height = rect.height.min(frame_h - y);
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+
+        s.content_x = x * s.rdp_w / frame_w;
+        s.content_y = y * s.rdp_h / frame_h;
+        s.content_w = width * s.rdp_w / frame_w;
+        s.content_h = height * s.rdp_h / frame_h;
     }
 }
 
