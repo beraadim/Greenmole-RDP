@@ -11,9 +11,50 @@ pub fn resolve_desktop_size(
     configured_width: u32,
     configured_height: u32,
 ) -> Result<(u16, u16)> {
+    resolve_size(
+        mode,
+        SizeBasis {
+            pixels: (geometry.pixel_width, geometry.pixel_height),
+            logical: (geometry.logical_width, geometry.logical_height),
+        },
+        configured_width,
+        configured_height,
+    )
+}
+
+/// Initial RDP negotiation size while the virtual backend has no connected
+/// client or native display. A client viewport replaces the automatic default
+/// during activation; fixed resolution and legacy scale retain their semantics.
+pub fn resolve_virtual_desktop_size(
+    mode: &str,
+    configured_width: u32,
+    configured_height: u32,
+) -> Result<(u16, u16)> {
+    resolve_size(
+        mode,
+        SizeBasis {
+            pixels: (1920, 1080),
+            logical: (1920.0, 1080.0),
+        },
+        configured_width,
+        configured_height,
+    )
+}
+
+struct SizeBasis {
+    pixels: (u32, u32),
+    logical: (f64, f64),
+}
+
+fn resolve_size(
+    mode: &str,
+    basis: SizeBasis,
+    configured_width: u32,
+    configured_height: u32,
+) -> Result<(u16, u16)> {
     let dimensions = if mode == "auto" {
         match (configured_width, configured_height) {
-            (0, 0) => (geometry.pixel_width, geometry.pixel_height),
+            (0, 0) => basis.pixels,
             (0, _) | (_, 0) => bail!("Configure both width and height, or leave both at zero"),
             size => size,
         }
@@ -26,8 +67,8 @@ pub fn resolve_desktop_size(
         if !(1..=4).contains(&scale) {
             bail!("Legacy display scale must be between 1 and 4");
         }
-        let width = geometry.logical_width * f64::from(scale);
-        let height = geometry.logical_height * f64::from(scale);
+        let width = basis.logical.0 * f64::from(scale);
+        let height = basis.logical.1 * f64::from(scale);
         if !width.is_finite()
             || !height.is_finite()
             || width < 1.0
@@ -83,6 +124,28 @@ mod tests {
             resolve_desktop_size("1", &display(), 0, 0).unwrap(),
             (1920, 1080)
         );
+    }
+
+    #[test]
+    fn virtual_negotiation_resolves_without_a_display_or_physical_geometry() {
+        assert_eq!(
+            resolve_virtual_desktop_size("auto", 0, 0).unwrap(),
+            (1920, 1080)
+        );
+        assert_eq!(
+            resolve_virtual_desktop_size("auto", 1536, 864).unwrap(),
+            (1536, 864)
+        );
+        assert_eq!(
+            resolve_virtual_desktop_size("1280x720", 0, 0).unwrap(),
+            (1280, 720)
+        );
+        assert_eq!(
+            resolve_virtual_desktop_size("2", 0, 0).unwrap(),
+            (3840, 2160)
+        );
+        assert!(resolve_virtual_desktop_size("auto", 0, 900).is_err());
+        assert!(resolve_virtual_desktop_size("65536x1080", 0, 0).is_err());
     }
 
     #[test]

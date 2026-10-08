@@ -17,6 +17,8 @@ pub(crate) enum Request {
         height: u16,
     },
     Geometry {},
+    BeginRemoteSession {},
+    EndRemoteSession {},
     PrepareCapture {
         width: u16,
         height: u16,
@@ -26,6 +28,12 @@ pub(crate) enum Request {
         serial: u32,
         width: u16,
         height: u16,
+    },
+    ConfigureLayout {
+        display_id: u32,
+        serial: u32,
+        primary: u32,
+        displays: Vec<crate::layout::Placement>,
     },
     Shutdown {},
 }

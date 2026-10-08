@@ -31,51 +31,38 @@ client-driven resizing. On a running virtual server, changing the configured
 resolution or listening port requires a restart; this avoids overlapping virtual
 display owners during the app's usual port migration.
 
-The virtual display belongs to the logged-in macOS desktop. Supported application
-windows move onto it automatically when the remote session starts, and return
-when the client disconnects. It is an additional screen in the same user session,
-with shared keyboard, pointer, applications and audio.
-macrdp does not automatically mirror displays, change the primary display, or
-create a separate user login session.
+The virtual display belongs to the logged-in macOS desktop. It becomes the main
+display while a remote client is connected, bringing the Dock and menu bar to the
+remote desktop. The previous display arrangement is restored on disconnect. It
+is an additional screen in the same user session, with shared keyboard, pointer,
+applications and audio. macrdp does not mirror displays or create a separate
+user login session.
 
-One native display object is retained in a background helper process for the
-server's lifetime. Resizing changes
-its mode in place, and an RDP disconnect leaves it available for reconnection.
-Stopping the server releases the virtual display. The display starts at
-1920×1080 and adopts the negotiated client size when capture starts.
+Starting the server does not create a virtual display. A background helper
+creates it when an authenticated remote connection starts capture and keeps it
+alive for that connection. Browser resizes change its mode in place. Disconnect
+restores the previous primary display and removes the virtual screen; reconnect
+creates a new one. Server shutdown also cleans up any active display.
 
-## Automatic window placement
+## Main display during a remote session
 
-Window placement requires the same **Accessibility** permission used for remote
-keyboard and mouse input. Grant access and restart the server if it was missing
-when the server started. The physical display backend does not move windows.
-For the virtual backend, placement begins after capture has adopted the client's
-negotiated size. Each supported window's original display, position and size are
-remembered once per connection. Remote viewport resizing keeps windows within
-the new desktop without replacing those original return positions.
+The virtual display becomes primary before capture and pointer coordinates are
+initialized. Its global origin is read back from macOS after the change. Resizing
+the browser changes the same display's mode without replacing the saved physical
+display arrangement. RDP resize reactivation remains part of the same connection.
 
-New windows are collected during the session. Windows opened on a physical
-display retain that return position; windows opened on the virtual display return
-to the physical display that was primary when the connection started. If an
-original display has been unplugged, restoration uses a remaining physical
-display and keeps windows within its bounds. Closed windows are ignored.
+macOS manages application window placement. Existing windows may remain on a
+physical screen, and applications can remember their preferred display or Space.
+The earlier Accessibility window mover has been removed: macrdp does not resize
+or reposition individual application windows. Accessibility permission is still
+needed for remote keyboard and mouse input.
 
-This uses macOS Accessibility window controls and is best effort. macrdp's own
-control windows stay in place. They are excluded before any Accessibility query
-because accessing the server's own AppKit windows from the placement worker can
-crash the application. Full-screen,
-already minimized, protected, and non-movable windows are not brought onto the
-remote display. A moved window that is minimized later is returned without
-unminimizing it when the application permits that. Applications can
-limit resizing or expose only some of their windows; moving windows between
-macOS Spaces is not guaranteed. Placement does not activate applications or
-change their minimized/full-screen state. Missing permission and unsupported or
-unresponsive windows are reported without recording window titles or contents.
-
-Disconnects and normal server shutdown restore the saved layout. RDP resize
-reactivation is part of the same connection and does not trigger restoration.
-Restoration has a bounded wait, so an unresponsive application cannot indefinitely
-block shutdown. Forced process termination cannot guarantee exact restoration.
+Disconnect and normal server shutdown restore the prior primary display and
+display origins before removing the virtual screen. These are temporary display
+settings, not a change to saved system preferences. The helper also attempts restoration when its parent closes
+the control pipe. A forced termination of the helper or a changed display layout
+may prevent exact restoration. Dock autohide and macOS Spaces settings still
+control the Dock's normal appearance.
 
 ## Guacamole connection
 
@@ -84,6 +71,11 @@ the Guacamole RDP connection. Leave its width and height unset to use the browse
 viewport. These settings are per connection, so verify them even when a Windows
 connection already resizes correctly. Guacamole's `reconnect` method starts a
 new RDP session instead of resizing the current session.
+
+The initial desktop size comes from the client's connection request. Later live
+resizes require Guacamole's Display update setting; the server cannot infer a
+browser viewport that the client does not send. Display Control is available
+even when H.264 graphics are disabled or Guacamole uses bitmap graphics.
 
 Supply the server's configured username and password in the RDP client.
 TLS-only connections now reject empty or incorrect credentials instead of
@@ -113,7 +105,6 @@ Build/test from the repository root on macOS:
 
 ```sh
 cargo test -p macrdp-display
-cargo test -p macrdp-windows
 cargo test -p macrdp-capture geometry::tests
 cargo test -p ironrdp-server --lib
 cargo test -p macrdp-core
@@ -141,79 +132,45 @@ selection can stall while displays sleep. Active RDP sessions already declare
 remote user activity and hold a display-sleep assertion before capture starts.
 
 On 2026-10-08, validation on the Apple M4 Pro Mac mini with macOS 26.6.2
-passed 129 native unit tests and the opt-in display smoke test. The native test
-verified exact modes through 3840×2160, odd-size normalization, a stable display
-ID across resizes, an unchanged physical display mode, and removal after shutdown.
-The release app's helper also passed independent mode and cleanup checks; the
-app bundle passed signature verification and the DMG passed checksum verification.
+passed 122 unit tests and the opt-in display smoke test. Fresh observer processes
+verified no virtual screen while idle, promotion to primary at origin (0,0),
+exact modes through 3840×2160, odd-size normalization, and a stable display ID
+across resizes. Disconnect restored the physical display's primary status and
+geometry and removed the virtual screen. Reconnect created a new display, which
+was also removed on final cleanup. Physical display modes stayed unchanged.
+The release CLI and UI builds passed; the app bundle passed signature
+verification and the DMG passed checksum verification.
 Live Guacamole/Windows client capture and pointer behavior still require the
 manual checks below.
 
-The window-placement tests cover geometry and session boundaries without moving
-your application windows. The automatic window-placement build on the same Mac
-passed 103 unit tests (27 RDP server, 53 core, 11 CLI, and 12 window-placement),
-the release CLI and UI builds, app signature verification, and DMG checksum
-verification. Actual Accessibility movement and restoration remain part of the
-manual installation checks below.
-
-The ignored `controlled_fixture_moves_and_restores`
-test additionally exercises Accessibility moves, but requires an already trusted
-test executable, a disposable fixture application's PID in
-`MACRDP_WINDOW_FIXTURE_PID`, and a disposable virtual display ID in
-`MACRDP_WINDOW_FIXTURE_DISPLAY_ID`. It disables discovery of other applications.
-Do not point this test at an application containing real work. Normal test and
-build commands leave it ignored; no Accessibility permissions are granted by
-the build process.
-
-The self-window regression creates only its own disposable AppKit window. It
-confirms that window is present in the raw WindowServer list, then checks that
-both production discovery and the Accessibility entry point exclude the current
-process from a background worker. It makes no Accessibility calls to other
-applications and needs no Accessibility permission:
-
-```sh
-cargo test -p macrdp-windows --test native_self_window --locked -- --ignored
-```
-
-This guards against the macOS 26.6.2 crash reported after the first frame:
-`AXUIElementSetAttributeValue` entered the server's own `NSWindow` implementation
-on the `macrdp-windows` thread, which trapped with
-`Must only be used from the main thread`. The regression checks that this unsafe
-path is excluded; it does not deliberately perform the crashing window mutation.
-On the Mac mini, the pre-fix code returned its own PID and one Accessibility
-window; the corrected code excluded the PID and returned no Accessibility
-windows. The native regression passed, along with all 15 window-placement unit
-tests. A live Guacamole connection still requires the manual checks below.
-
 1. Start with the physical backend and confirm its existing behavior.
-2. Open several ordinary windows on the physical display and note their positions
-   and sizes. Enable the virtual backend, restart, and connect with Guacamole.
-   Confirm the windows move onto the remote display automatically, while the
-   macrdp control window stays in place and the server remains running.
-3. Resize between 1280×720, 1920×1080, 2560×1440 and an odd size such as
-   2560×1305. Check menu items, the Dock, window controls and all four corners.
-   Repeat while idle and while rapidly dragging the browser window edges.
-4. Disconnect and confirm the original window positions and sizes return. Reconnect
-   at a different viewport size: windows should move back onto the remote display,
-   while the display ID remains the same in the log.
-5. Verify the log's negotiated size matches the actual virtual mode after
-   viewport dimensions are normalized.
-6. Arrange the virtual screen left of or above the primary screen, then reconnect.
-   Check negative origins in the log and accurate input throughout the screen.
-7. Confirm fixed resolution ignores client resize requests. Confirm saving a
-   backend change while running reports restart required.
-8. Stop the server and confirm the display disappears; restart and confirm a new
-   display can be created. Exercise screen lock/unlock and capture recovery.
-9. Open a new window during the remote session, resize it, and disconnect. Confirm
-   it returns to a physical display. Repeat with a dropped network connection,
-   rapid reconnect, and server stop. Minimized/full-screen windows should keep
-   their state; a closed window must not interrupt restoration of the others.
+2. Enable the virtual backend and automatic resolution, restart, and confirm no
+   virtual screen exists while idle. Connect through Guacamole and confirm the
+   virtual display is created and becomes primary, with the Dock
+   and menu bar are available. Existing application windows follow macOS behavior.
+3. Resize between 1280x720, 1920x1080, 2560x1440 and an odd viewport size such as
+   2560x1305. Confirm the desktop dimensions change, not just the image scale.
+   Check menu items, window controls and all four corners for pointer accuracy.
+4. Disconnect and confirm the previous primary display and arrangement return
+   and the virtual screen disappears. Reconnect with a different browser size:
+   a new virtual screen is created. Only resizes within one connection keep its ID.
+5. Repeat while rapidly resizing, with a dropped network connection, and while
+   stopping the server. A resize within one session must not restore the layout.
+6. Confirm fixed resolution ignores client resize requests. Confirm changing
+   backend or virtual resolution settings while running reports restart required.
+7. Stop the server and confirm the virtual display disappears. Exercise screen
+   lock/unlock and capture recovery, and repeat using Windows Remote Desktop.
 
 Capture info logs include the selected display ID, global origin, logical point
 size, output pixel size and native mode changes. Useful messages include
 `Persistent display helper ready`, `Virtual display mode ready for capture`,
 `Activated capture and pointer desktop size`, and
 `Display controller released on its owning thread`.
+Resize diagnosis also logs `Initial client desktop dimensions`, dynamic-channel
+creation states, `Display Control channel opened`, and
+`Received client Display Control layout`. A rejected or unopened Display Control
+channel points to negotiation or Guacamole settings; received layouts followed
+by `Applying resolution change` identify requests accepted by the server.
 
 Changing the macOS display arrangement during an active RDP session requires a
 reconnect to refresh the selected display's global origin. This backend is not a

@@ -22,7 +22,7 @@ pub struct MacInputHandler {
     translated_key_releases: HashMap<(u8, bool), Vec<u16>>,
     debug_state: Arc<Mutex<InputDebugState>>,
     active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
-    window_session: Option<macrdp_windows::WindowSession>,
+    display_controller: Option<macrdp_display::DisplayController>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -66,7 +66,7 @@ impl MacInputHandler {
         coord_mapper: MouseCoordMapper,
         debug_state: Arc<Mutex<InputDebugState>>,
         active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
-        window_session: Option<macrdp_windows::WindowSession>,
+        display_controller: Option<macrdp_display::DisplayController>,
     ) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
@@ -98,7 +98,7 @@ impl MacInputHandler {
             translated_key_releases: HashMap::new(),
             debug_state,
             active_connection,
-            window_session,
+            display_controller,
         }
     }
 
@@ -669,9 +669,11 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
-        if let Some(windows) = &self.window_session {
-            if let Err(error) = windows.disconnect() {
-                tracing::warn!(%error, "Failed to schedule local window restoration");
+        if let Some(display) = &self.display_controller {
+            // Queue restoration before another connection can begin. The
+            // display worker serializes this with the next capture activation.
+            if let Err(error) = display.end_remote_session_async() {
+                tracing::warn!(%error, "Failed to schedule physical display restoration");
             }
         }
         if let Some(wake) = &mut self.wake {

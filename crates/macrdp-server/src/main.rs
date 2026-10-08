@@ -75,7 +75,12 @@ async fn run_server() -> Result<()> {
     })
     .await
     .context("Display initialization worker failed")??;
-    let geometry = display_controller.geometry()?;
+    // Virtual display ownership begins with the first connected activation.
+    let geometry = if backend == macrdp_display::DisplayBackend::Main {
+        Some(display_controller.geometry()?)
+    } else {
+        None
+    };
 
     // Parse quality setting
     let quality = match config.quality.as_deref() {
@@ -98,39 +103,38 @@ async fn run_server() -> Result<()> {
 
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
     let res_auto = res_mode == "auto";
-    let (width, height) =
-        macrdp_display::resolve_desktop_size(res_mode, &geometry, config.width, config.height)?;
+    let (width, height) = if let Some(geometry) = &geometry {
+        macrdp_display::resolve_desktop_size(res_mode, geometry, config.width, config.height)?
+    } else {
+        macrdp_display::resolve_virtual_desktop_size(res_mode, config.width, config.height)?
+    };
     let (width, height) = display_controller.normalize_size(width, height);
     let coord_mapper = handler::MouseCoordMapper::new(1, 1, width, height);
-    coord_mapper.update_display_bounds(
-        geometry.origin_x,
-        geometry.origin_y,
-        geometry.logical_width,
-        geometry.logical_height,
-    );
+    if let Some(geometry) = &geometry {
+        coord_mapper.update_display_bounds(
+            geometry.origin_x,
+            geometry.origin_y,
+            geometry.logical_width,
+            geometry.logical_height,
+        );
+    }
+    // Virtual bounds are committed by capture activation before queued RDP
+    // input is dispatched; startup never substitutes a physical display.
     tracing::info!(
         ?backend,
         ?geometry,
+        virtual_display_deferred = geometry.is_none(),
         width,
         height,
-        "Selected remote desktop display"
+        "Prepared remote desktop negotiation"
     );
 
     // Create shared GFX state
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444, false)));
 
-    let window_session = if backend == macrdp_display::DisplayBackend::Virtual {
-        macrdp_windows::WindowSession::new(display_controller.clone())
-            .map_err(|error| {
-                tracing::warn!(%error, "Automatic window movement is unavailable");
-            })
-            .ok()
-    } else {
-        None
-    };
-
-    // Keep a handle outside the RDP server to await restoration on shutdown.
-    let input_handler = MacInputHandler::new(coord_mapper.clone(), window_session.clone());
+    // Input disconnect queues local display restoration on the controller.
+    let input_handler =
+        MacInputHandler::new(coord_mapper.clone(), Some(display_controller.clone()));
 
     // Audio setup — shared sender slot, recreated per connection by AudioFactory
     let shared_audio_tx = if config.audio.enabled {
@@ -196,8 +200,7 @@ async fn run_server() -> Result<()> {
         coord_mapper,
         shared_audio_tx,
         perf_stats.clone(),
-        display_controller,
-        window_session.clone(),
+        display_controller.clone(),
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
@@ -273,17 +276,16 @@ async fn run_server() -> Result<()> {
         ps.lock().unwrap().print_summary();
     }
 
-    // Ctrl-C cancels run() before the usual disconnect callback. Final session
-    // ownership restores windows and keeps the virtual display alive until done.
+    // Ctrl-C cancels run() before the usual disconnect callback. Restore the
+    // local display layout while the virtual display owner is still retained.
     drop(server);
-    if let Some(windows) = window_session {
-        if let Err(error) = tokio::task::spawn_blocking(move || windows.shutdown())
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || display_controller.end_remote_session())
             .await
-            .context("Window restoration task failed")
+            .context("Display restoration task failed")
             .and_then(|result| result)
-        {
-            tracing::warn!(%error, "Window restoration worker failed during shutdown");
-        }
+    {
+        tracing::warn!(%error, "Physical display restoration failed during shutdown");
     }
 
     result

@@ -407,7 +407,13 @@ pub async fn start_server(
     })
     .await
     .context("Display initialization worker failed")??;
-    let geometry = display_controller.geometry()?;
+    // An idle virtual backend owns no native display. Only physical capture
+    // needs live geometry before a client negotiates its initial desktop size.
+    let geometry = if backend == macrdp_display::DisplayBackend::Main {
+        Some(display_controller.geometry()?)
+    } else {
+        None
+    };
 
     // Quality / encoder / chroma
     let quality = match config.quality.as_deref() {
@@ -419,26 +425,36 @@ pub async fn start_server(
     let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
     let gfx_validation_mode = config.gfx_validation_mode.unwrap_or(false);
 
-    let (width, height) = macrdp_display::resolve_desktop_size(
-        config.resolution.as_deref().unwrap_or("auto"),
-        &geometry,
-        config.width,
-        config.height,
-    )?;
+    let resolution = config.resolution.as_deref().unwrap_or("auto");
+    let (width, height) = if let Some(geometry) = &geometry {
+        macrdp_display::resolve_desktop_size(
+            resolution,
+            geometry,
+            config.width,
+            config.height,
+        )?
+    } else {
+        macrdp_display::resolve_virtual_desktop_size(resolution, config.width, config.height)?
+    };
     let (width, height) = display_controller.normalize_size(width, height);
     let coord_mapper = crate::handler::MouseCoordMapper::new(1, 1, width, height);
-    coord_mapper.update_display_bounds(
-        geometry.origin_x,
-        geometry.origin_y,
-        geometry.logical_width,
-        geometry.logical_height,
-    );
+    if let Some(geometry) = &geometry {
+        coord_mapper.update_display_bounds(
+            geometry.origin_x,
+            geometry.origin_y,
+            geometry.logical_width,
+            geometry.logical_height,
+        );
+    }
+    // For virtual capture, activation commits real bounds before IronRDP
+    // dispatches any queued input. The idle mapper never selects a display.
     tracing::info!(
         ?backend,
         ?geometry,
+        virtual_display_deferred = geometry.is_none(),
         width,
         height,
-        "Selected remote desktop display"
+        "Prepared remote desktop negotiation"
     );
 
     // GFX state (shared between server thread and metrics task)
@@ -632,25 +648,15 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         };
 
-        let window_session =
-            if args.display_controller.backend() == macrdp_display::DisplayBackend::Virtual {
-                macrdp_windows::WindowSession::new(args.display_controller.clone())
-                    .map_err(|error| {
-                        tracing::warn!(%error, "Automatic window movement is unavailable");
-                    })
-                    .ok()
-            } else {
-                None
-            };
-
-        // Keep one window-session handle outside the RDP server so shutdown can
-        // restore windows on a blocking worker before the server thread exits.
+        // Retain display ownership outside the RDP server so cancellation can
+        // restore the local primary display before the server thread exits.
+        let display_controller = args.display_controller.clone();
         // Create input handler (clone coord_mapper — shared with display for resize sync)
         let input_handler = MacInputHandler::new(
             args.coord_mapper.clone(),
             Arc::clone(&args.input_debug_state),
             Arc::clone(&args.active_connection),
-            window_session.clone(),
+            Some(display_controller.clone()),
         );
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
@@ -707,7 +713,6 @@ fn run_server_thread(args: ServerThreadArgs) {
             shared_audio_tx,
             None, // perf_stats: not exposed via macrdp-core API yet
             args.display_controller,
-            window_session.clone(),
         );
 
         // Build RDP server (this is the !Send type)
@@ -841,17 +846,16 @@ fn run_server_thread(args: ServerThreadArgs) {
         }
 
         // Cancelling server.run() during shutdown skips its connection cleanup.
-        // Shutting down the window session explicitly restores saved frames in
-        // that path too. Its worker retains the virtual display until done.
+        // Restore the physical display layout explicitly in that path too.
+        // Keep the virtual display alive until restoration has completed.
         drop(server);
-        if let Some(windows) = window_session {
-            if let Err(error) = tokio::task::spawn_blocking(move || windows.shutdown())
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || display_controller.end_remote_session())
                 .await
-                .context("Window restoration task failed")
+                .context("Display restoration task failed")
                 .and_then(|result| result)
-            {
-                tracing::warn!(%error, "Window restoration worker failed during shutdown");
-            }
+        {
+            tracing::warn!(%error, "Physical display restoration failed during shutdown");
         }
     });
 }

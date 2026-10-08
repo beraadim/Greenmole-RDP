@@ -27,6 +27,22 @@ fn main() {
     }
     if args
         .first()
+        .is_some_and(|arg| arg == "--macrdp-display-inventory-observer")
+    {
+        assert_eq!(args.len(), 2, "inventory observer requires one request");
+        native::observe_inventory(&args[1]);
+        return;
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--macrdp-display-layout-observer")
+    {
+        assert_eq!(args.len(), 2, "layout observer requires one request");
+        native::observe_layout(&args[1]);
+        return;
+    }
+    if args
+        .first()
         .is_some_and(|arg| arg == "--macrdp-display-removal-observer")
     {
         assert_eq!(args.len(), 2, "removal observer requires one display ID");
@@ -79,6 +95,68 @@ mod native {
             serde_json::from_str(request).expect("invalid native observer request");
         assert!(CGDisplay::active_displays().unwrap().contains(&display_id));
         assert_eq!(native_mode_size(display_id), expected);
+    }
+
+    fn observe_layout_from_fresh_process(primary: u32, expected: DisplayGeometry) {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .arg("--macrdp-display-layout-observer")
+            .arg(serde_json::to_string(&(primary, expected)).unwrap())
+            .output()
+            .expect("could not start read-only layout observer");
+        assert!(
+            result.status.success(),
+            "fresh layout observer failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    pub fn observe_layout(request: &str) {
+        let (primary, expected): (u32, DisplayGeometry) = serde_json::from_str(request).unwrap();
+        assert!(CGDisplay::active_displays()
+            .unwrap()
+            .contains(&expected.display_id));
+        assert_eq!(CGDisplay::main().id, primary);
+        let bounds = CGDisplay::new(expected.display_id).bounds();
+        assert_eq!(
+            (bounds.origin.x, bounds.origin.y),
+            (expected.origin_x, expected.origin_y)
+        );
+        assert_eq!(
+            (bounds.size.width, bounds.size.height),
+            (expected.logical_width, expected.logical_height)
+        );
+        let mode = CGDisplay::new(expected.display_id).display_mode().unwrap();
+        assert_eq!(
+            (mode.pixel_width(), mode.pixel_height()),
+            (
+                u64::from(expected.pixel_width),
+                u64::from(expected.pixel_height)
+            )
+        );
+    }
+
+    fn observe_inventory_from_fresh_process(expected: &[u32]) {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .arg("--macrdp-display-inventory-observer")
+            .arg(serde_json::to_string(expected).unwrap())
+            .output()
+            .expect("could not start read-only inventory observer");
+        assert!(
+            result.status.success(),
+            "fresh inventory observer failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    pub fn observe_inventory(request: &str) {
+        let mut expected: Vec<u32> = serde_json::from_str(request).unwrap();
+        let mut active = CGDisplay::active_displays().unwrap();
+        active.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            active, expected,
+            "an idle controller added an active display"
+        );
     }
 
     pub fn observe_removal(display_id: u32) {
@@ -184,6 +262,7 @@ mod native {
             "a logged-in session with a main display is required"
         );
         let main_mode = native_mode_size(main_id);
+        let original_ids = CGDisplay::active_displays().unwrap();
         let main = DisplayController::new(DisplayBackend::default(), 641, 481).unwrap();
         assert_eq!(main.backend(), DisplayBackend::Main);
         let original_main = main.geometry().unwrap();
@@ -195,7 +274,17 @@ mod native {
 
         {
             let controller = DisplayController::new(DisplayBackend::Virtual, 1920, 1080).unwrap();
-            let geometry = controller.geometry().unwrap();
+            assert!(
+                controller.geometry().is_err(),
+                "idle virtual controller exposed capture geometry"
+            );
+            observe_inventory_from_fresh_process(&original_ids);
+            assert_eq!(CGDisplay::main().id, main_id);
+            let geometry = controller
+                .queue_remote_capture(1920, 1080)
+                .unwrap()
+                .wait()
+                .unwrap();
             let display_id = geometry.display_id;
             assert_ne!(display_id, main_id);
             assert_virtual_mode(&controller, geometry, display_id, (1920, 1080));
@@ -221,22 +310,68 @@ mod native {
                 ((320, 200), (320, 200)),
                 ((1280, 720), (1280, 720)),
             ];
+            let remote_geometry = remaining.begin_remote_session().unwrap();
+            assert_eq!(CGDisplay::main().id, display_id);
+            assert_eq!(
+                (remote_geometry.origin_x, remote_geometry.origin_y),
+                (0.0, 0.0)
+            );
+            assert_eq!(remaining.begin_remote_session().unwrap(), remote_geometry);
+            observe_layout_from_fresh_process(display_id, remote_geometry);
             for (requested, expected) in sizes {
-                let geometry = remaining.prepare_capture(requested.0, requested.1).unwrap();
+                let geometry = remaining
+                    .queue_remote_capture(requested.0, requested.1)
+                    .unwrap()
+                    .wait()
+                    .unwrap();
                 assert_virtual_mode(&remaining, geometry, display_id, expected);
-                assert_eq!(CGDisplay::main().id, main_id, "main display changed");
+                assert_eq!(
+                    CGDisplay::main().id,
+                    display_id,
+                    "remote primary display changed"
+                );
+                assert_eq!((geometry.origin_x, geometry.origin_y), (0.0, 0.0));
                 assert_eq!(
                     native_mode_size(main_id),
                     main_mode,
                     "physical mode changed"
                 );
                 assert_eq!(main.geometry().unwrap().display_id, main_id);
+                observe_layout_from_fresh_process(display_id, geometry);
+                observe_from_fresh_process(main_id, main_mode);
             }
 
-            drop(remaining);
+            remaining.end_remote_session().unwrap();
             assert_display_removed(display_id);
+            assert!(remaining.geometry().is_err());
+            observe_inventory_from_fresh_process(&original_ids);
+            remaining.end_remote_session().unwrap();
+            assert_eq!(CGDisplay::main().id, main_id);
+            assert_eq!(
+                main.geometry().unwrap(),
+                original_main,
+                "physical geometry was not restored"
+            );
+            assert_eq!(native_mode_size(main_id), main_mode);
+            observe_layout_from_fresh_process(main_id, original_main);
+
+            // Owner EOF/drop must restore the primary even if graceful session
+            // cleanup was skipped. No physical display mode may be changed.
+            let reconnect = remaining
+                .queue_remote_capture(1280, 720)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(CGDisplay::main().id, reconnect.display_id);
+            assert_virtual_mode(&remaining, reconnect, reconnect.display_id, (1280, 720));
+
+            drop(remaining);
+            assert_display_removed(reconnect.display_id);
+            observe_inventory_from_fresh_process(&original_ids);
             assert_eq!(CGDisplay::main().id, main_id);
             assert_eq!(native_mode_size(main_id), main_mode);
+            assert_eq!(main.geometry().unwrap(), original_main);
+            observe_layout_from_fresh_process(main_id, original_main);
             eprintln!("Virtual display {display_id} released cleanly");
         }
 

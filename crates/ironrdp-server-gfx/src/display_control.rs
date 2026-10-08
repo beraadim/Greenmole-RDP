@@ -2,10 +2,62 @@ use std::sync::Arc;
 
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_displaycontrol::server::DisplayControlHandler;
+use ironrdp_displaycontrol::server::DisplayControlServer;
+use ironrdp_dvc::{DvcMessage, DvcProcessor, DvcServerProcessor};
+use ironrdp_pdu::PduResult;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::display::RdpServerDisplay;
+
+/// Keep channel negotiation visible at normal log levels: the server cannot
+/// resize to a browser viewport until the client enables Display Control.
+pub(crate) struct DisplayControlChannel {
+    inner: DisplayControlServer,
+    opened: bool,
+}
+
+impl DisplayControlChannel {
+    pub(crate) fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>) -> Self {
+        Self {
+            inner: DisplayControlServer::new(Box::new(DisplayControlBackend::new(display))),
+            opened: false,
+        }
+    }
+}
+
+ironrdp_core::impl_as_any!(DisplayControlChannel);
+
+impl DvcProcessor for DisplayControlChannel {
+    fn channel_name(&self) -> &str {
+        self.inner.channel_name()
+    }
+
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        let response = self.inner.start(channel_id)?;
+        self.opened = true;
+        tracing::info!(
+            channel_id,
+            "Display Control channel opened; client viewport updates are available"
+        );
+        Ok(response)
+    }
+
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        self.inner.process(channel_id, payload).map_err(|error| {
+            tracing::warn!(channel_id, %error, "Invalid Display Control message");
+            error
+        })
+    }
+}
+
+impl DvcServerProcessor for DisplayControlChannel {}
+
+impl Drop for DisplayControlChannel {
+    fn drop(&mut self) {
+        tracing::info!(opened = self.opened, "Display Control channel session ended");
+    }
+}
 
 /// One consumer preserves layout order and coalesces requests while activation
 /// holds the display lock. Its lifetime follows the Display Control channel.
@@ -34,6 +86,16 @@ impl DisplayControlBackend {
 
 impl DisplayControlHandler for DisplayControlBackend {
     fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
+        let primary_size = layout
+            .monitors()
+            .iter()
+            .find(|monitor| monitor.is_primary())
+            .map(|monitor| monitor.dimensions());
+        tracing::info!(
+            monitor_count = layout.monitors().len(),
+            ?primary_size,
+            "Received client Display Control layout"
+        );
         self.layouts.send_replace(Some(layout));
     }
 }
@@ -49,7 +111,6 @@ impl Drop for DisplayControlBackend {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use ironrdp_displaycontrol::server::DisplayControlServer;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 

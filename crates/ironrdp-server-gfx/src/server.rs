@@ -9,7 +9,6 @@ use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsRequest, OwnedFileContentsResponse};
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_core::{decode, encode_vec, impl_as_any};
-use ironrdp_displaycontrol::server::DisplayControlServer;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
@@ -18,7 +17,9 @@ pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
-use ironrdp_svc::{server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage, SvcProcessor};
+use ironrdp_svc::{
+    server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage, SvcProcessor,
+};
 use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
@@ -31,7 +32,8 @@ use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
-use crate::display_control::DisplayControlBackend;
+use crate::display_control::DisplayControlChannel;
+use crate::dynamic_channels::DynamicChannels;
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::gfx::{GfxHandler, GfxState};
 use crate::handler::{ClientInputContext, RdpServerInputHandler};
@@ -326,21 +328,27 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpsndServer::new(backend));
         }
 
-        // Keep non-GFX sessions on the plain RDP path. Guacamole in particular
-        // is more reliable here if we avoid advertising unrelated DVC features.
-        if self.gfx_enabled {
-            let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-            let mut dvc = dvc::DrdynvcServer::new()
-                .with_dynamic_channel(AInputHandler {
-                    handler: Arc::clone(&self.handler),
-                })
-                .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+        acceptor.attach_static_channel(self.dynamic_channels());
+    }
 
+    fn dynamic_channels(&self) -> DynamicChannels {
+        // Display Control is independent of the graphics codec. Bitmap-only
+        // Guacamole sessions still need this channel for browser resizing.
+        let mut dvc =
+            dvc::DrdynvcServer::new().with_dynamic_channel(DisplayControlChannel::new(Arc::clone(&self.display)));
+        if self.gfx_enabled {
+            dvc = dvc.with_dynamic_channel(AInputHandler {
+                handler: Arc::clone(&self.handler),
+            });
             let gfx_handler = GfxHandler::new(Arc::clone(&self.gfx_state));
             dvc = dvc.with_dynamic_channel(gfx_handler);
             debug!("GFX channel registered");
-            acceptor.attach_static_channel(dvc);
         }
+        info!(
+            gfx_enabled = self.gfx_enabled,
+            "Registered Display Control channel for client viewport updates"
+        );
+        DynamicChannels(dvc)
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
@@ -362,9 +370,10 @@ impl RdpServer {
 
         // Apply hot-updated resolution for this new connection
         if let Some(ref res) = pending_resolution {
-            if let Some((w, h)) = res.split_once('x').and_then(|(w, h)| {
-                Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
-            }) {
+            if let Some((w, h)) = res
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
+            {
                 info!(w, h, "Applying hot-updated resolution for new connection");
                 // Use set_size (bypasses fixed_resolution check, since this is server-initiated)
                 self.display.lock().await.set_size(w, h);
@@ -553,19 +562,11 @@ impl RdpServer {
 
                     // Send as a single DVC message (auto-fragmented by encode_dvc_messages)
                     let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
-                    let svc_messages = dvc::encode_dvc_messages(
-                        channel_id,
-                        dvc_messages,
-                        ChannelFlags::SHOW_PROTOCOL,
-                    ).context("Failed to encode DVC messages")?;
+                    let svc_messages = dvc::encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                        .context("Failed to encode DVC messages")?;
 
-                    let data = server_encode_svc_messages(
-                        svc_messages.into(),
-                        drdynvc_id,
-                        user_channel_id,
-                    )?;
-                    writer.write_all(&data).await
-                        .context("failed to write GFX frame")?;
+                    let data = server_encode_svc_messages(svc_messages.into(), drdynvc_id, user_channel_id)?;
+                    writer.write_all(&data).await.context("failed to write GFX frame")?;
 
                     return Ok((RunState::Continue, encoder));
                 }
@@ -586,18 +587,13 @@ impl RdpServer {
                     drop(state);
 
                     let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
-                    let svc_messages = dvc::encode_dvc_messages(
-                        channel_id,
-                        dvc_messages,
-                        ChannelFlags::SHOW_PROTOCOL,
-                    ).context("Failed to encode DVC messages")?;
+                    let svc_messages = dvc::encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                        .context("Failed to encode DVC messages")?;
 
-                    let data = server_encode_svc_messages(
-                        svc_messages.into(),
-                        drdynvc_id,
-                        user_channel_id,
-                    )?;
-                    writer.write_all(&data).await
+                    let data = server_encode_svc_messages(svc_messages.into(), drdynvc_id, user_channel_id)?;
+                    writer
+                        .write_all(&data)
+                        .await
                         .context("failed to write GFX uncompressed frame")?;
 
                     return Ok((RunState::Continue, encoder));
@@ -686,9 +682,7 @@ impl RdpServer {
                         RdpsndServerMessage::SetVolume { left, right } => {
                             rdpsnd.set_volume(left, right).context("failed to send rdpsnd event")?
                         }
-                        RdpsndServerMessage::Close => {
-                            rdpsnd.close().context("failed to send rdpsnd event")?
-                        }
+                        RdpsndServerMessage::Close => rdpsnd.close().context("failed to send rdpsnd event")?,
                         RdpsndServerMessage::Error(error) => {
                             error!(?error, "Handling rdpsnd event");
                             continue;
@@ -741,11 +735,7 @@ impl RdpServer {
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
                     let pdu = ClipboardPdu::FileContentsRequest(request);
                     let svc_msg = encode_cliprdr_pdu(pdu);
-                    let data = server_encode_svc_messages(
-                        vec![svc_msg].into(),
-                        channel_id,
-                        user_channel_id,
-                    )?;
+                    let data = server_encode_svc_messages(vec![svc_msg].into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
             }
@@ -795,7 +785,7 @@ impl RdpServer {
         }
 
         // Get DRDYNVC channel ID for sending GFX frames
-        let drdynvc_channel_id = self.get_channel_id_by_type::<dvc::DrdynvcServer>();
+        let drdynvc_channel_id = self.get_channel_id_by_type::<DynamicChannels>();
 
         let s = Rc::new(Mutex::new(self));
 
@@ -935,7 +925,7 @@ impl RdpServer {
         self.static_channels = result.static_channels;
         {
             let mut gfx_state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = self.get_channel_id_by_type::<dvc::DrdynvcServer>().is_some();
+            let session_uses_gfx = self.gfx_enabled && self.get_channel_id_by_type::<DynamicChannels>().is_some();
             if !result.reactivation {
                 gfx_state.reset_connection_state(session_uses_gfx);
             } else {
@@ -963,6 +953,35 @@ impl RdpServer {
             }
         }
 
+        if !result.reactivation {
+            let confirmed_size = result.capabilities.iter().find_map(|capability| match capability {
+                CapabilitySet::Bitmap(bitmap) => Some(DesktopSize {
+                    width: bitmap.desktop_width,
+                    height: bitmap.desktop_height,
+                }),
+                _ => None,
+            });
+            // FreeRDP applies Demand Active before sending Confirm Active, so
+            // its bitmap capability often echoes our old size. Preserve the
+            // actual browser/client request from the initial GCC exchange.
+            let requested_size = result.client_desktop_size.or(confirmed_size);
+            info!(
+                ?requested_size,
+                ?confirmed_size,
+                ?activation_size,
+                "Initial client desktop dimensions"
+            );
+            if let Some(requested_size) = requested_size {
+                // The display owns fixed-resolution policy and normalization;
+                // its resize watch negotiates the resulting size before the
+                // next capture or pointer transform adopts it.
+                self.display
+                    .lock()
+                    .await
+                    .request_resize(requested_size.width, requested_size.height);
+            }
+        }
+
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
         for c in result.capabilities {
@@ -971,25 +990,6 @@ impl RdpServer {
                     let fastpath = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
                     if !fastpath {
                         bail!("Fastpath output not supported!");
-                    }
-                }
-                CapabilitySet::Bitmap(b) if !result.reactivation => {
-                    let client_size = DesktopSize {
-                        width: b.desktop_width,
-                        height: b.desktop_height,
-                    };
-                    let display_size = self.display.lock().await.size().await;
-
-                    if client_size.width != display_size.width || client_size.height != display_size.height {
-                        info!(
-                            client_w = client_size.width, client_h = client_size.height,
-                            server_w = display_size.width, server_h = display_size.height,
-                            "Client requested different resolution"
-                        );
-                        // Adopt client resolution via request_resize
-                        self.display.lock().await.request_resize(
-                            client_size.width, client_size.height,
-                        );
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {

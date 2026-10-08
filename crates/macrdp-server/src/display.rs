@@ -164,7 +164,6 @@ pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<Bit
 /// Display adapter that bridges ScreenCapturer to ironrdp-server
 pub struct MacDisplay {
     display_controller: macrdp_display::DisplayController,
-    window_session: Option<macrdp_windows::WindowSession>,
     width: u16,
     height: u16,
     /// Latest requested size, including requests received while reactivating.
@@ -265,7 +264,6 @@ impl MacDisplay {
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
         display_controller: macrdp_display::DisplayController,
-        window_session: Option<macrdp_windows::WindowSession>,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -292,7 +290,6 @@ impl MacDisplay {
         let (resize_tx, _) = tokio::sync::watch::channel(DesktopSize { width, height });
         Self {
             display_controller,
-            window_session,
             width,
             height,
             resize_tx,
@@ -350,13 +347,15 @@ impl RdpServerDisplay for MacDisplay {
         });
         let width = size.width;
         let height = size.height;
-        // Mode changes happen only after negotiation and after the previous
-        // capture has stopped. Keep the owner alive across connections/resizes.
-        let controller = self.display_controller.clone();
-        let geometry =
-            tokio::task::spawn_blocking(move || controller.prepare_capture(width, height))
-                .await
-                .context("Display mode worker failed")??;
+        // Make the virtual display primary before capturing its desktop
+        // controls. This runs after any previous connection's queued restore;
+        // repeated activation preserves the original local display snapshot.
+        // Enqueue before yielding; cancellation must not let a late activation
+        // run after the server's shutdown restoration barrier.
+        let preparation = self.display_controller.queue_remote_capture(width, height)?;
+        let geometry = tokio::task::spawn_blocking(move || preparation.wait())
+            .await
+            .context("Display mode worker failed")??;
         let capture_config = CaptureConfig {
             display_id: geometry.display_id,
             width: width as u32,
@@ -407,14 +406,6 @@ impl RdpServerDisplay for MacDisplay {
             ?geometry,
             "Activated capture and pointer desktop size"
         );
-        // Window movement begins only after capture is ready; later activations
-        // update the destination without replacing saved local window positions.
-        // Accessibility calls run on the window worker outside the RDP mutex.
-        if let Some(windows) = &self.window_session {
-            if let Err(error) = windows.update_target(geometry) {
-                tracing::warn!(%error, "Failed to schedule windows for the virtual display");
-            }
-        }
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,

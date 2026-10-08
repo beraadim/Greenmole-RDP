@@ -10,13 +10,13 @@ pub struct MacInputHandler {
     last_mouse_x: f64,
     last_mouse_y: f64,
     coord_mapper: MouseCoordMapper,
-    window_session: Option<macrdp_windows::WindowSession>,
+    display_controller: Option<macrdp_display::DisplayController>,
 }
 
 impl MacInputHandler {
     pub fn new(
         coord_mapper: MouseCoordMapper,
-        window_session: Option<macrdp_windows::WindowSession>,
+        display_controller: Option<macrdp_display::DisplayController>,
     ) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
@@ -40,7 +40,7 @@ impl MacInputHandler {
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
             coord_mapper,
-            window_session,
+            display_controller,
         }
     }
 }
@@ -55,9 +55,10 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
-        if let Some(windows) = &self.window_session {
-            if let Err(error) = windows.disconnect() {
-                tracing::warn!(%error, "Failed to schedule local window restoration");
+        if let Some(display) = &self.display_controller {
+            // This is queued before any following connection's activation.
+            if let Err(error) = display.end_remote_session_async() {
+                tracing::warn!(%error, "Failed to schedule physical display restoration");
             }
         }
         if let Some(wake) = &mut self.wake {

@@ -1,9 +1,13 @@
 # macrdp-display
 
 Owns the display selected for a macRDP server. `Main` pins the display ID that
-was primary at startup and only reads its geometry. `Virtual` owns one extended
-display in the existing macOS login session and changes that display's mode as
-the RDP viewport changes. It never configures mirroring or a primary display.
+was primary at startup and only reads its geometry. `Virtual` creates one extended
+display in the existing macOS login session when a connection activates and
+changes that display's mode as the RDP viewport changes. It becomes the primary
+display, giving the remote desktop the menu bar and primary desktop behavior.
+Disconnect restores the physical primary and saved display origins, then removes
+the virtual screen. No virtual display or helper exists while disconnected. Physical
+display modes and persistent display preferences are never changed.
 
 The virtual framebuffer uses one pixel per logical point and is limited to
 320×200 through 3840×2160 pixels. Each requested dimension rounds down to a
@@ -25,12 +29,22 @@ macOS's stale mode cache. When explicit mode selection is needed, a fresh
 short-lived selector reads the current mode list and selects the exact mode.
 Its transaction uses login-session scope so the mode survives selector exit;
 it does not write permanent display preferences.
-It verifies the owner's display ID, vendor, product and serial, and refuses main,
-built-in or mirrored displays. The persistent owner services reconfiguration
+It verifies the owner's display ID, vendor, product and serial, and refuses
+unowned, built-in or mirrored displays. The owned virtual display can be primary
+while its mode changes. The persistent owner services reconfiguration
 events while the selector runs. Actual mode pixels and global bounds return over
 bounded JSON pipes; the selector has its own native-call deadline.
-Reconnects and resolution changes reuse this process and display. Main-display
+Resolution changes reuse the connection's process and display; reconnects create
+a new owner after the previous one has been removed and reaped. Main-display
 queries use the existing worker and never change a physical mode.
+
+Primary layout changes use another fresh selector and the same bounded native
+transaction mechanism. The owner retains one snapshot per connection, including
+the original primary, and restores it on explicit disconnect, shutdown or EOF.
+If a physical display disappears, another remaining physical display becomes
+primary; Quartz may adjust origins to resolve gaps or overlap. `queue_remote_capture`
+orders activation and capture preparation before a following disconnect even
+when the async capture task is cancelled before its blocking waiter starts.
 
 Cloned controllers carry only channels and values across threads. Dropping the
 last controller requests helper shutdown, waits briefly for process exit, then
@@ -62,7 +76,9 @@ require testing on the supported macOS versions.
 
 An ignored native smoke test creates a temporary extended screen in the current
 logged-in macOS session. It checks dimension alignment, minimum and maximum
-sizes, persistent display IDs, and removal after the last controller is dropped.
+sizes, stable display IDs within a connection, primary-display activation through
+resizes, exact physical geometry restoration, absence while idle, removal on
+disconnect, recreation on reconnect, and final-controller-drop cleanup.
 One test keeps mode changes serial, and fresh read-only observer subprocesses
 verify actual native pixel modes independently of the creator's display-mode
 cache. It also checks that the default main-display

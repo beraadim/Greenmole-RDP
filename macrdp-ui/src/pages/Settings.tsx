@@ -280,10 +280,10 @@ function Settings() {
 
             {config.display_backend === "virtual" && (
               <p className="py-2 text-xs text-text-muted">
-                Moves supported app windows onto the remote display when you connect
-                and restores them when you disconnect. Requires Accessibility access.
-                macrdp control windows, full-screen windows, and windows that cannot
-                be moved stay in place.
+                Creates a main Mac display when you connect, bringing the Dock
+                and menu bar to the remote desktop. Removes it and restores the
+                previous display arrangement when you disconnect. macOS manages
+                window placement; existing windows may stay on another screen.
               </p>
             )}
 

@@ -28,9 +28,7 @@ const USER_CHANNEL_ID: u16 = 1002;
 /// Keep domain handling unchanged: clients may qualify a local account with
 /// different computer/domain names. An empty password is never a bypass.
 fn non_hybrid_credentials_match(configured: Option<&Credentials>, supplied: &Credentials) -> bool {
-    configured.is_some_and(|expected| {
-        expected.username == supplied.username && expected.password == supplied.password
-    })
+    configured.is_some_and(|expected| expected.username == supplied.username && expected.password == supplied.password)
 }
 
 pub struct Acceptor {
@@ -46,6 +44,8 @@ pub struct Acceptor {
     reactivation: bool,
     client_name: String,
     keyboard_layout: u32,
+    client_desktop_size: Option<DesktopSize>,
+    deferred_channel_pdus: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -58,6 +58,9 @@ pub struct AcceptorResult {
     pub reactivation: bool,
     pub client_name: String,
     pub keyboard_layout: u32,
+    /// Original size from Client Core Data. Confirm Active may already echo
+    /// the server's Demand Active size, especially with FreeRDP clients.
+    pub client_desktop_size: Option<DesktopSize>,
 }
 
 impl Acceptor {
@@ -80,6 +83,8 @@ impl Acceptor {
             reactivation: false,
             client_name: String::new(),
             keyboard_layout: 0,
+            client_desktop_size: None,
+            deferred_channel_pdus: Vec::new(),
         }
     }
 
@@ -123,6 +128,8 @@ impl Acceptor {
             reactivation: true,
             client_name: consumed.client_name,
             keyboard_layout: consumed.keyboard_layout,
+            client_desktop_size: consumed.client_desktop_size,
+            deferred_channel_pdus: Vec::new(),
         })
     }
 
@@ -172,12 +179,17 @@ impl Acceptor {
             } => Some(AcceptorResult {
                 static_channels: mem::take(&mut self.static_channels),
                 capabilities: client_capabilities,
-                input_events,
+                input_events: {
+                    let mut deferred = mem::take(&mut self.deferred_channel_pdus);
+                    deferred.extend(input_events);
+                    deferred
+                },
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 reactivation: self.reactivation,
                 client_name: self.client_name.clone(),
                 keyboard_layout: self.keyboard_layout,
+                client_desktop_size: self.client_desktop_size,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -409,6 +421,10 @@ impl Sequence for Acceptor {
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 self.client_name = gcc_blocks.core.client_name.clone();
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
+                self.client_desktop_size = Some(DesktopSize {
+                    width: gcc_blocks.core.desktop_width,
+                    height: gcc_blocks.core.desktop_height,
+                });
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
 
                 let joined: Vec<_> = gcc_blocks
@@ -562,10 +578,7 @@ impl Sequence for Acceptor {
                     // attempt unless it actually matches the configured account;
                     // prompting behavior must never bypass authentication.
                     if !non_hybrid_credentials_match(self.creds.as_ref(), &creds) {
-                        warn!(
-                            ?protocol,
-                            "Credential mismatch; rejecting connection"
-                        );
+                        warn!(?protocol, "Credential mismatch; rejecting connection");
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
                             ProtocolIndependentCode::ServerDeniedConnection,
                         ));
@@ -655,8 +668,10 @@ impl Sequence for Acceptor {
                         monitors: vec![gcc::Monitor {
                             left: 0,
                             top: 0,
-                            right: i32::from(self.desktop_size.width),
-                            bottom: i32::from(self.desktop_size.height),
+                            // TS_MONITOR_DEF uses inclusive lower-right
+                            // coordinates, unlike framebuffer dimensions.
+                            right: i32::from(self.desktop_size.width) - 1,
+                            bottom: i32::from(self.desktop_size.height) - 1,
                             flags: gcc::MonitorFlags::PRIMARY,
                         }],
                     });
@@ -692,6 +707,16 @@ impl Sequence for Acceptor {
                 };
                 match message {
                     mcs::McsMessage::SendDataRequest(data) => {
+                        if data.channel_id != self.io_channel_id {
+                            // DVC responses and browser resize requests can
+                            // arrive while Demand Active is in flight. Keep
+                            // them for the existing channel processors after
+                            // activation rather than interpreting them as a
+                            // Confirm Active PDU and dropping them.
+                            super::finalization::defer_input_pdu(&mut self.deferred_channel_pdus, input)?;
+                            self.state = prev_state;
+                            return Ok(Written::Nothing);
+                        }
                         let capabilities_confirm = decode::<rdp::headers::ShareControlHeader>(data.user_data.as_ref())
                             .map_err(ConnectorError::decode);
                         let capabilities_confirm = match capabilities_confirm {
@@ -795,7 +820,148 @@ fn create_gcc_blocks(
 
 #[cfg(test)]
 mod tests {
-    use super::{non_hybrid_credentials_match, Credentials};
+    use super::*;
+
+    #[test]
+    fn dynamic_channel_response_is_replayed_after_confirm_active() {
+        let mut acceptor = Acceptor::new(
+            SecurityProtocol::SSL,
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            Vec::new(),
+            None,
+        );
+        acceptor.reactivation = true;
+        acceptor.state = AcceptorState::CapabilitiesWaitConfirm { channels: Vec::new() };
+        // SVC header plus a DRDYNVC capability response, received while the
+        // server is waiting for the resize's Confirm Active message.
+        let packet = ironrdp_core::encode_vec(&X224(mcs::SendDataRequest {
+            initiator_id: USER_CHANNEL_ID,
+            channel_id: IO_CHANNEL_ID + 1,
+            user_data: vec![4, 0, 0, 0, 3, 0, 0, 0, 0x50, 0, 1, 0].into(),
+        }))
+        .unwrap();
+        assert_eq!(acceptor.step(&packet, &mut WriteBuf::new()).unwrap(), Written::Nothing);
+        assert!(matches!(acceptor.state, AcceptorState::CapabilitiesWaitConfirm { .. }));
+        acceptor.state = AcceptorState::Accepted {
+            channels: Vec::new(),
+            client_capabilities: Vec::new(),
+            input_events: vec![vec![0x04, 0x02]],
+        };
+        let result = acceptor.get_result().unwrap();
+        assert_eq!(result.input_events, [packet, vec![0x04, 0x02]]);
+    }
+
+    #[test]
+    fn initial_gcc_desktop_size_survives_acceptance_and_reactivation() {
+        // This is the requested browser size, before FreeRDP overwrites its
+        // Confirm Active dimensions with the server's Demand Active size.
+        let requested = DesktopSize {
+            width: 1537,
+            height: 865,
+        };
+        let mut acceptor = Acceptor::new(
+            SecurityProtocol::SSL,
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            Vec::new(),
+            None,
+        );
+        acceptor.state = AcceptorState::BasicSettingsWaitInitial {
+            requested_protocol: SecurityProtocol::SSL,
+            protocol: SecurityProtocol::SSL,
+        };
+        let initial = mcs::ConnectInitial::with_gcc_blocks(gcc::ClientGccBlocks {
+            core: gcc::ClientCoreData {
+                version: gcc::RdpVersion::V5_PLUS,
+                desktop_width: requested.width,
+                desktop_height: requested.height,
+                color_depth: gcc::ColorDepth::Bpp8,
+                sec_access_sequence: gcc::SecureAccessSequence::Del,
+                keyboard_layout: 0x0409,
+                client_build: 1,
+                client_name: "viewport-test".into(),
+                keyboard_type: gcc::KeyboardType::IbmEnhanced,
+                keyboard_subtype: 0,
+                keyboard_functional_keys_count: 12,
+                ime_file_name: String::new(),
+                optional_data: gcc::ClientCoreOptionalData::default(),
+            },
+            security: gcc::ClientSecurityData {
+                encryption_methods: gcc::EncryptionMethod::empty(),
+                ext_encryption_methods: 0,
+            },
+            network: None,
+            cluster: None,
+            monitor: None,
+            message_channel: None,
+            multi_transport_channel: None,
+            monitor_extended: None,
+        })
+        .unwrap();
+        let mut packet = WriteBuf::new();
+        encode_x224_packet(&initial, &mut packet).unwrap();
+        acceptor.step(packet.filled(), &mut WriteBuf::new()).unwrap();
+        acceptor.saved_for_reactivation = AcceptorState::CapabilitiesSendServer {
+            early_capability: None,
+            channels: Vec::new(),
+        };
+        acceptor.state = AcceptorState::Accepted {
+            channels: Vec::new(),
+            client_capabilities: Vec::new(),
+            input_events: Vec::new(),
+        };
+        let result = acceptor.get_result().unwrap();
+        assert_eq!(result.client_desktop_size, Some(requested));
+        let reactivated = Acceptor::new_deactivation_reactivation(
+            acceptor,
+            result.static_channels,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+        )
+        .unwrap();
+        assert_eq!(reactivated.client_desktop_size, Some(requested));
+        assert!(reactivated.reactivation);
+    }
+
+    #[test]
+    fn advertised_monitor_layout_matches_framebuffer_dimensions() {
+        for size in [
+            DesktopSize {
+                width: 1536,
+                height: 864,
+            },
+            DesktopSize {
+                width: 3840,
+                height: 2160,
+            },
+        ] {
+            let mut acceptor = Acceptor::new(SecurityProtocol::SSL, size, Vec::new(), None);
+            acceptor.state = AcceptorState::MonitorLayoutSend { channels: Vec::new() };
+            let mut packet = WriteBuf::new();
+            acceptor.step(&[], &mut packet).unwrap();
+            let X224(mcs::McsMessage::SendDataIndication(data)) = decode(packet.filled()).unwrap() else {
+                panic!("expected monitor layout indication")
+            };
+            let header: rdp::headers::ShareControlHeader = decode(&data.user_data).unwrap();
+            let ShareControlPdu::Data(data) = header.share_control_pdu else {
+                panic!("expected share data")
+            };
+            let rdp::headers::ShareDataPdu::MonitorLayout(layout) = data.share_data_pdu else {
+                panic!("expected monitor layout")
+            };
+            assert_eq!(layout.monitors.len(), 1);
+            let monitor = &layout.monitors[0];
+            assert_eq!(monitor.right - monitor.left + 1, i32::from(size.width));
+            assert_eq!(monitor.bottom - monitor.top + 1, i32::from(size.height));
+        }
+    }
 
     fn credentials(username: &str, password: &str, domain: Option<&str>) -> Credentials {
         Credentials {

@@ -6,6 +6,59 @@ use tracing::debug;
 
 use crate::util::{self, wrap_share_data};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_channel_messages_do_not_advance_finalization() {
+        let packet = ironrdp_core::encode_vec(&X224(ironrdp_pdu::mcs::SendDataRequest {
+            initiator_id: 1002,
+            channel_id: 1004,
+            user_data: vec![4, 0, 0, 0, 3, 0, 0, 0, 0x50, 0, 1, 0].into(),
+        }))
+        .unwrap();
+        for state in [
+            FinalizationState::WaitSynchronize,
+            FinalizationState::WaitControlCooperate,
+            FinalizationState::WaitRequestControl,
+            FinalizationState::WaitFontList,
+        ] {
+            let expected_state = state.name();
+            let mut sequence = FinalizationSequence::new(1002, 1003);
+            sequence.state = state;
+            assert_eq!(sequence.step(&packet, &mut WriteBuf::new()).unwrap(), Written::Nothing);
+            assert_eq!(sequence.state().name(), expected_state);
+            assert_eq!(sequence.into_input_events(), [packet.clone()]);
+        }
+    }
+
+    #[test]
+    fn activation_backlog_is_bounded_by_both_count_and_bytes() {
+        let mut backlog = Vec::new();
+        for _ in 0..256 {
+            defer_input_pdu(&mut backlog, &[1]).unwrap();
+        }
+        assert!(defer_input_pdu(&mut backlog, &[1]).is_err());
+        let mut backlog = Vec::new();
+        defer_input_pdu(&mut backlog, &vec![0; 1024 * 1024]).unwrap();
+        assert!(defer_input_pdu(&mut backlog, &[1]).is_err());
+    }
+}
+
+/// Bound activation backlog so an uncooperative authenticated client cannot
+/// grow memory indefinitely while delaying the expected handshake messages.
+pub(crate) fn defer_input_pdu(backlog: &mut Vec<Vec<u8>>, input: &[u8]) -> ConnectorResult<()> {
+    const MAX_PDUS: usize = 256;
+    const MAX_BYTES: usize = 1024 * 1024;
+    if backlog.len() >= MAX_PDUS || backlog.iter().map(Vec::len).sum::<usize>().saturating_add(input.len()) > MAX_BYTES
+    {
+        return Err(ConnectorError::general("activation input backlog exceeded"));
+    }
+    backlog.push(input.to_vec());
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct FinalizationSequence {
     state: FinalizationState,
@@ -79,6 +132,16 @@ impl Sequence for FinalizationSequence {
     }
 
     fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+        if !input.is_empty() {
+            if let Ok(X224(ironrdp_pdu::mcs::McsMessage::SendDataRequest(data))) = ironrdp_core::decode(input) {
+                if data.channel_id != self.io_channel_id {
+                    // Dynamic channels survive reactivation. Their messages
+                    // must not consume a Synchronize/Control/FontList step.
+                    defer_input_pdu(&mut self.input_events, input)?;
+                    return Ok(Written::Nothing);
+                }
+            }
+        }
         let (written, next_state) = match core::mem::take(&mut self.state) {
             FinalizationState::WaitSynchronize => {
                 let synchronize = decode_share_control(input);
@@ -112,7 +175,7 @@ impl Sequence for FinalizationSequence {
                 }
 
                 Err(()) => {
-                    self.input_events.push(input.to_vec());
+                    defer_input_pdu(&mut self.input_events, input)?;
 
                     (Written::Nothing, FinalizationState::WaitFontList)
                 }

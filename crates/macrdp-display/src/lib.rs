@@ -1,8 +1,9 @@
 //! Selected-display ownership and geometry for remote desktop capture.
 //!
 //! Virtual displays are extended displays in the existing macOS login session.
-//! A controller owns its display for the server lifetime; reconnecting or
-//! resizing changes its mode without removing it or rearranging other displays.
+//! A controller creates its virtual display when a remote connection activates,
+//! makes it primary, and restores the previous layout before removing it on
+//! disconnect. Resizing reuses the active connection's display.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 mod helper;
+#[cfg(any(target_os = "macos", test))]
+mod layout;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "macos", test))]
@@ -21,7 +24,7 @@ mod resolution;
 mod selector;
 #[cfg(target_os = "macos")]
 mod virtual_display;
-pub use resolution::resolve_desktop_size;
+pub use resolution::{resolve_desktop_size, resolve_virtual_desktop_size};
 const HELPER_ARGUMENT: &str = "--macrdp-display-helper";
 
 /// Main preserves the physical desktop; Virtual owns a separate extended screen.
@@ -75,7 +78,7 @@ const MAX_VIRTUAL_WIDTH: u16 = 3840;
 const MAX_VIRTUAL_HEIGHT: u16 = 2160;
 // Includes the native mode-settle budget, plus time for one queued operation.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn normalize_size(backend: DisplayBackend, width: u16, height: u16) -> (u16, u16) {
     if backend == DisplayBackend::Main {
@@ -93,6 +96,13 @@ fn normalize_size(backend: DisplayBackend, width: u16, height: u16) -> (u16, u16
 enum Command {
     Shutdown,
     Geometry(mpsc::Sender<Result<DisplayGeometry>>),
+    BeginRemoteSession(mpsc::Sender<Result<DisplayGeometry>>),
+    EndRemoteSession(mpsc::Sender<Result<()>>),
+    PrepareRemoteCapture {
+        width: u16,
+        height: u16,
+        reply: mpsc::Sender<Result<DisplayGeometry>>,
+    },
     PrepareCapture {
         width: u16,
         height: u16,
@@ -120,16 +130,29 @@ impl Drop for ControllerInner {
         };
         if let Err(error) = stopped.recv_timeout(SHUTDOWN_TIMEOUT) {
             tracing::warn!(%error, backend = ?self.backend,
-                "Display worker did not confirm release within 5 seconds");
+                "Display worker did not confirm release within 10 seconds");
         }
     }
 }
 
 /// Cheap, thread-safe handle. Only values and commands cross the channel;
-/// Virtual-display objects stay in one helper process; main-display queries stay
-/// on their worker. Dropping the final handle shuts down and reaps the helper.
+/// Virtual-display objects stay in one helper process per active connection;
+/// main-display queries stay on their worker. No helper or virtual screen exists
+/// while disconnected. Dropping the final handle also shuts down a live helper.
 #[derive(Clone, Debug)]
 pub struct DisplayController(Arc<ControllerInner>);
+
+/// A request already ordered against disconnect/shutdown on the display worker.
+/// Waiting belongs on a blocking task; dropping this value never reorders it.
+pub struct DisplayPreparation(mpsc::Receiver<Result<DisplayGeometry>>);
+
+impl DisplayPreparation {
+    pub fn wait(self) -> Result<DisplayGeometry> {
+        self.0
+            .recv_timeout(REQUEST_TIMEOUT)
+            .context("Timed out preparing the remote desktop display")?
+    }
+}
 
 impl DisplayController {
     pub fn new(backend: DisplayBackend, width: u16, height: u16) -> Result<Self> {
@@ -188,7 +211,8 @@ impl DisplayController {
         normalize_size(self.0.backend, width, height)
     }
 
-    /// Query current bounds of the pinned display, including any layout change.
+    /// Query current bounds of the selected display, including layout changes.
+    /// An idle virtual controller returns an error; no capture screen exists.
     pub fn geometry(&self) -> Result<DisplayGeometry> {
         let (reply, receiver) = mpsc::channel();
         self.0
@@ -200,7 +224,61 @@ impl DisplayController {
             .context("Timed out querying display geometry")?
     }
 
-    /// Make the virtual mode match the normalized RDP framebuffer dimensions.
+    /// Temporarily make an owned virtual display primary for the connected
+    /// remote desktop. Call before capture and input geometry are committed.
+    /// Repeated calls preserve the original layout until end_remote_session.
+    pub fn begin_remote_session(&self) -> Result<DisplayGeometry> {
+        let (reply, receiver) = mpsc::channel();
+        self.0
+            .commands
+            .try_send(Command::BeginRemoteSession(reply))
+            .context("Display controller worker is busy or unavailable")?;
+        receiver
+            .recv_timeout(REQUEST_TIMEOUT)
+            .context("Timed out beginning the remote display session")?
+    }
+
+    /// Restore the physical primary and display origins, then remove and reap
+    /// the session's virtual display. Main-display capture is unchanged.
+    pub fn end_remote_session(&self) -> Result<()> {
+        let (reply, receiver) = mpsc::channel();
+        self.0
+            .commands
+            .try_send(Command::EndRemoteSession(reply))
+            .context("Display controller worker is busy or unavailable")?;
+        receiver
+            .recv_timeout(REQUEST_TIMEOUT)
+            .context("Timed out restoring the physical display layout")?
+    }
+
+    /// Queue disconnect restoration without blocking the input callback. The
+    /// worker processes this before a subsequent begin_remote_session request.
+    pub fn end_remote_session_async(&self) -> Result<()> {
+        let (reply, _receiver) = mpsc::channel();
+        self.0
+            .commands
+            .try_send(Command::EndRemoteSession(reply))
+            .context("Display controller worker is busy or unavailable")
+    }
+
+    /// Queue session activation and mode preparation before yielding an async
+    /// caller. A concurrent cancellation therefore queues restoration after
+    /// this work, even if the blocking waiter has not started yet.
+    pub fn queue_remote_capture(&self, width: u16, height: u16) -> Result<DisplayPreparation> {
+        let (width, height) = self.normalize_size(width, height);
+        let (reply, receiver) = mpsc::channel();
+        self.0
+            .commands
+            .try_send(Command::PrepareRemoteCapture {
+                width,
+                height,
+                reply,
+            })
+            .context("Display controller worker is busy or unavailable")?;
+        Ok(DisplayPreparation(receiver))
+    }
+
+    /// Make an active virtual mode match the normalized RDP framebuffer dimensions.
     /// Main only queries geometry and never changes physical display modes.
     pub fn prepare_capture(&self, width: u16, height: u16) -> Result<DisplayGeometry> {
         let (width, height) = self.normalize_size(width, height);
@@ -278,6 +356,46 @@ mod tests {
     fn controller_handle_is_send_and_sync_without_native_objects() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DisplayController>();
+    }
+
+    #[test]
+    fn capture_disconnect_and_reconnect_are_queued_in_order_even_if_waiter_is_dropped() {
+        let (commands, receiver) = mpsc::sync_channel(8);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let controller = DisplayController(Arc::new(ControllerInner {
+            backend: DisplayBackend::Virtual,
+            commands,
+            stopping: Arc::new(AtomicBool::new(false)),
+            stopped: Mutex::new(stopped_rx),
+        }));
+        let preparation = controller.queue_remote_capture(1921, 1081).unwrap();
+        // Async cancellation may discard the waiter before its blocking task
+        // starts. The activation request is nevertheless already on the queue.
+        drop(preparation);
+        controller.end_remote_session_async().unwrap();
+        drop(controller.queue_remote_capture(1280, 720).unwrap());
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Command::PrepareRemoteCapture {
+                width: 1920,
+                height: 1080,
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Command::EndRemoteSession(_)
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Command::PrepareRemoteCapture {
+                width: 1280,
+                height: 720,
+                ..
+            }
+        ));
+        stopped_tx.send(()).unwrap();
+        drop(controller);
     }
 
     #[test]

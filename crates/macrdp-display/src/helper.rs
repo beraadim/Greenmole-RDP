@@ -14,7 +14,8 @@ use crate::protocol::{read_message, write_message, Reply, Request};
 use crate::{normalize_size, DisplayBackend, DisplayGeometry, HELPER_ARGUMENT};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+// Owner teardown may run one bounded layout-restoration selector.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct DisplayHelper {
@@ -118,6 +119,28 @@ impl DisplayHelper {
         Ok(geometry)
     }
 
+    pub(crate) fn configure_layout(
+        display_id: u32,
+        serial: u32,
+        primary: u32,
+        displays: Vec<crate::layout::Placement>,
+    ) -> Result<DisplayGeometry> {
+        let mut selector = Self::spawn()?;
+        selector.display_id = Some(display_id);
+        let geometry = selector.geometry_request_with_options(
+            Request::ConfigureLayout {
+                display_id,
+                serial,
+                primary,
+                displays,
+            },
+            Duration::from_millis(2500),
+            true,
+        )?;
+        selector.usable = false;
+        Ok(geometry)
+    }
+
     fn receive_reply(&self, timeout: Duration, service_owner_events: bool) -> Result<Reply> {
         if !service_owner_events {
             return self
@@ -194,6 +217,25 @@ impl DisplayHelper {
         self.geometry_request(Request::Geometry {})
     }
 
+    pub(crate) fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
+        let geometry = self.geometry_request(Request::BeginRemoteSession {})?;
+        tracing::info!(
+            display_id = self.id(),
+            ?geometry,
+            "Remote virtual display is primary for this connection"
+        );
+        Ok(geometry)
+    }
+
+    pub(crate) fn end_remote_session(&mut self) -> Result<DisplayGeometry> {
+        let geometry = self.geometry_request(Request::EndRemoteSession {})?;
+        tracing::info!(
+            display_id = self.id(),
+            "Restored the local primary display after the remote connection"
+        );
+        Ok(geometry)
+    }
+
     pub(crate) fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
         let geometry = self.geometry_request(Request::PrepareCapture { width, height })?;
         if let Err(error) = self.verify_requested_size(&geometry, width, height) {
@@ -244,7 +286,9 @@ impl DisplayHelper {
     fn abort(&mut self) {
         self.usable = false;
         self.input.take();
-        if self.wait_for_exit(Duration::ZERO) {
+        // Closing input gives a healthy owner an EOF and a chance to restore
+        // its saved layout before forced termination is necessary.
+        if self.wait_for_exit(SHUTDOWN_GRACE) {
             return;
         }
         if let Err(error) = self.child.kill() {
@@ -299,7 +343,10 @@ pub(crate) fn run_child() -> Result<()> {
             acknowledge_shutdown = true;
             break Ok(());
         }
-        let one_shot = matches!(request, Request::SelectMode { .. });
+        let one_shot = matches!(
+            request,
+            Request::SelectMode { .. } | Request::ConfigureLayout { .. }
+        );
         let response = autoreleasepool(|_| -> Result<DisplayGeometry> {
             match request {
                 Request::Initialize { width, height } => {
@@ -312,6 +359,14 @@ pub(crate) fn run_child() -> Result<()> {
                     .as_ref()
                     .context("Display helper is not initialized")?
                     .geometry(),
+                Request::BeginRemoteSession {} => owner
+                    .as_mut()
+                    .context("Display helper is not initialized")?
+                    .begin_remote_session(),
+                Request::EndRemoteSession {} => owner
+                    .as_mut()
+                    .context("Display helper is not initialized")?
+                    .end_remote_session(),
                 Request::PrepareCapture { width, height } => {
                     validate_size(width, height)?;
                     owner
@@ -331,6 +386,18 @@ pub(crate) fn run_child() -> Result<()> {
                     );
                     validate_size(width, height)?;
                     crate::selector::select_mode(display_id, serial, width, height)
+                }
+                Request::ConfigureLayout {
+                    display_id,
+                    serial,
+                    primary,
+                    displays,
+                } => {
+                    ensure!(
+                        owner.is_none(),
+                        "Layout configuration requires a fresh selector process"
+                    );
+                    crate::selector::configure_layout(display_id, serial, primary, &displays)
                 }
                 Request::Shutdown {} => unreachable!(),
             }

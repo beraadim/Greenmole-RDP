@@ -13,6 +13,7 @@ mod capabilities;
 mod clipboard;
 mod display;
 mod display_control;
+mod dynamic_channels;
 mod encoder;
 pub mod gfx;
 mod handler;

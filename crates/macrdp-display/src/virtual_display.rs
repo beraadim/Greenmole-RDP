@@ -3,7 +3,8 @@
 //! Apple does not publish these interfaces as a supported SDK API. Verify all
 //! selectors and ABI encodings before use, and report incompatibility instead
 //! of substituting capture of a physical display. These objects never leave the
-//! display worker. No mirroring, display-origin or primary-display APIs are used.
+//! display worker. Session-scoped primary layout changes are handled separately
+//! by the display owner; this bridge never configures mirroring or physical modes.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use objc2::rc::{Allocated, Retained};

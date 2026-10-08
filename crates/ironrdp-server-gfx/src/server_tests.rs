@@ -72,6 +72,7 @@ async fn resize_reactivation_refreshes_context_without_starting_a_new_session() 
             reactivation,
             client_name: client_name.to_owned(),
             keyboard_layout: 0x0409,
+            client_desktop_size: None,
         };
         let error = server
             .client_accepted(
@@ -92,4 +93,160 @@ async fn resize_reactivation_refreshes_context_without_starting_a_new_session() 
     assert_eq!(lifecycle.contexts, ["initial", "resized"]);
     assert_eq!(lifecycle.connections, 1);
     assert_eq!(lifecycle.disconnections, 0);
+}
+
+struct RequestedSizeDisplay(mpsc::UnboundedSender<DesktopSize>);
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for RequestedSizeDisplay {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    fn request_resize(&mut self, width: u16, height: u16) {
+        self.0.send(DesktopSize { width, height }).unwrap();
+    }
+
+    fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        let (width, height) = layout.monitors()[0].dimensions();
+        self.request_resize(width as u16, height as u16);
+    }
+
+    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        bail!("capture deliberately unavailable")
+    }
+}
+
+fn resize_test_server(display: Box<dyn RdpServerDisplay>) -> RdpServer {
+    RdpServer::new(
+        RdpServerOptions {
+            addr: ([127, 0, 0, 1], 0).into(),
+            security: RdpServerSecurity::None,
+            codecs: BitmapCodecs(Vec::new()),
+        },
+        Box::new(RecordingInput(Arc::new(StdMutex::new(InputLifecycle::default())))),
+        display,
+        None,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn freerdp_confirm_active_echo_does_not_replace_the_initial_viewport() {
+    let (requests, mut sizes) = mpsc::unbounded_channel();
+    let mut server = resize_test_server(Box::new(RequestedSizeDisplay(requests)));
+    let requested = DesktopSize {
+        width: 1537,
+        height: 865,
+    };
+    let advertised = DesktopSize {
+        width: 1920,
+        height: 1080,
+    };
+    for reactivation in [false, true] {
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+        let result = AcceptorResult {
+            static_channels: StaticChannelSet::new(),
+            // FreeRDP echoes the server's size, not its original viewport.
+            capabilities: capabilities::capabilities(&server.opts, advertised),
+            input_events: Vec::new(),
+            user_channel_id: 1002,
+            io_channel_id: 1003,
+            reactivation,
+            client_name: "Guacamole RDP".into(),
+            keyboard_layout: 0x0409,
+            client_desktop_size: Some(requested),
+        };
+        let error = server
+            .client_accepted(&mut reader, &mut writer, result, advertised)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("capture deliberately unavailable"));
+        if !reactivation {
+            assert_eq!(sizes.try_recv().unwrap(), requested);
+        }
+        // Reactivation must not replay the original browser size over later
+        // Display Control changes, which use this same connection.
+        assert!(matches!(sizes.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+}
+
+fn decode_dynamic_responses(messages: Vec<SvcMessage>) -> Vec<dvc::pdu::DrdynvcServerPdu> {
+    ironrdp_svc::StaticVirtualChannel::chunkify(messages)
+        .unwrap()
+        .into_iter()
+        .map(|chunk| {
+            // Every test message fits in one SVC chunk. Strip its 8-byte Channel
+            // PDU Header before decoding the actual DRDYNVC wire response.
+            decode(&chunk.filled()[8..]).unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn bitmap_only_session_negotiates_display_control_and_receives_resize() {
+    verify_display_control_resize(false).await;
+}
+
+#[tokio::test]
+async fn gfx_session_negotiates_display_control_and_receives_resize() {
+    verify_display_control_resize(true).await;
+}
+
+async fn verify_display_control_resize(gfx_enabled: bool) {
+    use dvc::pdu::{
+        CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DataPdu, DrdynvcClientPdu,
+        DrdynvcDataPdu, DrdynvcServerPdu,
+    };
+    use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, DisplayControlPdu};
+    let (requests, mut sizes) = mpsc::unbounded_channel();
+    let mut server = resize_test_server(Box::new(RequestedSizeDisplay(requests)));
+    server.set_gfx_enabled(gfx_enabled);
+    let mut channels = server.dynamic_channels();
+    let caps = encode_vec(&DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+        CapsVersion::V1,
+    )))
+    .unwrap();
+    let creates = decode_dynamic_responses(channels.process(&caps).unwrap());
+    assert_eq!(creates.len(), if gfx_enabled { 3 } else { 1 });
+    let DrdynvcServerPdu::Create(create) = &creates[0] else {
+        panic!("expected Display Control create request")
+    };
+    assert_eq!(create.channel_name(), ironrdp_displaycontrol::CHANNEL_NAME);
+    let channel_id = create.channel_id();
+    let create = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+        channel_id,
+        CreationStatus::OK,
+    )))
+    .unwrap();
+    let response = decode_dynamic_responses(channels.process(&create).unwrap());
+    let [DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(data))] = response.as_slice() else {
+        panic!("expected Display Control capabilities")
+    };
+    let DisplayControlPdu::Caps(caps) = decode(data.data()).unwrap() else {
+        panic!("expected Display Control capabilities")
+    };
+    assert!(caps.max_monitor_area() >= 3840 * 2160);
+    let layout: DisplayControlPdu = DisplayControlMonitorLayout::new_single_primary_monitor(1600, 900, None, None)
+        .unwrap()
+        .into();
+    let request = encode_vec(&DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+        channel_id,
+        encode_vec(&layout).unwrap(),
+    ))))
+    .unwrap();
+    assert!(channels.process(&request).unwrap().is_empty());
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), sizes.recv())
+            .await
+            .unwrap(),
+        Some(DesktopSize {
+            width: 1600,
+            height: 900
+        })
+    );
 }

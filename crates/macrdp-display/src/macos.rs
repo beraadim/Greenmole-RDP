@@ -47,6 +47,7 @@ fn online_display_ids() -> Result<Vec<u32>> {
 pub(crate) struct NativeDisplay {
     display_id: u32,
     virtual_display: Option<VirtualDisplay>,
+    session_layout: Option<crate::layout::Snapshot>,
 }
 
 impl NativeDisplay {
@@ -58,6 +59,7 @@ impl NativeDisplay {
                 let owner = Self {
                     display_id,
                     virtual_display: None,
+                    session_layout: None,
                 };
                 let geometry = owner.geometry()?;
                 tracing::info!(?geometry, "Pinned main display without changing its mode");
@@ -68,6 +70,7 @@ impl NativeDisplay {
                 let owner = Self {
                     display_id: virtual_display.id(),
                     virtual_display: Some(virtual_display),
+                    session_layout: None,
                 };
                 owner.wait_for_mode(width, height)?;
                 Ok(owner)
@@ -128,6 +131,112 @@ impl NativeDisplay {
                 && geometry.pixel_height > 0,
             "Selected display reported invalid geometry: {geometry:?}"
         );
+        Ok(geometry)
+    }
+
+    fn live_layout(&self) -> Result<Vec<crate::layout::Placement>> {
+        let ids = CGDisplay::active_displays()
+            .map_err(|error| anyhow::anyhow!("Could not query display layout: {error}"))?;
+        ensure!(
+            ids.len() <= 64,
+            "Display layout exceeded the enumeration limit"
+        );
+        ids.into_iter()
+            .map(|id| {
+                let display = CGDisplay::new(id);
+                ensure!(
+                    !display.is_in_mirror_set(),
+                    "Temporary primary display requires extended displays"
+                );
+                let bounds = display.bounds();
+                fn coordinate(value: f64) -> Result<i32> {
+                    ensure!(
+                        value.is_finite()
+                            && value.fract() == 0.0
+                            && value >= f64::from(i32::MIN)
+                            && value <= f64::from(i32::MAX),
+                        "Invalid display layout coordinate"
+                    );
+                    Ok(value as i32)
+                }
+                Ok(crate::layout::Placement {
+                    id,
+                    x: coordinate(bounds.origin.x)?,
+                    y: coordinate(bounds.origin.y)?,
+                    width: coordinate(bounds.size.width)?,
+                    height: coordinate(bounds.size.height)?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
+        let Some(virtual_display) = &self.virtual_display else {
+            return self.geometry();
+        };
+        if self.session_layout.is_some() {
+            CGDisplay::active_displays().map_err(|error| {
+                anyhow::anyhow!("Could not refresh the primary display: {error}")
+            })?;
+            ensure!(
+                CGDisplay::main().id == self.display_id,
+                "The remote primary display changed during the connection"
+            );
+            return self.geometry();
+        }
+        let snapshot = crate::layout::Snapshot {
+            primary: CGDisplay::main().id,
+            displays: self.live_layout()?,
+        };
+        if snapshot.primary == self.display_id {
+            // The user may have selected this screen as primary while idle.
+            // Preserve that explicit arrangement on disconnect; do not invent
+            // a physical primary that differs from the pre-connection layout.
+            self.session_layout = Some(snapshot);
+            return self.geometry();
+        }
+        let displays = snapshot.promoted(self.display_id)?;
+        let serial = virtual_display.serial();
+        // Retain the original before native mutation so teardown can restore it
+        // even after a configuration timeout or a partially reported failure.
+        self.session_layout = Some(snapshot);
+        let geometry = crate::helper::DisplayHelper::configure_layout(
+            self.display_id,
+            serial,
+            self.display_id,
+            displays,
+        )?;
+        tracing::info!(
+            display_id = self.display_id,
+            ?geometry,
+            "Remote virtual display became the temporary primary display"
+        );
+        Ok(geometry)
+    }
+
+    pub(crate) fn end_remote_session(&mut self) -> Result<DisplayGeometry> {
+        let Some(snapshot) = &self.session_layout else {
+            return self.geometry();
+        };
+        if snapshot.primary == self.display_id {
+            self.session_layout = None;
+            return self.geometry();
+        }
+        let live = self.live_layout()?;
+        let (primary, displays) = snapshot.restored(&live, self.display_id)?;
+        let serial = self
+            .virtual_display
+            .as_ref()
+            .context("Missing owned virtual display")?
+            .serial();
+        let geometry = crate::helper::DisplayHelper::configure_layout(
+            self.display_id,
+            serial,
+            primary,
+            displays,
+        )?;
+        self.session_layout = None;
+        tracing::info!(primary, "Restored the physical primary display and layout");
         Ok(geometry)
     }
 
@@ -270,6 +379,18 @@ impl NativeDisplay {
     }
 }
 
+impl Drop for NativeDisplay {
+    fn drop(&mut self) {
+        if self.session_layout.is_some() {
+            if let Err(error) = self.end_remote_session() {
+                // The protocol helper intentionally has no tracing subscriber.
+                eprintln!("Could not restore the display layout during owner teardown: {error:#}");
+                tracing::warn!(%error, "Could not restore the display layout during owner teardown");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +402,7 @@ mod tests {
         let selected = NativeDisplay {
             display_id,
             virtual_display: None,
+            session_layout: None,
         };
         let error = selected.geometry().unwrap_err();
         assert!(error.to_string().contains("no longer online"));
@@ -289,29 +411,113 @@ mod tests {
 
 enum WorkerOwner {
     Main(NativeDisplay),
-    Virtual(crate::helper::DisplayHelper),
+    Virtual {
+        helper: Option<crate::helper::DisplayHelper>,
+        initial_width: u16,
+        initial_height: u16,
+    },
 }
 
 impl WorkerOwner {
+    fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
+        match self {
+            Self::Main(owner) => owner.begin_remote_session(),
+            Self::Virtual {
+                helper,
+                initial_width,
+                initial_height,
+            } => {
+                if helper.is_none() {
+                    *helper = Some(crate::helper::DisplayHelper::new(
+                        *initial_width,
+                        *initial_height,
+                    )?);
+                }
+                helper
+                    .as_mut()
+                    .expect("initialized session display")
+                    .begin_remote_session()
+            }
+        }
+    }
+
+    fn end_remote_session(&mut self) -> Result<()> {
+        match self {
+            Self::Main(owner) => owner.end_remote_session().map(|_| ()),
+            Self::Virtual { helper, .. } => {
+                let Some(mut owner) = helper.take() else {
+                    return Ok(());
+                };
+                let display_id = owner.id();
+                let result = owner.end_remote_session().map(|_| ());
+                // Drop and reap before acknowledging disconnect. The next
+                // queued activation may then create its own display safely.
+                drop(owner);
+                let removed = wait_for_display_removal(display_id);
+                result.and(removed)
+            }
+        }
+    }
     fn geometry(&mut self) -> Result<DisplayGeometry> {
         match self {
             Self::Main(owner) => owner.geometry(),
-            Self::Virtual(owner) => owner.geometry(),
+            Self::Virtual { helper, .. } => helper
+                .as_mut()
+                .context("No remote display exists while disconnected")?
+                .geometry(),
         }
     }
 
     fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
         match self {
             Self::Main(owner) => owner.prepare_capture(width, height),
-            Self::Virtual(owner) => owner.prepare_capture(width, height),
+            Self::Virtual { helper, .. } => helper
+                .as_mut()
+                .context("Cannot prepare capture before the remote connection begins")?
+                .prepare_capture(width, height),
         }
+    }
+
+    fn prepare_remote_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
+        if let Self::Virtual { helper, .. } = self {
+            if helper.is_none() {
+                // Use the negotiated client dimensions for the very first
+                // mode; no startup-size screen or extra initial resize exists.
+                *helper = Some(crate::helper::DisplayHelper::new(width, height)?);
+            }
+        }
+        let result = self
+            .begin_remote_session()
+            .and_then(|_| self.prepare_capture(width, height));
+        if result.is_err() {
+            if let Err(error) = self.end_remote_session() {
+                tracing::warn!(%error, "Could not fully clean up failed remote display activation");
+            }
+        }
+        result
     }
 
     fn display_id(&self) -> u32 {
         match self {
             Self::Main(owner) => owner.display_id,
-            Self::Virtual(owner) => owner.id(),
+            Self::Virtual { helper, .. } => helper.as_ref().map_or(0, |owner| owner.id()),
         }
+    }
+}
+
+fn wait_for_display_removal(display_id: u32) -> Result<()> {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        // Check membership, not stale online/active flags for a removed ID.
+        if !online_display_ids()?.contains(&display_id) {
+            tracing::info!(display_id, "Removed the disconnected remote display");
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Disconnected virtual display {display_id} was not removed within 3 seconds"
+        );
+        std::thread::sleep(SETTLE_POLL);
     }
 }
 
@@ -326,9 +532,11 @@ pub(crate) fn run_worker(
 ) {
     let mut owner = match autoreleasepool(|_| match backend {
         DisplayBackend::Main => NativeDisplay::new(backend, width, height).map(WorkerOwner::Main),
-        DisplayBackend::Virtual => {
-            crate::helper::DisplayHelper::new(width, height).map(WorkerOwner::Virtual)
-        }
+        DisplayBackend::Virtual => Ok(WorkerOwner::Virtual {
+            helper: None,
+            initial_width: width,
+            initial_height: height,
+        }),
     }) {
         Ok(owner) => owner,
         Err(error) => {
@@ -347,6 +555,24 @@ pub(crate) fn run_worker(
                 Command::Shutdown => {}
                 Command::Geometry(reply) => {
                     let _ = reply.send(owner.geometry());
+                }
+                Command::BeginRemoteSession(reply) => {
+                    let _ = reply.send(owner.begin_remote_session());
+                }
+                Command::EndRemoteSession(reply) => {
+                    let result = owner.end_remote_session();
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "Could not restore the display layout after disconnect");
+                    }
+                    let _ = reply.send(result);
+                }
+                Command::PrepareRemoteCapture {
+                    width,
+                    height,
+                    reply,
+                } => {
+                    let result = owner.prepare_remote_capture(width, height);
+                    let _ = reply.send(result);
                 }
                 Command::PrepareCapture {
                     width,
