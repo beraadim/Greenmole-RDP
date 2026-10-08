@@ -39,6 +39,7 @@ pub struct AppState {
     pub server_handle: SharedServerHandle,
     pub ui_config: Mutex<UiConfig>,
     pub log_reload: LogReloadHandle,
+    pub window_move_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -51,6 +52,7 @@ impl AppState {
             server_handle: Arc::new(Mutex::new(None)),
             ui_config: Mutex::new(UiConfig::load().unwrap_or_default()),
             log_reload,
+            window_move_lock: Mutex::new(()),
         }
     }
 }

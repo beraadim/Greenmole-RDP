@@ -174,6 +174,7 @@ struct MetricsSnapshot {
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
     display_backend: macrdp_display::DisplayBackend,
+    display_controller: macrdp_display::DisplayController,
     port: u16,
     bind_addr: SocketAddr,
     started_at: Instant,
@@ -194,6 +195,42 @@ impl ServerHandle {
     /// Backend of the running server, independent of unsaved/pending UI changes.
     pub fn display_backend(&self) -> macrdp_display::DisplayBackend {
         self.display_backend
+    }
+
+    /// Fast UI availability check. The display worker revalidates its owned
+    /// virtual screen when the queued action runs, including disconnect races.
+    pub fn window_move_unavailable_reason(&self) -> Option<&'static str> {
+        if self.stopped.load(Ordering::Acquire) {
+            Some("Start the server and connect to the remote desktop first.")
+        } else if self.display_backend != macrdp_display::DisplayBackend::Virtual {
+            Some("Select the virtual display in Settings and restart the server.")
+        } else if self.active_connection.lock().unwrap().is_none() {
+            Some("Connect to the remote desktop first.")
+        } else {
+            None
+        }
+    }
+
+    /// Enqueue before the async UI command yields so disconnect cleanup cannot
+    /// overtake an action that has already been accepted for this connection.
+    pub fn queue_move_windows_to_remote_with(
+        &self,
+        own_windows: impl FnOnce(macrdp_display::DisplayGeometry) -> Result<usize> + Send + 'static,
+    ) -> Result<macrdp_display::WindowMovePreparation> {
+        // The input handler holds this same lock while enqueuing disconnect.
+        // Validation and enqueue therefore belong to the same connection.
+        let connection = self.active_connection.lock().unwrap();
+        anyhow::ensure!(
+            !self.stopped.load(Ordering::Acquire),
+            "The server is stopping."
+        );
+        anyhow::ensure!(
+            self.display_backend == macrdp_display::DisplayBackend::Virtual,
+            "Select the virtual display in Settings and restart the server."
+        );
+        anyhow::ensure!(connection.is_some(), "Connect to the remote desktop first.");
+        self.display_controller
+            .queue_move_windows_to_remote_with(own_windows)
     }
     /// The TCP port the server is listening on.
     pub fn port(&self) -> u16 {
@@ -427,12 +464,7 @@ pub async fn start_server(
 
     let resolution = config.resolution.as_deref().unwrap_or("auto");
     let (width, height) = if let Some(geometry) = &geometry {
-        macrdp_display::resolve_desktop_size(
-            resolution,
-            geometry,
-            config.width,
-            config.height,
-        )?
+        macrdp_display::resolve_desktop_size(resolution, geometry, config.width, config.height)?
     } else {
         macrdp_display::resolve_virtual_desktop_size(resolution, config.width, config.height)?
     };
@@ -479,7 +511,7 @@ pub async fn start_server(
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
-        display_controller,
+        display_controller: display_controller.clone(),
         config: config.clone(),
         bind_addr,
         cert_path,
@@ -574,6 +606,7 @@ pub async fn start_server(
 
     let handle = Arc::new(ServerHandle {
         display_backend: backend,
+        display_controller,
         port,
         bind_addr,
         started_at: Instant::now(),

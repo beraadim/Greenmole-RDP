@@ -9,6 +9,8 @@ import type {
   ConnectionHistory,
   TrafficStats,
   UiConfig,
+  WindowMoveStatus,
+  WindowMoveResult,
 } from "./types";
 
 export const api = {
@@ -19,6 +21,8 @@ export const api = {
   getConnections: () => invoke<Connection[]>("get_connections"),
   getPermissions: () => invoke<PermissionStatus>("get_permissions"),
   getInputDebugState: () => invoke<InputDebugState>("get_input_debug_state"),
+  getWindowMoveStatus: () => invoke<WindowMoveStatus>("get_window_move_status"),
+  moveWindowsToRemote: () => invoke<WindowMoveResult>("move_windows_to_remote"),
   getConfig: () => invoke<UiConfig>("get_config"),
   setConfig: (key: string, value: unknown) =>
     invoke<{ restart_required: boolean }>("set_config", { key, value }),

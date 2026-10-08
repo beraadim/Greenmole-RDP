@@ -5,6 +5,9 @@ mod permissions;
 mod state;
 mod tray;
 mod ui_config;
+mod window_commands;
+#[cfg(target_os = "macos")]
+mod own_windows;
 
 use std::sync::Arc;
 
@@ -139,6 +142,8 @@ pub fn run() {
             commands::open_system_preferences,
             commands::quit_app,
             commands::set_autostart,
+            window_commands::get_window_move_status,
+            window_commands::move_windows_to_remote,
         ])
         .run(tauri::generate_context!())
         .expect("error while running macrdp-ui");

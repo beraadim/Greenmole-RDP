@@ -53,9 +53,19 @@ display arrangement. RDP resize reactivation remains part of the same connection
 
 macOS manages application window placement. Existing windows may remain on a
 physical screen, and applications can remember their preferred display or Space.
-The earlier Accessibility window mover has been removed: macrdp does not resize
-or reposition individual application windows. Accessibility permission is still
-needed for remote keyboard and mouse input.
+The Dashboard's **Move windows to remote display** button gathers open windows
+when an app opens on the physical screen. This is a manual action, available
+while a client is connected to the virtual display. Windows already visible on
+the remote screen stay in place. Larger windows are fitted where the application
+allows it. Minimized, full-screen and unsupported windows may be skipped; the
+button reports moved, skipped and failed counts. Accessibility permission is
+required, as it is for remote keyboard and mouse input.
+
+There is no automatic window mover or per-window restoration on disconnect.
+macOS handles placement when the virtual display disappears. The manual action
+uses bounded Accessibility calls for other apps and main-thread AppKit for
+macrdp itself. It never queries macrdp's own Accessibility windows, which caused
+the earlier WebKit crash. Window titles and contents are not logged.
 
 Disconnect and normal server shutdown restore the prior primary display and
 display origins before removing the virtual screen. These are temporary display
@@ -81,7 +91,8 @@ Supply the server's configured username and password in the RDP client.
 TLS-only connections now reject empty or incorrect credentials instead of
 accepting an empty-password attempt. Authentication logs omit password values.
 
-See the [Apache Guacamole display settings](https://guacamole.apache.org/doc/gug/configuring-guacamole.html#display-settings)
+See the [Apache Guacamole display settings](https://guacamole.apache.org/doc/gug/configuring-guacamole.html#rdp-display-settings),
+the [live resize troubleshooting guide](guacamole-troubleshooting.md),
 and the [mouse coordinate test procedure](mouse-coordinate-testing.md).
 
 The RDP size is measured in framebuffer pixels. Virtual sizes are bounded to
@@ -143,6 +154,14 @@ verification and the DMG passed checksum verification.
 Live Guacamole/Windows client capture and pointer behavior still require the
 manual checks below.
 
+The subsequent manual window recovery build passed 143 native unit tests on
+the same Mac, including six UI tests. Coverage includes excluding the current
+PID before Accessibility access, rejecting actions on an inactive virtual
+controller, queue ordering, cancellation/expiry, negative display origins,
+logical versus pixel coordinates, and fitting oversized windows. The frontend
+production build also passed. These checks do not replace testing the Dashboard
+button against real application windows after installing the DMG.
+
 1. Start with the physical backend and confirm its existing behavior.
 2. Enable the virtual backend and automatic resolution, restart, and confirm no
    virtual screen exists while idle. Connect through Guacamole and confirm the
@@ -160,6 +179,13 @@ manual checks below.
    backend or virtual resolution settings while running reports restart required.
 7. Stop the server and confirm the virtual display disappears. Exercise screen
    lock/unlock and capture recovery, and repeat using Windows Remote Desktop.
+8. With a virtual session connected, open ordinary windows on the physical
+   display and click **Move windows to remote display** on the Dashboard.
+   Confirm they become usable remotely, existing remote windows stay put, and
+   minimized/full-screen windows are handled without forcing their state.
+   Repeat with macrdp's own window on the physical display and verify it moves
+   without crashing. Disconnect while gathering and confirm cleanup still runs;
+   the button must be disabled while disconnected or using the physical backend.
 
 Capture info logs include the selected display ID, global origin, logical point
 size, output pixel size and native mode changes. Useful messages include

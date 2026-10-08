@@ -42,6 +42,31 @@ export interface PermissionStatus {
   microphone: boolean;
 }
 
+export interface DisplayGeometry {
+  display_id: number;
+  origin_x: number;
+  origin_y: number;
+  logical_width: number;
+  logical_height: number;
+  pixel_width: number;
+  pixel_height: number;
+}
+
+export interface WindowMoveStatus {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface WindowMoveResult {
+  moved: number;
+  already_visible: number;
+  skipped: number;
+  failed: number;
+  app_failures: number;
+  timed_out: boolean;
+  target: DisplayGeometry;
+}
+
 export interface InputDebugState {
   active_modifiers: string[];
   suppressed_modifiers: string[];

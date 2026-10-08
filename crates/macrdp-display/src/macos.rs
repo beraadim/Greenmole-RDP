@@ -407,6 +407,23 @@ mod tests {
         let error = selected.geometry().unwrap_err();
         assert!(error.to_string().contains("no longer online"));
     }
+
+    #[test]
+    fn disconnected_window_action_cannot_create_a_display_or_call_appkit() {
+        let mut owner = WorkerOwner::Virtual {
+            helper: None,
+            initial_width: 1280,
+            initial_height: 720,
+        };
+        let (request, _preparation) = crate::window_move::Request::new(|_| {
+            panic!("disconnected action must never reach application windows")
+        });
+        let error = owner
+            .move_windows(request.budget, request.own_windows)
+            .unwrap_err();
+        assert!(error.to_string().contains("Connect a remote client"));
+        assert_eq!(owner.display_id(), 0);
+    }
 }
 
 enum WorkerOwner {
@@ -419,6 +436,29 @@ enum WorkerOwner {
 }
 
 impl WorkerOwner {
+    fn move_windows(
+        &mut self,
+        budget: crate::window_move::Budget,
+        own_windows: Box<dyn FnOnce(DisplayGeometry) -> Result<usize> + Send>,
+    ) -> Result<crate::WindowMoveReport> {
+        budget.check()?;
+        ensure!(
+            matches!(
+                self,
+                Self::Virtual {
+                    helper: Some(_),
+                    ..
+                }
+            ),
+            "Connect a remote client before moving windows to its virtual display"
+        );
+        // Geometry comes from the owner helper, never from a remembered ID
+        // that macOS could have reassigned. Ownership survives this whole call.
+        let geometry = self.geometry()?;
+        budget.check()?;
+        crate::manual_windows::move_windows(geometry, budget, own_windows)
+    }
+
     fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
         match self {
             Self::Main(owner) => owner.begin_remote_session(),
@@ -565,6 +605,13 @@ pub(crate) fn run_worker(
                         tracing::warn!(%error, "Could not restore the display layout after disconnect");
                     }
                     let _ = reply.send(result);
+                }
+                Command::MoveWindows(request) => {
+                    let result = owner.move_windows(request.budget, request.own_windows);
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "Manual window relocation could not run");
+                    }
+                    let _ = request.reply.send(result);
                 }
                 Command::PrepareRemoteCapture {
                     width,

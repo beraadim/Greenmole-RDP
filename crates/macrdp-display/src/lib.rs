@@ -18,13 +18,17 @@ mod layout;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "macos", test))]
+mod manual_windows;
+#[cfg(any(target_os = "macos", test))]
 mod protocol;
 mod resolution;
 #[cfg(target_os = "macos")]
 mod selector;
 #[cfg(target_os = "macos")]
 mod virtual_display;
+mod window_move;
 pub use resolution::{resolve_desktop_size, resolve_virtual_desktop_size};
+pub use window_move::{WindowMovePreparation, WindowMoveReport};
 const HELPER_ARGUMENT: &str = "--macrdp-display-helper";
 
 /// Main preserves the physical desktop; Virtual owns a separate extended screen.
@@ -98,6 +102,7 @@ enum Command {
     Geometry(mpsc::Sender<Result<DisplayGeometry>>),
     BeginRemoteSession(mpsc::Sender<Result<DisplayGeometry>>),
     EndRemoteSession(mpsc::Sender<Result<()>>),
+    MoveWindows(window_move::Request),
     PrepareRemoteCapture {
         width: u16,
         height: u16,
@@ -205,6 +210,35 @@ impl DisplayController {
         self.0.backend
     }
 
+    /// Queue a single, user-requested relocation of external application windows.
+    /// This never creates a display or enables automatic window management.
+    pub fn queue_move_windows_to_remote(&self) -> Result<WindowMovePreparation> {
+        self.queue_move_windows_to_remote_with(|_| Ok(0))
+    }
+
+    /// Also move this application's own windows through an AppKit-safe callback.
+    /// The display worker holds the active session until the callback and AX
+    /// work finish. The callback must finish within one second, and cancel any
+    /// scheduled main-thread work before returning an error or timing out.
+    /// Never block the application main thread waiting for this operation.
+    pub fn queue_move_windows_to_remote_with(
+        &self,
+        own_windows: impl FnOnce(DisplayGeometry) -> Result<usize> + Send + 'static,
+    ) -> Result<WindowMovePreparation> {
+        anyhow::ensure!(
+            self.backend() == DisplayBackend::Virtual,
+            "Moving windows requires a remote virtual display"
+        );
+        let (request, preparation) = window_move::Request::new(own_windows);
+        self.0
+            .commands
+            .try_send(Command::MoveWindows(request))
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })?;
+        Ok(preparation)
+    }
+
     /// Virtual framebuffers are clamped to 320×200 through 3840×2160 pixels;
     /// Each dimension rounds down to a multiple of eight. Main is unchanged.
     pub fn normalize_size(&self, width: u16, height: u16) -> (u16, u16) {
@@ -218,7 +252,9 @@ impl DisplayController {
         self.0
             .commands
             .try_send(Command::Geometry(reply))
-            .context("Display controller worker is busy or unavailable")?;
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })?;
         receiver
             .recv_timeout(REQUEST_TIMEOUT)
             .context("Timed out querying display geometry")?
@@ -232,7 +268,9 @@ impl DisplayController {
         self.0
             .commands
             .try_send(Command::BeginRemoteSession(reply))
-            .context("Display controller worker is busy or unavailable")?;
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })?;
         receiver
             .recv_timeout(REQUEST_TIMEOUT)
             .context("Timed out beginning the remote display session")?
@@ -245,7 +283,9 @@ impl DisplayController {
         self.0
             .commands
             .try_send(Command::EndRemoteSession(reply))
-            .context("Display controller worker is busy or unavailable")?;
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })?;
         receiver
             .recv_timeout(REQUEST_TIMEOUT)
             .context("Timed out restoring the physical display layout")?
@@ -258,7 +298,9 @@ impl DisplayController {
         self.0
             .commands
             .try_send(Command::EndRemoteSession(reply))
-            .context("Display controller worker is busy or unavailable")
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })
     }
 
     /// Queue session activation and mode preparation before yielding an async
@@ -274,7 +316,9 @@ impl DisplayController {
                 height,
                 reply,
             })
-            .context("Display controller worker is busy or unavailable")?;
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })?;
         Ok(DisplayPreparation(receiver))
     }
 
@@ -290,7 +334,9 @@ impl DisplayController {
                 height,
                 reply,
             })
-            .context("Display controller worker is busy or unavailable")?;
+            .map_err(|error| {
+                anyhow::anyhow!("Display controller worker is busy or unavailable: {error}")
+            })?;
         receiver
             .recv_timeout(REQUEST_TIMEOUT)
             .context("Timed out preparing the selected display")?
@@ -424,6 +470,32 @@ mod tests {
         });
         drop(clone);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn manual_window_actions_share_disconnect_ordering_and_expire_when_abandoned() {
+        let (commands, receiver) = mpsc::sync_channel(8);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let controller = DisplayController(Arc::new(ControllerInner {
+            backend: DisplayBackend::Virtual,
+            commands,
+            stopping: Arc::new(AtomicBool::new(false)),
+            stopped: Mutex::new(stopped_rx),
+        }));
+        let action = controller.queue_move_windows_to_remote().unwrap();
+        controller.end_remote_session_async().unwrap();
+        let Command::MoveWindows(request) = receiver.recv().unwrap() else {
+            panic!("window action must precede disconnect")
+        };
+        assert!(request.budget.check().is_ok());
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Command::EndRemoteSession(_)
+        ));
+        drop(action);
+        assert!(request.budget.check().is_err());
+        stopped_tx.send(()).unwrap();
+        drop(controller);
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -5,6 +5,7 @@ import { useConnections } from "../hooks/useConnections";
 import { useMetricHistory } from "../hooks/useFpsHistory";
 import { api } from "../lib/ipc";
 import StatusBar from "../components/StatusBar";
+import MoveWindowsControl from "../components/MoveWindowsControl";
 import MetricCard from "../components/MetricCard";
 import { ChartPanel } from "../components/ChartPanel";
 import { AreaChart } from "../components/AreaChart";
@@ -115,6 +116,8 @@ function Dashboard() {
         onStart={handleStart}
         onStop={handleStop}
       />
+
+      <MoveWindowsControl />
 
       <div className="flex gap-3">
         <ChartPanel

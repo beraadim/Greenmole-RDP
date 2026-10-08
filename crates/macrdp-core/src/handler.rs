@@ -669,18 +669,21 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
-        if let Some(display) = &self.display_controller {
-            // Queue restoration before another connection can begin. The
-            // display worker serializes this with the next capture activation.
-            if let Err(error) = display.end_remote_session_async() {
-                tracing::warn!(%error, "Failed to schedule physical display restoration");
+        {
+            // Manual window actions hold this lock through their queue send.
+            // Once disconnect starts, no action can target a later connection
+            // based on this connection's stale availability check.
+            let mut active_connection = self.active_connection.lock().unwrap();
+            if let Some(display) = &self.display_controller {
+                if let Err(error) = display.end_remote_session_async() {
+                    tracing::warn!(%error, "Failed to schedule physical display restoration");
+                }
             }
+            *active_connection = None;
         }
         if let Some(wake) = &mut self.wake {
             wake.deactivate_display_sleep_assertion();
         }
-        let mut active_connection = self.active_connection.lock().unwrap();
-        *active_connection = None;
         self.refresh_debug_state(Some("connection:disconnected".to_string()));
     }
 
