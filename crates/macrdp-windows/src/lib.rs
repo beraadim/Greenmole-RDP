@@ -18,6 +18,7 @@ mod discovery;
 mod geometry;
 #[cfg(target_os = "macos")]
 mod native;
+mod process_filter;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -384,7 +384,8 @@ pub(crate) fn run(
                     Ok(value) => {
                         tracing::info!(
                             display_id = target.display_id,
-                            "Moving application windows into the remote virtual desktop"
+                            excluded_pid = std::process::id(),
+                            "Moving other application windows into the remote virtual desktop; macrdp control windows stay in place"
                         );
                         session = Some(value);
                     }

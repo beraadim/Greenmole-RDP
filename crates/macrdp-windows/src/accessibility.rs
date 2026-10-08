@@ -2,6 +2,7 @@
 //! Native references never leave the worker that created them.
 
 use crate::geometry::Frame;
+use crate::process_filter::is_external_application;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex};
@@ -260,6 +261,11 @@ fn status(value: i32) -> AxResult<()> {
 }
 
 pub(crate) fn windows(pid: i32) -> AxResult<Vec<Element>> {
+    // Enforce the boundary here as well as in discovery so future callers
+    // cannot invoke our own AppKit implementation from this worker thread.
+    if !is_external_application(pid) {
+        return Ok(Vec::new());
+    }
     let raw = unsafe { AXUIElementCreateApplication(pid) };
     if raw.is_null() {
         return Err(AxError(-25201));
@@ -299,4 +305,26 @@ pub(crate) fn windows(pid: i32) -> AxResult<Vec<Element>> {
         }
     }
     Ok(elements)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_rejects_local_and_invalid_pids_before_accessibility_access() {
+        std::thread::Builder::new()
+            .name("macrdp-windows-self-pid-regression".into())
+            .spawn(|| {
+                let own_pid = i32::try_from(std::process::id()).expect("process PID fits pid_t");
+                // No Accessibility permission or GUI is needed: these calls
+                // must finish without creating or querying any native AX object.
+                for pid in [own_pid, 0, -1, i32::MIN] {
+                    assert!(windows(pid).expect("excluded PID is harmless").is_empty());
+                }
+            })
+            .expect("spawn AX boundary regression worker")
+            .join()
+            .expect("AX boundary regression worker finished");
+    }
 }

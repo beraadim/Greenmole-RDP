@@ -2268,6 +2268,9 @@ dependencies = [
  "core-foundation-sys",
  "core-graphics",
  "macrdp-display",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "tracing",
 ]
 

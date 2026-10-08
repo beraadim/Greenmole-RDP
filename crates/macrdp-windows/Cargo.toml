@@ -12,3 +12,12 @@ macrdp-display = { path = "../macrdp-display" }
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 core-graphics = "0.25"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSGraphics", "NSResponder", "NSRunningApplication", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSGeometry", "NSRunLoop", "NSString"] }
+
+[[test]]
+name = "native_self_window"
+harness = false

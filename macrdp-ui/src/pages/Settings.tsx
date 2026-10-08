@@ -282,7 +282,8 @@ function Settings() {
               <p className="py-2 text-xs text-text-muted">
                 Moves supported app windows onto the remote display when you connect
                 and restores them when you disconnect. Requires Accessibility access.
-                Full-screen windows and windows that cannot be moved stay in place.
+                macrdp control windows, full-screen windows, and windows that cannot
+                be moved stay in place.
               </p>
             )}
 

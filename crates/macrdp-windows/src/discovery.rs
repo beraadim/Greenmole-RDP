@@ -1,6 +1,7 @@
 //! Bounded, read-only CoreGraphics discovery for the AX worker.
 
 use crate::geometry::Frame;
+use crate::process_filter::is_external_application;
 use anyhow::{ensure, Result};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::number::CFNumber;
@@ -60,7 +61,8 @@ pub(crate) fn physical_screens(virtual_id: u32) -> Result<Vec<Screen>> {
 }
 
 /// The CG list includes offscreen/minimized windows and needs no AppKit runloop.
-/// Only owner PIDs are read; window titles and contents are never inspected.
+/// Only external owner PIDs are returned; window titles and contents are never
+/// inspected. Our own AppKit windows must not be accessed from this worker.
 pub(crate) fn application_pids() -> BTreeSet<i32> {
     let raw = unsafe { CGWindowListCopyWindowInfo(kCGWindowListExcludeDesktopElements, 0) };
     if raw.is_null() {
@@ -84,7 +86,7 @@ pub(crate) fn application_pids() -> BTreeSet<i32> {
             continue;
         }
         let value = unsafe { CFNumber::wrap_under_get_rule(raw.cast()) };
-        if let Some(pid) = value.to_i32().filter(|pid| *pid > 0) {
+        if let Some(pid) = value.to_i32().filter(|pid| is_external_application(*pid)) {
             pids.insert(pid);
         }
     }

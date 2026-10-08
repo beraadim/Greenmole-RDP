@@ -60,7 +60,10 @@ to the physical display that was primary when the connection started. If an
 original display has been unplugged, restoration uses a remaining physical
 display and keeps windows within its bounds. Closed windows are ignored.
 
-This uses macOS Accessibility window controls and is best effort. Full-screen,
+This uses macOS Accessibility window controls and is best effort. macrdp's own
+control windows stay in place. They are excluded before any Accessibility query
+because accessing the server's own AppKit windows from the placement worker can
+crash the application. Full-screen,
 already minimized, protected, and non-movable windows are not brought onto the
 remote display. A moved window that is minimized later is returned without
 unminimizing it when the application permits that. Applications can
@@ -162,10 +165,31 @@ Do not point this test at an application containing real work. Normal test and
 build commands leave it ignored; no Accessibility permissions are granted by
 the build process.
 
+The self-window regression creates only its own disposable AppKit window. It
+confirms that window is present in the raw WindowServer list, then checks that
+both production discovery and the Accessibility entry point exclude the current
+process from a background worker. It makes no Accessibility calls to other
+applications and needs no Accessibility permission:
+
+```sh
+cargo test -p macrdp-windows --test native_self_window --locked -- --ignored
+```
+
+This guards against the macOS 26.6.2 crash reported after the first frame:
+`AXUIElementSetAttributeValue` entered the server's own `NSWindow` implementation
+on the `macrdp-windows` thread, which trapped with
+`Must only be used from the main thread`. The regression checks that this unsafe
+path is excluded; it does not deliberately perform the crashing window mutation.
+On the Mac mini, the pre-fix code returned its own PID and one Accessibility
+window; the corrected code excluded the PID and returned no Accessibility
+windows. The native regression passed, along with all 15 window-placement unit
+tests. A live Guacamole connection still requires the manual checks below.
+
 1. Start with the physical backend and confirm its existing behavior.
 2. Open several ordinary windows on the physical display and note their positions
    and sizes. Enable the virtual backend, restart, and connect with Guacamole.
-   Confirm the windows move onto the remote display automatically.
+   Confirm the windows move onto the remote display automatically, while the
+   macrdp control window stays in place and the server remains running.
 3. Resize between 1280×720, 1920×1080, 2560×1440 and an odd size such as
    2560×1305. Check menu items, the Dock, window controls and all four corners.
    Repeat while idle and while rapidly dragging the browser window edges.
