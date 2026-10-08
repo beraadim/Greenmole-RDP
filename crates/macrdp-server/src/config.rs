@@ -1,4 +1,5 @@
 use clap::Parser;
+use macrdp_display::DisplayBackend;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -16,6 +17,10 @@ pub struct Cli {
     /// Target frame rate (30, 60, or 120)
     #[arg(long)]
     pub frame_rate: Option<u32>,
+
+    /// Share the main display or an experimental virtual display
+    #[arg(long, value_parser = ["main", "virtual"])]
+    pub display_backend: Option<String>,
 
     /// Log level: trace, debug, info, warn, error
     #[arg(long)]
@@ -69,6 +74,7 @@ impl Default for ClipboardConfig {
 pub struct ServerConfig {
     pub port: u16,
     pub frame_rate: u32,
+    pub display_backend: DisplayBackend,
     /// Resolution width (0 = auto-detect from display)
     pub width: u32,
     /// Resolution height (0 = auto-detect from display)
@@ -119,6 +125,7 @@ impl Default for ServerConfig {
         Self {
             port: 3389,
             frame_rate: 60,
+            display_backend: DisplayBackend::Main,
             width: 0,
             height: 0,
             username: None,
@@ -169,6 +176,13 @@ impl ServerConfig {
         }
         if let Some(fps) = cli.frame_rate {
             config.frame_rate = fps;
+        }
+        if let Some(backend) = &cli.display_backend {
+            config.display_backend = match backend.as_str() {
+                "main" => DisplayBackend::Main,
+                "virtual" => DisplayBackend::Virtual,
+                _ => anyhow::bail!("display_backend must be main or virtual"),
+            };
         }
         if let Some(level) = &cli.log_level {
             config.log_level = Some(level.clone());
@@ -235,6 +249,7 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3389);
         assert_eq!(config.frame_rate, 60);
+        assert_eq!(config.display_backend, DisplayBackend::Main);
         assert!(config.username.is_none());
     }
 
@@ -270,5 +285,23 @@ mod tests {
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
         assert_eq!(config.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn display_backend_config_rejects_unknown_values() {
+        let legacy: ServerConfig = toml::from_str("port = 13389").unwrap();
+        assert_eq!(legacy.display_backend, DisplayBackend::Main);
+        let config: ServerConfig = toml::from_str("display_backend = 'virtual'").unwrap();
+        assert_eq!(config.display_backend, DisplayBackend::Virtual);
+        assert!(toml::from_str::<ServerConfig>("display_backend = 'unknown'").is_err());
+    }
+
+    #[test]
+    fn display_cli_options_validate_and_preserve_unspecified_overrides() {
+        let defaults = Cli::try_parse_from(["macrdp"]).unwrap();
+        assert!(defaults.display_backend.is_none());
+        let enabled = Cli::try_parse_from(["macrdp", "--display-backend", "virtual"]).unwrap();
+        assert_eq!(enabled.display_backend.as_deref(), Some("virtual"));
+        assert!(Cli::try_parse_from(["macrdp", "--display-backend", "unknown"]).is_err());
     }
 }

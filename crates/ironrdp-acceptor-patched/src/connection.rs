@@ -24,6 +24,15 @@ use crate::util::{self, wrap_share_data};
 const IO_CHANNEL_ID: u16 = 1003;
 const USER_CHANNEL_ID: u16 = 1002;
 
+/// TLS-only connections must provide the configured username and password.
+/// Keep domain handling unchanged: clients may qualify a local account with
+/// different computer/domain names. An empty password is never a bypass.
+fn non_hybrid_credentials_match(configured: Option<&Credentials>, supplied: &Credentials) -> bool {
+    configured.is_some_and(|expected| {
+        expected.username == supplied.username && expected.password == supplied.password
+    })
+}
+
 pub struct Acceptor {
     pub(crate) state: AcceptorState,
     security: SecurityProtocol,
@@ -537,39 +546,25 @@ impl Sequence for Acceptor {
                 let client_info: rdp::ClientInfoPdu =
                     decode(data.user_data.as_ref()).map_err(ConnectorError::decode)?;
 
-                debug!(message = ?client_info, "Received");
+                // ClientInfoPdu contains plaintext credentials; never format it.
+                debug!(?protocol, "Received client info");
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
 
-                    warn!(
-                        client_user = %creds.username,
-                        client_domain = ?creds.domain,
-                        server_user = ?self.creds.as_ref().map(|c| &c.username),
+                    debug!(
+                        credentials_configured = self.creds.is_some(),
                         protocol = ?protocol,
-                        "Credential check (non-hybrid)"
+                        "Checking non-hybrid credentials"
                     );
 
-                    // Compare username and password only, ignore domain mismatch.
-                    // Accept empty client password — Windows mstsc sends empty creds on
-                    // first connect before prompting the user. Rejecting causes mstsc to
-                    // show an error instead of a login dialog.
-                    let creds_match = self.creds.as_ref().is_some_and(|server_creds| {
-                        creds.password.is_empty()
-                            || (server_creds.username == creds.username
-                                && server_creds.password == creds.password)
-                    });
-
-                    if !creds_match {
+                    // Some clients initially send an empty password. Reject that
+                    // attempt unless it actually matches the configured account;
+                    // prompting behavior must never bypass authentication.
+                    if !non_hybrid_credentials_match(self.creds.as_ref(), &creds) {
                         warn!(
-                            client_user = %creds.username,
-                            client_domain = ?creds.domain,
-                            server_user = ?self.creds.as_ref().map(|c| &c.username),
-                            client_pass_len = creds.password.len(),
-                            server_pass_len = ?self.creds.as_ref().map(|c| c.password.len()),
-                            client_pass_bytes = ?creds.password.as_bytes(),
-                            server_pass_bytes = ?self.creds.as_ref().map(|c| c.password.as_bytes()),
-                            "Credential mismatch — rejecting"
+                            ?protocol,
+                            "Credential mismatch; rejecting connection"
                         );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
                             ProtocolIndependentCode::ServerDeniedConnection,
@@ -581,7 +576,7 @@ impl Sequence for Acceptor {
 
                         return Err(ConnectorError::general("invalid credentials"));
                     }
-                    debug!(user = %creds.username, domain = ?creds.domain, "Credentials accepted");
+                    debug!("Credentials accepted");
                 }
 
                 (
@@ -795,5 +790,77 @@ fn create_gcc_blocks(
         },
         message_channel: None,
         multi_transport_channel: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{non_hybrid_credentials_match, Credentials};
+
+    fn credentials(username: &str, password: &str, domain: Option<&str>) -> Credentials {
+        Credentials {
+            username: username.to_owned(),
+            password: password.to_owned(),
+            domain: domain.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn empty_client_password_cannot_bypass_configured_credentials() {
+        let configured = credentials("remote-user", "configured-secret", None);
+        for username in ["remote-user", "another-user", ""] {
+            let supplied = credentials(username, "", None);
+            assert!(!non_hybrid_credentials_match(Some(&configured), &supplied));
+        }
+    }
+
+    #[test]
+    fn both_username_and_password_must_match_exactly() {
+        let configured = credentials("remote-user", "configured-secret", None);
+        for (username, password) in [
+            ("another-user", "configured-secret"),
+            ("REMOTE-USER", "configured-secret"),
+            ("remote-user", "wrong-secret"),
+            ("remote-user", "Configured-secret"),
+            ("remote-user", "configured-secret "),
+        ] {
+            let supplied = credentials(username, password, None);
+            assert!(!non_hybrid_credentials_match(Some(&configured), &supplied));
+        }
+        let supplied = credentials("remote-user", "configured-secret", None);
+        assert!(non_hybrid_credentials_match(Some(&configured), &supplied));
+    }
+
+    #[test]
+    fn domain_qualification_does_not_change_existing_account_matching() {
+        let configured = credentials("remote-user", "configured-secret", Some("SERVER"));
+        for domain in [None, Some("SERVER"), Some("CLIENT")] {
+            let supplied = credentials("remote-user", "configured-secret", domain);
+            assert!(non_hybrid_credentials_match(Some(&configured), &supplied));
+        }
+    }
+
+    #[test]
+    fn missing_server_credentials_still_reject_all_clients() {
+        for supplied in [
+            credentials("remote-user", "configured-secret", None),
+            credentials("remote-user", "", None),
+            credentials("", "", None),
+        ] {
+            assert!(!non_hybrid_credentials_match(None, &supplied));
+        }
+    }
+
+    #[test]
+    fn explicit_empty_password_still_requires_the_configured_username() {
+        let configured = credentials("remote-user", "", None);
+        assert!(non_hybrid_credentials_match(
+            Some(&configured),
+            &credentials("remote-user", "", None)
+        ));
+        assert!(!non_hybrid_credentials_match(
+            Some(&configured),
+            &credentials("another-user", "", None)
+        ));
     }
 }

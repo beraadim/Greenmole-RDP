@@ -11,8 +11,8 @@ pub struct MacInputHandler {
     keyboard: Option<KeyboardInjector>,
     mouse: Option<MouseInjector>,
     wake: Option<RemoteSessionWake>,
-    last_mouse_x: u16,
-    last_mouse_y: u16,
+    last_mouse_x: f64,
+    last_mouse_y: f64,
     last_sync_lock_bits: Option<u8>,
     coord_mapper: MouseCoordMapper,
     client_context: ClientInputContext,
@@ -85,8 +85,8 @@ impl MacInputHandler {
             keyboard,
             mouse,
             wake,
-            last_mouse_x: 0,
-            last_mouse_y: 0,
+            last_mouse_x: 0.0,
+            last_mouse_y: 0.0,
             last_sync_lock_bits: None,
             coord_mapper,
             client_context: ClientInputContext::default(),
@@ -904,8 +904,12 @@ mod tests {
     #[test]
     fn mouse_mapper_scales_linearly_across_resized_desktop() {
         let mapper = MouseCoordMapper::new(1920, 1200, 2560, 1305);
-        assert_eq!(mapper.map(1280, 652), (960, 599));
-        assert_eq!(mapper.map(2559, 1304), (1919, 1199));
+        let center = mapper.map(1280, 652);
+        assert!((center.0 - 960.0).abs() < 1e-8);
+        assert!((center.1 - 599.5402298850574).abs() < 1e-8);
+        let corner = mapper.map(2559, 1304);
+        assert!((corner.0 - 1919.25).abs() < 1e-8);
+        assert!((corner.1 - 1199.080459770115).abs() < 1e-8);
     }
 
     #[test]
@@ -919,9 +923,13 @@ mod tests {
         };
         mapper.update_frame_content_rect(2560, 1305, Some(&content));
 
-        assert_eq!(mapper.map(236, 0), (0, 0));
-        assert_eq!(mapper.map(1280, 652), (960, 599));
-        assert_eq!(mapper.map(2323, 1304), (1919, 1199));
+        assert_eq!(mapper.map(236, 0), (0.0, 0.0));
+        let center = mapper.map(1280, 652);
+        assert!((center.0 - 960.0).abs() < 1e-8);
+        assert!((center.1 - 599.5402298850574).abs() < 1e-8);
+        let corner = mapper.map(2323, 1304);
+        assert!((corner.0 - 1919.080459770115).abs() < 1e-8);
+        assert!((corner.1 - 1199.080459770115).abs() < 1e-8);
     }
 
     fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {

@@ -1,5 +1,6 @@
 //! Server configuration
 
+use macrdp_display::DisplayBackend;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -49,6 +50,8 @@ pub struct ServerConfig {
     /// Address to bind the RDP listener to (default: 0.0.0.0)
     pub bind_address: Option<String>,
     pub frame_rate: u32,
+    /// Display to share: the main display or an experimental virtual display.
+    pub display_backend: DisplayBackend,
     /// Resolution width (0 = auto-detect from display)
     pub width: u32,
     /// Resolution height (0 = auto-detect from display)
@@ -90,6 +93,7 @@ impl Default for ServerConfig {
             port: 3389,
             bind_address: None,
             frame_rate: 60,
+            display_backend: DisplayBackend::Main,
             width: 0,
             height: 0,
             username: None,
@@ -175,6 +179,7 @@ mod tests {
         assert_eq!(config.port, 3389);
         assert_eq!(config.bind_address, None);
         assert_eq!(config.frame_rate, 60);
+        assert_eq!(config.display_backend, DisplayBackend::Main);
         assert!(config.username.is_none());
     }
 
@@ -192,5 +197,17 @@ mod tests {
         assert_eq!(config.bind_address.as_deref(), Some("127.0.0.1"));
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn virtual_display_settings_round_trip_and_legacy_configs_keep_main_display() {
+        let legacy: ServerConfig = toml::from_str("port = 13389").unwrap();
+        assert_eq!(legacy.display_backend, DisplayBackend::Main);
+
+        let virtual_config: ServerConfig = toml::from_str("display_backend = 'virtual'").unwrap();
+        let saved = toml::to_string(&virtual_config).unwrap();
+        let restored: ServerConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.display_backend, DisplayBackend::Virtual);
+        assert!(toml::from_str::<ServerConfig>("display_backend = 'unknown'").is_err());
     }
 }

@@ -24,6 +24,9 @@
 # Rust
 # TLS certificates (generated at runtime)
 Cargo.lock
+# The CLI and desktop app are release artifacts; retain their resolved dependencies.
+!/Cargo.lock
+!/macrdp-ui/src-tauri/Cargo.lock
 config.toml
 docs/superpowers/
 tls/

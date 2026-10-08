@@ -12,6 +12,7 @@ mod builder;
 mod capabilities;
 mod clipboard;
 mod display;
+mod display_control;
 mod encoder;
 pub mod gfx;
 mod handler;

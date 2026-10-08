@@ -49,8 +49,13 @@ impl MouseInjector {
             .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
     }
 
-    pub fn move_to(&self, x: u16, y: u16) -> Result<()> {
-        let point = CGPoint::new(x as f64, y as f64);
+    /// Move in global CoreGraphics points, including negative secondary-display origins.
+    pub fn move_to(&self, x: f64, y: f64) -> Result<()> {
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite(),
+            "Mouse position must be finite"
+        );
+        let point = CGPoint::new(x, y);
         let source = Self::source()?;
         let event =
             CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
@@ -61,8 +66,12 @@ impl MouseInjector {
         Ok(())
     }
 
-    pub fn button_event(&self, button: MouseButton, pressed: bool, x: u16, y: u16) -> Result<()> {
-        let point = CGPoint::new(x as f64, y as f64);
+    pub fn button_event(&self, button: MouseButton, pressed: bool, x: f64, y: f64) -> Result<()> {
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite(),
+            "Mouse position must be finite"
+        );
+        let point = CGPoint::new(x, y);
         let (event_type, cg_button) = match (button, pressed) {
             (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
             (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
@@ -116,7 +125,20 @@ pub enum MouseButton {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_scroll_lines;
+    use super::{normalize_scroll_lines, MouseButton, MouseInjector};
+
+    #[test]
+    fn rejects_nonfinite_positions_before_creating_events() {
+        let mouse = MouseInjector;
+        for (x, y) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+            (f64::NEG_INFINITY, -1200.0),
+        ] {
+            assert!(mouse.move_to(x, y).is_err());
+            assert!(mouse.button_event(MouseButton::Left, true, x, y).is_err());
+        }
+    }
 
     #[test]
     fn keeps_small_scroll_values() {

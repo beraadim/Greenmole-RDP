@@ -251,7 +251,9 @@ impl BitmapUpdate {
         } else {
             let bpp = usize::from(self.format.bytes_per_pixel());
             let start = usize::from(y) * self.stride.get() + usize::from(x) * bpp;
-            let end = start + usize::from(height.get() - 1) * self.stride.get() + usize::from(width.get()) * bpp;
+            let end = start
+                + usize::from(height.get() - 1) * self.stride.get()
+                + usize::from(width.get()) * bpp;
             Some(Self {
                 x: self.x + x,
                 y: self.y + y,
@@ -380,6 +382,30 @@ pub async fn wait_for_display_resize(
     }
 }
 
+/// Coalesce a burst after the resize branch has won the capture select. Keeping
+/// this outside the cancellable frame wait prevents busy desktops from resetting
+/// the debounce on every video frame. Bound the pause during continuous dragging.
+pub async fn settle_display_resize(
+    mut resize_rx: tokio::sync::watch::Receiver<DesktopSize>,
+) -> DesktopSize {
+    use tokio::time::{sleep_until, Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(400);
+    loop {
+        let size = *resize_rx.borrow_and_update();
+        let now = Instant::now();
+        if now >= deadline {
+            return size;
+        }
+        let quiet_until = (now + Duration::from_millis(120)).min(deadline);
+        tokio::select! {
+            _ = sleep_until(quiet_until) => return *resize_rx.borrow_and_update(),
+            changed = resize_rx.changed() => {
+                if changed.is_err() { return *resize_rx.borrow_and_update(); }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::num::{NonZeroU16, NonZeroUsize};
@@ -387,7 +413,25 @@ mod tests {
     use ironrdp_graphics::diff::Rect;
     use ironrdp_graphics::image_processing::PixelFormat;
 
-    use super::{wait_for_display_resize, BitmapUpdate, DesktopSize, Framebuffer};
+    use super::{
+        settle_display_resize, wait_for_display_resize, BitmapUpdate, DesktopSize, Framebuffer,
+    };
+
+    #[tokio::test]
+    async fn resize_burst_commits_latest_dimensions() {
+        let (tx, rx) = tokio::sync::watch::channel(DesktopSize {
+            width: 1920,
+            height: 1080,
+        });
+        let changes = async {
+            for width in [1800, 1700, 1600] {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tx.send_replace(DesktopSize { width, height: 900 });
+            }
+        };
+        let (size, ()) = tokio::join!(settle_display_resize(rx), changes);
+        assert_eq!((size.width, size.height), (1600, 900));
+    }
 
     #[tokio::test]
     async fn resize_wait_wakes_without_a_capture_frame() {

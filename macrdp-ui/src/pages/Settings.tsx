@@ -263,7 +263,35 @@ function Settings() {
 
         {activeCategory === "display" && (
           <CategorySection title="Display">
-            <SettingRow label="Resolution" description="Applies to new connections; Auto follows the screen">
+            <SettingRow label="Display" description="Requires service restart">
+              <Select
+                value={config.display_backend}
+                onValueChange={(v) => updateConfig("display_backend", v)}
+              >
+                <SelectTrigger className="h-7 w-[210px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="main">Main display</SelectItem>
+                  <SelectItem value="virtual">Virtual display (experimental)</SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingRow>
+
+            {config.display_backend === "virtual" && (
+              <p className="py-2 text-xs text-text-muted">
+                Adds an extended display to your current macOS session. Move windows
+                onto it to use them remotely. The display stays available while the
+                service runs, including between client connections.
+              </p>
+            )}
+
+            <SettingRow
+              label="Resolution"
+              description={config.display_backend === "virtual"
+                ? "Requires service restart; Auto follows the client"
+                : "Applies to new connections; Auto follows the screen"}
+            >
               <Select
                 value={config.resolution || "auto"}
                 onValueChange={(v) => updateConfig("resolution", v)}
@@ -273,8 +301,12 @@ function Settings() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="auto">Auto</SelectItem>
-                  <SelectItem value="7680x4320">7680 × 4320</SelectItem>
-                  <SelectItem value="5120x2880">5120 × 2880</SelectItem>
+                  {config.display_backend === "main" && (
+                    <>
+                      <SelectItem value="7680x4320">7680 × 4320</SelectItem>
+                      <SelectItem value="5120x2880">5120 × 2880</SelectItem>
+                    </>
+                  )}
                   <SelectItem value="3840x2160">3840 × 2160</SelectItem>
                   <SelectItem value="2560x1600">2560 × 1600</SelectItem>
                   <SelectItem value="2560x1440">2560 × 1440</SelectItem>

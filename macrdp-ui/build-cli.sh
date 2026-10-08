@@ -12,10 +12,10 @@ PROFILE="${MACRDP_CLI_PROFILE:-${1:-debug}}"
 echo "Building macrdp-server (profile: $PROFILE, target: $TARGET_TRIPLE)..."
 
 if [ "$PROFILE" = "release" ]; then
-    cargo build -p macrdp-server --release --manifest-path "$PROJECT_ROOT/Cargo.toml"
+    cargo build -p macrdp-server --release --locked --manifest-path "$PROJECT_ROOT/Cargo.toml"
     SRC="$PROJECT_ROOT/target/release/macrdp-server"
 else
-    cargo build -p macrdp-server --manifest-path "$PROJECT_ROOT/Cargo.toml"
+    cargo build -p macrdp-server --locked --manifest-path "$PROJECT_ROOT/Cargo.toml"
     SRC="$PROJECT_ROOT/target/debug/macrdp-server"
 fi
 

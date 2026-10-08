@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ironrdp-server-gfx",
+    "crates/macrdp-display",
     "crates/macrdp-core",
     "crates/macrdp-server",
     "crates/macrdp-capture",

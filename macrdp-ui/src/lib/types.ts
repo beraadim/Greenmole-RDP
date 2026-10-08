@@ -80,6 +80,7 @@ export interface UiConfig {
   idle_timeout_secs: number;
   username: string;
   password: string;
+  display_backend: "main" | "virtual";
   resolution: string;
   show_cursor: boolean;
   log_level: string;

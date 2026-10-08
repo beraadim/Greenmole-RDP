@@ -22,6 +22,7 @@ A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or
 - **High fidelity color** — AVC444 mode for pixel-perfect color reproduction (RDP 10)
 - **Full keyboard & mouse** — complete input injection with 104-key mapping, numpad, modifiers, scroll
 - **HiDPI / Retina support** — capture at 2x/3x resolution for sharp 4K remote display
+- **Experimental virtual display** — an extended macOS desktop that follows the Guacamole viewport; see [setup and testing](docs/virtual-display.md)
 - **Configurable** — resolution, frame rate, bitrate, encoder, quality presets, all via simple TOML config
 - **Secure** — NLA/CredSSP authentication with auto-generated TLS certificates
 - **Lock screen capture** — automatic CoreGraphics fallback when the screen is locked
@@ -67,7 +68,7 @@ password = "123456"
 width = 0          # 0 = auto-detect
 height = 0
 frame_rate = 60
-hidpi_scale = 2    # 2x for 4K on Retina
+resolution = "auto" # use display pixels and follow the client viewport
 
 # Encoding
 quality = "high_quality"    # low_latency / balanced / high_quality
@@ -78,6 +79,11 @@ bitrate_mbps = 50           # target bitrate (Mbps)
 # Logging
 log_level = "info"          # trace / debug / info / warn / error
 ```
+
+With `width = 0`, `height = 0`, and `resolution = "auto"`, client requests can
+resize the remote desktop. A fixed value such as `resolution = "1920x1080"`
+disables client-driven resizing. Legacy scale values remain supported as strings
+(for example, `resolution = "2"`); these values must be quoted in TOML.
 
 Config search order:
 1. `./config.toml`
@@ -92,6 +98,7 @@ Config search order:
 crates/
 ├── macrdp-server/       Main server binary
 ├── macrdp-capture/      Screen capture
+├── macrdp-display/      Physical/virtual display ownership and mode changes
 ├── macrdp-input/        Keyboard & mouse injection
 ├── macrdp-encode/       Video encoding
 ├── ironrdp-server-gfx/  RDP protocol (IronRDP fork)

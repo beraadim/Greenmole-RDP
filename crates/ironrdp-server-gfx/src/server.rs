@@ -9,8 +9,7 @@ use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsRequest, OwnedFileContentsResponse};
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_core::{decode, encode_vec, impl_as_any};
-use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
-use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
+use ironrdp_displaycontrol::server::DisplayControlServer;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
@@ -32,6 +31,7 @@ use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
+use crate::display_control::DisplayControlBackend;
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::gfx::{GfxHandler, GfxState};
 use crate::handler::{ClientInputContext, RdpServerInputHandler};
@@ -138,23 +138,6 @@ impl dvc::DvcProcessor for AInputHandler {
 }
 
 impl dvc::DvcServerProcessor for AInputHandler {}
-
-struct DisplayControlBackend {
-    display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
-}
-
-impl DisplayControlBackend {
-    fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>) -> Self {
-        Self { display }
-    }
-}
-
-impl DisplayControlHandler for DisplayControlBackend {
-    fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
-        let display = Arc::clone(&self.display);
-        task::spawn_blocking(move || display.blocking_lock().request_layout(layout));
-    }
-}
 
 /// RDP Server
 ///
@@ -1284,6 +1267,10 @@ impl RdpServer {
             }
         };
 
+        // Dispose per-connection channel workers before another client can
+        // negotiate against this display. Reactivation stays inside the loop
+        // above and preserves those channels until the connection actually ends.
+        self.static_channels = StaticChannelSet::new();
         if client_connected {
             self.handler.lock().await.on_disconnect();
         }
@@ -1292,7 +1279,7 @@ impl RdpServer {
     }
 
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
-        debug!(?creds, "Changing credentials");
+        debug!(configured = creds.is_some(), "Changing credentials");
         self.creds = creds
     }
 }

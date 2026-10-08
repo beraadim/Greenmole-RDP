@@ -16,6 +16,11 @@ tauri-build = { version = "=2.5.6", features = [] }
 [dependencies]
 macrdp-core = { path = "../../crates/macrdp-core" }
 tauri = { version = "=2.10.1", features = ["tray-icon", "macos-private-api"] }
+# Tauri 2.10.1's runtime traits and menu macros must come from its release set.
+# Newer 2.x internals can introduce APIs that this pinned Tauri version lacks.
+tauri-runtime = "=2.10.0"
+tauri-runtime-wry = { version = "=2.10.0", default-features = false }
+tauri-macros = "=2.5.3"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }

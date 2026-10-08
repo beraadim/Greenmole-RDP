@@ -206,13 +206,16 @@ pub async fn set_config(
     value: serde_json::Value,
     state: State<'_, Arc<AppState>>,
 ) -> Result<SetConfigResponse, String> {
-    tracing::info!("set_config: key={key}, value={value}");
+    tracing::info!(%key, "Updating configuration");
 
+    let running_backend = state.server_handle.lock().await
+        .as_ref()
+        .map(|handle| handle.display_backend());
     let restart_required = {
         let mut config = state.ui_config.lock().await;
-        let restart = config.set_field(&key, &value)?;
+        config.set_field(&key, &value)?;
         config.save()?;
-        restart
+        config.requires_restart(&key, running_backend)
     };
 
     if key == "log_level" {
@@ -228,8 +231,9 @@ pub async fn set_config(
         tracing::info!(%level, "Reloaded tracing filter");
     }
 
-    // Hot-update: push changes to running server
-    {
+    // Display ownership changes apply on the next server start. Persist them
+    // without changing the current display or moving its windows mid-session.
+    if !restart_required {
         let guard = state.server_handle.lock().await;
         if let Some(handle) = guard.as_ref() {
             let config = state.ui_config.lock().await;
@@ -254,7 +258,7 @@ pub async fn set_config(
     }
 
     // Seamless port migration: start new port first, then stop old
-    if key == "port" {
+    if key == "port" && !restart_required {
         let old_handle = state.server_handle.lock().await.clone();
         if old_handle.is_some() {
             tracing::info!("Port changed, starting new listener before releasing old");

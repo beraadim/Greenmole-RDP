@@ -133,6 +133,8 @@ pub struct CursorShape {
 /// Configuration for screen capture
 #[derive(Clone)]
 pub struct CaptureConfig {
+    /// Pinned CoreGraphics display ID. Capture never falls back to another display.
+    pub display_id: u32,
     pub width: u32,
     pub height: u32,
     pub frame_rate: u32,
@@ -143,6 +145,7 @@ pub struct CaptureConfig {
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
     stream: SCStream,
+    stopped: bool,
     frame_rx: mpsc::Receiver<CaptureEvent>,
     config: CaptureConfig,
     actual_width: u32,
@@ -612,7 +615,7 @@ pub fn detect_cg_display_size() -> Result<(u32, u32)> {
 }
 
 impl ScreenCapturer {
-    /// Create a new screen capturer for the main display.
+    /// Create a screen capturer for the exact display selected by the session.
     ///
     /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
     /// to the provided channel as `AudioFrame` (interleaved Float32 PCM, 48 kHz stereo).
@@ -628,8 +631,13 @@ impl ScreenCapturer {
         let display = content
             .displays()
             .into_iter()
-            .find(|display| display.display_id() == core_graphics::display::CGDisplay::main().id)
-            .context("Main display is not available to ScreenCaptureKit")?;
+            .find(|display| display.display_id() == config.display_id)
+            .with_context(|| {
+                format!(
+                    "Selected display {} is not available to ScreenCaptureKit",
+                    config.display_id
+                )
+            })?;
 
         let actual_width = if config.width == 0 {
             display.width() as u32
@@ -674,7 +682,7 @@ impl ScreenCapturer {
         stream.start_capture().context("Failed to start capture")?;
 
         tracing::info!(
-            display_id = display.display_id(),
+            display_id = config.display_id,
             width = actual_width,
             height = actual_height,
             fps = config.frame_rate,
@@ -685,6 +693,7 @@ impl ScreenCapturer {
 
         Ok(Self {
             stream,
+            stopped: false,
             frame_rx,
             config,
             actual_width,
@@ -701,6 +710,26 @@ impl ScreenCapturer {
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
     pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
         self.frame_rx.try_recv().ok()
+    }
+
+    /// Wait for ScreenCaptureKit to finish stopping before changing display modes.
+    ///
+    /// The upstream API waits for Apple's completion callback and has no timeout.
+    /// A failure is returned without marking the stream stopped, so a caller can
+    /// abort reconfiguration and cleanup can retry. No native object crosses threads.
+    pub fn stop(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stream
+            .stop_capture()
+            .context("Failed to stop screen capture")?;
+        self.stopped = true;
+        tracing::debug!(
+            display_id = self.config.display_id,
+            "Screen capture stopped"
+        );
+        Ok(())
     }
 
     /// Update capture frame rate at runtime.
@@ -728,6 +757,20 @@ impl ScreenCapturer {
     }
 }
 
+impl Drop for ScreenCapturer {
+    fn drop(&mut self) {
+        // SCStream's own Drop only releases its reference; it does not wait for
+        // capture to stop. Keep callbacks and their Rust context alive until the
+        // stop completion arrives, including disconnect and recovery teardown.
+        if let Err(error) = self.stop() {
+            // Destructors cannot report failure to the session. Log it and let
+            // SCStream release its resources; explicit stop() is used when a
+            // successful stop is required before a display-mode transition.
+            tracing::warn!(display_id = self.config.display_id, %error, "Capture cleanup could not confirm stop");
+        }
+    }
+}
+
 /// Fallback capturer using CGDisplayCreateImage (CoreGraphics).
 /// Works during lock screen because it captures at the display level,
 /// below the window server / ScreenCaptureKit layer.
@@ -739,16 +782,15 @@ pub struct CgFallbackCapturer {
 }
 
 impl CgFallbackCapturer {
-    /// Create a fallback capturer for the main display
+    /// Keep fallback capture pinned to the session's selected display.
     pub fn new(config: &CaptureConfig) -> Self {
-        let display_id = core_graphics::display::CGDisplay::main().id;
         let fps = if config.frame_rate > 0 {
             config.frame_rate
         } else {
             30
         };
         Self {
-            display_id,
+            display_id: config.display_id,
             width: config.width,
             height: config.height,
             frame_interval: std::time::Duration::from_micros(1_000_000 / fps as u64),

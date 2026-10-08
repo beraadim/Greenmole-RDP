@@ -13,8 +13,17 @@ use ironrdp_server::{gfx::GfxState, Credentials, RdpServer, TlsIdentityCtx};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+fn main() -> Result<()> {
+    // A display owner must start before this process queries CoreGraphics or
+    // initializes the server. Its stdio is a private parent/child protocol.
+    if let Some(result) = macrdp_display::run_display_helper_if_requested() {
+        return result;
+    }
+    run_server()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run_server() -> Result<()> {
     let cli = Cli::parse();
     let config = ServerConfig::load(&cli)?;
 
@@ -43,7 +52,8 @@ async fn main() -> Result<()> {
 
     eprintln!("Log file: {}", log_path.display());
 
-    tracing::info!(?config, "macrdp server starting");
+    // Configuration includes credentials; log only operational fields.
+    tracing::info!(port = config.port, backend = ?config.display_backend, "macrdp server starting");
 
     // Ensure TLS certificates exist
     let (cert_path, key_path) =
@@ -59,50 +69,13 @@ async fn main() -> Result<()> {
     // Check and request required macOS permissions
     check_permissions();
 
-    // Detect macOS display sizes:
-    // - SCK logical: from ScreenCaptureKit SCDisplay, used for capture sizing
-    // - CG logical: from CoreGraphics CGDisplay.bounds(), used for mouse mapping
-    //   CGEvent operates in the CG coordinate space, so mouse mapping MUST use CG dimensions.
-    let (sck_w, sck_h) = match macrdp_capture::detect_display_size() {
-        Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "SCK logical display size");
-            (w as u16, h as u16)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
-        }
-    };
-    let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
-        Ok((w, h)) => {
-            tracing::info!(
-                width = w,
-                height = h,
-                "CG logical display size (CGEvent coordinate space)"
-            );
-            (w as u16, h as u16)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
-            (sck_w, sck_h)
-        }
-    };
-    if sck_w != cg_w || sck_h != cg_h {
-        tracing::warn!(
-            sck_w,
-            sck_h,
-            cg_w,
-            cg_h,
-            "SCK and CG display sizes differ! Using CG for mouse mapping, SCK for capture."
-        );
-    }
-
-    // Determine RDP desktop resolution (what we capture and send)
-    let (width, height) = if config.width > 0 && config.height > 0 {
-        (config.width as u16, config.height as u16)
-    } else {
-        (sck_w, sck_h)
-    };
+    let backend = config.display_backend;
+    let display_controller = tokio::task::spawn_blocking(move || {
+        macrdp_display::DisplayController::new(backend, 1920, 1080)
+    })
+    .await
+    .context("Display initialization worker failed")??;
+    let geometry = display_controller.geometry()?;
 
     // Parse quality setting
     let quality = match config.quality.as_deref() {
@@ -123,60 +96,24 @@ async fn main() -> Result<()> {
         "Chroma mode"
     );
 
-    // Resolution: "auto", "WxH" (e.g. "3840x2160"), or legacy scale (e.g. "2")
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
     let res_auto = res_mode == "auto";
-    let (width, height) = if res_mode == "auto" {
-        match macrdp_capture::detect_display_pixel_size() {
-            Ok((physical_w, physical_h)) => {
-                tracing::info!(
-                    logical_w = width,
-                    logical_h = height,
-                    physical_w,
-                    physical_h,
-                    "Resolution auto: using physical display size"
-                );
-                (physical_w as u16, physical_h as u16)
-            }
-            Err(err) => {
-                tracing::warn!(%err, logical_w = width, logical_h = height, "Resolution auto: failed to detect physical display size, using logical");
-                (width, height)
-            }
-        }
-    } else if let Some((w, h)) = res_mode
-        .split_once('x')
-        .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
-    {
-        tracing::info!(w, h, "Resolution: explicit WxH");
-        (w, h)
-    } else if let Ok(scale) = res_mode.parse::<u32>() {
-        let scale = scale.max(1).min(4);
-        let (rw, rh) = (width as u32 * scale, height as u32 * scale);
-        tracing::info!(
-            scale,
-            rw,
-            rh,
-            "Resolution: legacy hidpi_scale → {}x{}",
-            rw,
-            rh
-        );
-        (rw as u16, rh as u16)
-    } else {
-        tracing::warn!(res_mode, "Resolution: unrecognized, using logical");
-        (width, height)
-    };
-
-    // The shared mapper follows the negotiated desktop and the capture's
-    // visible content rectangle, excluding letterboxing and encoder padding.
-    let coord_mapper = handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
+    let (width, height) =
+        macrdp_display::resolve_desktop_size(res_mode, &geometry, config.width, config.height)?;
+    let (width, height) = display_controller.normalize_size(width, height);
+    let coord_mapper = handler::MouseCoordMapper::new(1, 1, width, height);
+    coord_mapper.update_display_bounds(
+        geometry.origin_x,
+        geometry.origin_y,
+        geometry.logical_width,
+        geometry.logical_height,
+    );
     tracing::info!(
-        rdp_w = width,
-        rdp_h = height,
-        cg_logical_w = cg_w,
-        cg_logical_h = cg_h,
-        sck_w,
-        sck_h,
-        "Display resolution configured"
+        ?backend,
+        ?geometry,
+        width,
+        height,
+        "Selected remote desktop display"
     );
 
     // Create shared GFX state
@@ -249,6 +186,7 @@ async fn main() -> Result<()> {
         coord_mapper,
         shared_audio_tx,
         perf_stats.clone(),
+        display_controller,
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;

@@ -39,12 +39,14 @@ impl ContentRect {
 }
 
 /// Maps the negotiated RDP desktop through the visible capture content to the
-/// main display's CoreGraphics logical coordinates. Encoder padding is excluded.
+/// selected display's global CoreGraphics points. Encoder padding is excluded.
 #[derive(Debug, Clone)]
 pub struct MouseCoordMapper(Arc<Mutex<CoordState>>);
 
 #[derive(Debug)]
 struct CoordState {
+    origin_x: f64,
+    origin_y: f64,
     logical_w: f64,
     logical_h: f64,
     rdp_w: f64,
@@ -64,6 +66,8 @@ impl MouseCoordMapper {
             "Mouse coordinate mapper initialized"
         );
         Self(Arc::new(Mutex::new(CoordState {
+            origin_x: 0.0,
+            origin_y: 0.0,
             logical_w: f64::from(logical_w.max(1)),
             logical_h: f64::from(logical_h.max(1)),
             rdp_w,
@@ -77,13 +81,55 @@ impl MouseCoordMapper {
         })))
     }
 
-    pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
+    /// Preserve subpoint precision and signed global coordinates through injection.
+    pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (f64, f64) {
         let s = self.0.lock().unwrap();
-        let x = ((f64::from(rdp_x) - s.content.x) * s.logical_w / s.content.width)
-            .clamp(0.0, s.logical_w - 1.0) as u16;
-        let y = ((f64::from(rdp_y) - s.content.y) * s.logical_h / s.content.height)
-            .clamp(0.0, s.logical_h - 1.0) as u16;
+        let x = map_axis(rdp_x, s.content.x, s.content.width, s.origin_x, s.logical_w);
+        let y = map_axis(
+            rdp_y,
+            s.content.y,
+            s.content.height,
+            s.origin_y,
+            s.logical_h,
+        );
         (x, y)
+    }
+
+    /// Set the selected display's global bounds before activating its capture stream.
+    /// Invalid or unrepresentable bounds leave the previous mapping intact.
+    pub fn update_display_bounds(
+        &self,
+        origin_x: f64,
+        origin_y: f64,
+        logical_width: f64,
+        logical_height: f64,
+    ) {
+        if !valid_axis(origin_x, logical_width) || !valid_axis(origin_y, logical_height) {
+            tracing::warn!(
+                origin_x,
+                origin_y,
+                logical_width,
+                logical_height,
+                "Ignoring invalid mouse display bounds"
+            );
+            return;
+        }
+        let mut s = self.0.lock().unwrap();
+        if (s.origin_x, s.origin_y, s.logical_w, s.logical_h)
+            != (origin_x, origin_y, logical_width, logical_height)
+        {
+            s.origin_x = origin_x;
+            s.origin_y = origin_y;
+            s.logical_w = logical_width;
+            s.logical_h = logical_height;
+            tracing::info!(
+                origin_x,
+                origin_y,
+                logical_width,
+                logical_height,
+                "Mouse coordinate mapper: selected display bounds changed"
+            );
+        }
     }
 
     /// Refresh CG bounds when starting a capture stream after a display-mode change.
@@ -94,12 +140,17 @@ impl MouseCoordMapper {
         let mut s = self.0.lock().unwrap();
         let width = f64::from(logical_w);
         let height = f64::from(logical_h);
+        if !valid_axis(s.origin_x, width) || !valid_axis(s.origin_y, height) {
+            return;
+        }
         if (s.logical_w, s.logical_h) != (width, height) {
             s.logical_w = width;
             s.logical_h = height;
             tracing::info!(
                 logical_w,
                 logical_h,
+                origin_x = s.origin_x,
+                origin_y = s.origin_y,
                 "Mouse coordinate mapper: CG display bounds changed"
             );
         }
@@ -187,9 +238,43 @@ impl MouseCoordMapper {
     }
 }
 
+fn valid_axis(origin: f64, extent: f64) -> bool {
+    origin.is_finite()
+        && extent.is_finite()
+        && extent > 0.0
+        && (origin + extent).is_finite()
+        && origin + extent > origin
+}
+
+fn map_axis(input: u16, content_origin: f64, content_extent: f64, origin: f64, extent: f64) -> f64 {
+    let fraction = ((f64::from(input) - content_origin) / content_extent).clamp(0.0, 1.0);
+    // Display bounds are half-open. Keep clicks in padding on this display, while
+    // allowing the last Retina pixel's fractional point instead of rounding it away.
+    let upper = origin + extent;
+    let last_inside = if upper == 0.0 {
+        -f64::from_bits(1)
+    } else if upper > 0.0 {
+        f64::from_bits(upper.to_bits() - 1)
+    } else {
+        f64::from_bits(upper.to_bits() + 1)
+    };
+    (origin + fraction * extent).clamp(origin, last_inside)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_point(actual: (f64, f64), expected: (f64, f64)) {
+        assert!(
+            (actual.0 - expected.0).abs() < 1e-8,
+            "x: {actual:?} != {expected:?}"
+        );
+        assert!(
+            (actual.1 - expected.1).abs() < 1e-8,
+            "y: {actual:?} != {expected:?}"
+        );
+    }
 
     #[test]
     fn retina_surface_points_are_converted_before_mapping() {
@@ -203,8 +288,8 @@ mod tests {
         .from_surface_points(2.0)
         .unwrap();
         mapper.update_frame_content_rect(3840, 2400, Some(&rect));
-        assert_eq!(mapper.map(1920, 1200), (960, 600));
-        assert_eq!(mapper.map(3839, 2399), (1919, 1199));
+        assert_point(mapper.map(1920, 1200), (960.0, 600.0));
+        assert_point(mapper.map(3839, 2399), (1919.5, 1199.5));
     }
 
     #[test]
@@ -220,11 +305,16 @@ mod tests {
         .from_surface_points(2.0)
         .unwrap();
         mapper.update_frame_content_rect(2560, 1305, Some(&rect));
-        assert_eq!(mapper.map(236, 0), (0, 0));
-        assert_eq!(mapper.map(1280, 652), (960, 599));
-        assert_eq!(mapper.map(2323, 1304), (1919, 1199));
-        assert_eq!(mapper.map(0, 652), (0, 599));
-        assert_eq!(mapper.map(2559, 652), (1919, 599));
+        assert_point(mapper.map(236, 0), (0.0, 0.0));
+        assert_point(mapper.map(1280, 652), (960.0, 599.5402298850574));
+        assert_point(
+            mapper.map(2323, 1304),
+            (1919.080459770115, 1199.080459770115),
+        );
+        assert_point(mapper.map(0, 652), (0.0, 599.5402298850574));
+        let padded = mapper.map(2559, 652);
+        assert!(padded.0 < 1920.0);
+        assert_point(padded, (1920.0, 599.5402298850574));
     }
 
     #[test]
@@ -239,9 +329,9 @@ mod tests {
         .from_surface_points(1.5)
         .unwrap();
         mapper.update_frame_content_rect(1920, 1200, Some(&rect));
-        assert_eq!(mapper.map(960, 600), (960, 540));
-        assert_eq!(mapper.map(0, 60), (0, 0));
-        assert_eq!(mapper.map(1919, 1139), (1919, 1079));
+        assert_point(mapper.map(960, 600), (960.0, 540.0));
+        assert_point(mapper.map(0, 60), (0.0, 0.0));
+        assert_point(mapper.map(1919, 1139), (1919.0, 1079.0));
     }
 
     #[test]
@@ -255,10 +345,10 @@ mod tests {
         };
         mapper.update_frame_content_rect(2560, 1305, Some(&rect));
         mapper.update_rdp_size(1920, 1200);
-        assert_eq!(mapper.map(960, 600), (960, 600));
+        assert_point(mapper.map(960, 600), (960.0, 600.0));
         mapper.update_frame_content_rect(2560, 1305, Some(&rect));
         mapper.update_frame_content_rect(3840, 2400, None);
-        assert_eq!(mapper.map(480, 300), (480, 300));
+        assert_point(mapper.map(480, 300), (480.0, 300.0));
     }
 
     #[test]
@@ -273,18 +363,19 @@ mod tests {
             };
             assert!(rect.from_surface_points(2.0).is_none());
             mapper.update_frame_content_rect(1920, 1200, Some(&rect));
-            assert_eq!(mapper.map(960, 600), (960, 600));
+            assert_point(mapper.map(960, 600), (960.0, 600.0));
         }
-        assert_eq!(MouseCoordMapper::new(0, 0, 0, 0).map(10, 10), (0, 0));
+        let tiny = MouseCoordMapper::new(0, 0, 0, 0).map(10, 10);
+        assert!(tiny.0 >= 0.0 && tiny.0 < 1.0 && tiny.1 >= 0.0 && tiny.1 < 1.0);
     }
 
     #[test]
     fn new_capture_refreshes_host_display_mode() {
         let mapper = MouseCoordMapper::new(1920, 1200, 2560, 1600);
         mapper.update_logical_size(1280, 800);
-        assert_eq!(mapper.map(1280, 800), (640, 400));
+        assert_point(mapper.map(1280, 800), (640.0, 400.0));
         mapper.update_logical_size(0, 0);
-        assert_eq!(mapper.map(1280, 800), (640, 400));
+        assert_point(mapper.map(1280, 800), (640.0, 400.0));
     }
 
     #[test]
@@ -297,9 +388,9 @@ mod tests {
             height: 1200.0,
         };
         mapper.update_frame_content_rect(2560, 1600, Some(&rect));
-        assert_eq!(mapper.map(160, 100), (0, 0));
-        assert_eq!(mapper.map(640, 400), (960, 600));
-        assert_eq!(mapper.map(1119, 699), (1918, 1198));
+        assert_point(mapper.map(160, 100), (0.0, 0.0));
+        assert_point(mapper.map(640, 400), (960.0, 600.0));
+        assert_point(mapper.map(1119, 699), (1918.0, 1198.0));
     }
 
     #[test]
@@ -312,11 +403,13 @@ mod tests {
             height: 1200.0,
         };
         mapper.update_frame_content_rect(1900, 1200, Some(&rect));
-        assert_eq!(mapper.map(0, 0), (100, 0));
-        assert_eq!(mapper.map(1900, 1200), (1999, 1199));
+        assert_point(mapper.map(0, 0), (100.0, 0.0));
+        let edge = mapper.map(1900, 1200);
+        assert!(edge.0 < 2000.0 && edge.1 < 1200.0);
+        assert_point(edge, (2000.0, 1200.0));
         let outside = ContentRect { x: 1900.0, ..rect };
         mapper.update_frame_content_rect(1900, 1200, Some(&outside));
-        assert_eq!(mapper.map(0, 0), (100, 0));
+        assert_point(mapper.map(0, 0), (100.0, 0.0));
     }
 
     #[test]
@@ -329,6 +422,88 @@ mod tests {
         };
         for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(rect.from_surface_points(scale).is_none());
+        }
+    }
+
+    #[test]
+    fn secondary_retina_display_keeps_negative_global_origin_and_subpoints() {
+        let mapper = MouseCoordMapper::new(1920, 1200, 3840, 2400);
+        mapper.update_display_bounds(-1920.0, -1200.0, 1920.0, 1200.0);
+        let content = ContentRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1200.0,
+        }
+        .from_surface_points(2.0)
+        .unwrap();
+        mapper.update_frame_content_rect(3840, 2400, Some(&content));
+
+        assert_point(mapper.map(0, 0), (-1920.0, -1200.0));
+        assert_point(mapper.map(1920, 1200), (-960.0, -600.0));
+        assert_point(mapper.map(3839, 2399), (-0.5, -0.5));
+        let outside = mapper.map(u16::MAX, u16::MAX);
+        assert!(outside.0 < 0.0 && outside.1 < 0.0);
+    }
+
+    #[test]
+    fn secondary_display_letterboxing_clamps_inside_global_bounds() {
+        let mapper = MouseCoordMapper::new(1920, 1200, 2560, 1600);
+        mapper.update_display_bounds(3840.0, 240.0, 1920.0, 1200.0);
+        let content = ContentRect {
+            x: 320.0,
+            y: 200.0,
+            width: 1920.0,
+            height: 1200.0,
+        };
+        mapper.update_frame_content_rect(2560, 1600, Some(&content));
+
+        assert_point(mapper.map(0, 0), (3840.0, 240.0));
+        assert_point(mapper.map(1280, 800), (4800.0, 840.0));
+        let lower_right = mapper.map(2559, 1599);
+        assert!(lower_right.0 < 5760.0 && lower_right.1 < 1440.0);
+        assert_point(lower_right, (5760.0, 1440.0));
+
+        // A resize must retain the selected display's position in the global desktop.
+        mapper.update_logical_size(1280, 800);
+        mapper.update_rdp_size(1280, 800);
+        assert_point(mapper.map(640, 400), (4480.0, 640.0));
+    }
+
+    #[test]
+    fn clipped_secondary_display_keeps_transform_and_negative_upper_edge() {
+        let mapper = MouseCoordMapper::new(2000, 1200, 1900, 1200);
+        mapper.update_display_bounds(-3000.0, -2000.0, 2000.0, 1200.0);
+        let content = ContentRect {
+            x: -100.0,
+            y: 0.0,
+            width: 2000.0,
+            height: 1200.0,
+        };
+        mapper.update_frame_content_rect(1900, 1200, Some(&content));
+
+        assert_point(mapper.map(0, 0), (-2900.0, -2000.0));
+        assert_point(mapper.map(900, 600), (-2000.0, -1400.0));
+        let edge = mapper.map(u16::MAX, u16::MAX);
+        assert!(edge.0 < -1000.0 && edge.1 < -800.0);
+        assert_point(edge, (-1000.0, -800.0));
+    }
+
+    #[test]
+    fn invalid_global_bounds_preserve_the_selected_display() {
+        let mapper = MouseCoordMapper::new(1920, 1200, 1920, 1200);
+        mapper.update_display_bounds(-1920.0, 240.0, 1920.0, 1200.0);
+        for bounds in [
+            (f64::NAN, 0.0, 1920.0, 1200.0),
+            (0.0, f64::INFINITY, 1920.0, 1200.0),
+            (0.0, 0.0, 0.0, 1200.0),
+            (0.0, 0.0, 1920.0, -1.0),
+            (0.0, 0.0, f64::INFINITY, 1200.0),
+            (f64::MAX, 0.0, f64::MAX, 1200.0),
+            (f64::MAX, 0.0, 1.0, 1200.0),
+        ] {
+            mapper.update_display_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            assert_point(mapper.map(960, 600), (-960.0, 840.0));
         }
     }
 }

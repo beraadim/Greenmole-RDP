@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
@@ -163,6 +163,7 @@ pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<Bit
 
 /// Display adapter that bridges ScreenCapturer to ironrdp-server
 pub struct MacDisplay {
+    display_controller: macrdp_display::DisplayController,
     width: u16,
     height: u16,
     /// Latest requested size, including requests received while reactivating.
@@ -193,6 +194,10 @@ pub struct MacDisplay {
 
 impl MacDisplay {
     fn apply_resize(&mut self, width: u16, height: u16, source: &str) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let (width, height) = self.display_controller.normalize_size(width, height);
         let w = width.min(self.max_width);
         let h = height.min(self.max_height);
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
@@ -258,6 +263,7 @@ impl MacDisplay {
         coord_mapper: MouseCoordMapper,
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
+        display_controller: macrdp_display::DisplayController,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -266,15 +272,24 @@ impl MacDisplay {
             base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0,
             "Base bitrate"
         );
-        // Max resolution: use physical display size so clients can resize freely.
-        // SCK scales_to_fit handles any resolution.
-        let (max_w, max_h) = macrdp_capture::detect_display_pixel_size()
-            .map(|(physical_w, physical_h)| {
-                (width.max(physical_w as u16), height.max(physical_h as u16))
-            })
-            .unwrap_or((width.max(3840), height.max(2160)));
+        let (max_w, max_h) =
+            if display_controller.backend() == macrdp_display::DisplayBackend::Virtual {
+                // Virtual desktop limits are independent of attached monitor sizes.
+                display_controller.normalize_size(u16::MAX, u16::MAX)
+            } else {
+                display_controller
+                    .geometry()
+                    .map(|geometry| {
+                        (
+                            width.max(geometry.pixel_width.min(u32::from(u16::MAX)) as u16),
+                            height.max(geometry.pixel_height.min(u32::from(u16::MAX)) as u16),
+                        )
+                    })
+                    .unwrap_or((width, height))
+            };
         let (resize_tx, _) = tokio::sync::watch::channel(DesktopSize { width, height });
         Self {
+            display_controller,
             width,
             height,
             resize_tx,
@@ -332,7 +347,15 @@ impl RdpServerDisplay for MacDisplay {
         });
         let width = size.width;
         let height = size.height;
+        // Mode changes happen only after negotiation and after the previous
+        // capture has stopped. Keep the owner alive across connections/resizes.
+        let controller = self.display_controller.clone();
+        let geometry =
+            tokio::task::spawn_blocking(move || controller.prepare_capture(width, height))
+                .await
+                .context("Display mode worker failed")??;
         let capture_config = CaptureConfig {
+            display_id: geometry.display_id,
             width: width as u32,
             height: height as u32,
             frame_rate: self.frame_rate,
@@ -368,16 +391,19 @@ impl RdpServerDisplay for MacDisplay {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
 
-        // The host display mode may have changed since server startup.
-        match macrdp_capture::detect_cg_display_size() {
-            Ok((logical_width, logical_height)) => {
-                self.coord_mapper
-                    .update_logical_size(logical_width, logical_height);
-            }
-            Err(error) => tracing::warn!(%error, "Could not refresh host pointer bounds"),
-        }
+        self.coord_mapper.update_display_bounds(
+            geometry.origin_x,
+            geometry.origin_y,
+            geometry.logical_width,
+            geometry.logical_height,
+        );
         self.coord_mapper.update_rdp_size(width, height);
-        tracing::info!(width, height, "Activated capture and pointer desktop size");
+        tracing::info!(
+            width,
+            height,
+            ?geometry,
+            "Activated capture and pointer desktop size"
+        );
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
@@ -415,25 +441,31 @@ struct MacDisplayUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        let resize_rx = self.resize_rx.clone();
-        let width = self.capture_config.width;
-        let height = self.capture_config.height;
-        tokio::select! {
-            biased;
-            size = ironrdp_server::wait_for_display_resize(resize_rx, width, height) => {
-                match size {
-                    Some(size) => {
-                        tracing::info!(
-                            width = size.width,
-                            height = size.height,
-                            "Requesting RDP reactivation for display resize"
-                        );
-                        Ok(Some(DisplayUpdate::Resize(size)))
+        loop {
+            let resize_rx = self.resize_rx.clone();
+            let width = self.capture_config.width;
+            let height = self.capture_config.height;
+            tokio::select! {
+                biased;
+                size = ironrdp_server::wait_for_display_resize(resize_rx.clone(), width, height) => {
+                    match size {
+                        Some(_) => {
+                            let size = ironrdp_server::settle_display_resize(resize_rx).await;
+                            if u32::from(size.width) == width && u32::from(size.height) == height {
+                                continue;
+                            }
+                            // Confirm native capture has stopped before reactivation
+                            // can change the selected virtual display's mode.
+                            self.capturer.stop()?;
+                            tracing::info!(width = size.width, height = size.height,
+                                "Requesting RDP reactivation for display resize");
+                            return Ok(Some(DisplayUpdate::Resize(size)));
+                        }
+                        None => return self.next_frame_update().await,
                     }
-                    None => self.next_frame_update().await,
                 }
+                update = self.next_frame_update() => return update,
             }
-            update = self.next_frame_update() => update,
         }
     }
 }

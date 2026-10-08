@@ -14,4 +14,5 @@ pub mod tls;
 pub use callbacks::*;
 pub use config::{config_dir, AudioConfig, ClipboardConfig, ServerConfig};
 pub use log_bridge::{init_log_file, log_file_path, LogBridgeLayer};
+pub use macrdp_display::{run_display_helper_if_requested, DisplayBackend};
 pub use server::{resolve_resolution, start_server, ServerHandle};

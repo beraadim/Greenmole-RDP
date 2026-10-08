@@ -19,6 +19,12 @@ password = "123456"
 
 # ─── Display ───────────────────────────────────────────────────────────────────
 
+# "main" shares the main display. "virtual" creates an experimental extended
+# display in the same macOS session; move windows onto it to use them remotely.
+# The virtual display remains available until the server stops.
+# Changes require a server restart; ordinary client resizing does not.
+display_backend = "main"
+
 # Resolution width in pixels
 # Default: 0 (auto-detect from macOS display + follow client request)
 # Set to a specific value (e.g. 1920) to force a fixed resolution
@@ -39,11 +45,9 @@ frame_rate = 60
 # within this ceiling based on network conditions.
 # bitrate_mbps = 50
 
-# HiDPI scale factor
-# Default: 1 (no scaling)
-# Multiplies capture resolution for sharper image on Retina displays.
-# e.g. scale=2 on a 1920x1080 logical display → captures at 3840x2160 (4K)
-# Mouse coordinates are automatically mapped back to logical points.
+# Remote framebuffer resolution: "auto" or "WIDTHxHEIGHT" in pixels.
+# "auto" follows the selected screen and client request. Virtual displays support
+# up to 3840x2160; changing this setting for a virtual display requires a restart.
 # resolution = "3840x2160"
 
 # ─── Encoding ──────────────────────────────────────────────────────────────────

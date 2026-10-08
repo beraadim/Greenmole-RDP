@@ -26,7 +26,7 @@ APP_BIN="$SCRIPT_DIR/src-tauri/target/$TARGET_DIR/macrdp-ui"
 
 echo "==> Building macrdp-ui (profile: $PROFILE)..."
 cd "$SCRIPT_DIR"
-npm run tauri build -- "${TAURI_ARGS[@]}"
+npm run tauri build -- "${TAURI_ARGS[@]}" -- --locked
 
 if [ -d "$APP_BUNDLE" ]; then
     if [ -f "$APP_BIN" ]; then

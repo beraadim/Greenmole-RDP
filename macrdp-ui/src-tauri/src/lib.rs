@@ -25,6 +25,15 @@ async fn start_server_on_launch(app: tauri::AppHandle) {
 }
 
 pub fn run() {
+    // Dispatch before AppKit/Tauri, including the single-instance plugin, can
+    // query displays or activate the UI in this background owner process.
+    if let Some(result) = macrdp_core::run_display_helper_if_requested() {
+        if let Err(error) = result {
+            eprintln!("Display helper failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Load UI config early to get log level
     let ui_config = ui_config::UiConfig::load().unwrap_or_default();
     let log_level = ui_config.log_level.clone();

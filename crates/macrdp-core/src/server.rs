@@ -173,6 +173,7 @@ struct MetricsSnapshot {
 
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
+    display_backend: macrdp_display::DisplayBackend,
     port: u16,
     bind_addr: SocketAddr,
     started_at: Instant,
@@ -190,6 +191,10 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Backend of the running server, independent of unsaved/pending UI changes.
+    pub fn display_backend(&self) -> macrdp_display::DisplayBackend {
+        self.display_backend
+    }
     /// The TCP port the server is listening on.
     pub fn port(&self) -> u16 {
         self.port
@@ -317,6 +322,7 @@ impl Drop for ServerHandle {
 /// Arguments that are Send-safe, passed to the server thread.
 /// RdpServer itself is !Send, so we pass everything needed to construct it.
 struct ServerThreadArgs {
+    display_controller: macrdp_display::DisplayController,
     config: ServerConfig,
     bind_addr: SocketAddr,
     cert_path: std::path::PathBuf,
@@ -395,41 +401,13 @@ pub async fn start_server(
     let (cert_path, key_path) =
         tls::ensure_tls_files(config.cert_path.as_deref(), config.key_path.as_deref())?;
 
-    // Display detection — SCK for capture sizing, CG for mouse mapping
-    let (sck_w, sck_h) = match permissions::detect_display_size() {
-        Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "SCK logical display size");
-            (w as u16, h as u16)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
-        }
-    };
-    let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
-        Ok((w, h)) => {
-            tracing::info!(
-                width = w,
-                height = h,
-                "CG logical display size (CGEvent coordinate space)"
-            );
-            (w as u16, h as u16)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
-            (sck_w, sck_h)
-        }
-    };
-    if sck_w != cg_w || sck_h != cg_h {
-        tracing::warn!(sck_w, sck_h, cg_w, cg_h, "SCK and CG display sizes differ!");
-    }
-
-    // Resolution
-    let (width, height) = if config.width > 0 && config.height > 0 {
-        (config.width as u16, config.height as u16)
-    } else {
-        (sck_w, sck_h)
-    };
+    let backend = config.display_backend;
+    let display_controller = tokio::task::spawn_blocking(move || {
+        macrdp_display::DisplayController::new(backend, 1920, 1080)
+    })
+    .await
+    .context("Display initialization worker failed")??;
+    let geometry = display_controller.geometry()?;
 
     // Quality / encoder / chroma
     let quality = match config.quality.as_deref() {
@@ -441,12 +419,27 @@ pub async fn start_server(
     let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
     let gfx_validation_mode = config.gfx_validation_mode.unwrap_or(false);
 
-    // Resolution
-    let res_mode = config.resolution.as_deref().unwrap_or("auto");
-    let (width, height) = resolve_resolution(res_mode, width, height);
-
-    // Input follows the negotiated desktop through the visible capture rectangle.
-    let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
+    let (width, height) = macrdp_display::resolve_desktop_size(
+        config.resolution.as_deref().unwrap_or("auto"),
+        &geometry,
+        config.width,
+        config.height,
+    )?;
+    let (width, height) = display_controller.normalize_size(width, height);
+    let coord_mapper = crate::handler::MouseCoordMapper::new(1, 1, width, height);
+    coord_mapper.update_display_bounds(
+        geometry.origin_x,
+        geometry.origin_y,
+        geometry.logical_width,
+        geometry.logical_height,
+    );
+    tracing::info!(
+        ?backend,
+        ?geometry,
+        width,
+        height,
+        "Selected remote desktop display"
+    );
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(
@@ -470,6 +463,7 @@ pub async fn start_server(
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
+        display_controller,
         config: config.clone(),
         bind_addr,
         cert_path,
@@ -563,6 +557,7 @@ pub async fn start_server(
     });
 
     let handle = Arc::new(ServerHandle {
+        display_backend: backend,
         port,
         bind_addr,
         started_at: Instant::now(),
@@ -697,6 +692,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.coord_mapper,
             shared_audio_tx,
             None, // perf_stats: not exposed via macrdp-core API yet
+            args.display_controller,
         );
 
         // Build RDP server (this is the !Send type)

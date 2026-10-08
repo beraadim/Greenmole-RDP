@@ -7,8 +7,8 @@ pub struct MacInputHandler {
     keyboard: Option<KeyboardInjector>,
     mouse: Option<MouseInjector>,
     wake: Option<RemoteSessionWake>,
-    last_mouse_x: u16,
-    last_mouse_y: u16,
+    last_mouse_x: f64,
+    last_mouse_y: f64,
     coord_mapper: MouseCoordMapper,
 }
 
@@ -33,8 +33,8 @@ impl MacInputHandler {
             keyboard,
             mouse,
             wake,
-            last_mouse_x: 0,
-            last_mouse_y: 0,
+            last_mouse_x: 0.0,
+            last_mouse_y: 0.0,
             coord_mapper,
         }
     }

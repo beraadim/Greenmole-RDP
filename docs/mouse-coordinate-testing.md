@@ -2,12 +2,14 @@
 
 The UI server and standalone server share `macrdp-capture::MouseCoordMapper`.
 RDP positions are mapped through the captured content rectangle to CoreGraphics
-logical display coordinates. Capture selects the same main display by ID that
-CoreGraphics uses for input. ScreenCaptureKit's frame `contentRect` is in surface
+logical display coordinates, including the selected display's signed origin.
+Capture selects the exact physical or virtual display ID whose geometry is used
+for input. ScreenCaptureKit's frame `contentRect` is in surface
 points; capture converts it to output pixels with `scaleFactor` before mapping.
 The fit described by `contentScale` is already included in that rectangle.
 
-A Display Control request queues a desktop size. It does not immediately change
+A Display Control request queues a desktop size. Resize bursts are coalesced
+with a 120 ms quiet period and a maximum 400 ms wait. The request does not immediately change
 the input transform. The display stream requests RDP reactivation, then creates
 capture and encoding resources for the size advertised in Demand Active. Only
 that activation commits the mouse desktop size. A later queued resize gets a
@@ -36,6 +38,8 @@ The geometry tests cover Retina and fractional scale factors, pillarboxing,
 letterboxing, invalid metadata, changed host bounds, and reset after resize or
 capture fallback. Pointer packet tests cover button-only coordinates, combined
 move/button flags, simultaneous buttons, extended buttons, and wheel precedence.
+See [virtual display setup and testing](virtual-display.md) for a viewport-sized
+macOS desktop and additional lifecycle checks.
 
 ## Client verification
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+macrdp-display = { path = "../macrdp-display" }
 macrdp-capture = { path = "../macrdp-capture" }
 macrdp-input = { path = "../macrdp-input" }
 macrdp-encode = { path = "../macrdp-encode" }
