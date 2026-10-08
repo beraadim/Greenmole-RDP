@@ -280,9 +280,9 @@ function Settings() {
 
             {config.display_backend === "virtual" && (
               <p className="py-2 text-xs text-text-muted">
-                Adds an extended display to your current macOS session. Move windows
-                onto it to use them remotely. The display stays available while the
-                service runs, including between client connections.
+                Moves supported app windows onto the remote display when you connect
+                and restores them when you disconnect. Requires Accessibility access.
+                Full-screen windows and windows that cannot be moved stay in place.
               </p>
             )}
 

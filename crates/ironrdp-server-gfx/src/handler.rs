@@ -77,8 +77,11 @@ pub struct ClientInputContext {
 /// }
 /// ```
 pub trait RdpServerInputHandler: Send {
+    /// Refresh input context after initial activation and resize reactivation.
     fn update_client_context(&mut self, _context: ClientInputContext) {}
+    /// Start a connection once; resize reactivation does not start a new session.
     fn on_connect(&mut self, _context: ClientInputContext, _peer_addr: Option<String>) {}
+    /// End the real connection, including failed reactivation or capture setup.
     fn on_disconnect(&mut self) {}
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);

@@ -22,6 +22,7 @@ pub struct MacInputHandler {
     translated_key_releases: HashMap<(u8, bool), Vec<u16>>,
     debug_state: Arc<Mutex<InputDebugState>>,
     active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
+    window_session: Option<macrdp_windows::WindowSession>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -65,6 +66,7 @@ impl MacInputHandler {
         coord_mapper: MouseCoordMapper,
         debug_state: Arc<Mutex<InputDebugState>>,
         active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
+        window_session: Option<macrdp_windows::WindowSession>,
     ) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
@@ -96,6 +98,7 @@ impl MacInputHandler {
             translated_key_releases: HashMap::new(),
             debug_state,
             active_connection,
+            window_session,
         }
     }
 
@@ -666,6 +669,11 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
+        if let Some(windows) = &self.window_session {
+            if let Err(error) = windows.disconnect() {
+                tracing::warn!(%error, "Failed to schedule local window restoration");
+            }
+        }
         if let Some(wake) = &mut self.wake {
             wake.deactivate_display_sleep_assertion();
         }
@@ -937,6 +945,7 @@ mod tests {
             MouseCoordMapper::new(1920, 1200, 1920, 1200),
             Arc::new(Mutex::new(InputDebugState::default())),
             Arc::new(Mutex::new(None::<crate::callbacks::ConnectionInfo>)),
+            None,
         );
         handler.client_context = ClientInputContext {
             client_name: client_name.to_string(),

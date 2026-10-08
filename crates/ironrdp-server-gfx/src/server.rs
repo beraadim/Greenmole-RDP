@@ -37,6 +37,10 @@ use crate::gfx::{GfxHandler, GfxState};
 use crate::handler::{ClientInputContext, RdpServerInputHandler};
 use crate::{builder, capabilities, SoundServerFactory};
 
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;
+
 #[derive(Clone)]
 pub struct RdpServerOptions {
     pub addr: SocketAddr,
@@ -914,14 +918,18 @@ impl RdpServer {
                 keyboard_layout: result.keyboard_layout,
             };
             handler.update_client_context(context.clone());
-            handler.on_connect(
-                context,
-                self.gfx_state
-                    .lock()
-                    .unwrap()
-                    .peer_addr
-                    .map(|addr| addr.to_string()),
-            );
+            // Reactivation is a resize within the same connection. Preserve
+            // session state and the original connected-at timestamp across it.
+            if !result.reactivation {
+                handler.on_connect(
+                    context,
+                    self.gfx_state
+                        .lock()
+                        .unwrap()
+                        .peer_addr
+                        .map(|addr| addr.to_string()),
+                );
+            }
         }
 
         self.static_channels = result.static_channels;
@@ -1252,11 +1260,16 @@ impl RdpServer {
                     // specification, but apparently, we must keep the channel
                     // state as they were during reactivation. This fixes
                     // various state issues during client resize.
-                    acceptor = Acceptor::new_deactivation_reactivation(
+                    acceptor = match Acceptor::new_deactivation_reactivation(
                         acceptor,
                         core::mem::take(&mut self.static_channels),
                         desktop_size,
-                    )?;
+                    ) {
+                        Ok(acceptor) => acceptor,
+                        // Route reactivation failures through the same real
+                        // disconnect cleanup as capture and transport errors.
+                        Err(error) => break Err(error.into()),
+                    };
                     framed = unsplit_tokio_framed(reader, writer);
                     continue;
                 }

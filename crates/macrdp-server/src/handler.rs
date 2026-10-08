@@ -10,10 +10,14 @@ pub struct MacInputHandler {
     last_mouse_x: f64,
     last_mouse_y: f64,
     coord_mapper: MouseCoordMapper,
+    window_session: Option<macrdp_windows::WindowSession>,
 }
 
 impl MacInputHandler {
-    pub fn new(coord_mapper: MouseCoordMapper) -> Self {
+    pub fn new(
+        coord_mapper: MouseCoordMapper,
+        window_session: Option<macrdp_windows::WindowSession>,
+    ) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -36,6 +40,7 @@ impl MacInputHandler {
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
             coord_mapper,
+            window_session,
         }
     }
 }
@@ -50,6 +55,11 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
+        if let Some(windows) = &self.window_session {
+            if let Err(error) = windows.disconnect() {
+                tracing::warn!(%error, "Failed to schedule local window restoration");
+            }
+        }
         if let Some(wake) = &mut self.wake {
             wake.deactivate_display_sleep_assertion();
         }

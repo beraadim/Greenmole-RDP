@@ -2181,6 +2181,7 @@ dependencies = [
  "macrdp-display",
  "macrdp-encode",
  "macrdp-input",
+ "macrdp-windows",
  "rcgen",
  "serde",
  "tempfile",
@@ -2247,6 +2248,7 @@ dependencies = [
  "macrdp-display",
  "macrdp-encode",
  "macrdp-input",
+ "macrdp-windows",
  "rcgen",
  "serde",
  "tempfile",
@@ -2255,6 +2257,18 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "macrdp-windows"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics",
+ "macrdp-display",
+ "tracing",
 ]
 
 [[package]]

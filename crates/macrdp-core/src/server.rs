@@ -632,11 +632,25 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         };
 
+        let window_session =
+            if args.display_controller.backend() == macrdp_display::DisplayBackend::Virtual {
+                macrdp_windows::WindowSession::new(args.display_controller.clone())
+                    .map_err(|error| {
+                        tracing::warn!(%error, "Automatic window movement is unavailable");
+                    })
+                    .ok()
+            } else {
+                None
+            };
+
+        // Keep one window-session handle outside the RDP server so shutdown can
+        // restore windows on a blocking worker before the server thread exits.
         // Create input handler (clone coord_mapper — shared with display for resize sync)
         let input_handler = MacInputHandler::new(
             args.coord_mapper.clone(),
             Arc::clone(&args.input_debug_state),
             Arc::clone(&args.active_connection),
+            window_session.clone(),
         );
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
@@ -693,6 +707,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             shared_audio_tx,
             None, // perf_stats: not exposed via macrdp-core API yet
             args.display_controller,
+            window_session.clone(),
         );
 
         // Build RDP server (this is the !Send type)
@@ -822,6 +837,20 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
             _ = args.shutdown_notify.notified() => {
                 tracing::info!("Shutdown signal received, stopping server");
+            }
+        }
+
+        // Cancelling server.run() during shutdown skips its connection cleanup.
+        // Shutting down the window session explicitly restores saved frames in
+        // that path too. Its worker retains the virtual display until done.
+        drop(server);
+        if let Some(windows) = window_session {
+            if let Err(error) = tokio::task::spawn_blocking(move || windows.shutdown())
+                .await
+                .context("Window restoration task failed")
+                .and_then(|result| result)
+            {
+                tracing::warn!(%error, "Window restoration worker failed during shutdown");
             }
         }
     });

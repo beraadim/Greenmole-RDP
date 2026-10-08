@@ -699,6 +699,7 @@ fn should_use_nv12_capture_for_gfx(
 /// Display adapter that bridges ScreenCapturer to ironrdp-server
 pub struct MacDisplay {
     display_controller: macrdp_display::DisplayController,
+    window_session: Option<macrdp_windows::WindowSession>,
     width: u16,
     height: u16,
     /// Latest requested size, including requests received while reactivating.
@@ -741,6 +742,7 @@ impl MacDisplay {
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
         display_controller: macrdp_display::DisplayController,
+        window_session: Option<macrdp_windows::WindowSession>,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -767,6 +769,7 @@ impl MacDisplay {
         let (resize_tx, _) = tokio::sync::watch::channel(DesktopSize { width, height });
         Self {
             display_controller,
+            window_session,
             width,
             height,
             resize_tx,
@@ -978,6 +981,15 @@ impl RdpServerDisplay for MacDisplay {
             ?geometry,
             "Activated capture and pointer desktop size"
         );
+        // Capture is ready before windows move onto the remote display. This
+        // also updates the target after a resize without starting a new session
+        // or replacing the windows' saved local positions. Native Accessibility
+        // work runs on its own worker, never under the RDP display mutex.
+        if let Some(windows) = &self.window_session {
+            if let Err(error) = windows.update_target(geometry) {
+                tracing::warn!(%error, "Failed to schedule windows for the virtual display");
+            }
+        }
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,

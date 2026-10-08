@@ -31,9 +31,10 @@ client-driven resizing. On a running virtual server, changing the configured
 resolution or listening port requires a restart; this avoids overlapping virtual
 display owners during the app's usual port migration.
 
-The virtual display belongs to the logged-in macOS desktop. Move application
-windows onto it using macOS display/window controls. It is an additional screen
-in the same user session, with shared keyboard, pointer, applications and audio.
+The virtual display belongs to the logged-in macOS desktop. Supported application
+windows move onto it automatically when the remote session starts, and return
+when the client disconnects. It is an additional screen in the same user session,
+with shared keyboard, pointer, applications and audio.
 macrdp does not automatically mirror displays, change the primary display, or
 create a separate user login session.
 
@@ -42,6 +43,36 @@ server's lifetime. Resizing changes
 its mode in place, and an RDP disconnect leaves it available for reconnection.
 Stopping the server releases the virtual display. The display starts at
 1920×1080 and adopts the negotiated client size when capture starts.
+
+## Automatic window placement
+
+Window placement requires the same **Accessibility** permission used for remote
+keyboard and mouse input. Grant access and restart the server if it was missing
+when the server started. The physical display backend does not move windows.
+For the virtual backend, placement begins after capture has adopted the client's
+negotiated size. Each supported window's original display, position and size are
+remembered once per connection. Remote viewport resizing keeps windows within
+the new desktop without replacing those original return positions.
+
+New windows are collected during the session. Windows opened on a physical
+display retain that return position; windows opened on the virtual display return
+to the physical display that was primary when the connection started. If an
+original display has been unplugged, restoration uses a remaining physical
+display and keeps windows within its bounds. Closed windows are ignored.
+
+This uses macOS Accessibility window controls and is best effort. Full-screen,
+already minimized, protected, and non-movable windows are not brought onto the
+remote display. A moved window that is minimized later is returned without
+unminimizing it when the application permits that. Applications can
+limit resizing or expose only some of their windows; moving windows between
+macOS Spaces is not guaranteed. Placement does not activate applications or
+change their minimized/full-screen state. Missing permission and unsupported or
+unresponsive windows are reported without recording window titles or contents.
+
+Disconnects and normal server shutdown restore the saved layout. RDP resize
+reactivation is part of the same connection and does not trigger restoration.
+Restoration has a bounded wait, so an unresponsive application cannot indefinitely
+block shutdown. Forced process termination cannot guarantee exact restoration.
 
 ## Guacamole connection
 
@@ -79,6 +110,7 @@ Build/test from the repository root on macOS:
 
 ```sh
 cargo test -p macrdp-display
+cargo test -p macrdp-windows
 cargo test -p macrdp-capture geometry::tests
 cargo test -p ironrdp-server --lib
 cargo test -p macrdp-core
@@ -114,14 +146,32 @@ app bundle passed signature verification and the DMG passed checksum verificatio
 Live Guacamole/Windows client capture and pointer behavior still require the
 manual checks below.
 
+The window-placement tests cover geometry and session boundaries without moving
+your application windows. The automatic window-placement build on the same Mac
+passed 103 unit tests (27 RDP server, 53 core, 11 CLI, and 12 window-placement),
+the release CLI and UI builds, app signature verification, and DMG checksum
+verification. Actual Accessibility movement and restoration remain part of the
+manual installation checks below.
+
+The ignored `controlled_fixture_moves_and_restores`
+test additionally exercises Accessibility moves, but requires an already trusted
+test executable, a disposable fixture application's PID in
+`MACRDP_WINDOW_FIXTURE_PID`, and a disposable virtual display ID in
+`MACRDP_WINDOW_FIXTURE_DISPLAY_ID`. It disables discovery of other applications.
+Do not point this test at an application containing real work. Normal test and
+build commands leave it ignored; no Accessibility permissions are granted by
+the build process.
+
 1. Start with the physical backend and confirm its existing behavior.
-2. Enable the virtual backend and restart. Confirm an extended display appears
-   in macOS Displays settings. Move a window onto it and connect with Guacamole.
+2. Open several ordinary windows on the physical display and note their positions
+   and sizes. Enable the virtual backend, restart, and connect with Guacamole.
+   Confirm the windows move onto the remote display automatically.
 3. Resize between 1280×720, 1920×1080, 2560×1440 and an odd size such as
    2560×1305. Check menu items, the Dock, window controls and all four corners.
    Repeat while idle and while rapidly dragging the browser window edges.
-4. Disconnect and reconnect at a different viewport size. Confirm the display
-   ID remains the same in the log and windows remain on the virtual screen.
+4. Disconnect and confirm the original window positions and sizes return. Reconnect
+   at a different viewport size: windows should move back onto the remote display,
+   while the display ID remains the same in the log.
 5. Verify the log's negotiated size matches the actual virtual mode after
    viewport dimensions are normalized.
 6. Arrange the virtual screen left of or above the primary screen, then reconnect.
@@ -130,6 +180,10 @@ manual checks below.
    backend change while running reports restart required.
 8. Stop the server and confirm the display disappears; restart and confirm a new
    display can be created. Exercise screen lock/unlock and capture recovery.
+9. Open a new window during the remote session, resize it, and disconnect. Confirm
+   it returns to a physical display. Repeat with a dropped network connection,
+   rapid reconnect, and server stop. Minimized/full-screen windows should keep
+   their state; a closed window must not interrupt restoration of the others.
 
 Capture info logs include the selected display ID, global origin, logical point
 size, output pixel size and native mode changes. Useful messages include

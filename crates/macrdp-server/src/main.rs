@@ -119,8 +119,18 @@ async fn run_server() -> Result<()> {
     // Create shared GFX state
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444, false)));
 
-    // Create input handler with coordinate mapper
-    let input_handler = MacInputHandler::new(coord_mapper.clone());
+    let window_session = if backend == macrdp_display::DisplayBackend::Virtual {
+        macrdp_windows::WindowSession::new(display_controller.clone())
+            .map_err(|error| {
+                tracing::warn!(%error, "Automatic window movement is unavailable");
+            })
+            .ok()
+    } else {
+        None
+    };
+
+    // Keep a handle outside the RDP server to await restoration on shutdown.
+    let input_handler = MacInputHandler::new(coord_mapper.clone(), window_session.clone());
 
     // Audio setup — shared sender slot, recreated per connection by AudioFactory
     let shared_audio_tx = if config.audio.enabled {
@@ -187,6 +197,7 @@ async fn run_server() -> Result<()> {
         shared_audio_tx,
         perf_stats.clone(),
         display_controller,
+        window_session.clone(),
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
@@ -260,6 +271,19 @@ async fn run_server() -> Result<()> {
 
     if let Some(ps) = &perf_stats {
         ps.lock().unwrap().print_summary();
+    }
+
+    // Ctrl-C cancels run() before the usual disconnect callback. Final session
+    // ownership restores windows and keeps the virtual display alive until done.
+    drop(server);
+    if let Some(windows) = window_session {
+        if let Err(error) = tokio::task::spawn_blocking(move || windows.shutdown())
+            .await
+            .context("Window restoration task failed")
+            .and_then(|result| result)
+        {
+            tracing::warn!(%error, "Window restoration worker failed during shutdown");
+        }
     }
 
     result
