@@ -39,6 +39,21 @@ move/button flags, simultaneous buttons, extended buttons, and wheel precedence.
 
 ## Client verification
 
+### Guacamole connection settings
+
+Set the RDP connection's **Resize method** to **Display update**, equivalent to
+`resize-method=display-update`. Guacamole then sends Display Control requests
+when the browser viewport changes size. Leave the connection's width and height
+unset to use the initial client viewport, and use `resolution = "auto"` in
+macrdp to allow live resizing. Guacamole's `reconnect` method instead ends and
+reopens the RDP session; an unset resize method does not send live resize requests.
+
+A connection that already resizes a Windows host may already have this setting.
+Verify it on the Mac connection as Guacamole settings are per connection.
+See the [Apache Guacamole display settings documentation](https://guacamole.apache.org/doc/gug/configuring-guacamole.html#display-settings).
+
+### Test sequence
+
 Use both Guacamole and Windows Remote Desktop Connection. Choose resolutions
 within the host's capture limit. For a 1920×1200 source, useful targets include
 1920×1200, 1280×800, 1920×1080, and 2560×1305 if supported. Include a Retina
