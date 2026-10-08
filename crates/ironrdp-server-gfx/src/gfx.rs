@@ -8,7 +8,7 @@ use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
     Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
     CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
-    CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
+    CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, Encoding,
     MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
     ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
@@ -286,6 +286,8 @@ pub struct GfxState {
     pub session_uses_gfx: bool,
     pub channel_id: Option<u32>,
     pub surface_created: bool,
+    /// ResetGraphics resizes output but does not delete existing surfaces.
+    surface_delete_pending: bool,
     pub caps_confirmed: bool,
     pub frame_id: u32,
     pub avc420_supported: bool,
@@ -359,6 +361,7 @@ impl GfxState {
             session_uses_gfx: false,
             channel_id: None,
             surface_created: false,
+            surface_delete_pending: false,
             caps_confirmed: false,
             frame_id: 0,
             avc420_supported: false,
@@ -461,6 +464,7 @@ impl GfxState {
         self.session_uses_gfx = session_uses_gfx;
         self.channel_id = None;
         self.surface_created = false;
+        self.surface_delete_pending = false;
         self.caps_confirmed = false;
         self.confirmed_cap = None;
         self.avc420_supported = false;
@@ -488,8 +492,25 @@ impl GfxState {
         self.channel_id.is_some() && self.caps_confirmed
     }
 
+    /// Retire the current surface before reusing ID 0 on this graphics channel.
+    pub fn invalidate_surface(&mut self) {
+        self.surface_delete_pending |= self.surface_created;
+        self.surface_created = false;
+    }
+
     pub fn is_ready(&self) -> bool {
         self.has_gfx_channel() && self.avc420_supported
+    }
+}
+
+/// Surface IDs remain allocated across ResetGraphics (MS-RDPEGFX 3.3.5.14).
+/// Delete the prior allocation before creating a new surface with the same ID.
+fn append_pending_surface_delete(state: &mut GfxState, raw_pdus: &mut Vec<u8>) {
+    if state.surface_delete_pending {
+        if let Ok(data) = encode_vec(&ServerPdu::DeleteSurface(DeleteSurfacePdu { surface_id: 0 })) {
+            raw_pdus.extend_from_slice(&data);
+            state.surface_delete_pending = false;
+        }
     }
 }
 
@@ -535,11 +556,12 @@ impl GfxHandler {
             );
             state.width = frame.width;
             state.height = frame.height;
-            state.surface_created = false;
+            state.invalidate_surface();
         }
 
         // First frame: surface setup (CapConfirm already sent by DVC handler)
         if !state.surface_created {
+            append_pending_surface_delete(state, &mut raw_pdus);
             if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
                 width: state.width as u32,
                 height: state.height as u32,
@@ -697,11 +719,12 @@ impl GfxHandler {
             );
             state.width = update.width;
             state.height = update.height;
-            state.surface_created = false;
+            state.invalidate_surface();
         }
 
         // First frame: surface setup (same as H.264 path)
         if !state.surface_created {
+            append_pending_surface_delete(state, &mut raw_pdus);
             if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
                 width: state.width as u32,
                 height: state.height as u32,
@@ -982,9 +1005,96 @@ mod tests {
         choose_confirmed_capability, should_prefer_bitmap_fallback, CapabilitySelection, GfxState,
     };
     use ironrdp_pdu::rdp::vc::dvc::gfx::{
-        CapabilitiesV10Flags, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags,
+        CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV8Flags,
         CapabilitySet,
     };
+
+    fn assert_surface_recreated(bytes: &[u8], width: u16, height: u16) {
+        use ironrdp_core::{Decode, ReadCursor};
+        use ironrdp_pdu::rdp::vc::dvc::gfx::ServerPdu;
+
+        let raw = super::unwrap_zgfx(bytes).unwrap();
+        let mut cursor = ReadCursor::new(&raw);
+        assert!(matches!(ServerPdu::decode(&mut cursor).unwrap(),
+            ServerPdu::DeleteSurface(pdu) if pdu.surface_id == 0));
+        assert!(matches!(ServerPdu::decode(&mut cursor).unwrap(),
+            ServerPdu::ResetGraphics(pdu)
+                if pdu.width == u32::from(width) && pdu.height == u32::from(height)));
+        assert!(matches!(ServerPdu::decode(&mut cursor).unwrap(),
+            ServerPdu::CreateSurface(pdu)
+                if pdu.surface_id == 0 && pdu.width == width && pdu.height == height));
+    }
+
+    #[test]
+    fn reactivation_deletes_old_surface_before_reusing_its_id() {
+        let mut state = GfxState::new(1920, 1200, false, false);
+        state.surface_created = true;
+        state.channel_id = Some(7);
+        state.caps_confirmed = true;
+        state.avc420_supported = true;
+        state.invalidate_surface();
+        state.width = 1280;
+        state.height = 720;
+        let frame = crate::display::GfxUncompressedUpdate {
+            rects: Vec::new(),
+            width: 1280,
+            height: 720,
+        };
+        let bytes = super::GfxHandler::create_uncompressed_pdu(&mut state, &frame);
+        assert_surface_recreated(&bytes, 1280, 720);
+        assert_eq!(state.channel_id, Some(7));
+        assert!(state.is_ready());
+        assert!(!state.surface_delete_pending);
+    }
+
+    #[test]
+    fn avc_frame_resize_deletes_old_surface_before_reusing_its_id() {
+        let mut state = GfxState::new(1920, 1200, false, false);
+        state.surface_created = true;
+        let frame = crate::display::GfxFrameUpdate {
+            h264_data: bytes::Bytes::new(),
+            width: 1280,
+            height: 720,
+            enc_width: 1280,
+            enc_height: 720,
+            is_keyframe: true,
+            h264_aux: None,
+        };
+        let bytes = super::GfxHandler::create_frame_pdu(&mut state, &frame);
+        assert_surface_recreated(&bytes, 1280, 720);
+    }
+
+    #[test]
+    fn uncompressed_frame_resize_deletes_old_surface_before_reusing_its_id() {
+        let mut state = GfxState::new(1920, 1200, false, false);
+        state.surface_created = true;
+        let frame = crate::display::GfxUncompressedUpdate {
+            rects: Vec::new(),
+            width: 1280,
+            height: 720,
+        };
+        let bytes = super::GfxHandler::create_uncompressed_pdu(&mut state, &frame);
+        assert_surface_recreated(&bytes, 1280, 720);
+    }
+
+    #[test]
+    fn first_graphics_frame_does_not_delete_a_nonexistent_surface() {
+        use ironrdp_core::{Decode, ReadCursor};
+        use ironrdp_pdu::rdp::vc::dvc::gfx::ServerPdu;
+
+        let mut state = GfxState::new(1280, 720, false, false);
+        let frame = crate::display::GfxUncompressedUpdate {
+            rects: Vec::new(),
+            width: 1280,
+            height: 720,
+        };
+        let bytes = super::GfxHandler::create_uncompressed_pdu(&mut state, &frame);
+        let raw = super::unwrap_zgfx(&bytes).unwrap();
+        assert!(matches!(
+            ServerPdu::decode(&mut ReadCursor::new(&raw)).unwrap(),
+            ServerPdu::ResetGraphics(_)
+        ));
+    }
 
     #[test]
     fn prefers_avc_capability_over_plain_v8_when_both_are_offered() {
@@ -1032,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn respects_explicit_avc_disable_from_newer_caps() {
+    fn prefers_non_avc_v81_over_ambiguous_v10_1() {
         let caps = vec![
             CapabilitySet::V8 {
                 flags: CapabilitiesV8Flags::THIN_CLIENT,
@@ -1045,11 +1155,11 @@ mod tests {
 
         let (confirmed, selection) = choose_confirmed_capability(&caps);
 
-        assert!(matches!(confirmed, CapabilitySet::V10_1));
+        assert!(matches!(confirmed, CapabilitySet::V8_1 { .. }));
         assert_eq!(
             selection,
             CapabilitySelection {
-                rank: 6,
+                rank: 7,
                 avc420: false,
                 avc444: false,
             }

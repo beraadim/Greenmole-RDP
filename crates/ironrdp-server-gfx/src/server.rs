@@ -431,7 +431,7 @@ impl RdpServer {
                     .await?;
                 }
 
-                let framed = self.accept_finalize(framed, acceptor).await?;
+                let framed = self.accept_finalize(framed, acceptor, size).await?;
                 debug!("Shutting down TLS connection");
                 let (mut tls_stream, _) = framed.into_inner();
                 if let Err(e) = tls_stream.shutdown().await {
@@ -440,7 +440,7 @@ impl RdpServer {
             }
 
             BeginResult::Continue(framed) => {
-                self.accept_finalize(framed, acceptor).await?;
+                self.accept_finalize(framed, acceptor, size).await?;
             }
         };
 
@@ -774,13 +774,26 @@ impl RdpServer {
         io_channel_id: u16,
         user_channel_id: u16,
         mut encoder: UpdateEncoder,
+        desktop_size: DesktopSize,
+        input_events: Vec<Vec<u8>>,
     ) -> Result<RunState>
     where
         R: FramedRead,
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = self.display.lock().await.updates().await?;
+        let mut display_updates = {
+            let mut display = self.display.lock().await;
+            display.activate_size(desktop_size);
+            display.updates().await?
+        };
+        // Capture creation commits the input transform. Replay input received
+        // during activation only after it uses the newly negotiated desktop.
+        if !input_events.is_empty() {
+            debug!("Handling input event backlog from acceptor sequence");
+            self.handle_input_backlog(writer, io_channel_id, user_channel_id, input_events)
+                .await?;
+        }
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -789,10 +802,9 @@ impl RdpServer {
 
         // Update GFX state with current desktop size
         {
-            let size = self.display.lock().await.size().await;
             let mut gs = self.gfx_state.lock().unwrap();
-            gs.width = size.width;
-            gs.height = size.height;
+            gs.width = desktop_size.width;
+            gs.height = desktop_size.height;
         }
 
         // Get DRDYNVC channel ID for sending GFX frames
@@ -904,6 +916,7 @@ impl RdpServer {
         reader: &mut Framed<R>,
         writer: &mut Framed<W>,
         result: AcceptorResult,
+        activation_size: DesktopSize,
     ) -> Result<RunState>
     where
         R: FramedRead,
@@ -928,22 +941,20 @@ impl RdpServer {
             );
         }
 
-        if !result.input_events.is_empty() {
-            debug!("Handling input event backlog from acceptor sequence");
-            self.handle_input_backlog(
-                writer,
-                result.io_channel_id,
-                result.user_channel_id,
-                result.input_events,
-            )
-            .await?;
-        }
-
         self.static_channels = result.static_channels;
         {
             let mut gfx_state = self.gfx_state.lock().unwrap();
             let session_uses_gfx = self.get_channel_id_by_type::<dvc::DrdynvcServer>().is_some();
-            gfx_state.reset_connection_state(session_uses_gfx);
+            if !result.reactivation {
+                gfx_state.reset_connection_state(session_uses_gfx);
+            } else {
+                // Dynamic channels and their negotiated codecs survive RDP
+                // reactivation. Recreate graphics surfaces at the new size
+                // without waiting for a second channel-capability exchange.
+                gfx_state.invalidate_surface();
+                gfx_state.pending_acks = 0;
+                gfx_state.frame_send_times.clear();
+            }
             info!(
                 session_uses_gfx = gfx_state.session_uses_gfx,
                 "Connection graphics path negotiated"
@@ -971,7 +982,7 @@ impl RdpServer {
                         bail!("Fastpath output not supported!");
                     }
                 }
-                CapabilitySet::Bitmap(b) => {
+                CapabilitySet::Bitmap(b) if !result.reactivation => {
                     let client_size = DesktopSize {
                         width: b.desktop_width,
                         height: b.desktop_height,
@@ -1036,12 +1047,23 @@ impl RdpServer {
             }
         }
 
-        let desktop_size = self.display.lock().await.size().await;
+        // Demand Active defines the current coordinate space. Confirm Active
+        // can request another size or echo the previous one; keep the advertised
+        // size through capture creation and negotiate pending changes separately.
+        let desktop_size = activation_size;
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs)
             .context("failed to initialize update encoder")?;
 
         let state = self
-            .client_loop(reader, writer, result.io_channel_id, result.user_channel_id, encoder)
+            .client_loop(
+                reader,
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                encoder,
+                desktop_size,
+                result.input_events,
+            )
             .await
             .context("client loop failure")?;
 
@@ -1092,11 +1114,11 @@ impl RdpServer {
                 }
 
                 FastPathInputEvent::MouseEvent(mouse) => {
-                    handler.mouse(mouse.into());
+                    handler.mouse_pdu(mouse);
                 }
 
                 FastPathInputEvent::MouseEventEx(mouse) => {
-                    handler.mouse(mouse.into());
+                    handler.mouse_x_pdu(mouse);
                 }
 
                 FastPathInputEvent::MouseEventRel(mouse) => {
@@ -1191,11 +1213,11 @@ impl RdpServer {
                 }
 
                 ironrdp_pdu::input::InputEvent::Mouse(mouse) => {
-                    handler.mouse(mouse.into());
+                    handler.mouse_pdu(mouse);
                 }
 
                 ironrdp_pdu::input::InputEvent::MouseX(mouse) => {
-                    handler.mouse(mouse.into());
+                    handler.mouse_x_pdu(mouse);
                 }
 
                 ironrdp_pdu::input::InputEvent::MouseRel(mouse) => {
@@ -1207,7 +1229,12 @@ impl RdpServer {
         }
     }
 
-    async fn accept_finalize<S>(&mut self, mut framed: TokioFramed<S>, mut acceptor: Acceptor) -> Result<TokioFramed<S>>
+    async fn accept_finalize<S>(
+        &mut self,
+        mut framed: TokioFramed<S>,
+        mut acceptor: Acceptor,
+        mut activation_size: DesktopSize,
+    ) -> Result<TokioFramed<S>>
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
@@ -1224,7 +1251,10 @@ impl RdpServer {
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
             client_connected = true;
 
-            let run_state = match self.client_accepted(&mut reader, &mut writer, result).await {
+            let run_state = match self
+                .client_accepted(&mut reader, &mut writer, result, activation_size)
+                .await
+            {
                 Ok(run_state) => run_state,
                 Err(error) => break Err(error),
             };
@@ -1234,6 +1264,7 @@ impl RdpServer {
                     unreachable!();
                 }
                 RunState::DeactivationReactivation { desktop_size } => {
+                    activation_size = desktop_size;
                     // No description of such behavior was found in the
                     // specification, but apparently, we must keep the channel
                     // state as they were during reactivation. This fixes

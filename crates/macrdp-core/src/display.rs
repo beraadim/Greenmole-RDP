@@ -700,6 +700,10 @@ fn should_use_nv12_capture_for_gfx(
 pub struct MacDisplay {
     width: u16,
     height: u16,
+    /// Latest requested size, including requests received while reactivating.
+    resize_tx: tokio::sync::watch::Sender<DesktopSize>,
+    /// Exact size advertised for the activation about to create a capture.
+    activation_size: Option<DesktopSize>,
     /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
     max_width: u16,
     max_height: u16,
@@ -748,9 +752,12 @@ impl MacDisplay {
                 (width.max(physical_w as u16), height.max(physical_h as u16))
             })
             .unwrap_or((width.max(3840), height.max(2160)));
+        let (resize_tx, _) = tokio::sync::watch::channel(DesktopSize { width, height });
         Self {
             width,
             height,
+            resize_tx,
+            activation_size: None,
             max_width: max_w,
             max_height: max_h,
             fixed_resolution,
@@ -812,7 +819,12 @@ impl MacDisplay {
                 self.frame_rate as f32,
                 self.quality,
             );
-            self.coord_mapper.update_rdp_size(w, h);
+            // Keep the active input transform unchanged until RDP reactivation
+            // has completed and a capture at the negotiated size is ready.
+            self.resize_tx.send_replace(DesktopSize {
+                width: w,
+                height: h,
+            });
         }
     }
 }
@@ -847,7 +859,17 @@ impl RdpServerDisplay for MacDisplay {
         self.fixed_resolution = true;
     }
 
+    fn activate_size(&mut self, size: DesktopSize) {
+        self.activation_size = Some(size);
+    }
+
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        let size = self.activation_size.take().unwrap_or(DesktopSize {
+            width: self.width,
+            height: self.height,
+        });
+        let width = size.width;
+        let height = size.height;
         let (session_uses_gfx, gfx_avc_ready) = {
             let gfx = self.gfx_state.lock().unwrap();
             (gfx.session_uses_gfx, gfx.is_ready())
@@ -859,8 +881,8 @@ impl RdpServerDisplay for MacDisplay {
         };
 
         let capture_config = CaptureConfig {
-            width: self.width as u32,
-            height: self.height as u32,
+            width: width as u32,
+            height: height as u32,
             frame_rate: configured_frame_rate,
             // Start GFX sessions in BGRA so we can guarantee one visible full-frame
             // seed before switching into the NV12/pipelined hardware path.
@@ -893,8 +915,8 @@ impl RdpServerDisplay for MacDisplay {
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(
-            self.width as u32,
-            self.height as u32,
+            width as u32,
+            height as u32,
             configured_frame_rate as f32,
             self.quality,
             self.encoder_pref,
@@ -918,12 +940,23 @@ impl RdpServerDisplay for MacDisplay {
         self.gfx_state.lock().unwrap().applied_frame_rate = Some(initial_fps.max(1));
         let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
+        // The host display mode may have changed since server startup.
+        match macrdp_capture::detect_cg_display_size() {
+            Ok((logical_width, logical_height)) => {
+                self.coord_mapper
+                    .update_logical_size(logical_width, logical_height);
+            }
+            Err(error) => tracing::warn!(%error, "Could not refresh host pointer bounds"),
+        }
+        self.coord_mapper.update_rdp_size(width, height);
+        tracing::info!(width, height, "Activated capture and pointer desktop size");
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
             encoder,
             gfx_state: Arc::clone(&self.gfx_state),
             coord_mapper: self.coord_mapper.clone(),
+            resize_rx: self.resize_tx.subscribe(),
             encoder_pref: self.encoder_pref,
             mode_444: self.mode_444,
             shared_audio_tx: self.shared_audio_tx.clone(),
@@ -1001,6 +1034,7 @@ struct MacDisplayUpdates {
     encoder: Option<Box<dyn VideoEncoder>>,
     gfx_state: Arc<Mutex<GfxState>>,
     coord_mapper: MouseCoordMapper,
+    resize_rx: tokio::sync::watch::Receiver<DesktopSize>,
     encoder_pref: macrdp_encode::EncoderPreference,
     mode_444: bool,
     shared_audio_tx: Option<SharedAudioTx>,
@@ -1067,6 +1101,31 @@ struct MacDisplayUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        let resize_rx = self.resize_rx.clone();
+        let width = self.capture_config.width;
+        let height = self.capture_config.height;
+        tokio::select! {
+            biased;
+            size = ironrdp_server::wait_for_display_resize(resize_rx, width, height) => {
+                match size {
+                    Some(size) => {
+                        tracing::info!(
+                            width = size.width,
+                            height = size.height,
+                            "Requesting RDP reactivation for display resize"
+                        );
+                        Ok(Some(DisplayUpdate::Resize(size)))
+                    }
+                    None => self.next_frame_update().await,
+                }
+            }
+            update = self.next_frame_update() => update,
+        }
+    }
+}
+
+impl MacDisplayUpdates {
+    async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
         loop {
             if let Some(bitmap) = self.pending_bitmap_updates.pop_front() {
                 self.record_bitmap_update_metrics(bitmap.data.len() as u32);

@@ -1,5 +1,8 @@
 //! macOS screen capture via ScreenCaptureKit
 
+mod geometry;
+pub use geometry::{ContentRect, MouseCoordMapper};
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,6 +20,7 @@ use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate
 use tokio::sync::mpsc;
 
 static UNEXPECTED_BGRA_LAYOUT_WARNINGS: AtomicU64 = AtomicU64::new(0);
+static INVALID_FRAME_GEOMETRY_WARNINGS: AtomicU64 = AtomicU64::new(0);
 const MAX_RDP_CURSOR_EDGE: u16 = 32;
 
 /// Check if Screen Recording permission is granted (no prompt)
@@ -45,20 +49,6 @@ pub struct Rect {
     pub y: u32,
     pub width: u32,
     pub height: u32,
-}
-
-/// The visible source-content rectangle within an output frame.
-///
-/// ScreenCaptureKit supplies this with each sample. It is essential for
-/// translating RDP pointer coordinates when a stream is aspect-fitted: the
-/// frame can contain padding while the actual macOS display occupies only this
-/// rectangle.
-#[derive(Clone, Debug)]
-pub struct ContentRect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
 }
 
 /// Pixel format for screen capture output
@@ -378,6 +368,33 @@ fn clamp_cursor_shape(shape: CursorShape) -> CursorShape {
     }
 }
 
+/// Normalize metadata at the capture boundary so downstream paths always use pixels.
+fn frame_content_pixels(sample: &CMSampleBuffer) -> Option<ContentRect> {
+    let rect = sample.content_rect().map(|rect| ContentRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    });
+    let scale_factor = sample.scale_factor();
+    let pixels = rect
+        .zip(scale_factor)
+        .and_then(|(rect, scale)| rect.from_surface_points(scale));
+    if pixels.is_none() {
+        let count = INVALID_FRAME_GEOMETRY_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 3 {
+            tracing::warn!(?rect, ?scale_factor,
+                "ScreenCaptureKit frame geometry missing or invalid; using full-frame pointer mapping");
+        }
+    }
+    tracing::trace!(
+        content_rect_points = ?rect,
+        ?scale_factor, content_scale = ?sample.content_scale(), ?pixels,
+        "ScreenCaptureKit content geometry"
+    );
+    pixels
+}
+
 fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
@@ -446,20 +463,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         })
         .collect::<Vec<_>>();
 
-    let content_rect = sample.content_rect().and_then(|rect| {
-        (rect.x.is_finite()
-            && rect.y.is_finite()
-            && rect.width.is_finite()
-            && rect.height.is_finite()
-            && rect.width > 0.0
-            && rect.height > 0.0)
-            .then_some(ContentRect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-            })
-    });
+    let content_rect = frame_content_pixels(sample);
 
     let safe_buf = unsafe { SafePixelBuffer::from_raw(pixel_buffer.as_ptr()) };
 
@@ -525,20 +529,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         })
         .collect::<Vec<_>>();
 
-    let content_rect = sample.content_rect().and_then(|rect| {
-        (rect.x.is_finite()
-            && rect.y.is_finite()
-            && rect.width.is_finite()
-            && rect.height.is_finite()
-            && rect.width > 0.0
-            && rect.height > 0.0)
-            .then_some(ContentRect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-            })
-    });
+    let content_rect = frame_content_pixels(sample);
 
     let t = sample.presentation_timestamp();
     let timestamp_us = if t.timescale > 0 {
@@ -583,8 +574,8 @@ pub fn detect_display_scale() -> Result<u32> {
     let display = content
         .displays()
         .into_iter()
-        .next()
-        .context("No display found")?;
+        .find(|display| display.display_id() == core_graphics::display::CGDisplay::main().id)
+        .context("Main display is not available to ScreenCaptureKit")?;
     let logical_w = display.width();
     let scale = if logical_w > 0 {
         physical_w / logical_w
@@ -600,8 +591,8 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
     let display = content
         .displays()
         .into_iter()
-        .next()
-        .context("No display found")?;
+        .find(|display| display.display_id() == core_graphics::display::CGDisplay::main().id)
+        .context("Main display is not available to ScreenCaptureKit")?;
     Ok((display.width() as u32, display.height() as u32))
 }
 
@@ -637,8 +628,8 @@ impl ScreenCapturer {
         let display = content
             .displays()
             .into_iter()
-            .next()
-            .context("No display found")?;
+            .find(|display| display.display_id() == core_graphics::display::CGDisplay::main().id)
+            .context("Main display is not available to ScreenCaptureKit")?;
 
         let actual_width = if config.width == 0 {
             display.width() as u32
@@ -683,6 +674,7 @@ impl ScreenCapturer {
         stream.start_capture().context("Failed to start capture")?;
 
         tracing::info!(
+            display_id = display.display_id(),
             width = actual_width,
             height = actual_height,
             fps = config.frame_rate,

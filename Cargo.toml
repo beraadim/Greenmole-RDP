@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ironrdp-server-gfx",
     "crates/macrdp-core",
     "crates/macrdp-server",
     "crates/macrdp-capture",

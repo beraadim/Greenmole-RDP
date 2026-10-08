@@ -333,13 +333,18 @@ pub trait RdpServerDisplayUpdates {
 /// ```
 #[async_trait::async_trait]
 pub trait RdpServerDisplay: Send {
-    /// This method should return the current size of the display.
-    /// Currently, there is no way for the client to negotiate resolution,
-    /// so the size returned by this method will be enforced.
+    /// Return the requested desktop size used for the initial Demand Active.
+    /// Later layout changes are announced with DisplayUpdate::Resize; capture
+    /// and input must use the size committed through activate_size.
     async fn size(&mut self) -> DesktopSize;
 
     /// Return a display updates receiver
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>>;
+
+    /// Commit the desktop size negotiated for this activation. A newer layout
+    /// request may already be pending, so implementations must keep that request
+    /// separate from the size used to create the active capture stream.
+    fn activate_size(&mut self, _size: DesktopSize) {}
 
     /// Request a new size for the display
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
@@ -359,6 +364,22 @@ pub trait RdpServerDisplay: Send {
     }
 }
 
+/// Wait independently of capture so resize also works on an unchanged or
+/// unavailable desktop. Watching before reading prevents a lost wakeup.
+pub async fn wait_for_display_resize(
+    mut resize_rx: tokio::sync::watch::Receiver<DesktopSize>,
+    width: u32,
+    height: u32,
+) -> Option<DesktopSize> {
+    loop {
+        let size = *resize_rx.borrow_and_update();
+        if u32::from(size.width) != width || u32::from(size.height) != height {
+            return Some(size);
+        }
+        resize_rx.changed().await.ok()?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::num::{NonZeroU16, NonZeroUsize};
@@ -366,7 +387,92 @@ mod tests {
     use ironrdp_graphics::diff::Rect;
     use ironrdp_graphics::image_processing::PixelFormat;
 
-    use super::{BitmapUpdate, Framebuffer};
+    use super::{wait_for_display_resize, BitmapUpdate, DesktopSize, Framebuffer};
+
+    #[tokio::test]
+    async fn resize_wait_wakes_without_a_capture_frame() {
+        let (tx, rx) = tokio::sync::watch::channel(DesktopSize {
+            width: 1920,
+            height: 1200,
+        });
+        let wait = wait_for_display_resize(rx, 1920, 1200);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut wait)
+                .await
+                .is_err()
+        );
+        tx.send_replace(DesktopSize {
+            width: 2560,
+            height: 1305,
+        });
+        let resized = tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((resized.width, resized.height), (2560, 1305));
+    }
+
+    #[tokio::test]
+    async fn resize_wait_preserves_newest_request_during_activation() {
+        let (tx, rx) = tokio::sync::watch::channel(DesktopSize {
+            width: 1920,
+            height: 1200,
+        });
+        tx.send_replace(DesktopSize {
+            width: 1600,
+            height: 900,
+        });
+        let activating = wait_for_display_resize(rx.clone(), 1920, 1200)
+            .await
+            .unwrap();
+        assert_eq!((activating.width, activating.height), (1600, 900));
+
+        // A second layout arrives while the first Demand Active is in flight.
+        // The new capture uses the first negotiated size; the pending request
+        // must still trigger a second reactivation rather than being lost.
+        tx.send_replace(DesktopSize {
+            width: 1280,
+            height: 720,
+        });
+        tx.send_replace(DesktopSize {
+            width: 1024,
+            height: 768,
+        });
+        let newest = wait_for_display_resize(
+            rx,
+            u32::from(activating.width),
+            u32::from(activating.height),
+        )
+        .await
+        .unwrap();
+        assert_eq!((newest.width, newest.height), (1024, 768));
+    }
+
+    #[tokio::test]
+    async fn resize_wait_does_not_reactivate_for_the_current_size() {
+        let (tx, rx) = tokio::sync::watch::channel(DesktopSize {
+            width: 1920,
+            height: 1200,
+        });
+        tx.send_replace(DesktopSize {
+            width: 1280,
+            height: 720,
+        });
+        tx.send_replace(DesktopSize {
+            width: 1920,
+            height: 1200,
+        });
+        let wait = wait_for_display_resize(rx, 1920, 1200);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut wait)
+                .await
+                .is_err()
+        );
+        drop(tx);
+        assert!(wait.await.is_none());
+    }
 
     #[test]
     fn framebuffer_update() {

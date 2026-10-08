@@ -445,7 +445,7 @@ pub async fn start_server(
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
     let (width, height) = resolve_resolution(res_mode, width, height);
 
-    // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
+    // Input follows the negotiated desktop through the visible capture rectangle.
     let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
 
     // GFX state (shared between server thread and metrics task)
