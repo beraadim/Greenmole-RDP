@@ -2,17 +2,21 @@
 
 #[cfg(target_os = "macos")]
 pub mod color_convert;
+mod completion;
 mod openh264_enc;
+pub use completion::EncodeTiming;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
 pub mod yuv444_split;
-#[cfg(target_os = "macos")]
 use anyhow::Result;
 use bytes::Bytes;
 
 pub use openh264_enc::OpenH264Encoder;
 #[cfg(target_os = "macos")]
 pub use videotoolbox::VtEncoder;
+
+/// Keep the native encoders' signed integer bitrate properties in range.
+pub const MAX_BITRATE_BPS: u32 = 1_000_000_000;
 
 /// Encoded frame output
 pub struct EncodedFrame {
@@ -77,9 +81,23 @@ pub trait VideoEncoder: Send {
     /// Whether this encoder supports AVC444 dual-stream encoding
     fn supports_444(&self) -> bool;
 
+    /// Whether native NV12 buffers can be encoded without a BGRA conversion.
+    fn supports_pixel_buffer(&self) -> bool {
+        false
+    }
+
     /// Whether this encoder supports async submit/collect pipelining.
     fn supports_pipelining(&self) -> bool {
         false
+    }
+
+    /// Callback completion, usable without waiting for another captured frame.
+    fn encode_completion(&self) -> Option<tokio::sync::watch::Receiver<Option<EncodeTiming>>> {
+        None
+    }
+
+    fn last_encode_timing(&self) -> Option<EncodeTiming> {
+        None
     }
 
     /// Submit a BGRA frame for async encoding. Returns immediately.
@@ -118,7 +136,7 @@ pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u3
         Quality::HighQuality => 24.0,
     };
     let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
+    ((pixels * base_bpp * fps_factor) as u32).clamp(1, MAX_BITRATE_BPS)
 }
 
 /// Encoder preference
@@ -153,6 +171,7 @@ pub fn create_encoder(
     mode_444: bool,
     bitrate: u32,
 ) -> Result<Box<dyn VideoEncoder>> {
+    let bitrate = bitrate.clamp(1, MAX_BITRATE_BPS);
     let enc_w = align16(width);
     let enc_h = align16(height);
 

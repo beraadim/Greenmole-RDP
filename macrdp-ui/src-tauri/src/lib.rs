@@ -1,13 +1,13 @@
 mod commands;
 mod database;
 mod event_bridge;
+#[cfg(target_os = "macos")]
+mod own_windows;
 mod permissions;
 mod state;
 mod tray;
 mod ui_config;
 mod window_commands;
-#[cfg(target_os = "macos")]
-mod own_windows;
 
 use std::sync::Arc;
 
@@ -38,7 +38,13 @@ pub fn run() {
         return;
     }
     // Load UI config early to get log level
-    let ui_config = ui_config::UiConfig::load().unwrap_or_default();
+    let ui_config = match ui_config::UiConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Cannot load macrdp configuration securely: {error}");
+            return;
+        }
+    };
     let log_level = ui_config.log_level.clone();
     let filter = format!("macrdp_ui={log_level},macrdp_core={log_level},{log_level}");
 
@@ -74,7 +80,7 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // Initialize application state
-            state::init_app_state(&handle, log_reload.clone())?;
+            state::init_app_state(&handle, log_reload.clone(), ui_config.clone())?;
 
             // Request permissions proactively on startup (non-blocking)
             std::thread::spawn(|| {

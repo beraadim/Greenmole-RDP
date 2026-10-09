@@ -28,6 +28,8 @@ Cargo.lock
 !/Cargo.lock
 !/macrdp-ui/src-tauri/Cargo.lock
 config.toml
+/tmp_logs/
+config-ui*.toml
 docs/superpowers/
 tls/
 # Node / Frontend build artifacts

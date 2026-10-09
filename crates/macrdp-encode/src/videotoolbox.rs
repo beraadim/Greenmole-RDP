@@ -268,10 +268,26 @@ fn cf_f64(v: f64) -> CFTypeRef {
 
 // --- Callback context (shared between encoder thread and VT callback thread) ---
 
+#[derive(Default)]
 struct CallbackCtx {
     output: std::sync::Mutex<Option<(Vec<u8>, bool)>>, // (nal_data, is_keyframe)
     ready: std::sync::Condvar,
     has_data: std::sync::atomic::AtomicBool,
+    completion: crate::completion::EncodeCompletion,
+}
+
+/// Every callback exit, including malformed/error output, wakes its consumer.
+struct CallbackFinished<'a>(&'a CallbackCtx);
+
+impl Drop for CallbackFinished<'_> {
+    fn drop(&mut self) {
+        let _output = self.0.output.lock().unwrap();
+        self.0
+            .has_data
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.completion.finish();
+        self.0.ready.notify_one();
+    }
 }
 
 fn low_latency_wait_budget(fps: f32) -> std::time::Duration {
@@ -292,6 +308,7 @@ extern "C" fn encode_callback(
     sample_buffer: CMSampleBufferRef,
 ) {
     let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
+    let _finished = CallbackFinished(ctx);
 
     if status != 0 || sample_buffer.is_null() {
         // Signal has_data so encoder doesn't timeout waiting — it will get empty data
@@ -300,9 +317,6 @@ extern "C" fn encode_callback(
             null_buf = sample_buffer.is_null(),
             "VT encode callback error"
         );
-        ctx.has_data
-            .store(true, std::sync::atomic::Ordering::Release);
-        ctx.ready.notify_one();
         return;
     }
 
@@ -441,9 +455,6 @@ extern "C" fn encode_callback(
         let mut guard = ctx.output.lock().unwrap();
         *guard = Some((annex_b, is_keyframe));
     }
-    ctx.has_data
-        .store(true, std::sync::atomic::Ordering::Release);
-    ctx.ready.notify_one();
 }
 
 // --- YUV444 reusable buffers for AVC444 mode ---
@@ -580,11 +591,7 @@ impl VtEncoder {
     }
 
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
-        let callback_ctx = Arc::new(CallbackCtx {
-            output: std::sync::Mutex::new(None),
-            ready: std::sync::Condvar::new(),
-            has_data: std::sync::atomic::AtomicBool::new(false),
-        });
+        let callback_ctx = Arc::new(CallbackCtx::default());
 
         // NV12 full-range input for both AVC420 and AVC444.
         // BGRA input produces video range (16-235) causing washed-out colors.
@@ -1288,6 +1295,7 @@ impl VtEncoder {
         frame_properties: CFDictionaryRef,
         wait_budget: std::time::Duration,
     ) -> Result<(Vec<u8>, bool)> {
+        ctx.completion.begin();
         // Reset callback state
         {
             let mut guard = ctx.output.lock().unwrap();
@@ -1845,11 +1853,30 @@ impl VideoEncoder for VtEncoder {
         self.mode_444
     }
 
+    fn supports_pixel_buffer(&self) -> bool {
+        true
+    }
+
     fn supports_pipelining(&self) -> bool {
         true
     }
 
+    fn encode_completion(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<crate::EncodeTiming>>> {
+        Some(self.callback_ctx.completion.subscribe())
+    }
+
+    fn last_encode_timing(&self) -> Option<crate::EncodeTiming> {
+        self.callback_ctx.completion.timing()
+    }
+
     fn submit_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_input_buffer.is_none(),
+            "Previous async encode is still pending"
+        );
+        self.callback_ctx.completion.begin();
         let pixel_buffer = self.create_nv12_vimage(
             self.session,
             self.width,
@@ -1892,6 +1919,11 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn submit_pixel_buffer(&mut self, ptr: *mut std::ffi::c_void) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_input_buffer.is_none(),
+            "Previous async encode is still pending"
+        );
+        self.callback_ctx.completion.begin();
         let (pts, duration) = self.make_pts_duration();
         let frame_props = self.make_force_keyframe_props();
         let pixel_buffer = ptr as CVPixelBufferRef;
@@ -1930,6 +1962,16 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn collect_encoded(&mut self, timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
+        // Zero duration is a nonblocking poll, never a request to flush the
+        // hardware codec or release an input buffer still being encoded.
+        if timeout.is_zero()
+            && !self
+                .callback_ctx
+                .has_data
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(None);
+        }
         let collected = Self::collect_session_frame(self.session, &self.callback_ctx, timeout)?;
         self.clear_pending_input_buffer();
         match collected {
@@ -1939,6 +1981,18 @@ impl VideoEncoder for VtEncoder {
                 width: self.width,
                 height: self.height,
             })),
+            None if self
+                .callback_ctx
+                .has_data
+                .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                Ok(Some(EncodedFrame {
+                    data: Bytes::new(),
+                    is_keyframe: false,
+                    width: self.width,
+                    height: self.height,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -1946,12 +2000,42 @@ impl VideoEncoder for VtEncoder {
 
 impl Drop for VtEncoder {
     fn drop(&mut self) {
-        self.clear_pending_input_buffer();
         unsafe {
             VTCompressionSessionInvalidate(self.session);
+            CFRelease(self.session);
             if let Some(aux) = self.session_aux {
                 VTCompressionSessionInvalidate(aux);
+                CFRelease(aux);
             }
         }
+        self.clear_pending_input_buffer();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_native_callback_wakes_async_consumer() {
+        let ctx = CallbackCtx::default();
+        ctx.completion.begin();
+        let mut completion = ctx.completion.subscribe();
+        encode_callback(
+            &ctx as *const CallbackCtx as *mut c_void,
+            std::ptr::null_mut(),
+            -1,
+            0,
+            std::ptr::null_mut(),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            completion.wait_for(|timing| timing.is_some()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ctx.has_data.load(std::sync::atomic::Ordering::Acquire));
+        assert!(ctx.output.lock().unwrap().is_none());
     }
 }

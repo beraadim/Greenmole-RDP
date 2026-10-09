@@ -10,7 +10,19 @@ pub struct Database {
 
 impl Database {
     pub fn new(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        if !path.exists() {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(path)?;
+        }
+        macrdp_core::credentials::protect_config_file(path)?;
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -38,78 +50,45 @@ impl Database {
         })
     }
 
-    /// Record a client disconnection event.
-    ///
-    /// Inserts a row into `connections` and upserts `traffic_daily` for today.
+    /// Persist the measured session and its daily totals atomically.
     pub fn record_disconnection(
         &self,
-        client_ip: &str,
-        client_name: Option<&str>,
-        bytes_total: u64,
+        info: &macrdp_core::DisconnectionInfo,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-
-        let now = chrono::Utc::now();
-        let disconnected_at = now.to_rfc3339();
-        // We don't have the exact connected_at time from the IPC message,
-        // so use disconnected_at as a reasonable fallback.
-        let connected_at = &disconnected_at;
-        let client_name = client_name.unwrap_or("");
-        let today = now.format("%Y-%m-%d").to_string();
-
-        conn.execute(
-            "INSERT INTO connections (client_ip, client_name, connected_at, disconnected_at, duration_secs, bytes_total)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-            rusqlite::params![client_ip, client_name, connected_at, disconnected_at, bytes_total as i64],
-        )
-        .map_err(|e| format!("Failed to insert connection: {}", e))?;
-
-        conn.execute(
-            "INSERT INTO traffic_daily (date, bytes_sent, connection_count)
-             VALUES (?1, ?2, 1)
-             ON CONFLICT(date) DO UPDATE SET
-                 bytes_sent = bytes_sent + excluded.bytes_sent,
-                 connection_count = connection_count + 1",
-            rusqlite::params![today, bytes_total as i64],
-        )
-        .map_err(|e| format!("Failed to upsert traffic_daily: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Record a disconnection with full details (connected_at, duration, etc.).
-    #[allow(dead_code)]
-    pub fn record_disconnection_full(
-        &self,
-        client_ip: &str,
-        client_name: &str,
-        connected_at: &str,
-        disconnected_at: &str,
-        duration_secs: u64,
-        bytes_total: u64,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-        conn.execute(
+        let connected = chrono::DateTime::parse_from_rfc3339(&info.connected_at)
+            .map_err(|_| "Invalid connection timestamp".to_string())?;
+        let disconnected = chrono::DateTime::parse_from_rfc3339(&info.disconnected_at)
+            .map_err(|_| "Invalid disconnection timestamp".to_string())?;
+        let day = disconnected
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%d")
+            .to_string();
+        let duration = i64::try_from(info.duration_secs)
+            .map_err(|_| "Session duration exceeds database range")?;
+        let bytes = i64::try_from(info.bytes_total)
+            .map_err(|_| "Session traffic exceeds database range")?;
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let transaction = conn
+            .transaction()
+            .map_err(|e| format!("Begin history transaction: {e}"))?;
+        transaction.execute(
             "INSERT INTO connections (client_ip, client_name, connected_at, disconnected_at, duration_secs, bytes_total)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![client_ip, client_name, connected_at, disconnected_at, duration_secs as i64, bytes_total as i64],
-        )
-        .map_err(|e| format!("Failed to insert connection: {}", e))?;
-
-        conn.execute(
-            "INSERT INTO traffic_daily (date, bytes_sent, connection_count)
+            rusqlite::params![info.client_ip, info.client_name, connected.to_rfc3339(), disconnected.to_rfc3339(), duration, bytes],
+        ).map_err(|e| format!("Insert connection history: {e}"))?;
+        transaction
+            .execute(
+                "INSERT INTO traffic_daily (date, bytes_sent, connection_count)
              VALUES (?1, ?2, 1)
              ON CONFLICT(date) DO UPDATE SET
                  bytes_sent = bytes_sent + excluded.bytes_sent,
                  connection_count = connection_count + 1",
-            rusqlite::params![today, bytes_total as i64],
-        )
-        .map_err(|e| format!("Failed to upsert traffic_daily: {}", e))?;
-
-        Ok(())
+                rusqlite::params![day, bytes],
+            )
+            .map_err(|e| format!("Update daily traffic: {e}"))?;
+        transaction
+            .commit()
+            .map_err(|e| format!("Commit connection history: {e}"))
     }
 
     /// Retrieve connection history with pagination.
@@ -152,10 +131,7 @@ impl Database {
     }
 
     /// Retrieve daily traffic statistics for the last N days.
-    pub fn get_traffic_stats(
-        &self,
-        days: u32,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    pub fn get_traffic_stats(&self, days: u32) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         let mut stmt = conn
@@ -187,10 +163,68 @@ impl Database {
     }
 
     /// Retrieve recent log entries (placeholder — logs are not yet stored in DB).
-    pub fn get_logs(
-        &self,
-        _limit: usize,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    pub fn get_logs(&self, _limit: usize) -> Result<Vec<serde_json::Value>, String> {
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> macrdp_core::DisconnectionInfo {
+        macrdp_core::DisconnectionInfo {
+            client_ip: "192.0.2.1:1234".into(),
+            client_name: "test-client".into(),
+            connected_at: "2026-01-01T23:59:40Z".into(),
+            disconnected_at: "2026-01-02T00:00:10Z".into(),
+            duration_secs: 30,
+            bytes_total: 12345,
+        }
+    }
+
+    #[test]
+    fn history_preserves_session_times_and_accounts_on_event_date() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::new(&directory.path().join("test.db")).unwrap();
+        database.record_disconnection(&session()).unwrap();
+        let history = database.get_connection_history(10, 0).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["duration_secs"], 30);
+        assert_eq!(history[0]["bytes_total"], 12345);
+        assert!(history[0]["connected_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-01-01T23:59:40"));
+        let conn = database.conn.lock().unwrap();
+        let totals: (String, i64, i64) = conn
+            .query_row(
+                "SELECT date, bytes_sent, connection_count FROM traffic_daily",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, ("2026-01-02".into(), 12345, 1));
+    }
+
+    #[test]
+    fn failed_daily_update_rolls_back_the_history_insert() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::new(&directory.path().join("test.db")).unwrap();
+        database.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_totals BEFORE INSERT ON traffic_daily BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        assert!(database.record_disconnection(&session()).is_err());
+        assert!(database.get_connection_history(10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrepresentable_traffic_does_not_wrap_or_create_a_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::new(&directory.path().join("test.db")).unwrap();
+        let mut info = session();
+        info.bytes_total = u64::MAX;
+        assert!(database.record_disconnection(&info).is_err());
+        assert!(database.get_connection_history(10, 0).unwrap().is_empty());
     }
 }

@@ -106,7 +106,7 @@ function Popover() {
             <span className="text-sm font-semibold text-foreground">
               {metricsAvailable ? metrics.fps : "--"}
             </span>
-            <span className="text-[10px] text-muted-foreground">FPS</span>
+            <span className="text-[10px] text-muted-foreground">Updates/s</span>
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">
@@ -118,9 +118,9 @@ function Popover() {
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? metrics.latency_ms : "--"}
+              {metricsAvailable && !metrics.ack_suspended ? metrics.latency_ms.toFixed(1) : "--"}
             </span>
-            <span className="text-[10px] text-muted-foreground">RTT</span>
+            <span className="text-[10px] text-muted-foreground">ACK ms</span>
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">
@@ -130,9 +130,9 @@ function Popover() {
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? metrics.net_ms : "--"}
+              {metricsAvailable ? metrics.write_ms.toFixed(1) : "--"}
             </span>
-            <span className="text-[10px] text-muted-foreground">Network</span>
+            <span className="text-[10px] text-muted-foreground">Write ms</span>
           </div>
           <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
             <span className="text-sm font-semibold text-foreground">

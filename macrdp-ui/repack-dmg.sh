@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_BUNDLE="${1:-$SCRIPT_DIR/src-tauri/target/release/bundle/macos/macrdp.app}"
-DMG_PATH="${2:-$SCRIPT_DIR/src-tauri/target/release/bundle/dmg/macrdp_0.1.0_aarch64.dmg}"
+DMG_PATH="${2:?Pass the destination DMG path}"
 VOLNAME="${VOLNAME:-macrdp}"
 
 if [ ! -d "$APP_BUNDLE" ]; then
@@ -12,7 +12,6 @@ if [ ! -d "$APP_BUNDLE" ]; then
 fi
 
 mkdir -p "$(dirname "$DMG_PATH")"
-rm -f "$DMG_PATH"
 
 hdiutil create \
   -volname "$VOLNAME" \

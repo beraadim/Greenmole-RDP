@@ -43,7 +43,7 @@ impl Default for ClipboardConfig {
 }
 
 /// Server configuration (loaded from TOML, shared between CLI and UI)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     pub port: u16,
@@ -116,16 +116,55 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Reject unsafe/inconsistent settings before initializing the desktop or listener.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.port > 0, "port must be between 1 and 65535");
+        anyhow::ensure!(
+            self.username
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "A nonempty RDP username is required"
+        );
+        anyhow::ensure!(
+            self.password
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            "A nonempty RDP password is required"
+        );
+        anyhow::ensure!(
+            (1..=240).contains(&self.frame_rate),
+            "frame_rate must be between 1 and 240"
+        );
+        anyhow::ensure!(
+            self.bitrate_mbps
+                .map_or(true, |value| value > 0 && value <= 1000),
+            "bitrate_mbps must be between 1 and 1000"
+        );
+        anyhow::ensure!(
+            matches!(self.audio.channels, 1 | 2),
+            "audio channels must be 1 or 2"
+        );
+        anyhow::ensure!(
+            (8000..=192000).contains(&self.audio.sample_rate),
+            "Invalid audio sample rate"
+        );
+        Ok(())
+    }
+
     /// Load config from a TOML file path, or use defaults if None.
     pub fn load_from_file(path: Option<&std::path::Path>) -> anyhow::Result<Self> {
         if let Some(path) = path {
+            crate::credentials::protect_config_file(path)?;
             let content = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&content)?)
+            toml::from_str(&content)
+                .map_err(|_| anyhow::anyhow!("Invalid server configuration file"))
         } else {
             let default_path = config_dir().join("config.toml");
             if default_path.exists() {
+                crate::credentials::protect_config_file(&default_path)?;
                 let content = std::fs::read_to_string(&default_path)?;
-                Ok(toml::from_str(&content)?)
+                toml::from_str(&content)
+                    .map_err(|_| anyhow::anyhow!("Invalid server configuration file"))
             } else {
                 Ok(ServerConfig::default())
             }
@@ -181,6 +220,26 @@ mod tests {
         assert_eq!(config.frame_rate, 60);
         assert_eq!(config.display_backend, DisplayBackend::Main);
         assert!(config.username.is_none());
+    }
+
+    #[test]
+    fn authentication_and_encoder_limits_are_checked_before_startup() {
+        let mut config = ServerConfig::default();
+        assert!(config.validate().is_err());
+        config.username = Some("macrdp".into());
+        config.password = Some("fixture-password".into());
+        assert!(config.validate().is_ok());
+        config.port = 0;
+        assert!(config.validate().is_err());
+        config.port = 3389;
+        config.frame_rate = 0;
+        assert!(config.validate().is_err());
+        config.frame_rate = 60;
+        config.bitrate_mbps = Some(u32::MAX);
+        assert!(config.validate().is_err());
+        config.bitrate_mbps = Some(50);
+        config.password = Some(String::new());
+        assert!(config.validate().is_err());
     }
 
     #[test]

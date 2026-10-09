@@ -78,75 +78,8 @@ use crate::config::ServerConfig;
 use crate::permissions;
 use crate::tls;
 
-fn sanitize_f64(value: f64) -> f64 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
-}
-
-fn sanitize_f32(value: f32) -> f32 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
-}
-
-fn derive_transport_mode(gfx: &GfxState) -> String {
-    if !gfx.session_uses_gfx {
-        return "bitmap".to_string();
-    }
-
-    if gfx.bitmap_fallback_mode {
-        return "bitmap-fallback".to_string();
-    }
-
-    if gfx.avc_fallback_to_uncompressed {
-        return "gfx-uncompressed-fallback".to_string();
-    }
-
-    if gfx.avc420_supported {
-        if gfx.avc444_supported && gfx.avc444_enabled {
-            "gfx-avc444".to_string()
-        } else {
-            "gfx-avc420".to_string()
-        }
-    } else if gfx.caps_confirmed {
-        "gfx-uncompressed".to_string()
-    } else {
-        "gfx-negotiating".to_string()
-    }
-}
-
-fn derive_encoder_mode(gfx: &GfxState, transport_mode: &str) -> String {
-    let encoder = gfx.encoder_pref.as_deref().unwrap_or("auto");
-    let chroma = gfx.chroma_mode.as_deref().unwrap_or("avc420");
-
-    match transport_mode {
-        "gfx-avc444" => format!("{encoder} / avc444"),
-        "gfx-avc420" => format!("{encoder} / avc420"),
-        "gfx-uncompressed" | "gfx-uncompressed-fallback" => {
-            format!("{encoder} / {chroma} configured, uncompressed active")
-        }
-        "bitmap" | "bitmap-fallback" => {
-            format!("{encoder} / {chroma} configured, bitmap active")
-        }
-        _ => format!("{encoder} / {chroma}"),
-    }
-}
-
-fn derive_bitrate_mode(transport_mode: &str) -> String {
-    match transport_mode {
-        "gfx-avc420" | "gfx-avc444" => "AVC target + wire throughput".to_string(),
-        "gfx-uncompressed" | "gfx-uncompressed-fallback" => {
-            "Wire throughput only (uncompressed GFX)".to_string()
-        }
-        "bitmap" | "bitmap-fallback" => "Wire throughput only (bitmap updates)".to_string(),
-        _ => "Wire throughput".to_string(),
-    }
-}
+mod metrics;
+use metrics::MetricsSnapshot;
 
 #[cfg(test)]
 mod tests {
@@ -165,20 +98,14 @@ mod tests {
     }
 }
 
-#[derive(Debug, Default)]
-struct MetricsSnapshot {
-    last_sample_at: Option<Instant>,
-    last_bytes_sent: u64,
-}
-
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
+    terminal_result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
     display_backend: macrdp_display::DisplayBackend,
     display_controller: macrdp_display::DisplayController,
     port: u16,
     bind_addr: SocketAddr,
     started_at: Instant,
-    fps: u32,
     gfx_state: Arc<Mutex<GfxState>>,
     input_debug_state: Arc<Mutex<InputDebugState>>,
     active_connection: Arc<Mutex<Option<ConnectionInfo>>>,
@@ -239,7 +166,7 @@ impl ServerHandle {
 
     /// Current server status.
     pub fn status(&self) -> ServerStatus {
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Relaxed) || self.thread_finished() {
             ServerStatus {
                 running: false,
                 state: "stopped".to_string(),
@@ -261,51 +188,12 @@ impl ServerHandle {
     /// Current performance metrics.
     pub fn metrics(&self) -> Metrics {
         let gfx = self.gfx_state.lock().unwrap();
-        let now = Instant::now();
-        let mut snapshot = self.metrics_snapshot.lock().unwrap();
-        let bitrate_kbps = if let Some(last_sample_at) = snapshot.last_sample_at {
-            let elapsed = now.duration_since(last_sample_at).as_secs_f64();
-            if elapsed > 0.0 {
-                let delta_bytes = gfx
-                    .total_bytes_sent
-                    .saturating_sub(snapshot.last_bytes_sent);
-                ((delta_bytes as f64 * 8.0) / elapsed / 1000.0).round() as u64
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        snapshot.last_sample_at = Some(now);
-        snapshot.last_bytes_sent = gfx.total_bytes_sent;
-        let rtt_ms = sanitize_f64(gfx.rtt_ewma_ms);
-        let encode_ms = sanitize_f64(gfx.last_encode_ms);
-        let net_ms = sanitize_f64((rtt_ms - encode_ms).max(0.0));
-        let transport_mode = derive_transport_mode(&gfx);
-        let encoder_mode = derive_encoder_mode(&gfx, &transport_mode);
-        let bitrate_mode = derive_bitrate_mode(&transport_mode);
-        Metrics {
-            fps: gfx
-                .applied_frame_rate
-                .or(gfx.target_frame_rate)
-                .unwrap_or(self.fps)
-                .max(1),
-            bitrate_kbps,
-            rtt_ms,
-            bytes_sent: gfx.total_bytes_sent,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            encode_ms,
-            net_ms,
-            last_frame_bytes: gfx.last_frame_bytes,
-            network_quality: sanitize_f32(gfx.network_quality),
-            pending_acks: gfx.pending_acks,
-            transport_mode,
-            encoder_mode,
-            bitrate_mode,
-        }
+        self.metrics_snapshot.lock().unwrap().sample(&gfx)
+    }
+
+    /// Total successfully written display bytes without advancing rate sampling.
+    pub fn bytes_sent(&self) -> u64 {
+        self.gfx_state.lock().unwrap().total_bytes_sent
     }
 
     /// Current keyboard/input diagnostic state.
@@ -319,8 +207,33 @@ impl ServerHandle {
     }
 
     /// Push a hot config update to the running server.
-    pub fn update_config(&self, update: ConfigUpdate) {
-        let _ = self.config_tx.send(update);
+    pub fn update_config(&self, update: ConfigUpdate) -> Result<()> {
+        update.validate()?;
+        self.config_tx
+            .send(update)
+            .map_err(|_| anyhow::anyhow!("Server configuration worker is no longer running"))
+    }
+
+    fn thread_finished(&self) -> bool {
+        self.server_thread
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(true, |thread| thread.is_finished())
+    }
+
+    /// Wait for a fatal server error or an orderly stop without losing a notification.
+    pub async fn wait_until_stopped(&self) -> Result<()> {
+        while !self.stopped.load(Ordering::Acquire) && !self.thread_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        match self.terminal_result.lock().unwrap().as_ref() {
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None if !self.stopped.load(Ordering::Acquire) => {
+                anyhow::bail!("RDP server thread terminated unexpectedly")
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Gracefully stop the server.
@@ -328,21 +241,32 @@ impl ServerHandle {
         if self.stopped.swap(true, Ordering::Relaxed) {
             return Ok(()); // Already stopped
         }
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_notify.notify_one();
 
         // Extract thread handle from mutex *before* the await point so that
         // the MutexGuard is dropped and the future remains Send.
         let thread = self.server_thread.lock().unwrap().take();
-        if let Some(thread) = thread {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = thread.join();
+        let join_result = if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("RDP server thread panicked"))
             })
-            .await;
-        }
+            .await
+            .context("RDP server join task failed")
+            .and_then(|result| result)
+        } else {
+            Ok(())
+        };
         // Cancel metrics task
         let task = self.metrics_task.lock().unwrap().take();
         if let Some(task) = task {
             task.abort();
+        }
+        let _ = tokio::task::spawn_blocking(crate::log_bridge::flush_logs).await;
+        join_result?;
+        if let Some(Err(error)) = self.terminal_result.lock().unwrap().as_ref() {
+            anyhow::bail!("{error}");
         }
         Ok(())
     }
@@ -351,7 +275,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         if !self.stopped.load(Ordering::Relaxed) {
-            self.shutdown_notify.notify_waiters();
+            self.shutdown_notify.notify_one();
         }
     }
 }
@@ -359,6 +283,7 @@ impl Drop for ServerHandle {
 /// Arguments that are Send-safe, passed to the server thread.
 /// RdpServer itself is !Send, so we pass everything needed to construct it.
 struct ServerThreadArgs {
+    perf_stats: Option<crate::perf_stats::SharedPerfStats>,
     display_controller: macrdp_display::DisplayController,
     config: ServerConfig,
     bind_addr: SocketAddr,
@@ -419,6 +344,16 @@ pub async fn start_server(
     config: ServerConfig,
     handler: impl ServerEventHandler,
 ) -> Result<Arc<ServerHandle>> {
+    start_server_with_perf(config, handler, None).await
+}
+
+/// Start the shared engine with optional bounded performance collection.
+pub async fn start_server_with_perf(
+    config: ServerConfig,
+    handler: impl ServerEventHandler,
+    perf_stats: Option<crate::perf_stats::SharedPerfStats>,
+) -> Result<Arc<ServerHandle>> {
+    config.validate()?;
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
 
     // Notify handler: starting
@@ -511,6 +446,7 @@ pub async fn start_server(
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
+        perf_stats,
         display_controller: display_controller.clone(),
         config: config.clone(),
         bind_addr,
@@ -533,84 +469,36 @@ pub async fn start_server(
     // Spawn RDP server on a dedicated OS thread.
     // RdpServer is !Send (contains dyn SoundServerFactory, dyn CliprdrServerFactory),
     // so we construct and run it entirely within this thread.
+    let terminal_result = Arc::new(Mutex::new(None));
+    let worker_result = Arc::clone(&terminal_result);
     let server_thread = std::thread::Builder::new()
         .name("rdp-server".into())
         .spawn(move || {
-            run_server_thread(args);
+            *worker_result.lock().unwrap() =
+                Some(run_server_thread(args).map_err(|error| format!("{error:#}")));
         })
         .context("Failed to spawn RDP server thread")?;
 
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&gfx_state);
     let handler_for_metrics = Arc::clone(&handler);
-    let fps = config.frame_rate;
     let metrics_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut prev_bytes_sent: u64 = 0;
+        let mut snapshot = MetricsSnapshot::default();
         loop {
             interval.tick().await;
-            let (
-                rtt_ms,
-                bytes_sent,
-                encode_ms,
-                last_frame_bytes,
-                network_quality,
-                pending_acks,
-                transport_mode,
-                encoder_mode,
-                bitrate_mode,
-            ) = {
-                let gfx = metrics_gfx.lock().unwrap();
-                let transport_mode = derive_transport_mode(&gfx);
-                let encoder_mode = derive_encoder_mode(&gfx, &transport_mode);
-                let bitrate_mode = derive_bitrate_mode(&transport_mode);
-                (
-                    gfx.rtt_ewma_ms,
-                    gfx.total_bytes_sent,
-                    gfx.last_encode_ms,
-                    gfx.last_frame_bytes,
-                    gfx.network_quality,
-                    gfx.pending_acks,
-                    transport_mode,
-                    encoder_mode,
-                    bitrate_mode,
-                )
-            };
-            let delta_bytes = bytes_sent.saturating_sub(prev_bytes_sent);
-            prev_bytes_sent = bytes_sent;
-            let bitrate_kbps = delta_bytes * 8 / 1000;
-            let rtt_ms = sanitize_f64(rtt_ms);
-            let encode_ms = sanitize_f64(encode_ms);
-            let net_ms = sanitize_f64((rtt_ms - encode_ms).max(0.0));
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            handler_for_metrics.on_metrics(Metrics {
-                fps,
-                bitrate_kbps,
-                rtt_ms,
-                bytes_sent,
-                timestamp,
-                encode_ms,
-                net_ms,
-                last_frame_bytes,
-                network_quality: sanitize_f32(network_quality),
-                pending_acks,
-                transport_mode,
-                encoder_mode,
-                bitrate_mode,
-            });
+            let metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
+            handler_for_metrics.on_metrics(metrics);
         }
     });
 
     let handle = Arc::new(ServerHandle {
+        terminal_result,
         display_backend: backend,
         display_controller,
         port,
         bind_addr,
         started_at: Instant::now(),
-        fps,
         gfx_state,
         input_debug_state,
         active_connection,
@@ -637,7 +525,7 @@ pub async fn start_server(
 /// Runs the RDP server entirely on the current thread. Called from the dedicated
 /// server thread. Constructs the !Send RdpServer here so it never crosses thread
 /// boundaries.
-fn run_server_thread(args: ServerThreadArgs) {
+fn run_server_thread(args: ServerThreadArgs) -> Result<()> {
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
     use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
@@ -645,7 +533,7 @@ fn run_server_thread(args: ServerThreadArgs) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("Failed to create tokio runtime for RDP server");
+        .context("Failed to create tokio runtime for RDP server")?;
 
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
@@ -658,12 +546,12 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::error!("Failed to load TLS certificate: {e}");
                 args.handler.on_status_change(ServerStatus {
                     running: false,
-                    state: format!("error: {e}"),
+                    state: "error: TLS certificate initialization failed".to_string(),
                     uptime_secs: 0,
                     port: Some(args.bind_addr.port()),
                     bind_address: Some(args.bind_addr.ip().to_string()),
                 });
-                return;
+                return Err(e).context("Failed to load TLS certificate");
             }
         };
         let tls_acceptor = match tls_identity.make_acceptor() {
@@ -672,12 +560,12 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::error!("Failed to create TLS acceptor: {e}");
                 args.handler.on_status_change(ServerStatus {
                     running: false,
-                    state: format!("error: {e}"),
+                    state: "error: TLS configuration failed".to_string(),
                     uptime_secs: 0,
                     port: Some(args.bind_addr.port()),
                     bind_address: Some(args.bind_addr.ip().to_string()),
                 });
-                return;
+                return Err(e).context("Failed to create TLS acceptor");
             }
         };
 
@@ -690,7 +578,8 @@ fn run_server_thread(args: ServerThreadArgs) {
             Arc::clone(&args.input_debug_state),
             Arc::clone(&args.active_connection),
             Some(display_controller.clone()),
-        );
+        )
+        .with_events(Arc::clone(&args.handler), Arc::clone(&args.gfx_state));
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
         let shared_audio_tx = if args.config.audio.enabled {
@@ -721,6 +610,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                 Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(
                     temp_dir,
                     args.config.clipboard.max_file_size_mb,
+                    args.config.clipboard.file_transfer,
                 )))
             } else {
                 None
@@ -744,7 +634,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             Arc::clone(&args.gfx_state),
             args.coord_mapper,
             shared_audio_tx,
-            None, // perf_stats: not exposed via macrdp-core API yet
+            args.perf_stats,
             args.display_controller,
         );
 
@@ -759,45 +649,16 @@ fn run_server_thread(args: ServerThreadArgs) {
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));
+        server.set_idle_timeout(Some(std::time::Duration::from_secs(
+            args.config.idle_timeout_secs,
+        )));
 
-        // Credentials
-        let (username, password) = match (&args.config.username, &args.config.password) {
-            (Some(u), Some(p)) => (u.clone(), p.clone()),
-            _ => {
-                let seed = std::process::id() as u64
-                    ^ std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as u64;
-                let random_pass: String = (0..8)
-                    .map(|i| {
-                        let v = ((seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(i * 1442695040888963407))
-                            >> (i * 5 + 3))
-                            % 36;
-                        if v < 10 {
-                            (b'0' + v as u8) as char
-                        } else {
-                            (b'a' + (v - 10) as u8) as char
-                        }
-                    })
-                    .collect();
-                let user = "macrdp".to_string();
-                tracing::warn!("No credentials in config — using generated credentials:");
-                println!("\n  ┌──────────────────────────────────┐");
-                println!("  │  Username: {:<22}│", &user);
-                println!("  │  Password: {:<22}│", &random_pass);
-                println!("  └──────────────────────────────────┘\n");
-                (user, random_pass)
-            }
-        };
+        // Validated before any native resources are created; never log the password.
         server.set_credentials(Some(Credentials {
-            username: username.clone(),
-            password: password.clone(),
+            username: args.config.username.clone().expect("validated username"),
+            password: args.config.password.clone().expect("validated password"),
             domain: None,
         }));
-        tracing::info!("Authentication configured for user: {}", username);
 
         tracing::info!(%args.bind_addr, "RDP server listening");
 
@@ -860,23 +721,25 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         });
 
-        tokio::select! {
+        let server_result = tokio::select! {
             result = server.run() => {
-                if let Err(e) = result {
+                if let Err(ref e) = result {
                     tracing::error!("RDP server error: {e}");
                     args.handler.on_status_change(ServerStatus {
                         running: false,
-                        state: format!("error: {e}"),
+                        state: "error: RDP server stopped unexpectedly".to_string(),
                         uptime_secs: 0,
                         port: Some(args.bind_addr.port()),
                         bind_address: Some(args.bind_addr.ip().to_string()),
                     });
                 }
+                result
             }
             _ = args.shutdown_notify.notified() => {
                 tracing::info!("Shutdown signal received, stopping server");
+                Ok(())
             }
-        }
+        };
 
         // Cancelling server.run() during shutdown skips its connection cleanup.
         // Restore the physical display layout explicitly in that path too.
@@ -890,5 +753,6 @@ fn run_server_thread(args: ServerThreadArgs) {
         {
             tracing::warn!(%error, "Physical display restoration failed during shutdown");
         }
-    });
+        server_result
+    })
 }

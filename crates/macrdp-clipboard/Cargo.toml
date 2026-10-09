@@ -16,3 +16,4 @@ tokio = { workspace = true, features = ["sync"] }
 ironrdp-server = "0.10"
 ironrdp-cliprdr = "0.5"
 ironrdp-core = "0.1"
+tempfile = "3"

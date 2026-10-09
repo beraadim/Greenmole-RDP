@@ -39,14 +39,8 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(cert_path, cert.pem())?;
-    fs::write(key_path, key_pair.serialize_pem())?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
-    }
+    crate::credentials::write_private_file(key_path, key_pair.serialize_pem().as_bytes())?;
+    crate::credentials::write_private_file(cert_path, cert.pem().as_bytes())?;
 
     tracing::info!(
         ?cert_path,
@@ -73,6 +67,7 @@ pub fn ensure_tls_files(
         generate_self_signed_cert(&cert, &key)
             .context("Failed to generate self-signed certificate")?;
     }
+    crate::credentials::protect_config_file(&key)?;
 
     Ok((cert, key))
 }

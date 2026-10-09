@@ -2,6 +2,105 @@ use super::*;
 use crate::{KeyboardEvent, MouseEvent, RdpServerDisplayUpdates};
 use std::sync::Mutex as StdMutex;
 
+#[tokio::test(start_paused = true)]
+async fn silent_peer_cannot_hold_the_listener_indefinitely() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+    let _client = client.unwrap();
+    let (stream, _) = accepted.unwrap();
+    let mut server = RdpServer::builder()
+        .with_addr(address)
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+    server.set_handshake_timeout(Duration::from_millis(25));
+    let error = tokio::time::timeout(Duration::from_secs(1), server.run_connection(stream))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("RDP negotiation timed out"));
+}
+
+#[tokio::test]
+async fn pending_authentication_services_address_requests_and_quit() {
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+    server.local_addr = Some(([127, 0, 0, 1], 3389).into());
+    let (reply, address) = oneshot::channel();
+    let events = server.event_sender().clone();
+    events.send(ServerEvent::GetLocalAddr(reply)).unwrap();
+    events
+        .send(ServerEvent::Quit("test shutdown".into()))
+        .unwrap();
+    let error = server
+        .await_connection_stage("test authentication", std::future::pending::<Result<()>>())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("server stopped"));
+    assert_eq!(address.await.unwrap(), server.local_addr);
+    assert!(server.quit_requested);
+}
+
+#[tokio::test(start_paused = true)]
+async fn inactive_client_loop_expires_even_with_capture_waiting() {
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+    server.set_idle_timeout(Some(Duration::from_millis(25)));
+    let (stream, _peer) = tokio::io::duplex(1024);
+    let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+    let size = DesktopSize {
+        width: 800,
+        height: 600,
+    };
+    let encoder = UpdateEncoder::new(size, CmdFlags::empty(), UpdateEncoderCodecs::new()).unwrap();
+    let state = server
+        .client_loop(
+            &mut reader,
+            &mut writer,
+            1003,
+            1002,
+            encoder,
+            size,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state, RunState::Disconnect);
+}
+
+#[tokio::test]
+async fn session_quit_stops_the_listener_after_disconnect() {
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+    let (stream, _peer) = tokio::io::duplex(1024);
+    let (_, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+    let mut events = vec![ServerEvent::Quit("test shutdown".into())];
+    assert_eq!(
+        server
+            .dispatch_server_events(&mut events, &mut writer, 1002)
+            .await
+            .unwrap(),
+        RunState::Disconnect
+    );
+    assert!(server.quit_requested);
+}
+
 #[derive(Default)]
 struct InputLifecycle {
     contexts: Vec<String>,
@@ -127,7 +226,9 @@ fn resize_test_server(display: Box<dyn RdpServerDisplay>) -> RdpServer {
             security: RdpServerSecurity::None,
             codecs: BitmapCodecs(Vec::new()),
         },
-        Box::new(RecordingInput(Arc::new(StdMutex::new(InputLifecycle::default())))),
+        Box::new(RecordingInput(Arc::new(StdMutex::new(
+            InputLifecycle::default(),
+        )))),
         display,
         None,
         None,
@@ -171,7 +272,10 @@ async fn freerdp_confirm_active_echo_does_not_replace_the_initial_viewport() {
         }
         // Reactivation must not replay the original browser size over later
         // Display Control changes, which use this same connection.
-        assert!(matches!(sizes.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            sizes.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }
 
@@ -199,17 +303,17 @@ async fn gfx_session_negotiates_display_control_and_receives_resize() {
 
 async fn verify_display_control_resize(gfx_enabled: bool) {
     use dvc::pdu::{
-        CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DataPdu, DrdynvcClientPdu,
-        DrdynvcDataPdu, DrdynvcServerPdu,
+        CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DataPdu,
+        DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu,
     };
     use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, DisplayControlPdu};
     let (requests, mut sizes) = mpsc::unbounded_channel();
     let mut server = resize_test_server(Box::new(RequestedSizeDisplay(requests)));
     server.set_gfx_enabled(gfx_enabled);
     let mut channels = server.dynamic_channels();
-    let caps = encode_vec(&DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
-        CapsVersion::V1,
-    )))
+    let caps = encode_vec(&DrdynvcClientPdu::Capabilities(
+        CapabilitiesResponsePdu::new(CapsVersion::V1),
+    ))
     .unwrap();
     let creates = decode_dynamic_responses(channels.process(&caps).unwrap());
     assert_eq!(creates.len(), if gfx_enabled { 3 } else { 1 });
@@ -231,9 +335,10 @@ async fn verify_display_control_resize(gfx_enabled: bool) {
         panic!("expected Display Control capabilities")
     };
     assert!(caps.max_monitor_area() >= 3840 * 2160);
-    let layout: DisplayControlPdu = DisplayControlMonitorLayout::new_single_primary_monitor(1600, 900, None, None)
-        .unwrap()
-        .into();
+    let layout: DisplayControlPdu =
+        DisplayControlMonitorLayout::new_single_primary_monitor(1600, 900, None, None)
+            .unwrap()
+            .into();
     let request = encode_vec(&DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
         channel_id,
         encode_vec(&layout).unwrap(),

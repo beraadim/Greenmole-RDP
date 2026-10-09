@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "macrdp-runtime-password"
+description = "Runtime and captured RDP credentials must never be committed"
+path = '''(^|/)(tmp_logs/.*|config\.toml|config-ui[^/]*\.toml)$'''
+regex = '''(?i)password\s*=\s*["']([^"'\r\n]+)["']'''
+secretGroup = 1

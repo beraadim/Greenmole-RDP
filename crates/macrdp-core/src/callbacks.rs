@@ -27,16 +27,24 @@ impl Default for ServerStatus {
 /// Real-time performance metrics
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
+    /// Delivered graphics updates per second; bitmap updates may be subregions.
     pub fps: u32,
     pub bitrate_kbps: u64,
-    /// Round-trip time in milliseconds (serialized as "latency_ms" for JSON backward compat)
+    /// Graphics frame send-to-decode-ACK latency, including transport and client decoding.
+    /// Serialized as "latency_ms" for backward compatibility; this is not a network ping.
     #[serde(rename = "latency_ms")]
     pub rtt_ms: f64,
     pub bytes_sent: u64,
     pub timestamp: u64,
     /// Time spent encoding the last frame (milliseconds)
     pub encode_ms: f64,
-    /// Estimated network-only latency: rtt_ms minus encode_ms (milliseconds)
+    pub capture_queue_ms: f64,
+    pub completion_queue_ms: f64,
+    pub write_ms: f64,
+    pub capture_frames_coalesced: u64,
+    pub client_queue_depth_bytes: Option<u32>,
+    pub ack_suspended: bool,
+    /// Legacy alias of ACK latency. Network-only latency is not measured by GFX ACKs.
     pub net_ms: f64,
     /// Byte size of the last encoded frame
     pub last_frame_bytes: u32,
@@ -75,6 +83,8 @@ pub struct ConnectionInfo {
 pub struct DisconnectionInfo {
     pub client_ip: String,
     pub client_name: String,
+    pub connected_at: String,
+    pub disconnected_at: String,
     pub duration_secs: u64,
     pub bytes_total: u64,
 }
@@ -109,7 +119,7 @@ pub struct InputDebugState {
 }
 
 /// Hot-updatable configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ConfigUpdate {
     FrameRate(u32),
     BitrateKbps(u32),
@@ -120,6 +130,114 @@ pub enum ConfigUpdate {
     ChromaMode(String),
     GfxValidationMode(bool),
     Credentials { username: String, password: String },
+}
+
+impl std::fmt::Debug for ConfigUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameRate(value) => f.debug_tuple("FrameRate").field(value).finish(),
+            Self::BitrateKbps(value) => f.debug_tuple("BitrateKbps").field(value).finish(),
+            Self::LogLevel(value) => f.debug_tuple("LogLevel").field(value).finish(),
+            Self::ShowCursor(value) => f.debug_tuple("ShowCursor").field(value).finish(),
+            Self::Resolution(value) => f.debug_tuple("Resolution").field(value).finish(),
+            Self::Encoder(value) => f.debug_tuple("Encoder").field(value).finish(),
+            Self::ChromaMode(value) => f.debug_tuple("ChromaMode").field(value).finish(),
+            Self::GfxValidationMode(value) => {
+                f.debug_tuple("GfxValidationMode").field(value).finish()
+            }
+            Self::Credentials { .. } => f
+                .debug_struct("Credentials")
+                .field("password", &"[REDACTED]")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_updates_never_include_secret_values_in_debug_output() {
+        let update = ConfigUpdate::Credentials {
+            username: "test-user".into(),
+            password: "test-secret".into(),
+        };
+        let output = format!("{update:?}");
+        assert!(output.contains("REDACTED"));
+        assert!(!output.contains("test-secret"));
+        assert!(!output.contains("test-user"));
+        assert_eq!(
+            format!("{:?}", ConfigUpdate::FrameRate(60)),
+            "FrameRate(60)"
+        );
+    }
+}
+
+impl ConfigUpdate {
+    /// Validate public runtime updates before they reach the session worker.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::FrameRate(fps) => anyhow::ensure!(
+                (1..=240).contains(fps),
+                "frame_rate must be between 1 and 240"
+            ),
+            Self::BitrateKbps(kbps) => anyhow::ensure!(
+                (1..=1_000_000).contains(kbps),
+                "bitrate must be between 1 and 1000000 Kbps"
+            ),
+            Self::Credentials { username, password } => {
+                anyhow::ensure!(
+                    !username.trim().is_empty(),
+                    "A nonempty RDP username is required"
+                );
+                anyhow::ensure!(!password.is_empty(), "A nonempty RDP password is required");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_update_tests {
+    use super::ConfigUpdate;
+
+    #[test]
+    fn hot_encoder_updates_reject_zero_and_overflowing_values() {
+        for fps in [0, 241, u32::MAX] {
+            assert!(ConfigUpdate::FrameRate(fps).validate().is_err());
+        }
+        for fps in [1, 240] {
+            assert!(ConfigUpdate::FrameRate(fps).validate().is_ok());
+        }
+        for kbps in [0, 1_000_001, u32::MAX] {
+            assert!(ConfigUpdate::BitrateKbps(kbps).validate().is_err());
+        }
+        for kbps in [1, 1_000_000] {
+            assert!(ConfigUpdate::BitrateKbps(kbps).validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn hot_credentials_require_both_values_without_disclosing_them() {
+        for (username, password) in [(" ", "private-value"), ("user", "")] {
+            let error = ConfigUpdate::Credentials {
+                username: username.into(),
+                password: password.into(),
+            }
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains("private-value"));
+        }
+        assert!(ConfigUpdate::Credentials {
+            username: "user".into(),
+            password: "private-value".into()
+        }
+        .validate()
+        .is_ok());
+    }
 }
 
 /// Callback trait for receiving server events.

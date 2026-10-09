@@ -1,7 +1,9 @@
 //! macOS screen capture via ScreenCaptureKit
 
 mod geometry;
+mod mailbox;
 pub use geometry::{ContentRect, MouseCoordMapper};
+pub use mailbox::CaptureDeliveryStats;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,7 +148,7 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: SCStream,
     stopped: bool,
-    frame_rx: mpsc::Receiver<CaptureEvent>,
+    frame_rx: Arc<mailbox::FrameMailbox>,
     config: CaptureConfig,
     actual_width: u32,
     actual_height: u32,
@@ -154,7 +156,7 @@ pub struct ScreenCapturer {
 }
 
 struct VideoOutputHandler {
-    frame_tx: mpsc::Sender<CaptureEvent>,
+    frame_tx: mailbox::FrameSender,
     pixel_format: CapturePixelFormat,
 }
 
@@ -174,8 +176,7 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         };
         let Some(event) = event else { return };
 
-        // Non-blocking send — drop frame if channel is full
-        let _ = self.frame_tx.try_send(event);
+        self.frame_tx.send(event);
     }
 }
 
@@ -659,9 +660,8 @@ impl ScreenCapturer {
         let stream_config =
             build_stream_config(actual_width, actual_height, &config, captures_audio);
 
-        // Channel for capture events: buffer 2 entries to allow for jitter
-        let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
-            mpsc::channel(2);
+        let frame_rx = Arc::new(mailbox::FrameMailbox::default());
+        let frame_tx = mailbox::FrameSender(frame_rx.clone());
 
         let video_handler = VideoOutputHandler {
             frame_tx,
@@ -709,7 +709,11 @@ impl ScreenCapturer {
 
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
     pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
-        self.frame_rx.try_recv().ok()
+        self.frame_rx.try_recv()
+    }
+
+    pub fn last_delivery_stats(&self) -> CaptureDeliveryStats {
+        self.frame_rx.last_delivery_stats()
     }
 
     /// Wait for ScreenCaptureKit to finish stopping before changing display modes.

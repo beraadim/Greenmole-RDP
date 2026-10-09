@@ -1,29 +1,15 @@
 [package]
 name = "macrdp-server"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 
 [dependencies]
-macrdp-display = { path = "../macrdp-display" }
-macrdp-capture = { path = "../macrdp-capture" }
-macrdp-input = { path = "../macrdp-input" }
-macrdp-encode = { path = "../macrdp-encode" }
-macrdp-audio = { path = "../macrdp-audio" }
-macrdp-clipboard = { path = "../macrdp-clipboard" }
+macrdp-core = { path = "../macrdp-core" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-bytes.workspace = true
-time.workspace = true
-ironrdp-server = { version = "0.10", features = ["helper"] }
-ironrdp-displaycontrol = "0.5"
-async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-rcgen = "0.13"
-dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"

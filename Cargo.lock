@@ -2160,21 +2160,24 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "tempfile",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
  "chrono",
  "dirs",
+ "getrandom 0.2.17",
  "ironrdp-displaycontrol",
  "ironrdp-server",
+ "libc",
  "macrdp-audio",
  "macrdp-capture",
  "macrdp-clipboard",
@@ -2182,7 +2185,9 @@ dependencies = [
  "macrdp-encode",
  "macrdp-input",
  "rcgen",
+ "security-framework",
  "serde",
+ "serde_json",
  "tempfile",
  "time",
  "tokio",
@@ -2215,6 +2220,7 @@ dependencies = [
  "criterion",
  "openh264",
  "openh264-sys2",
+ "tokio",
  "tracing",
 ]
 
@@ -2233,27 +2239,13 @@ dependencies = [
 
 [[package]]
 name = "macrdp-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
- "async-trait",
- "bytes",
  "clap",
- "dirs",
- "ironrdp-displaycontrol",
- "ironrdp-server",
- "macrdp-audio",
- "macrdp-capture",
- "macrdp-clipboard",
- "macrdp-display",
- "macrdp-encode",
- "macrdp-input",
- "rcgen",
- "serde",
+ "macrdp-core",
  "tempfile",
- "time",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
 ]

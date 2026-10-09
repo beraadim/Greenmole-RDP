@@ -144,7 +144,7 @@ function Dashboard() {
       <div className="flex gap-2">
         <MetricCard
           value={metricsAvailable ? metrics.fps : null}
-          label="FPS"
+          label="Updates/s"
           color="blue"
         />
         <MetricCard
@@ -175,6 +175,19 @@ function Dashboard() {
             {currentTransport ?? "inactive"}
           </span>
         </div>
+        {metricsAvailable && (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] mb-3">
+            <div>Capture queue: {metrics.capture_queue_ms.toFixed(1)} ms</div>
+            <div>Encode delivery: {metrics.completion_queue_ms.toFixed(1)} ms</div>
+            <div>Socket write: {metrics.write_ms.toFixed(1)} ms</div>
+            <div>Frames combined: {metrics.capture_frames_coalesced}</div>
+            <div title="Time from sending graphics to client decode acknowledgement; includes client processing.">
+              Graphics ACK: {metrics.ack_suspended ? "not reported" : `${metrics.latency_ms.toFixed(1)} ms`}
+            </div>
+            <div>Pending ACKs: {metrics.ack_suspended ? "not reported" : metrics.pending_acks}</div>
+            <div>Client queue: {metrics.client_queue_depth_bytes === null ? "not reported" : `${Math.round(metrics.client_queue_depth_bytes / 1024)} KiB`}</div>
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px]">
           <div className="rounded-[6px] bg-black/10 px-2 py-2">
             <div className="text-text-muted mb-1">Transport</div>

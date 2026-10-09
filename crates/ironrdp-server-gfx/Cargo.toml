@@ -130,6 +130,7 @@ features = [
     "macros",
     "sync",
     "rt",
+    "time",
 ]
 
 [dependencies.tokio-rustls]
@@ -153,7 +154,7 @@ optional = true
 
 [dev-dependencies.tokio]
 version = "1"
-features = ["sync"]
+features = ["sync", "test-util"]
 
 [lints.clippy]
 alloc_instead_of_core = "warn"

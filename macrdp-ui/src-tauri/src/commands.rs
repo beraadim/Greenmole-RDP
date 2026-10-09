@@ -89,10 +89,7 @@ pub async fn stop_server(
         status.port = None;
         status.bind_address = None;
     }
-    let _ = app.emit(
-        "server-status",
-        &*state.status.lock().await,
-    );
+    let _ = app.emit("server-status", &*state.status.lock().await);
 
     // Clear metrics and connections
     {
@@ -125,9 +122,7 @@ pub async fn get_server_status(
 }
 
 #[tauri::command]
-pub async fn get_metrics(
-    state: State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_metrics(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     // If we have a live handle, refresh from it so polling fallback works even
     // if an event update was missed.
     {
@@ -143,9 +138,7 @@ pub async fn get_metrics(
 }
 
 #[tauri::command]
-pub async fn get_connections(
-    state: State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_connections(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let live_connections = {
         let guard = state.server_handle.lock().await;
         if let Some(ref handle) = *guard {
@@ -154,7 +147,7 @@ pub async fn get_connections(
                     client_ip: connection.client_ip,
                     client_name: connection.client_name,
                     connected_at: connection.connected_at,
-                    bytes_total: handle.metrics().bytes_sent,
+                    bytes_total: handle.bytes_sent(),
                 }]
             } else {
                 Vec::new()
@@ -192,9 +185,7 @@ pub async fn get_input_debug_state(
 }
 
 #[tauri::command]
-pub async fn get_config(
-    state: State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let config = state.ui_config.lock().await.clone();
     serde_json::to_value(&config).map_err(|e| e.to_string())
 }
@@ -208,14 +199,20 @@ pub async fn set_config(
 ) -> Result<SetConfigResponse, String> {
     tracing::info!(%key, "Updating configuration");
 
-    let running_backend = state.server_handle.lock().await
+    let running_backend = state
+        .server_handle
+        .lock()
+        .await
         .as_ref()
         .map(|handle| handle.display_backend());
     let restart_required = {
         let mut config = state.ui_config.lock().await;
-        config.set_field(&key, &value)?;
-        config.save()?;
-        config.requires_restart(&key, running_backend)
+        let mut candidate = config.clone();
+        candidate.set_field(&key, &value)?;
+        candidate.save()?;
+        let restart = candidate.requires_restart(&key, running_backend);
+        *config = candidate;
+        restart
     };
 
     if key == "log_level" {
@@ -238,22 +235,44 @@ pub async fn set_config(
         if let Some(handle) = guard.as_ref() {
             let config = state.ui_config.lock().await;
             match key.as_str() {
-                "frame_rate" => handle.update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate)),
-                "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(config.bitrate_mbps * 1000)),
-                "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(config.log_level.clone())),
-                "show_cursor" => handle.update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor)),
-                "resolution" | "hidpi_scale" => handle.update_config(macrdp_core::ConfigUpdate::Resolution(config.resolution.clone())),
-                "encoder" => handle.update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
-                "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(config.chroma_mode.clone())),
-                "gfx_validation_mode" => handle.update_config(macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode)),
-                "username" | "password" => handle.update_config(macrdp_core::ConfigUpdate::Credentials {
-                    username: config.username.clone(),
-                    password: config.password.clone(),
-                }),
+                "frame_rate" => {
+                    handle.update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate))
+                }
+                "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(
+                    config
+                        .bitrate_mbps
+                        .checked_mul(1000)
+                        .ok_or("Bitrate is out of range")?,
+                )),
+                "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(
+                    config.log_level.clone(),
+                )),
+                "show_cursor" => {
+                    handle.update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor))
+                }
+                "resolution" | "hidpi_scale" => handle.update_config(
+                    macrdp_core::ConfigUpdate::Resolution(config.resolution.clone()),
+                ),
+                "encoder" => {
+                    handle.update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone()))
+                }
+                "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(
+                    config.chroma_mode.clone(),
+                )),
+                "gfx_validation_mode" => handle.update_config(
+                    macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode),
+                ),
+                "username" | "password" => {
+                    handle.update_config(macrdp_core::ConfigUpdate::Credentials {
+                        username: config.username.clone(),
+                        password: config.password.clone(),
+                    })
+                }
                 // port: auto-restart needed (can't rebind TCP listener)
-                "port" => { /* handled below */ }
-                _ => {}
+                "port" => Ok(()), // handled below
+                _ => Ok(()),
             }
+            .map_err(|error| error.to_string())?;
         }
     }
 
@@ -289,9 +308,7 @@ pub async fn set_config(
 }
 
 #[tauri::command]
-pub async fn get_logs(
-    limit: Option<usize>,
-) -> Result<Vec<serde_json::Value>, String> {
+pub async fn get_logs(limit: Option<usize>) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(500);
 
     // Read from log file (lock-free read, writer holds its own lock)
@@ -327,10 +344,7 @@ pub fn get_traffic_stats(
 
 #[tauri::command]
 pub fn check_for_updates() -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!({
-        "current_version": env!("CARGO_PKG_VERSION"),
-        "available": false,
-    }))
+    Err("Automatic update checks are unavailable. Use the Releases link in About.".to_string())
 }
 
 #[tauri::command]
@@ -371,10 +385,7 @@ pub async fn quit_app(
 }
 
 #[tauri::command]
-pub fn set_autostart(
-    enabled: bool,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+pub fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let autolaunch = app.autolaunch();
     if enabled {

@@ -70,10 +70,14 @@ pub struct BitrateController {
     last_eval_time: Instant,
     eval_interval: Duration,
     network: NetworkQuality,
+    write_ewma_ms: f64,
+    pending_acks: Option<u32>,
 }
 
 impl BitrateController {
     pub fn new(initial_bitrate: u32, target_fps: u32, network: NetworkQuality) -> Self {
+        let initial_bitrate = initial_bitrate.clamp(1, macrdp_encode::MAX_BITRATE_BPS);
+        let target_fps = target_fps.clamp(1, 240);
         Self {
             initial_bitrate,
             current_bitrate: initial_bitrate,
@@ -84,6 +88,8 @@ impl BitrateController {
             // React quickly to overload so latency drops before the stream feels sticky.
             eval_interval: Duration::from_millis(500),
             network,
+            write_ewma_ms: 0.0,
+            pending_acks: None,
         }
     }
 
@@ -94,14 +100,25 @@ impl BitrateController {
         self.current_bitrate
     }
     pub fn current_fps(&self) -> u32 {
-        (self.target_fps as f32 * FPS_TIERS[self.current_fps_tier]) as u32
+        ((self.target_fps as f32 * FPS_TIERS[self.current_fps_tier]) as u32).max(1)
     }
     pub fn target_fps(&self) -> u32 {
         self.target_fps
     }
 
+    pub fn base_bitrate(&self) -> u32 {
+        self.initial_bitrate
+    }
+
+    pub fn set_target_bitrate(&mut self, bitrate_bps: u32) {
+        self.initial_bitrate = bitrate_bps.clamp(1, macrdp_encode::MAX_BITRATE_BPS);
+        self.current_bitrate = self.initial_bitrate;
+        self.eval_window.clear();
+        self.last_eval_time = Instant::now();
+    }
+
     pub fn set_target_fps(&mut self, target_fps: u32) {
-        self.target_fps = target_fps.max(1);
+        self.target_fps = target_fps.clamp(1, 240);
         self.current_fps_tier = 0;
         self.eval_window.clear();
         self.last_eval_time = Instant::now();
@@ -114,11 +131,22 @@ impl BitrateController {
         self.network.update_rtt(rtt_ewma_ms);
     }
 
+    /// Socket backpressure and acknowledged-client backlog are separate from
+    /// encoding cost. A slow link must not look healthy just because VT is fast.
+    pub fn update_transport(&mut self, write_ms: f64, pending_acks: Option<u32>) {
+        if write_ms.is_finite() && write_ms >= 0.0 {
+            self.write_ewma_ms = self.write_ewma_ms * 0.8 + write_ms * 0.2;
+        }
+        self.pending_acks = pending_acks;
+    }
+
     pub fn on_idle_recovery(&mut self) {
         self.eval_window.clear();
         self.current_bitrate = self.initial_bitrate;
         self.current_fps_tier = 0;
         self.last_eval_time = Instant::now();
+        self.write_ewma_ms = 0.0;
+        self.pending_acks = None;
     }
 
     pub fn evaluate(&mut self) -> AdaptiveDecision {
@@ -141,8 +169,9 @@ impl BitrateController {
             non_kf.iter().map(|s| s.frame_bytes as f64).sum::<f64>() / non_kf.len() as f64
         };
 
-        let floor = (self.initial_bitrate as f64 * 0.3) as u32;
-        let ceiling = (self.initial_bitrate as f64 * (1.0 + score * 0.5)) as u32;
+        let floor = ((self.initial_bitrate as f64 * 0.3) as u32).max(1);
+        let ceiling = ((self.initial_bitrate as f64 * (1.0 + score * 0.5)) as u32)
+            .min(macrdp_encode::MAX_BITRATE_BPS);
         let target_frame_bytes = self.current_bitrate as f64 / current_fps as f64 / 8.0;
 
         // Score-based decrease factor: worse network → more aggressive reduction
@@ -161,7 +190,21 @@ impl BitrateController {
         // Even on a great LAN, slow encode must still trigger adaptation or latency balloons.
         let encode_overloaded = avg_encode_ms > frame_interval_ms * 0.6;
         let severe_encode_overload = avg_encode_ms > frame_interval_ms * 0.9;
-        if encode_overloaded {
+        // Allow the frames naturally in flight during the measured round trip.
+        // Disabled acknowledgements are represented by None, not congestion.
+        let normal_in_flight =
+            ((self.network.rtt_ms / frame_interval_ms).ceil() as u32).saturating_add(2);
+        let ack_backlogged = self
+            .pending_acks
+            .is_some_and(|pending| pending > normal_in_flight.saturating_mul(2));
+        let transport_overloaded = self.write_ewma_ms > frame_interval_ms * 0.8 || ack_backlogged;
+        let severe_transport_overload = self.write_ewma_ms > frame_interval_ms * 1.5
+            || self
+                .pending_acks
+                .is_some_and(|pending| pending > normal_in_flight.saturating_mul(4));
+        if transport_overloaded {
+            new_bitrate = ((new_bitrate as f64) * 0.8) as u32;
+        } else if encode_overloaded {
             new_bitrate = ((new_bitrate as f64) * decrease_factor) as u32;
         } else if avg_frame_bytes > 0.0
             && target_frame_bytes > 0.0
@@ -173,6 +216,7 @@ impl BitrateController {
 
         // FPS step down: do it aggressively on severe overload, or once bitrate bottoms out.
         if severe_encode_overload
+            || severe_transport_overload
             || (new_bitrate <= floor && avg_encode_ms > frame_interval_ms * 0.8)
         {
             if new_fps_tier < FPS_TIERS.len() - 1 {
@@ -181,7 +225,7 @@ impl BitrateController {
         }
 
         // Recovery (PRIORITY: fps first, then bitrate), but only when encode headroom is clearly back.
-        if avg_encode_ms < frame_interval_ms * 0.25 {
+        if avg_encode_ms < frame_interval_ms * 0.25 && !transport_overloaded {
             if new_fps_tier > 0 {
                 new_fps_tier -= 1; // fps first
             } else if new_bitrate < ceiling {
@@ -213,6 +257,113 @@ impl BitrateController {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn bitrate_override_rebases_adaptation_and_idle_recovery() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        ctrl.record_frame(FrameStats {
+            encode_ms: 100.0,
+            frame_bytes: 10_000,
+            is_keyframe: false,
+        });
+        ctrl.set_target_bitrate(2_000_000);
+        assert_eq!(ctrl.evaluate().bitrate_bps, 2_000_000);
+        ctrl.on_idle_recovery();
+        assert_eq!(ctrl.current_bitrate(), 2_000_000);
+        assert_eq!(ctrl.base_bitrate(), 2_000_000);
+    }
+
+    #[test]
+    fn encoder_numeric_bounds_remain_valid_through_adaptation() {
+        let mut ctrl = make_controller(u32::MAX, true, u32::MAX);
+        assert_eq!(ctrl.current_bitrate(), macrdp_encode::MAX_BITRATE_BPS);
+        assert_eq!(ctrl.target_fps(), 240);
+        ctrl.record_frame(FrameStats {
+            encode_ms: 0.0,
+            frame_bytes: 1,
+            is_keyframe: false,
+        });
+        assert!(ctrl.evaluate().bitrate_bps <= macrdp_encode::MAX_BITRATE_BPS);
+        ctrl.set_target_bitrate(0);
+        ctrl.set_target_fps(0);
+        ctrl.record_frame(FrameStats {
+            encode_ms: 10_000.0,
+            frame_bytes: 1,
+            is_keyframe: false,
+        });
+        let decision = ctrl.evaluate();
+        assert_eq!(decision.bitrate_bps, 1);
+        assert_eq!(decision.fps, 1);
+    }
+
+    #[test]
+    fn slow_transport_reduces_rate_even_when_encoding_is_fast() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 1.0,
+                frame_bytes: 10_000,
+                is_keyframe: false,
+            });
+            ctrl.update_transport(40.0, Some(1));
+        }
+        let decision = ctrl.evaluate();
+        assert_eq!(decision.fps, 30);
+        assert!(decision.bitrate_bps < 10_000_000);
+    }
+
+    #[test]
+    fn disabled_acknowledgements_and_normal_high_rtt_are_not_congestion() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        ctrl.update_network_rtt(200.0);
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 1.0,
+                frame_bytes: 10_000,
+                is_keyframe: false,
+            });
+            ctrl.update_transport(1.0, Some(12));
+        }
+        assert_eq!(ctrl.evaluate().fps, 60);
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 1.0,
+                frame_bytes: 10_000,
+                is_keyframe: false,
+            });
+            ctrl.update_transport(1.0, None);
+        }
+        assert_eq!(ctrl.evaluate().fps, 60);
+    }
+
+    #[test]
+    fn growing_ack_backlog_reduces_rate_without_socket_stalls() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 1.0,
+                frame_bytes: 10_000,
+                is_keyframe: false,
+            });
+            ctrl.update_transport(0.0, Some(30));
+        }
+        let decision = ctrl.evaluate();
+        assert_eq!(decision.fps, 30);
+        assert!(decision.bitrate_bps < 10_000_000);
+    }
+
+    #[test]
+    fn low_target_fps_never_adapts_to_zero() {
+        let mut ctrl = make_controller(10_000_000, true, 1);
+        for _ in 0..3 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 2_000.0,
+                frame_bytes: 10_000,
+                is_keyframe: false,
+            });
+            assert_eq!(ctrl.evaluate().fps, 1);
+        }
+    }
 
     #[test]
     fn test_private_ipv4_ranges() {

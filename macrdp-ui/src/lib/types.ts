@@ -7,13 +7,19 @@ export interface ServerStatus {
 }
 
 export interface Metrics {
-  fps: number;
+  fps: number; // Delivered updates/s; bitmap regions count individually.
   bitrate_kbps: number;
   latency_ms: number;  // JSON field name (backend uses serde rename from rtt_ms)
   bytes_sent: number;
   timestamp: number;
   // New fields
   encode_ms: number;
+  capture_queue_ms: number;
+  completion_queue_ms: number;
+  write_ms: number;
+  capture_frames_coalesced: number;
+  client_queue_depth_bytes: number | null;
+  ack_suspended: boolean;
   net_ms: number;
   last_frame_bytes: number;
   network_quality: number;

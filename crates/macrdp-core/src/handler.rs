@@ -23,6 +23,14 @@ pub struct MacInputHandler {
     debug_state: Arc<Mutex<InputDebugState>>,
     active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
     display_controller: Option<macrdp_display::DisplayController>,
+    session_events: Option<SessionEvents>,
+}
+
+/// Records one real connection; resize reactivation does not reset its duration.
+struct SessionEvents {
+    handler: Arc<dyn crate::callbacks::ServerEventHandler>,
+    gfx: Arc<Mutex<ironrdp_server::gfx::GfxState>>,
+    started_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -99,7 +107,21 @@ impl MacInputHandler {
             debug_state,
             active_connection,
             display_controller,
+            session_events: None,
         }
+    }
+
+    pub fn with_events(
+        mut self,
+        handler: Arc<dyn crate::callbacks::ServerEventHandler>,
+        gfx: Arc<Mutex<ironrdp_server::gfx::GfxState>>,
+    ) -> Self {
+        self.session_events = Some(SessionEvents {
+            handler,
+            gfx,
+            started_at: None,
+        });
+        self
     }
 
     fn translation_profile_name(&self) -> &'static str {
@@ -628,15 +650,17 @@ impl MacInputHandler {
     }
 
     fn release_ctrl_companion_if_needed(&mut self, extended: bool) -> anyhow::Result<()> {
-        let kb = self.keyboard.as_ref().expect("keyboard checked above");
         if extended {
             self.suppressed_ctrl_for_altgr.right = true;
             self.modifier_state.right_ctrl = false;
-            kb.inject_key(0x1D, true, false)?;
         } else {
             self.suppressed_ctrl_for_altgr.left = true;
             self.modifier_state.left_ctrl = false;
-            kb.inject_key(0x1D, false, false)?;
+        }
+        // Keep protocol modifier bookkeeping independent of native injection,
+        // including when accessibility is unavailable or tests use no device.
+        if let Some(kb) = &self.keyboard {
+            kb.inject_key(0x1D, extended, false)?;
         }
         Ok(())
     }
@@ -664,12 +688,18 @@ impl RdpServerInputHandler for MacInputHandler {
                 tracing::warn!("Failed to wake display for new remote session: {e}");
             }
         }
-        let mut active_connection = self.active_connection.lock().unwrap();
-        *active_connection = Some(crate::callbacks::ConnectionInfo {
+        let info = crate::callbacks::ConnectionInfo {
             client_ip: peer_addr.unwrap_or_else(|| "unknown".to_string()),
             client_name: context.client_name,
-            connected_at: chrono::Local::now().to_rfc3339(),
-        });
+            connected_at: chrono::Utc::now().to_rfc3339(),
+        };
+        *self.active_connection.lock().unwrap() = Some(info.clone());
+        if let Some(events) = &mut self.session_events {
+            events.started_at = Some(std::time::Instant::now());
+            events
+                .handler
+                .on_connection(crate::callbacks::ConnectionEvent::Connected(info));
+        }
         self.refresh_debug_state(Some("connection:connected".to_string()));
     }
 
@@ -680,7 +710,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 tracing::warn!(%error, "Failed to release mouse buttons on disconnect");
             }
         }
-        {
+        let disconnected = {
             // Manual window actions hold this lock through their queue send.
             // Once disconnect starts, no action can target a later connection
             // based on this connection's stale availability check.
@@ -690,7 +720,26 @@ impl RdpServerInputHandler for MacInputHandler {
                     tracing::warn!(%error, "Failed to schedule physical display restoration");
                 }
             }
-            *active_connection = None;
+            active_connection.take()
+        };
+        if let (Some(events), Some(info)) = (&mut self.session_events, disconnected) {
+            let duration_secs = events
+                .started_at
+                .take()
+                .map_or(0, |start| start.elapsed().as_secs());
+            let bytes_total = events.gfx.lock().unwrap().total_bytes_sent;
+            events
+                .handler
+                .on_connection(crate::callbacks::ConnectionEvent::Disconnected(
+                    crate::callbacks::DisconnectionInfo {
+                        client_ip: info.client_ip,
+                        client_name: info.client_name,
+                        connected_at: info.connected_at,
+                        disconnected_at: chrono::Utc::now().to_rfc3339(),
+                        duration_secs,
+                        bytes_total,
+                    },
+                ));
         }
         if let Some(wake) = &mut self.wake {
             wake.deactivate_display_sleep_assertion();
@@ -905,6 +954,11 @@ impl RdpServerInputHandler for MacInputHandler {
 
 impl Drop for MacInputHandler {
     fn drop(&mut self) {
+        // Cancellation during server shutdown must still record the connection.
+        let connected = self.active_connection.lock().unwrap().is_some();
+        if connected {
+            self.on_disconnect();
+        }
         if let Some(kb) = &self.keyboard {
             if let Err(e) = kb.release_transient_modifiers() {
                 tracing::warn!("Failed to release transient modifiers on drop: {e}");
@@ -921,8 +975,9 @@ impl Drop for MacInputHandler {
 mod tests {
     use super::{
         ClientInputContext, InputDebugState, KeyboardTranslationProfile, MacInputHandler,
-        ModifierState, MouseCoordMapper, TextTranslation,
+        ModifierState, MouseCoordMapper, SuppressedCtrlState, TextTranslation,
     };
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -957,17 +1012,29 @@ mod tests {
     }
 
     fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
-        let mut handler = MacInputHandler::new(
-            MouseCoordMapper::new(1920, 1200, 1920, 1200),
-            Arc::new(Mutex::new(InputDebugState::default())),
-            Arc::new(Mutex::new(None::<crate::callbacks::ConnectionInfo>)),
-            None,
-        );
-        handler.client_context = ClientInputContext {
-            client_name: client_name.to_string(),
-            keyboard_layout,
-        };
-        handler
+        // Pure translation tests must never construct native injectors: their
+        // disconnect/Drop cleanup posts modifier releases to the user's Mac.
+        MacInputHandler {
+            keyboard: None,
+            mouse: None,
+            wake: None,
+            last_mouse_x: 0.0,
+            last_mouse_y: 0.0,
+            last_sync_lock_bits: None,
+            coord_mapper: MouseCoordMapper::new(1920, 1200, 1920, 1200),
+            client_context: ClientInputContext {
+                client_name: client_name.to_string(),
+                keyboard_layout,
+            },
+            modifier_state: ModifierState::default(),
+            suppressed_ctrl_for_altgr: SuppressedCtrlState::default(),
+            pending_dead_key: None,
+            translated_key_releases: HashMap::new(),
+            debug_state: Arc::new(Mutex::new(InputDebugState::default())),
+            active_connection: Arc::new(Mutex::new(None)),
+            display_controller: None,
+            session_events: None,
+        }
     }
 
     #[test]
@@ -1155,12 +1222,15 @@ mod tests {
     fn norwegian_altgr_press_clears_companion_ctrl_state() {
         let mut handler = handler_for("Windows App", 0x0414);
         handler.modifier_state.left_ctrl = true;
+        handler.modifier_state.right_ctrl = true;
         handler.modifier_state.right_alt = true;
 
         handler.handle_norwegian_altgr_press().unwrap();
 
         assert!(!handler.modifier_state.left_ctrl);
+        assert!(!handler.modifier_state.right_ctrl);
         assert!(handler.suppressed_ctrl_for_altgr.left);
+        assert!(handler.suppressed_ctrl_for_altgr.right);
     }
 
     #[test]

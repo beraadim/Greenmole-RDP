@@ -43,14 +43,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(log_reload: LogReloadHandle) -> Self {
+    pub fn new(log_reload: LogReloadHandle, ui_config: UiConfig) -> Self {
         Self {
             status: Mutex::new(ServerStatus::default()),
             metrics: Mutex::new(Metrics::default()),
             connections: Mutex::new(Vec::new()),
             logs: Mutex::new(VecDeque::new()),
             server_handle: Arc::new(Mutex::new(None)),
-            ui_config: Mutex::new(UiConfig::load().unwrap_or_default()),
+            ui_config: Mutex::new(ui_config),
             log_reload,
             window_move_lock: Mutex::new(()),
         }
@@ -61,8 +61,9 @@ impl AppState {
 pub fn init_app_state(
     handle: &AppHandle,
     log_reload: LogReloadHandle,
+    ui_config: UiConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(AppState::new(log_reload));
+    let state = Arc::new(AppState::new(log_reload, ui_config));
     handle.manage(state);
     Ok(())
 }

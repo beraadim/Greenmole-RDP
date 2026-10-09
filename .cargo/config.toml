@@ -1,5 +1,4 @@
-[env]
-# Swift concurrency runtime library required by screencapturekit crate.
-# Paths are searched in order: Xcode toolchain, then CommandLineTools.
-# This is needed for `cargo test` and `cargo bench` to find libswift_Concurrency.dylib.
-DYLD_LIBRARY_PATH = { value = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx:/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx", force = true }
+# Do not inject the developer toolchain's Swift runtime into every Cargo process.
+# It can collide with the system runtime and cause invalid casts or crashes.
+# tools/check.sh normalizes native test binaries to the macOS system runtime;
+# macrdp-ui/build.sh applies the same policy to release executables.

@@ -1,13 +1,13 @@
 //! Independent UI configuration with persistent storage at ~/.macrdp/config-ui.toml
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use macrdp_core::DisplayBackend;
 use serde::{Deserialize, Serialize};
 
-/// UI-specific configuration. All fields have sensible defaults so
-/// `UiConfig::default()` is always usable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// UI preferences and the in-memory credential. `load()` supplies a Keychain-backed
+/// password; defaults alone intentionally cannot start an authenticated server.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     // ── Server ──────────────────────────────────────────────
@@ -35,6 +35,15 @@ pub struct UiConfig {
     pub log_level: String,
     pub theme: String,
     pub autostart: bool,
+}
+
+impl std::fmt::Debug for UiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiConfig")
+            .field("port", &self.port)
+            .field("password", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for UiConfig {
@@ -69,33 +78,126 @@ pub fn config_path() -> PathBuf {
         .join("config-ui.toml")
 }
 
+fn integer_in_range(
+    value: &serde_json::Value,
+    key: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    let number = value
+        .as_u64()
+        .ok_or_else(|| format!("{key} must be a nonnegative integer"))?;
+    if !(minimum..=maximum).contains(&number) {
+        return Err(format!("{key} must be between {minimum} and {maximum}"));
+    }
+    Ok(number)
+}
+
 impl UiConfig {
-    /// Load from `~/.macrdp/config-ui.toml`, creating defaults if the file
-    /// does not exist or is unparseable.
+    /// Load configuration and migrate legacy plaintext passwords to Keychain.
+    /// A locked or unavailable Keychain is an error, never permission to replace credentials.
     pub fn load() -> Result<Self, String> {
-        let path = config_path();
-        if !path.exists() {
-            let cfg = Self::default();
-            // Try to persist the defaults so the user has a file to edit.
-            let _ = cfg.save();
-            return Ok(cfg);
-        }
-        let content = std::fs::read_to_string(&path).map_err(|e| format!("read config: {e}"))?;
-        toml::from_str(&content).map_err(|e| format!("parse config: {e}"))
+        Self::load_with_store(
+            &config_path(),
+            || macrdp_core::credentials::load_desktop_password().map_err(|e| e.to_string()),
+            |password| {
+                macrdp_core::credentials::save_desktop_password(password).map_err(|e| e.to_string())
+            },
+            || macrdp_core::credentials::delete_desktop_password().map_err(|e| e.to_string()),
+        )
     }
 
-    /// Serialize to TOML and write to `~/.macrdp/config-ui.toml`.
-    pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create config dir: {e}"))?;
+    fn load_with_store(
+        path: &Path,
+        load_password: impl FnOnce() -> Result<Option<String>, String>,
+        save_password: impl Fn(&str) -> Result<(), String>,
+        delete_password: impl Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let mut config = if path.exists() {
+            macrdp_core::credentials::protect_config_file(path).map_err(|e| e.to_string())?;
+            let content = std::fs::read_to_string(path).map_err(|e| format!("read config: {e}"))?;
+            // TOML errors may include the source line containing a password.
+            toml::from_str::<Self>(&content)
+                .map_err(|_| "Invalid configuration file".to_string())?
+        } else {
+            Self::default()
+        };
+        let previous_password = load_password()?;
+        if config.password.is_empty() {
+            config.password = match previous_password.clone() {
+                Some(password) if !password.is_empty() => password,
+                _ => macrdp_core::credentials::generate_password().map_err(|e| e.to_string())?,
+            };
         }
-        let content = toml::to_string_pretty(self).map_err(|e| format!("serialize config: {e}"))?;
-        std::fs::write(&path, content).map_err(|e| format!("write config: {e}"))
+        config.save_with_store(
+            path,
+            previous_password.as_deref(),
+            save_password,
+            delete_password,
+        )?;
+        Ok(config)
+    }
+
+    /// Keep the password in Keychain; the TOML file contains preferences only.
+    pub fn save(&self) -> Result<(), String> {
+        let previous =
+            macrdp_core::credentials::load_desktop_password().map_err(|e| e.to_string())?;
+        self.save_with_store(
+            &config_path(),
+            previous.as_deref(),
+            |password| {
+                macrdp_core::credentials::save_desktop_password(password).map_err(|e| e.to_string())
+            },
+            || macrdp_core::credentials::delete_desktop_password().map_err(|e| e.to_string()),
+        )
+    }
+
+    fn save_with_store(
+        &self,
+        path: &Path,
+        previous_password: Option<&str>,
+        save_password: impl Fn(&str) -> Result<(), String>,
+        delete_password: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.password.is_empty() || self.username.trim().is_empty() {
+            return Err("A nonempty username and password are required".to_string());
+        }
+        let mut preferences =
+            toml::Value::try_from(self).map_err(|e| format!("serialize config: {e}"))?;
+        preferences
+            .as_table_mut()
+            .ok_or("Configuration is not a table")?
+            .remove("password");
+        let content =
+            toml::to_string_pretty(&preferences).map_err(|e| format!("serialize config: {e}"))?;
+        let preferences_changed =
+            std::fs::read(path).map_or(true, |current| current != content.as_bytes());
+        let password_changed = previous_password != Some(self.password.as_str());
+        if password_changed {
+            save_password(&self.password)?;
+        }
+        // Password-only updates have no subsequent filesystem operation that can fail.
+        if preferences_changed {
+            if let Err(error) =
+                macrdp_core::credentials::write_private_file(path, content.as_bytes())
+            {
+                if password_changed {
+                    let rollback = match previous_password {
+                        Some(previous) => save_password(previous),
+                        None => delete_password(),
+                    };
+                    if let Err(rollback_error) = rollback {
+                        return Err(format!("Preferences were not saved ({error}); credential rollback also failed ({rollback_error})"));
+                    }
+                }
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Update a single field by key name from a JSON value.
-    /// Display backend changes require a restart. Changing the initial
+    /// Listener address, idle timeout, and display backend changes require a restart. Changing the initial
     /// virtual display resolution also requires a restart so `auto` can resume
     /// following client requests. Virtual display port changes require a restart
     /// to avoid creating overlapping display owners. Other settings use their live update
@@ -103,13 +205,13 @@ impl UiConfig {
     pub fn set_field(&mut self, key: &str, value: &serde_json::Value) -> Result<bool, String> {
         match key {
             "port" => {
-                self.port = value.as_u64().ok_or("port must be a number")? as u16;
+                self.port = integer_in_range(value, key, 1, u16::MAX as u64)? as u16;
             }
             "frame_rate" => {
-                self.frame_rate = value.as_u64().ok_or("frame_rate must be a number")? as u32;
+                self.frame_rate = integer_in_range(value, key, 1, 240)? as u32;
             }
             "bitrate_mbps" => {
-                self.bitrate_mbps = value.as_u64().ok_or("bitrate_mbps must be a number")? as u32;
+                self.bitrate_mbps = integer_in_range(value, key, 1, 1000)? as u32;
             }
             "encoder" => {
                 self.encoder = value
@@ -135,24 +237,31 @@ impl UiConfig {
                     .to_string();
             }
             "max_connections" => {
-                self.max_connections =
-                    value.as_u64().ok_or("max_connections must be a number")? as u32;
+                self.max_connections = integer_in_range(value, key, 1, u32::MAX as u64)? as u32;
             }
             "idle_timeout_secs" => {
                 self.idle_timeout_secs =
                     value.as_u64().ok_or("idle_timeout_secs must be a number")?;
             }
             "username" => {
-                self.username = value
+                let username = value
                     .as_str()
                     .ok_or("username must be a string")?
                     .to_string();
+                if username.trim().is_empty() {
+                    return Err("Username cannot be empty".to_string());
+                }
+                self.username = username;
             }
             "password" => {
-                self.password = value
+                let password = value
                     .as_str()
                     .ok_or("password must be a string")?
                     .to_string();
+                if password.is_empty() {
+                    return Err("Password cannot be empty".to_string());
+                }
+                self.password = password;
             }
             "display_backend" => {
                 self.display_backend = serde_json::from_value(value.clone())
@@ -192,10 +301,12 @@ impl UiConfig {
     /// A pending switch away from a virtual display must not permit port
     /// migration to replace its owner before the user restarts the service.
     pub fn requires_restart(&self, key: &str, running_backend: Option<DisplayBackend>) -> bool {
-        key == "display_backend"
-            || (matches!(key, "resolution" | "hidpi_scale" | "port")
-                && (self.display_backend == DisplayBackend::Virtual
-                    || running_backend == Some(DisplayBackend::Virtual)))
+        matches!(
+            key,
+            "display_backend" | "bind_address" | "idle_timeout_secs"
+        ) || (matches!(key, "resolution" | "hidpi_scale" | "port")
+            && (self.display_backend == DisplayBackend::Virtual
+                || running_backend == Some(DisplayBackend::Virtual)))
     }
 
     /// Convert to the core library's `ServerConfig` used to start the server.
@@ -234,6 +345,166 @@ impl UiConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn invalid_numeric_updates_do_not_truncate_or_mutate_settings() {
+        let mut config = UiConfig::default();
+        let before = serde_json::to_value(&config).unwrap();
+        for (key, invalid) in [
+            ("port", json!(65536u64)),
+            ("port", json!(0)),
+            ("frame_rate", json!(241)),
+            ("frame_rate", json!(0)),
+            ("bitrate_mbps", json!(1001)),
+            ("bitrate_mbps", json!(0)),
+            ("max_connections", json!(u32::MAX as u64 + 1)),
+        ] {
+            assert!(
+                config.set_field(key, &invalid).is_err(),
+                "{key} accepted invalid value"
+            );
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+        for key in ["port", "frame_rate", "bitrate_mbps", "max_connections"] {
+            for invalid in [
+                json!(u64::MAX),
+                json!(-1),
+                json!(1.5),
+                json!(true),
+                json!("60"),
+            ] {
+                assert!(config.set_field(key, &invalid).is_err());
+                assert_eq!(serde_json::to_value(&config).unwrap(), before);
+            }
+        }
+        config.set_field("port", &json!(65535)).unwrap();
+        config.set_field("frame_rate", &json!(240)).unwrap();
+        config.set_field("bitrate_mbps", &json!(1000)).unwrap();
+        assert_eq!(
+            (config.port, config.frame_rate, config.bitrate_mbps),
+            (65535, 240, 1000)
+        );
+    }
+
+    #[test]
+    fn listener_and_idle_changes_require_restart_for_both_display_backends() {
+        let mut config = UiConfig::default();
+        assert!(config
+            .set_field("bind_address", &json!("127.0.0.1"))
+            .unwrap());
+        assert!(config.set_field("idle_timeout_secs", &json!(120)).unwrap());
+        for backend in [DisplayBackend::Main, DisplayBackend::Virtual] {
+            assert!(config.requires_restart("bind_address", Some(backend)));
+            assert!(config.requires_restart("idle_timeout_secs", Some(backend)));
+        }
+    }
+
+    #[test]
+    fn loading_preserves_existing_numeric_values_for_explicit_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config-ui.toml");
+        std::fs::write(&path, "frame_rate = 0\nbitrate_mbps = 1001\nport = 65535\n").unwrap();
+        let config = UiConfig::load_with_store(
+            &path,
+            || Ok(Some("test-secret".into())),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            (config.frame_rate, config.bitrate_mbps, config.port),
+            (0, 1001, 65535)
+        );
+        assert!(config.to_server_config().validate().is_err());
+    }
+
+    #[test]
+    fn legacy_password_migrates_only_after_successful_secret_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config-ui.toml");
+        let legacy = "username = 'test-user'\npassword = 'migration-test-secret'\n";
+        std::fs::write(&path, legacy).unwrap();
+        assert!(UiConfig::load_with_store(
+            &path,
+            || Ok(None),
+            |_| Err("Keychain locked".to_string()),
+            || Ok(())
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+        let stored = std::cell::RefCell::new(String::new());
+        let config = UiConfig::load_with_store(
+            &path,
+            || Ok(None),
+            |password| {
+                *stored.borrow_mut() = password.to_string();
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(config.password, *stored.borrow());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("password"));
+        let restored = UiConfig::load_with_store(
+            &path,
+            || Ok(Some(stored.borrow().clone())),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(restored.password, config.password);
+        assert!(!format!("{config:?}").contains(&config.password));
+    }
+
+    #[test]
+    fn keychain_read_failure_does_not_generate_or_overwrite_a_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config-ui.toml");
+        std::fs::write(&path, "username = 'test-user'\n").unwrap();
+        assert!(UiConfig::load_with_store(
+            &path,
+            || Err("Keychain locked".to_string()),
+            |_| panic!("Must not overwrite unavailable credential"),
+            || Ok(())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preferences_write_failure_restores_previous_keychain_state() {
+        let dir = tempfile::tempdir().unwrap();
+        for previous in [Some("previous-test-secret".to_string()), None] {
+            let stored = std::cell::RefCell::new(previous.clone());
+            let mut config = UiConfig::default();
+            config.password = "replacement-test-secret".to_string();
+            // Persisting a regular file over a directory fails after secret storage.
+            assert!(config
+                .save_with_store(
+                    dir.path(),
+                    previous.as_deref(),
+                    |password| {
+                        *stored.borrow_mut() = Some(password.to_string());
+                        Ok(())
+                    },
+                    || {
+                        *stored.borrow_mut() = None;
+                        Ok(())
+                    }
+                )
+                .is_err());
+            assert_eq!(*stored.borrow(), previous);
+        }
+    }
+
+    #[test]
+    fn empty_credential_updates_leave_existing_values_unchanged() {
+        let mut config = UiConfig::default();
+        config.password = "test-secret".to_string();
+        assert!(config.set_field("username", &json!(" ")).is_err());
+        assert!(config.set_field("password", &json!("")).is_err());
+        assert_eq!(config.password, "test-secret");
+        assert_eq!(config.username, "macrdp");
+    }
 
     #[test]
     fn display_settings_preserve_legacy_defaults_and_round_trip() {

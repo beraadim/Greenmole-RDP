@@ -1,243 +1,55 @@
 use clap::Parser;
-use macrdp_display::DisplayBackend;
-use serde::{Deserialize, Serialize};
+use macrdp_core::{DisplayBackend, ServerConfig};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "macrdp", about = "macOS RDP Server")]
+#[command(name = "macrdp", about = "macOS RDP Server", version)]
 pub struct Cli {
-    /// TCP port to listen on
-    #[arg(short, long, default_value_t = 3389)]
-    pub port: u16,
-
-    /// Path to config file
+    /// TCP port to listen on (defaults to the configuration file, or 3389).
+    #[arg(short, long)]
+    pub port: Option<u16>,
+    /// Path to the shared server configuration.
     #[arg(short, long)]
     pub config: Option<PathBuf>,
-
-    /// Target frame rate (30, 60, or 120)
+    /// Target frame rate.
     #[arg(long)]
     pub frame_rate: Option<u32>,
-
-    /// Share the main display or an experimental virtual display
+    /// Share the main display or an experimental virtual display.
     #[arg(long, value_parser = ["main", "virtual"])]
     pub display_backend: Option<String>,
-
-    /// Log level: trace, debug, info, warn, error
+    /// Log level: trace, debug, info, warn, error.
     #[arg(long)]
     pub log_level: Option<String>,
-
-    /// Enable performance statistics collection and print summary on exit
-    #[arg(long, default_value_t = false)]
+    /// Collect bounded performance statistics and print a summary on exit.
+    #[arg(long)]
     pub perf: bool,
 }
 
-/// Audio forwarding configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AudioConfig {
-    pub enabled: bool,
-    pub sample_rate: u32,
-    pub channels: u16,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            sample_rate: 48000,
-            channels: 2,
-        }
-    }
-}
-
-/// Clipboard synchronization configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ClipboardConfig {
-    pub enabled: bool,
-    pub file_transfer: bool,
-    pub max_file_size_mb: u32,
-}
-
-impl Default for ClipboardConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            file_transfer: true,
-            max_file_size_mb: 100,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct ServerConfig {
-    pub port: u16,
-    pub frame_rate: u32,
-    pub display_backend: DisplayBackend,
-    /// Resolution width (0 = auto-detect from display)
-    pub width: u32,
-    /// Resolution height (0 = auto-detect from display)
-    pub height: u32,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub cert_path: Option<PathBuf>,
-    pub key_path: Option<PathBuf>,
-    pub idle_timeout_secs: u64,
-    /// Log level: trace, debug, info, warn, error
-    pub log_level: Option<String>,
-    /// Video quality: low_latency, balanced, high_quality (default: high_quality)
-    pub quality: Option<String>,
-    /// H.264 encoder: software, hardware, auto (default: software)
-    /// - software: OpenH264 CPU encoder (P-frame support, ~40ms latency)
-    /// - hardware: VideoToolbox GPU encoder (IDR-only, ~6ms latency, higher bandwidth)
-    /// - auto: same as software
-    pub encoder: Option<String>,
-    /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
-    /// - avc420: standard 4:2:0 chroma (compatible with all RDP clients)
-    /// - avc444: full 4:4:4 chroma via dual-stream AVC444 (requires V10+ client, best quality)
-    pub chroma_mode: Option<String>,
-    /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")
-    #[serde(alias = "hidpi_scale")]
-    pub resolution: Option<String>,
-    /// Show cursor in capture (default: true)
-    pub show_cursor: Option<bool>,
-    /// Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
-    /// Override this to force a specific bitrate, e.g. 50 for 50 Mbps.
-    pub bitrate_mbps: Option<u32>,
-    /// Skip encoding when screen content is unchanged (default: true)
-    /// When enabled, idle frames from ScreenCaptureKit are not encoded,
-    /// reducing CPU/GPU usage on static screens.
-    pub skip_unchanged: Option<bool>,
-    /// Seconds between keepalive IDR frames during screen idle (default: 2)
-    /// Prevents RDP client timeout when no frames are being sent.
-    pub idle_keyframe_sec: Option<u32>,
-    /// Audio forwarding configuration
-    #[serde(default)]
-    pub audio: AudioConfig,
-    /// Clipboard synchronization configuration
-    #[serde(default)]
-    pub clipboard: ClipboardConfig,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            port: 3389,
-            frame_rate: 60,
-            display_backend: DisplayBackend::Main,
-            width: 0,
-            height: 0,
-            username: None,
-            password: None,
-            cert_path: None,
-            key_path: None,
-            idle_timeout_secs: 1800,
-            log_level: None,
-            quality: None,
-            encoder: None,
-            chroma_mode: None,
-            resolution: None,
-            show_cursor: None,
-            bitrate_mbps: None,
-            skip_unchanged: None,
-            idle_keyframe_sec: None,
-            audio: AudioConfig::default(),
-            clipboard: ClipboardConfig::default(),
-        }
-    }
-}
-
-impl ServerConfig {
-    /// Load config from file, then apply CLI overrides
-    pub fn load(cli: &Cli) -> anyhow::Result<Self> {
-        let mut config = if let Some(path) = &cli.config {
-            tracing::info!(?path, "Loading config from CLI-specified path");
-            let content = std::fs::read_to_string(path)?;
-            toml::from_str(&content)?
-        } else {
-            let default_path = config_dir().join("config.toml");
-            if default_path.exists() {
-                tracing::info!(path = %default_path.display(), "Loading config");
-                let content = std::fs::read_to_string(&default_path)?;
-                toml::from_str(&content)?
-            } else {
-                tracing::info!(
-                    search_paths = ?config_dir_candidates().iter().map(|p| p.join("config.toml")).collect::<Vec<_>>(),
-                    "No config.toml found, using defaults"
-                );
-                ServerConfig::default()
-            }
-        };
-
-        // CLI overrides
-        if cli.port != 3389 {
-            config.port = cli.port;
-        }
-        if let Some(fps) = cli.frame_rate {
-            config.frame_rate = fps;
-        }
-        if let Some(backend) = &cli.display_backend {
-            config.display_backend = match backend.as_str() {
-                "main" => DisplayBackend::Main,
-                "virtual" => DisplayBackend::Virtual,
-                _ => anyhow::bail!("display_backend must be main or virtual"),
-            };
-        }
-        if let Some(level) = &cli.log_level {
-            config.log_level = Some(level.clone());
-        }
-
+impl Cli {
+    pub fn load_config(&self) -> anyhow::Result<ServerConfig> {
+        let mut config = ServerConfig::load_from_file(self.config.as_deref())?;
+        self.apply_overrides(&mut config);
         Ok(config)
     }
-}
 
-/// Returns the macrdp config directory.
-/// Search order for existing `config.toml`:
-///   1. ./  (current working directory)
-///   2. ~/.config/macrdp  (XDG convention)
-///   3. ~/Library/Application Support/macrdp  (macOS native)
-///
-/// Fallback when no config exists: native config dir -> ~/.config/macrdp -> ./.
-pub fn config_dir() -> PathBuf {
-    let candidates = config_dir_candidates();
-    for dir in &candidates {
-        if dir.join("config.toml").exists() {
-            return dir.clone();
+    fn apply_overrides(&self, config: &mut ServerConfig) {
+        if let Some(port) = self.port {
+            config.port = port;
+        }
+        if let Some(fps) = self.frame_rate {
+            config.frame_rate = fps;
+        }
+        if let Some(backend) = &self.display_backend {
+            config.display_backend = if backend == "virtual" {
+                DisplayBackend::Virtual
+            } else {
+                DisplayBackend::Main
+            };
+        }
+        if let Some(level) = &self.log_level {
+            config.log_level = Some(level.clone());
         }
     }
-
-    if let Some(native) = dirs::config_dir() {
-        return native.join("macrdp");
-    }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".config").join("macrdp");
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-/// All candidate config directories in priority order.
-fn config_dir_candidates() -> Vec<PathBuf> {
-    let mut dirs_list = Vec::new();
-
-    // 1. Current working directory
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs_list.push(cwd);
-    } else {
-        dirs_list.push(PathBuf::from("."));
-    }
-
-    // 2. ~/.config/macrdp (XDG)
-    if let Some(home) = dirs::home_dir() {
-        dirs_list.push(home.join(".config").join("macrdp"));
-    }
-
-    // 3. macOS native (~/Library/Application Support/macrdp)
-    if let Some(native) = dirs::config_dir() {
-        dirs_list.push(native.join("macrdp"));
-    }
-
-    dirs_list
 }
 
 #[cfg(test)]
@@ -245,63 +57,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let config = ServerConfig::default();
-        assert_eq!(config.port, 3389);
-        assert_eq!(config.frame_rate, 60);
-        assert_eq!(config.display_backend, DisplayBackend::Main);
-        assert!(config.username.is_none());
-    }
-
-    #[test]
-    fn test_parse_encoding_config() {
-        let toml_str = r#"
-            port = 3389
-            skip_unchanged = false
-            idle_keyframe_sec = 5
-        "#;
-        let config: ServerConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.skip_unchanged, Some(false));
-        assert_eq!(config.idle_keyframe_sec, Some(5));
-    }
-
-    #[test]
-    fn test_default_encoding_config() {
-        let config = ServerConfig::default();
-        assert!(config.skip_unchanged.is_none());
-        assert!(config.idle_keyframe_sec.is_none());
-    }
-
-    #[test]
-    fn test_parse_toml_config() {
-        let toml_str = r#"
-            port = 13389
-            frame_rate = 120
-            username = "admin"
-            password = "secret"
-        "#;
-        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+    fn default_port_can_explicitly_override_a_configured_port() {
+        let mut config = ServerConfig {
+            port: 13389,
+            ..ServerConfig::default()
+        };
+        Cli::try_parse_from(["macrdp"])
+            .unwrap()
+            .apply_overrides(&mut config);
         assert_eq!(config.port, 13389);
-        assert_eq!(config.frame_rate, 120);
-        assert_eq!(config.username.as_deref(), Some("admin"));
-        assert_eq!(config.password.as_deref(), Some("secret"));
+        Cli::try_parse_from(["macrdp", "--port", "3389"])
+            .unwrap()
+            .apply_overrides(&mut config);
+        assert_eq!(config.port, 3389);
     }
 
     #[test]
-    fn display_backend_config_rejects_unknown_values() {
-        let legacy: ServerConfig = toml::from_str("port = 13389").unwrap();
-        assert_eq!(legacy.display_backend, DisplayBackend::Main);
-        let config: ServerConfig = toml::from_str("display_backend = 'virtual'").unwrap();
+    fn display_backend_is_validated_and_applied() {
+        assert!(Cli::try_parse_from(["macrdp", "--display-backend", "invalid"]).is_err());
+        let mut config = ServerConfig::default();
+        Cli::try_parse_from(["macrdp", "--display-backend", "virtual"])
+            .unwrap()
+            .apply_overrides(&mut config);
         assert_eq!(config.display_backend, DisplayBackend::Virtual);
-        assert!(toml::from_str::<ServerConfig>("display_backend = 'unknown'").is_err());
-    }
-
-    #[test]
-    fn display_cli_options_validate_and_preserve_unspecified_overrides() {
-        let defaults = Cli::try_parse_from(["macrdp"]).unwrap();
-        assert!(defaults.display_backend.is_none());
-        let enabled = Cli::try_parse_from(["macrdp", "--display-backend", "virtual"]).unwrap();
-        assert_eq!(enabled.display_backend.as_deref(), Some("virtual"));
-        assert!(Cli::try_parse_from(["macrdp", "--display-backend", "unknown"]).is_err());
     }
 }

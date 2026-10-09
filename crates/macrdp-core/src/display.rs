@@ -1,3 +1,6 @@
+mod event_wait;
+use event_wait::DisplayWake;
+
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
@@ -421,8 +424,9 @@ fn should_fallback_from_gfx_avc_no_ack(
         return false;
     }
 
-    (frame_id >= AVC_NO_ACK_FALLBACK_FRAMES && pending_acks >= frame_id)
-        || oldest_pending_age.is_some_and(|age| age >= AVC_NO_ACK_FALLBACK_MAX_AGE)
+    frame_id >= AVC_NO_ACK_FALLBACK_FRAMES
+        && pending_acks >= AVC_NO_ACK_FALLBACK_FRAMES
+        && oldest_pending_age.is_some_and(|age| age >= AVC_NO_ACK_FALLBACK_MAX_AGE)
 }
 
 fn rect_area(rect: ClampedRect) -> u32 {
@@ -893,7 +897,9 @@ impl RdpServerDisplay for MacDisplay {
         // connection's queued restoration and preserves its snapshot on resize.
         // Enqueue before yielding so cancelling this activation cannot leave a
         // late promotion behind the server's shutdown restoration barrier.
-        let preparation = self.display_controller.queue_remote_capture(width, height)?;
+        let preparation = self
+            .display_controller
+            .queue_remote_capture(width, height)?;
         let geometry = tokio::task::spawn_blocking(move || preparation.wait())
             .await
             .context("Display mode worker failed")??;
@@ -902,9 +908,16 @@ impl RdpServerDisplay for MacDisplay {
             (gfx.session_uses_gfx, gfx.is_ready())
         };
 
-        let configured_frame_rate = {
+        let (configured_frame_rate, configured_bitrate) = {
             let gfx = self.gfx_state.lock().unwrap();
-            gfx.target_frame_rate.unwrap_or(self.frame_rate).max(1)
+            (
+                gfx.target_frame_rate
+                    .unwrap_or(self.frame_rate)
+                    .clamp(1, 240),
+                gfx.target_bitrate
+                    .unwrap_or(self.base_bitrate)
+                    .clamp(1, macrdp_encode::MAX_BITRATE_BPS),
+            )
         };
 
         let capture_config = CaptureConfig {
@@ -949,7 +962,7 @@ impl RdpServerDisplay for MacDisplay {
             self.quality,
             self.encoder_pref,
             self.mode_444,
-            self.base_bitrate,
+            configured_bitrate,
         )
         .ok();
 
@@ -966,7 +979,7 @@ impl RdpServerDisplay for MacDisplay {
             .unwrap_or(NetworkQuality::from_ip(false));
         let initial_fps = capture_config.frame_rate;
         self.gfx_state.lock().unwrap().applied_frame_rate = Some(initial_fps.max(1));
-        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
+        let bitrate_ctrl = BitrateController::new(configured_bitrate, initial_fps, network);
 
         self.coord_mapper.update_display_bounds(
             geometry.origin_x,
@@ -1163,100 +1176,126 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
 impl MacDisplayUpdates {
     async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        loop {
+        'updates: loop {
             if let Some(bitmap) = self.pending_bitmap_updates.pop_front() {
                 self.record_bitmap_update_metrics(bitmap.data.len() as u32);
                 self.record_bitmap_audit(&bitmap, "queued-bitmap-region");
                 return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
             }
 
-            self.refresh_capture_transport_if_needed().await?;
-
             if let Some(update) = self.poll_cursor_update_if_due() {
                 return Ok(Some(update));
             }
 
-            // Drain stale frames — always use the latest available frame.
-            // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
-            // which works at the display level (including lock screen).
-            let frame = loop {
-                // Calculate timeout for idle IDR keepalive.
-                // If we have a cached frame and are in idle state, wait at most until
-                // the next IDR keepalive is due instead of blocking forever.
-                let idle_deadline = if self.idle_frame_count > 0 && self.last_frame_cache.is_some()
+            // Await the codec callback itself: a desktop can become idle
+            // immediately after submission, with no next capture to collect it.
+            // Captures continue into the latest-frame mailbox during this wait.
+            if self.has_pending_submit {
+                let mut completion = self
+                    .encoder
+                    .as_ref()
+                    .and_then(|encoder| encoder.encode_completion())
+                    .ok_or_else(|| anyhow::anyhow!("Pipelined encoder has no completion signal"))?;
+                let cursor_wait = self.cursor_poll_timeout();
+                let watchdog = Duration::from_secs(2).saturating_sub(
+                    self.pending_frame_time
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default(),
+                );
+                match tokio::time::timeout(
+                    watchdog,
+                    event_wait::next_event(
+                        completion.wait_for(|timing| timing.is_some()),
+                        None,
+                        cursor_wait,
+                    ),
+                )
+                .await
                 {
-                    let elapsed = self.last_idr_time.elapsed();
-                    if elapsed >= IDLE_IDR_INTERVAL {
-                        // IDR keepalive is overdue — send it immediately
-                        if let Some(update) = self.send_idle_idr() {
+                    Ok(DisplayWake::Capture(result)) => {
+                        result.map_err(|_| anyhow::anyhow!("Encoder completion channel closed"))?;
+                        if let Some(update) = self.collect_and_send_pending()? {
                             return Ok(Some(update));
                         }
-                        // If send_idle_idr returned None (no encoder/gfx), just continue waiting
-                        None
-                    } else {
-                        Some(IDLE_IDR_INTERVAL - elapsed)
                     }
-                } else {
+                    Ok(DisplayWake::Cursor | DisplayWake::Idle) => {}
+                    Err(_) => {
+                        tracing::warn!("Async encoder did not complete within two seconds; recovering with uncompressed graphics");
+                        // Invalidation waits for outstanding codec work before
+                        // dropping its callback context or retained pixel data.
+                        self.encoder = None;
+                        self.has_pending_submit = false;
+                        self.pending_frame_time = None;
+                        self.pending_visible_size = None;
+                        self.mark_client_may_be_stale("async-encode-watchdog");
+                        if let Some(update) = self.send_cached_full_frame_recovery() {
+                            return Ok(Some(update));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            self.refresh_capture_transport_if_needed().await?;
+
+            // Capture events and timers all return to this outer loop. A cursor
+            // timeout must advance its deadline even when the desktop is idle.
+            let idle_deadline = if self.idle_frame_count > 0 && self.last_frame_cache.is_some() {
+                let elapsed = self.last_idr_time.elapsed();
+                if elapsed >= IDLE_IDR_INTERVAL {
+                    if let Some(update) = self.send_idle_idr() {
+                        return Ok(Some(update));
+                    }
                     None
-                };
-
-                let cursor_deadline = self.cursor_poll_timeout();
-                let (wait_timeout, timeout_should_send_idle_idr) =
-                    match (idle_deadline, cursor_deadline) {
-                        (Some(idle), Some(cursor)) if idle <= cursor => (Some(idle), true),
-                        (Some(_idle), Some(cursor)) => (Some(cursor), false),
-                        (Some(idle), None) => (Some(idle), true),
-                        (None, Some(cursor)) => (Some(cursor), false),
-                        (None, None) => (None, false),
-                    };
-
-                let event = if let Some(timeout) = wait_timeout {
-                    match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
-                        Ok(Some(e)) => e,
-                        Ok(None) => {
-                            if let Some(update) =
-                                self.run_coregraphics_fallback_until_recovered().await?
-                            {
-                                return Ok(Some(update));
-                            }
-                            continue;
-                        }
-                        Err(_elapsed) => {
-                            if timeout_should_send_idle_idr {
-                                // Timeout — time to send an idle IDR keepalive
-                                if let Some(update) = self.send_idle_idr() {
-                                    return Ok(Some(update));
-                                }
-                            }
-                            // Cursor poll window elapsed, or no encoder/GFX is available
-                            // for an idle keepalive. Continue the display loop.
-                            continue;
-                        }
-                    }
                 } else {
-                    match self.capturer.next_frame().await {
-                        Some(e) => e,
-                        None => {
-                            if let Some(update) =
-                                self.run_coregraphics_fallback_until_recovered().await?
-                            {
-                                return Ok(Some(update));
-                            }
-                            continue;
-                        }
+                    Some(IDLE_IDR_INTERVAL - elapsed)
+                }
+            } else {
+                None
+            };
+            let cursor_deadline = self.cursor_poll_timeout();
+            let event = match event_wait::next_event(
+                self.capturer.next_frame(),
+                idle_deadline,
+                cursor_deadline,
+            )
+            .await
+            {
+                DisplayWake::Capture(Some(event)) => event,
+                DisplayWake::Capture(None) => {
+                    if let Some(update) = self.run_coregraphics_fallback_until_recovered().await? {
+                        return Ok(Some(update));
                     }
-                };
-
+                    continue 'updates;
+                }
+                DisplayWake::Cursor => continue 'updates,
+                DisplayWake::Idle => {
+                    if let Some(update) = self.send_idle_idr() {
+                        return Ok(Some(update));
+                    }
+                    continue 'updates;
+                }
+            };
+            let frame = {
                 // Handle idle events (desktop unchanged)
                 let frame = match event {
                     macrdp_capture::CaptureEvent::Frame(f) => {
+                        let delivery = self.capturer.last_delivery_stats();
+                        {
+                            let mut gfx = self.gfx_state.lock().unwrap();
+                            gfx.capture_queue_ms = delivery.queue_ms;
+                            gfx.capture_frames_coalesced = gfx
+                                .capture_frames_coalesced
+                                .saturating_add(delivery.coalesced_frames);
+                        }
+                        if let Some(stats) = &self.perf_stats {
+                            stats
+                                .lock()
+                                .unwrap()
+                                .record_capture(delivery.queue_ms, delivery.coalesced_frames);
+                        }
                         // Desktop became active — reset idle counter
                         if self.idle_frame_count > 0 {
-                            // Collect any pending pipelined frame before recovery
-                            if self.has_pending_submit {
-                                let _ = self.collect_and_send_pending();
-                            }
-
                             tracing::debug!(
                                 idle_frames = self.idle_frame_count,
                                 "Desktop active again — forcing keyframe for clean recovery"
@@ -1285,7 +1324,7 @@ impl MacDisplayUpdates {
                             }
                         }
                         self.idle_frame_count += 1;
-                        continue;
+                        continue 'updates;
                     }
                     macrdp_capture::CaptureEvent::Unavailable => {
                         if let Some(update) =
@@ -1293,22 +1332,16 @@ impl MacDisplayUpdates {
                         {
                             return Ok(Some(update));
                         }
-                        continue;
+                        continue 'updates;
                     }
                 };
 
-                // Drain buffered frames so we always encode the newest available frame.
+                // The capture mailbox already keeps the newest image and
+                // accumulates all overwritten damage relative to our last read.
+                // Draining here would discard that accumulated damage.
                 let mut latest = frame;
-                loop {
-                    match self.capturer.try_next_frame() {
-                        Some(macrdp_capture::CaptureEvent::Frame(newer)) => latest = newer,
-                        Some(macrdp_capture::CaptureEvent::Idle)
-                        | Some(macrdp_capture::CaptureEvent::Unavailable)
-                        | None => break,
-                    }
-                }
                 self.refine_capture_dirty_rects(&mut latest);
-                break latest;
+                latest
             };
 
             match self.encode_and_send(frame)? {
@@ -1368,6 +1401,9 @@ impl MacDisplayUpdates {
                 match self.encode_and_send(cg_frame)? {
                     Some(update) => return Ok(Some(update)),
                     None => {
+                        if self.has_pending_submit {
+                            return Ok(None);
+                        }
                         tracing::debug!(
                             "CoreGraphics fallback frame produced no display update; waiting for next frame"
                         );
@@ -1567,12 +1603,6 @@ impl MacDisplayUpdates {
             tracing::debug!(reason, "Cleared client stale state");
         }
         self.client_may_be_stale = false;
-    }
-
-    fn pipeline_collect_timeout(&self) -> Duration {
-        let fps = self.last_applied_fps.max(1) as f64;
-        let frame_ms = 1000.0 / fps;
-        Duration::from_millis((frame_ms * 0.5).clamp(4.0, 12.0).round() as u64)
     }
 
     fn fallback_pointer_update(&self) -> DisplayUpdate {
@@ -1792,6 +1822,15 @@ impl MacDisplayUpdates {
     }
 
     fn desired_capture_pixel_format(&self) -> CapturePixelFormat {
+        // Hardware initialization/recovery may leave a software encoder or no
+        // encoder at all. Both require BGRA for a usable fallback transport.
+        if !self
+            .encoder
+            .as_ref()
+            .is_some_and(|encoder| encoder.supports_pixel_buffer())
+        {
+            return CapturePixelFormat::Bgra;
+        }
         let gfx = self.gfx_state.lock().unwrap();
         if should_use_nv12_capture_for_gfx(
             gfx.session_uses_gfx,
@@ -1838,21 +1877,30 @@ impl MacDisplayUpdates {
         );
     }
 
-    fn sync_runtime_frame_rate_override(&mut self) {
-        let configured_fps = self
-            .gfx_state
-            .lock()
-            .unwrap()
-            .target_frame_rate
-            .unwrap_or(self.bitrate_ctrl.target_fps())
-            .max(1);
-
-        if configured_fps == self.bitrate_ctrl.target_fps() {
-            return;
+    fn sync_runtime_encoder_overrides(&mut self) {
+        let (configured_fps, configured_bitrate) = {
+            let gfx = self.gfx_state.lock().unwrap();
+            (
+                gfx.target_frame_rate
+                    .unwrap_or(self.bitrate_ctrl.target_fps())
+                    .clamp(1, 240),
+                gfx.target_bitrate
+                    .map(|bps| bps.clamp(1, macrdp_encode::MAX_BITRATE_BPS)),
+            )
+        };
+        if configured_fps != self.bitrate_ctrl.target_fps() {
+            self.bitrate_ctrl.set_target_fps(configured_fps);
+            self.apply_capture_fps(configured_fps, "config-hot-update");
         }
-
-        self.bitrate_ctrl.set_target_fps(configured_fps);
-        self.apply_capture_fps(configured_fps, "config-hot-update");
+        if let Some(bitrate) =
+            configured_bitrate.filter(|bps| *bps != self.bitrate_ctrl.base_bitrate())
+        {
+            self.bitrate_ctrl.set_target_bitrate(bitrate);
+            if let Some(encoder) = &mut self.encoder {
+                encoder.set_bitrate(bitrate);
+            }
+            tracing::info!(bitrate_bps = bitrate, "Encoder bitrate hot-update applied");
+        }
     }
 
     async fn refresh_capture_transport_if_needed(&mut self) -> Result<()> {
@@ -1980,19 +2028,24 @@ impl MacDisplayUpdates {
 
     /// Evaluate the BitrateController window and apply any adaptive bitrate/fps changes.
     fn apply_adaptive_decision(&mut self) {
-        if !self.bitrate_ctrl.should_evaluate() {
-            return;
-        }
-
-        // Phase 2 RTT check
+        // Observe transport independently from actual codec completion timing.
         {
             let gfx = self.gfx_state.lock().unwrap();
+            self.bitrate_ctrl.update_transport(
+                gfx.last_write_ms,
+                (!gfx.frame_acknowledgements_suspended && gfx.last_ack_frame != 0)
+                    .then_some(gfx.pending_acks),
+            );
             if gfx.rtt_ewma_ms > 0.0 {
                 self.bitrate_ctrl.update_network_rtt(gfx.rtt_ewma_ms);
                 if let Some(ps) = &self.perf_stats {
                     ps.lock().unwrap().record_rtt(gfx.rtt_ewma_ms);
                 }
             }
+        }
+
+        if !self.bitrate_ctrl.should_evaluate() {
+            return;
         }
 
         let decision = self.bitrate_ctrl.evaluate();
@@ -2014,30 +2067,37 @@ impl MacDisplayUpdates {
 
     /// Collect a previously submitted async (pipelined) encode result and build a GFX DisplayUpdate.
     fn collect_and_send_pending(&mut self) -> Result<Option<DisplayUpdate>> {
-        let timeout = self.pipeline_collect_timeout();
         let encoder = match &mut self.encoder {
             Some(e) if e.supports_pipelining() => e,
             _ => return Ok(None),
         };
 
-        match encoder.collect_encoded(timeout)? {
+        match encoder.collect_encoded(Duration::ZERO)? {
             Some(encoded) if !encoded.data.is_empty() => {
-                let encode_ms = self
+                let timing = encoder.last_encode_timing().ok_or_else(|| {
+                    anyhow::anyhow!("Pipelined encoder returned no completion timing")
+                })?;
+                let encode_ms = timing.encode_duration.as_secs_f64() * 1000.0;
+                let completion_queue_ms = timing.completed_at.elapsed().as_secs_f64() * 1000.0;
+                let pipeline_residence_ms = self
                     .pending_frame_time
                     .map(|t| t.elapsed().as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
+                    .unwrap_or_default();
                 let is_keyframe = encoded.is_keyframe;
 
                 tracing::debug!(
                     h264_bytes = encoded.data.len(),
                     is_keyframe,
                     encode_ms = format!("{:.1}", encode_ms),
+                    completion_queue_ms,
+                    pipeline_residence_ms,
                     "Display: collected pipelined GFX frame"
                 );
                 {
                     let mut st = self.gfx_state.lock().unwrap();
                     st.last_encode_ms = encode_ms;
                     st.last_frame_bytes = encoded.data.len() as u32;
+                    st.completion_queue_ms = completion_queue_ms;
                 }
                 self.bitrate_ctrl
                     .record_frame(crate::bitrate_controller::FrameStats {
@@ -2092,11 +2152,8 @@ impl MacDisplayUpdates {
                 Ok(None)
             }
             None => {
-                tracing::warn!("Pipelined collect timed out — frame lost");
-                self.has_pending_submit = false;
-                self.pending_visible_size = None;
-                self.pending_frame_time = None;
-                self.mark_client_may_be_stale("pipelined-collect-timeout");
+                // A nonblocking poll must preserve the outstanding input and
+                // its metadata until the callback completes.
                 Ok(None)
             }
         }
@@ -2140,6 +2197,7 @@ impl MacDisplayUpdates {
                 .map(|sent_at| sent_at.elapsed());
             if gfx_avc_ready
                 && !state.gfx_validation_mode
+                && !state.frame_acknowledgements_suspended
                 && !state.bitmap_fallback_mode
                 && should_fallback_from_gfx_avc_no_ack(
                     state.frame_id,
@@ -2191,7 +2249,7 @@ impl MacDisplayUpdates {
         if request_bitmap_fallback_full_frames {
             self.request_full_bitmap_updates(BITMAP_FORCED_FULL_UPDATES_AFTER_GFX_FALLBACK);
         }
-        self.sync_runtime_frame_rate_override();
+        self.sync_runtime_encoder_overrides();
 
         if gfx_channel_ready {
             if self.needs_full_gfx_seed {
@@ -3750,13 +3808,19 @@ mod tests {
     #[test]
     fn falls_back_when_avc_frames_are_never_acknowledged() {
         assert!(!should_fallback_from_gfx_avc_no_ack(3, 0, 3, None));
-        assert!(should_fallback_from_gfx_avc_no_ack(4, 0, 4, None));
+        assert!(!should_fallback_from_gfx_avc_no_ack(4, 0, 4, None));
+        assert!(should_fallback_from_gfx_avc_no_ack(
+            4,
+            0,
+            4,
+            Some(Duration::from_millis(1_300))
+        ));
         assert!(!should_fallback_from_gfx_avc_no_ack(4, 1, 3, None));
     }
 
     #[test]
     fn falls_back_when_oldest_unacked_avc_frame_stalls_too_long() {
-        assert!(should_fallback_from_gfx_avc_no_ack(
+        assert!(!should_fallback_from_gfx_avc_no_ack(
             1,
             0,
             1,
@@ -3767,6 +3831,19 @@ mod tests {
             0,
             1,
             Some(Duration::from_millis(800)),
+        ));
+        // Four frames sent quickly must not punish a healthy high-latency client.
+        assert!(!should_fallback_from_gfx_avc_no_ack(
+            30,
+            0,
+            30,
+            Some(Duration::from_millis(500))
+        ));
+        assert!(should_fallback_from_gfx_avc_no_ack(
+            30,
+            0,
+            30,
+            Some(Duration::from_millis(1_300))
         ));
     }
 

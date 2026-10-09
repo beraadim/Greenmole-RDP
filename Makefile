@@ -95,10 +95,4 @@ build: build-cli build-ui-front build-ui-rust
 clean: clean-cli clean-ui
 
 check:
-	@echo "检查 CLI..."
-	@cargo build -p macrdp-server 2>&1 | tail -1
-	@echo "检查 UI Rust..."
-	@cargo build --manifest-path macrdp-ui/src-tauri/Cargo.toml 2>&1 | tail -1
-	@echo "检查 UI 前端..."
-	@cd macrdp-ui && npm run build 2>&1 | tail -1
-	@echo "全部通过."
+	./tools/check.sh

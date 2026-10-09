@@ -1,6 +1,7 @@
 use core::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
@@ -12,19 +13,24 @@ use ironrdp_core::{decode, encode_vec, impl_as_any};
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
-use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags,
+};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
 use ironrdp_svc::{
-    server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage, SvcProcessor,
+    server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage,
+    SvcProcessor,
 };
-use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed};
+use ironrdp_tokio::{
+    split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed,
+};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
@@ -42,6 +48,10 @@ use crate::{builder, capabilities, SoundServerFactory};
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[path = "connection_control.rs"]
+mod connection_control;
+use connection_control::{wait_for_idle_timeout, DEFAULT_HANDSHAKE_TIMEOUT};
 
 #[derive(Clone)]
 pub struct RdpServerOptions {
@@ -107,7 +117,37 @@ impl RdpServerSecurity {
 }
 
 struct AInputHandler {
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    pending: mpsc::Sender<crate::MouseEvent>,
+    worker: task::JoinHandle<()>,
+    activity: watch::Sender<tokio::time::Instant>,
+}
+
+impl AInputHandler {
+    fn new(
+        handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+        activity: watch::Sender<tokio::time::Instant>,
+    ) -> Self {
+        // A single ordered worker replaces one blocking task per peer packet.
+        // Overflow terminates the channel/session instead of retaining an
+        // unbounded queue or silently dropping a button release.
+        let (pending, mut receiver) = mpsc::channel(128);
+        let worker = task::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                handler.lock().await.mouse(event);
+            }
+        });
+        Self {
+            pending,
+            worker,
+            activity,
+        }
+    }
+}
+
+impl Drop for AInputHandler {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
 }
 
 impl_as_any!(AInputHandler);
@@ -132,10 +172,12 @@ impl dvc::DvcProcessor for AInputHandler {
 
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
-                let handler = Arc::clone(&self.handler);
-                task::spawn_blocking(move || {
-                    handler.blocking_lock().mouse(pdu.into());
-                });
+                self.pending.try_send(pdu.into()).map_err(|_| {
+                    decode_err!(std::io::Error::other(
+                        "additional input queue is full or closed"
+                    ))
+                })?;
+                self.activity.send_replace(tokio::time::Instant::now());
             }
         }
 
@@ -220,6 +262,10 @@ pub struct RdpServer {
     local_addr: Option<SocketAddr>,
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
+    handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    input_activity: watch::Sender<tokio::time::Instant>,
+    quit_requested: bool,
 }
 
 #[derive(Debug)]
@@ -287,6 +333,10 @@ impl RdpServer {
             local_addr: None,
             gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false, false))),
             gfx_enabled: true,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            idle_timeout: None,
+            input_activity: watch::channel(tokio::time::Instant::now()).0,
+            quit_requested: false,
         }
     }
 
@@ -334,12 +384,13 @@ impl RdpServer {
     fn dynamic_channels(&self) -> DynamicChannels {
         // Display Control is independent of the graphics codec. Bitmap-only
         // Guacamole sessions still need this channel for browser resizing.
-        let mut dvc =
-            dvc::DrdynvcServer::new().with_dynamic_channel(DisplayControlChannel::new(Arc::clone(&self.display)));
+        let mut dvc = dvc::DrdynvcServer::new()
+            .with_dynamic_channel(DisplayControlChannel::new(Arc::clone(&self.display)));
         if self.gfx_enabled {
-            dvc = dvc.with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
-            });
+            dvc = dvc.with_dynamic_channel(AInputHandler::new(
+                Arc::clone(&self.handler),
+                self.input_activity.clone(),
+            ));
             let gfx_handler = GfxHandler::new(Arc::clone(&self.gfx_state));
             dvc = dvc.with_dynamic_channel(gfx_handler);
             debug!("GFX channel registered");
@@ -352,6 +403,8 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        self.input_activity
+            .send_replace(tokio::time::Instant::now());
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         let framed = TokioFramed::new(stream);
 
@@ -385,53 +438,66 @@ impl RdpServer {
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
-        let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+        let mut acceptor = Acceptor::new(
+            self.opts.security.flag(),
+            size,
+            capabilities,
+            self.creds.clone(),
+        );
 
         self.attach_channels(&mut acceptor);
 
-        let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
-            .await
-            .context("accept_begin failed")?;
+        let res = self
+            .await_connection_stage("RDP negotiation", async {
+                ironrdp_acceptor::accept_begin(framed, &mut acceptor)
+                    .await
+                    .map_err(Into::into)
+            })
+            .await?;
 
         match res {
             BeginResult::ShouldUpgrade(stream) => {
                 let tls_acceptor = match &self.opts.security {
-                    RdpServerSecurity::Tls(acceptor) => acceptor,
-                    RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+                    RdpServerSecurity::Tls(acceptor) => acceptor.clone(),
+                    RdpServerSecurity::Hybrid((acceptor, _)) => acceptor.clone(),
                     RdpServerSecurity::None => unreachable!(),
                 };
-                let accept = match tls_acceptor.accept(stream).await {
-                    Ok(accept) => accept,
-                    Err(e) => {
-                        warn!("Failed to TLS accept: {}", e);
-                        return Ok(());
-                    }
-                };
+                let accept = self
+                    .await_connection_stage("TLS handshake", async {
+                        tls_acceptor.accept(stream).await.map_err(Into::into)
+                    })
+                    .await?;
                 let mut framed = TokioFramed::new(accept);
 
                 acceptor.mark_security_upgrade_as_done();
 
-                if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
+                if let RdpServerSecurity::Hybrid((_, pub_key)) = self.opts.security.clone() {
                     // how to get the client name?
                     // doesn't seem to matter yet
                     let client_name = framed.get_inner().0.get_ref().0.peer_addr()?.to_string();
 
-                    ironrdp_acceptor::accept_credssp(
-                        &mut framed,
-                        &mut acceptor,
-                        &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
-                        client_name.into(),
-                        pub_key.clone(),
-                        None,
-                    )
+                    self.await_connection_stage("CredSSP authentication", async {
+                        ironrdp_acceptor::accept_credssp(
+                            &mut framed,
+                            &mut acceptor,
+                            &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                            client_name.into(),
+                            pub_key,
+                            None,
+                        )
+                        .await
+                        .map_err(Into::into)
+                    })
                     .await?;
                 }
 
                 let framed = self.accept_finalize(framed, acceptor, size).await?;
                 debug!("Shutting down TLS connection");
                 let (mut tls_stream, _) = framed.into_inner();
-                if let Err(e) = tls_stream.shutdown().await {
-                    debug!(?e, "TLS shutdown error");
+                match tokio::time::timeout(Duration::from_secs(1), tls_stream.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => debug!(?error, "TLS shutdown error"),
+                    Err(_) => debug!("TLS shutdown timed out"),
                 }
             }
 
@@ -450,7 +516,7 @@ impl RdpServer {
         debug!("Listening for connections on {local_addr}");
         self.local_addr = Some(local_addr);
 
-        loop {
+        while !self.quit_requested {
             let ev_receiver = Arc::clone(&self.ev_receiver);
             let mut ev_receiver = ev_receiver.lock().await;
             tokio::select! {
@@ -558,15 +624,35 @@ impl RdpServer {
                     let channel_id = state.channel_id.unwrap();
                     // All frame PDUs combined into a single ZGFX-wrapped buffer
                     let pdu_data = GfxHandler::create_frame_pdu(&mut state, gfx_frame);
+                    let frame_id = state.frame_id;
                     drop(state); // release lock before async
 
                     // Send as a single DVC message (auto-fragmented by encode_dvc_messages)
-                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
-                    let svc_messages = dvc::encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                        .context("Failed to encode DVC messages")?;
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let svc_messages = dvc::encode_dvc_messages(
+                        channel_id,
+                        dvc_messages,
+                        ChannelFlags::SHOW_PROTOCOL,
+                    )
+                    .context("Failed to encode DVC messages")?;
 
-                    let data = server_encode_svc_messages(svc_messages.into(), drdynvc_id, user_channel_id)?;
-                    writer.write_all(&data).await.context("failed to write GFX frame")?;
+                    let data = server_encode_svc_messages(
+                        svc_messages.into(),
+                        drdynvc_id,
+                        user_channel_id,
+                    )?;
+                    let write_started = std::time::Instant::now();
+                    writer
+                        .write_all(&data)
+                        .await
+                        .context("failed to write GFX frame")?;
+                    let mut state = gfx_state.lock().unwrap();
+                    state.frame_written(frame_id);
+                    state.record_display_write(
+                        data.len(),
+                        write_started.elapsed().as_secs_f64() * 1000.0,
+                    );
 
                     return Ok((RunState::Continue, encoder));
                 }
@@ -584,17 +670,34 @@ impl RdpServer {
                 if let Some(drdynvc_id) = drdynvc_channel_id {
                     let channel_id = state.channel_id.unwrap();
                     let pdu_data = GfxHandler::create_uncompressed_pdu(&mut state, uncompressed);
+                    let frame_id = state.frame_id;
                     drop(state);
 
-                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
-                    let svc_messages = dvc::encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                        .context("Failed to encode DVC messages")?;
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let svc_messages = dvc::encode_dvc_messages(
+                        channel_id,
+                        dvc_messages,
+                        ChannelFlags::SHOW_PROTOCOL,
+                    )
+                    .context("Failed to encode DVC messages")?;
 
-                    let data = server_encode_svc_messages(svc_messages.into(), drdynvc_id, user_channel_id)?;
+                    let data = server_encode_svc_messages(
+                        svc_messages.into(),
+                        drdynvc_id,
+                        user_channel_id,
+                    )?;
+                    let write_started = std::time::Instant::now();
                     writer
                         .write_all(&data)
                         .await
                         .context("failed to write GFX uncompressed frame")?;
+                    let mut state = gfx_state.lock().unwrap();
+                    state.frame_written(frame_id);
+                    state.record_display_write(
+                        data.len(),
+                        write_started.elapsed().as_secs_f64() * 1000.0,
+                    );
 
                     return Ok((RunState::Continue, encoder));
                 }
@@ -606,6 +709,7 @@ impl RdpServer {
 
         let mut encoder_iter = encoder.update(update);
         let mut bytes_written = 0usize;
+        let mut write_ms = 0.0;
         loop {
             let Some(fragmenter) = encoder_iter.next().await else {
                 break;
@@ -617,19 +721,22 @@ impl RdpServer {
             }
 
             while let Some(len) = fragmenter.next(buffer) {
+                let write_started = std::time::Instant::now();
                 writer
                     .write_all(&buffer[..len])
                     .await
                     .context("failed to write display update")?;
                 bytes_written = bytes_written.saturating_add(len);
+                write_ms += write_started.elapsed().as_secs_f64() * 1000.0;
             }
         }
 
         if is_bitmap_update {
             let mut state = gfx_state.lock().unwrap();
-            state.last_frame_bytes = bytes_written as u32;
-            state.total_bytes_sent = state.total_bytes_sent.saturating_add(bytes_written as u64);
             state.bitmap_wire_bytes = state.bitmap_wire_bytes.saturating_add(bytes_written as u64);
+            if bytes_written > 0 {
+                state.record_display_write(bytes_written, write_ms);
+            }
         }
 
         Ok((RunState::Continue, encoder))
@@ -650,6 +757,7 @@ impl RdpServer {
             match event {
                 ServerEvent::Quit(reason) => {
                     debug!("Got quit event: {reason}");
+                    self.quit_requested = true;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -679,10 +787,12 @@ impl RdpServer {
                                 }
                             }
                         }
-                        RdpsndServerMessage::SetVolume { left, right } => {
-                            rdpsnd.set_volume(left, right).context("failed to send rdpsnd event")?
+                        RdpsndServerMessage::SetVolume { left, right } => rdpsnd
+                            .set_volume(left, right)
+                            .context("failed to send rdpsnd event")?,
+                        RdpsndServerMessage::Close => {
+                            rdpsnd.close().context("failed to send rdpsnd event")?
                         }
-                        RdpsndServerMessage::Close => rdpsnd.close().context("failed to send rdpsnd event")?,
                         RdpsndServerMessage::Error(error) => {
                             error!(?error, "Handling rdpsnd event");
                             continue;
@@ -691,7 +801,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::Clipboard(c) => {
@@ -700,9 +811,13 @@ impl RdpServer {
                         continue;
                     };
                     let msgs = match c {
-                        ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
+                        ClipboardMessage::SendInitiateCopy(formats) => {
+                            cliprdr.initiate_copy(&formats)
+                        }
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
-                        ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
+                        ClipboardMessage::SendInitiatePaste(format) => {
+                            cliprdr.initiate_paste(format)
+                        }
                         ClipboardMessage::Error(error) => {
                             error!(?error, "Handling clipboard event");
                             continue;
@@ -712,7 +827,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::ClipboardFileContents(response) => {
@@ -726,7 +842,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::ClipboardFileContentsRequest(request) => {
@@ -735,7 +852,11 @@ impl RdpServer {
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
                     let pdu = ClipboardPdu::FileContentsRequest(request);
                     let svc_msg = encode_cliprdr_pdu(pdu);
-                    let data = server_encode_svc_messages(vec![svc_msg].into(), channel_id, user_channel_id)?;
+                    let data = server_encode_svc_messages(
+                        vec![svc_msg].into(),
+                        channel_id,
+                        user_channel_id,
+                    )?;
                     writer.write_all(&data).await?;
                 }
             }
@@ -776,6 +897,8 @@ impl RdpServer {
         let mut event_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let gfx_state = Arc::clone(&self.gfx_state);
+        let idle_timeout = self.idle_timeout;
+        let activity = self.input_activity.subscribe();
 
         // Update GFX state with current desktop size
         {
@@ -788,6 +911,7 @@ impl RdpServer {
         let drdynvc_channel_id = self.get_channel_id_by_type::<DynamicChannels>();
 
         let s = Rc::new(Mutex::new(self));
+        let quit_received = Rc::new(std::cell::Cell::new(false));
 
         let this = Rc::clone(&s);
         let dispatch_pdu = async move {
@@ -842,6 +966,7 @@ impl RdpServer {
         };
 
         let this = Rc::clone(&s);
+        let event_quit_received = Rc::clone(&quit_received);
         let mut ev_receiver = ev_receiver.lock().await;
         let dispatch_events = async move {
             let mut events = Vec::with_capacity(100);
@@ -851,8 +976,16 @@ impl RdpServer {
                     debug!("No sever events.. stopping");
                     break Ok(RunState::Disconnect);
                 }
-                while let Ok(ev) = ev_receiver.try_recv() {
-                    events.push(ev);
+                // Bound each batch so continuous audio/clipboard traffic
+                // cannot prevent input and shutdown from being dispatched.
+                if events
+                    .iter()
+                    .any(|event| matches!(event, ServerEvent::Quit(_)))
+                {
+                    // Do not wait for a handler holding the server lock while
+                    // a peer has stopped reading its channel response.
+                    event_quit_received.set(true);
+                    break Ok(RunState::Disconnect);
                 }
                 let mut this = this.lock().await;
                 match this
@@ -869,7 +1002,15 @@ impl RdpServer {
             state = dispatch_pdu => ("pdu", state),
             state = dispatch_display => ("display", state),
             state = dispatch_events => ("events", state),
+            _ = wait_for_idle_timeout(activity, idle_timeout) => {
+                info!(?idle_timeout, "Disconnecting inactive session");
+                ("idle-timeout", Ok(RunState::Disconnect))
+            },
         );
+
+        if quit_received.get() {
+            s.lock().await.quit_requested = true;
+        }
 
         match &state {
             Ok(run_state) => {
@@ -878,7 +1019,11 @@ impl RdpServer {
             Err(error) => {
                 let err_str = format!("{error:#}");
                 if is_benign_disconnect_error_text(&err_str) {
-                    info!(source, error = err_str, "Client loop ended after client disconnect");
+                    info!(
+                        source,
+                        error = err_str,
+                        "Client loop ended after client disconnect"
+                    );
                 } else {
                     warn!(source, error = err_str, "Client loop failed");
                 }
@@ -900,6 +1045,13 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
+
+        if !result.reactivation {
+            // Authentication time is not part of a connected user's idle
+            // allowance. Reactivation retains the existing session deadline.
+            self.input_activity
+                .send_replace(tokio::time::Instant::now());
+        }
 
         {
             let mut handler = self.handler.lock().await;
@@ -925,7 +1077,8 @@ impl RdpServer {
         self.static_channels = result.static_channels;
         {
             let mut gfx_state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = self.gfx_enabled && self.get_channel_id_by_type::<DynamicChannels>().is_some();
+            let session_uses_gfx =
+                self.gfx_enabled && self.get_channel_id_by_type::<DynamicChannels>().is_some();
             if !result.reactivation {
                 gfx_state.reset_connection_state(session_uses_gfx);
             } else {
@@ -948,19 +1101,24 @@ impl RdpServer {
                     continue;
                 };
                 let svc_responses = channel.start()?;
-                let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
+                let response =
+                    server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
             }
         }
 
         if !result.reactivation {
-            let confirmed_size = result.capabilities.iter().find_map(|capability| match capability {
-                CapabilitySet::Bitmap(bitmap) => Some(DesktopSize {
-                    width: bitmap.desktop_width,
-                    height: bitmap.desktop_height,
-                }),
-                _ => None,
-            });
+            let confirmed_size =
+                result
+                    .capabilities
+                    .iter()
+                    .find_map(|capability| match capability {
+                        CapabilitySet::Bitmap(bitmap) => Some(DesktopSize {
+                            width: bitmap.desktop_width,
+                            height: bitmap.desktop_height,
+                        }),
+                        _ => None,
+                    });
             // FreeRDP applies Demand Active before sending Confirm Active, so
             // its bitmap capability often echoes our old size. Preserve the
             // actual browser/client request from the initial GCC exchange.
@@ -987,7 +1145,9 @@ impl RdpServer {
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
-                    let fastpath = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
+                    let fastpath = c
+                        .extra_flags
+                        .contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
                     if !fastpath {
                         bail!("Fastpath output not supported!");
                     }
@@ -1007,16 +1167,16 @@ impl RdpServer {
                             // We should distinguish parameters for both modes,
                             // and somehow choose the "best", instead of picking
                             // the last parsed here.
-                            CodecProperty::RemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(c))
-                                if self.opts.has_remote_fx() =>
-                            {
+                            CodecProperty::RemoteFx(
+                                rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
+                            ) if self.opts.has_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
                             }
-                            CodecProperty::ImageRemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(
-                                c,
-                            )) if self.opts.has_image_remote_fx() => {
+                            CodecProperty::ImageRemoteFx(
+                                rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
+                            ) if self.opts.has_image_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
@@ -1076,7 +1236,9 @@ impl RdpServer {
                 }
 
                 Ok(Action::X224) => {
-                    let _ = self.handle_x224(writer, io_channel_id, user_channel_id, &frame).await;
+                    let _ = self
+                        .handle_x224(writer, io_channel_id, user_channel_id, &frame)
+                        .await;
                 }
 
                 // the frame here is always valid, because otherwise it would
@@ -1089,6 +1251,14 @@ impl RdpServer {
     }
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {
+        if input
+            .input_events()
+            .iter()
+            .any(|event| !matches!(event, FastPathInputEvent::QoeEvent(_)))
+        {
+            self.input_activity
+                .send_replace(tokio::time::Instant::now());
+        }
         for event in input.input_events().iter().copied() {
             let mut handler = self.handler.lock().await;
             match event {
@@ -1166,10 +1336,17 @@ impl RdpServer {
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
                     let response_pdus = svc.process(&data.user_data)?;
-                    let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)?;
+                    let response = server_encode_svc_messages(
+                        response_pdus,
+                        data.channel_id,
+                        user_channel_id,
+                    )?;
                     writer.write_all(&response).await?;
                 } else {
-                    warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
+                    warn!(
+                        channel_id = data.channel_id,
+                        "Unexpected channel received: ID",
+                    );
                 }
             }
 
@@ -1180,7 +1357,10 @@ impl RdpServer {
             }
 
             _ => {
-                warn!(name = ironrdp_core::name(&message), "Unexpected mcs message");
+                warn!(
+                    name = ironrdp_core::name(&message),
+                    "Unexpected mcs message"
+                );
             }
         }
 
@@ -1188,6 +1368,14 @@ impl RdpServer {
     }
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
+        if input
+            .0
+            .iter()
+            .any(|event| !matches!(event, ironrdp_pdu::input::InputEvent::Unused(_)))
+        {
+            self.input_activity
+                .send_replace(tokio::time::Instant::now());
+        }
         for event in input.0 {
             let mut handler = self.handler.lock().await;
             match event {
@@ -1231,9 +1419,13 @@ impl RdpServer {
     {
         let mut client_connected = false;
         let result = loop {
-            let (new_framed, result) = match ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
+            let (new_framed, result) = match self
+                .await_connection_stage("RDP activation", async {
+                    ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
+                        .await
+                        .map_err(Into::into)
+                })
                 .await
-                .context("failed to accept client during finalize")
             {
                 Ok(value) => value,
                 Err(error) => break Err(error),
