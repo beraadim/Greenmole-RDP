@@ -34,14 +34,24 @@ fn normalize_scroll_lines(vertical: i16) -> i32 {
     }
 }
 
-pub struct MouseInjector;
+pub struct MouseInjector {
+    state: MouseState,
+}
+
+#[derive(Default)]
+struct MouseState {
+    pressed: [bool; 3],
+    position: (f64, f64),
+}
 
 impl MouseInjector {
     pub fn new() -> Result<Self> {
         let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
             anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
         })?;
-        Ok(Self)
+        Ok(Self {
+            state: MouseState::default(),
+        })
     }
 
     fn source() -> Result<CGEventSource> {
@@ -50,43 +60,35 @@ impl MouseInjector {
     }
 
     /// Move in global CoreGraphics points, including negative secondary-display origins.
-    pub fn move_to(&self, x: f64, y: f64) -> Result<()> {
-        anyhow::ensure!(
-            x.is_finite() && y.is_finite(),
-            "Mouse position must be finite"
-        );
-        let point = CGPoint::new(x, y);
-        let source = Self::source()?;
-        let event =
-            CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
-                .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
-
-        event.post(CGEventTapLocation::HID);
-        tracing::trace!(x, y, "Mouse moved");
-        Ok(())
+    pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
+        self.state.move_to(x, y, Self::post_mouse_event)
     }
 
-    pub fn button_event(&self, button: MouseButton, pressed: bool, x: f64, y: f64) -> Result<()> {
-        anyhow::ensure!(
-            x.is_finite() && y.is_finite(),
-            "Mouse position must be finite"
-        );
-        let point = CGPoint::new(x, y);
-        let (event_type, cg_button) = match (button, pressed) {
-            (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-            (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-            (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-            (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-            (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-            (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
-        };
+    pub fn button_event(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.state
+            .button_event(button, pressed, x, y, Self::post_mouse_event)
+    }
 
+    /// Release only buttons held by this remote session, at its last posted position.
+    pub fn release_all(&mut self) -> Result<()> {
+        self.state.release_all(Self::post_mouse_event)
+    }
+
+    fn post_mouse_event(
+        event_type: CGEventType,
+        button: CGMouseButton,
+        point: CGPoint,
+    ) -> Result<()> {
         let source = Self::source()?;
-        let event = CGEvent::new_mouse_event(source, event_type, point, cg_button)
-            .map_err(|_| anyhow::anyhow!("Failed to create mouse button event"))?;
-
+        let event = CGEvent::new_mouse_event(source, event_type, point, button)
+            .map_err(|_| anyhow::anyhow!("Failed to create mouse event: {event_type:?}"))?;
         event.post(CGEventTapLocation::HID);
-        tracing::trace!(?button, pressed, x, y, "Mouse button event");
         Ok(())
     }
 
@@ -116,7 +118,107 @@ impl MouseInjector {
     }
 }
 
+impl Drop for MouseInjector {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_all() {
+            tracing::warn!(%error, "Failed to release mouse buttons on drop");
+        }
+    }
+}
+
+impl MouseState {
+    fn move_to(
+        &mut self,
+        x: f64,
+        y: f64,
+        mut post: impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite(),
+            "Mouse position must be finite"
+        );
+        // RDP button packets also deliver their position before the transition.
+        // A stationary release must not turn an ordinary click into a drag.
+        if self.position == (x, y) && self.pressed.iter().any(|pressed| *pressed) {
+            return Ok(());
+        }
+        let point = CGPoint::new(x, y);
+        // macOS does not turn MouseMoved into a drag when a button is held.
+        // Track remote buttons independently of the local hardware mouse. Prefer
+        // the left button for chords so another held button cannot stop selection.
+        let (event_type, button) = if self.pressed[MouseButton::Left as usize] {
+            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+        } else if self.pressed[MouseButton::Right as usize] {
+            (CGEventType::RightMouseDragged, CGMouseButton::Right)
+        } else if self.pressed[MouseButton::Middle as usize] {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        } else {
+            (CGEventType::MouseMoved, CGMouseButton::Left)
+        };
+        post(event_type, button, point)?;
+        self.position = (x, y);
+        tracing::trace!(x, y, ?event_type, "Mouse moved");
+        Ok(())
+    }
+
+    fn button_event(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        x: f64,
+        y: f64,
+        mut post: impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite(),
+            "Mouse position must be finite"
+        );
+        let point = CGPoint::new(x, y);
+        let (event_type, cg_button) = match (button, pressed) {
+            (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+            (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+            (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+            (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+            (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+            (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+        };
+
+        post(event_type, cg_button, point)?;
+        // Failed creation must not lose a held button or start a phantom drag.
+        self.pressed[button as usize] = pressed;
+        self.position = (x, y);
+        tracing::trace!(?button, pressed, x, y, "Mouse button event");
+        Ok(())
+    }
+
+    fn release_all(
+        &mut self,
+        mut post: impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()>,
+    ) -> Result<()> {
+        let mut first_error = None;
+        let mut released = 0;
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            if self.pressed[button as usize] {
+                let (x, y) = self.position;
+                match self.button_event(button, false, x, y, &mut post) {
+                    Ok(()) => released += 1,
+                    Err(error) => {
+                        // Keep failed buttons held for a later cleanup attempt,
+                        // but do not let one failure prevent the other releases.
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        if released > 0 {
+            tracing::debug!(released, "Released held remote mouse buttons");
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
+#[repr(usize)]
 pub enum MouseButton {
     Left,
     Right,
@@ -124,33 +226,4 @@ pub enum MouseButton {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{normalize_scroll_lines, MouseButton, MouseInjector};
-
-    #[test]
-    fn rejects_nonfinite_positions_before_creating_events() {
-        let mouse = MouseInjector;
-        for (x, y) in [
-            (f64::NAN, 0.0),
-            (0.0, f64::INFINITY),
-            (f64::NEG_INFINITY, -1200.0),
-        ] {
-            assert!(mouse.move_to(x, y).is_err());
-            assert!(mouse.button_event(MouseButton::Left, true, x, y).is_err());
-        }
-    }
-
-    #[test]
-    fn keeps_small_scroll_values() {
-        assert_eq!(normalize_scroll_lines(1), 1);
-        assert_eq!(normalize_scroll_lines(-3), -3);
-    }
-
-    #[test]
-    fn converts_windows_wheel_detents_to_lines() {
-        assert_eq!(normalize_scroll_lines(120), 1);
-        assert_eq!(normalize_scroll_lines(-120), -1);
-        assert_eq!(normalize_scroll_lines(240), 2);
-        assert_eq!(normalize_scroll_lines(-241), -3);
-    }
-}
+mod tests;

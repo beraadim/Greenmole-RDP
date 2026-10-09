@@ -19,12 +19,23 @@ Button packets carry their own absolute position. Both fast-path and slow-path
 input deliver that position before the button; wheel position fields are ignored
 as required by MS-RDPBCGR.
 
+The shared mouse injector tracks each remote button independently. Movement
+while a button is held emits the corresponding
+[CoreGraphics drag event](https://developer.apple.com/documentation/coregraphics/cgeventtype); an
+ordinary `MouseMoved` event does not perform text selection on macOS. If several
+buttons are held, left drag takes priority, followed by right and middle drag.
+Unchanged positions in button packets do not create synthetic drag events, so a
+stationary click remains a down/up sequence.
+Disconnect releases held buttons at the last successfully posted position before
+display restoration. A new connection and injector teardown retry failed cleanup.
+
 ## Automated checks
 
 On the Mac build host, from the repository root:
 
 ```sh
 cargo test -p macrdp-capture geometry::tests
+cargo test -p macrdp-input
 cargo test -p ironrdp-server --lib
 cargo test -p macrdp-core
 cargo test -p macrdp-server
@@ -38,6 +49,8 @@ The geometry tests cover Retina and fractional scale factors, pillarboxing,
 letterboxing, invalid metadata, changed host bounds, and reset after resize or
 capture fallback. Pointer packet tests cover button-only coordinates, combined
 move/button flags, simultaneous buttons, extended buttons, and wheel precedence.
+Mouse injector tests record events without posting input to the desktop. They
+cover drag sequences, button chords, failed injection, and cleanup/retry behavior.
 See [virtual display setup and testing](virtual-display.md) for a viewport-sized
 macOS desktop and additional lifecycle checks.
 
@@ -75,6 +88,12 @@ display when available.
    it stays in place.
 5. Test with fixed server resolution. A client layout request should leave the
    negotiated desktop and input scale unchanged.
+6. Click and drag across text in TextEdit and a browser, in both directions.
+   Selection should follow the pointer while held and stop after release. Drag a
+   window by its title bar, then verify an ordinary move does not continue dragging.
+7. Disconnect while holding the left button during a drag. Reconnect and move
+   without pressing: no selection or window drag should continue. Repeat after a
+   client resize and on a display with a negative origin if available.
 
 Record client name, client desktop size, Mac display mode, whether the session
 was freshly connected or resized, and the server log. Useful info-level messages:
@@ -90,3 +109,8 @@ For a remaining scaling discrepancy, enable trace logging for
 `macrdp_capture` to include `ScreenCaptureKit content geometry`, which records
 the original point rectangle, `scaleFactor`, `contentScale`, and converted pixels.
 Do not infer successful live client testing from unit tests or a successful build.
+
+For drag diagnosis, enable trace logging for `macrdp_input::mouse`. `Mouse button
+event` records the button transition, and `Mouse moved` includes `event_type`
+(`LeftMouseDragged` while selecting, `MouseMoved` after release). Cleanup logs
+`Released held remote mouse buttons` at debug level, and failures at warning level.

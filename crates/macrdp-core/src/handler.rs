@@ -654,6 +654,11 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn on_connect(&mut self, context: ClientInputContext, peer_addr: Option<String>) {
+        if let Some(mouse) = &mut self.mouse {
+            if let Err(error) = mouse.release_all() {
+                tracing::warn!(%error, "Failed to release mouse buttons before new session");
+            }
+        }
         if let Some(wake) = &mut self.wake {
             if let Err(e) = wake.wake_display_for_session_start() {
                 tracing::warn!("Failed to wake display for new remote session: {e}");
@@ -669,6 +674,12 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
+        // End drags before virtual-display teardown changes the pointer geometry.
+        if let Some(mouse) = &mut self.mouse {
+            if let Err(error) = mouse.release_all() {
+                tracing::warn!(%error, "Failed to release mouse buttons on disconnect");
+            }
+        }
         {
             // Manual window actions hold this lock through their queue send.
             // Once disconnect starts, no action can target a later connection
@@ -828,7 +839,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        let Some(m) = &self.mouse else { return };
+        let Some(m) = &mut self.mouse else { return };
 
         if let Some(wake) = &mut self.wake {
             if let Err(e) = wake.wake_display_for_input("mouse") {
