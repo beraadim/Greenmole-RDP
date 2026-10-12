@@ -1,3 +1,5 @@
+mod bitmap_freshness;
+mod bitmap_pacing;
 mod event_wait;
 mod idle_policy;
 use event_wait::DisplayWake;
@@ -12,8 +14,8 @@ use ironrdp_server::{
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{
-    capture_current_cursor_shape, CaptureConfig, CapturePixelFormat, CapturedFrame,
-    CgFallbackCapturer, CursorShape, FrameData, Rect, SafePixelBuffer, ScreenCapturer,
+    CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, CursorCapture,
+    CursorShape, CursorUpdate, FrameData, Rect, SafePixelBuffer, ScreenCapturer,
 };
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::collections::hash_map::DefaultHasher;
@@ -923,6 +925,7 @@ impl RdpServerDisplay for MacDisplay {
         )
         .ok();
 
+        self.gfx_state.lock().unwrap().active_encoder = encoder.as_ref().map(|e| e.backend_name());
         if encoder.is_some() {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
@@ -970,6 +973,7 @@ impl RdpServerDisplay for MacDisplay {
             last_idr_time: Instant::now(),
             last_frame_cache: None,
             last_cursor_fingerprint: None,
+            cursor_capture: CursorCapture::default(),
             next_cursor_poll_at: Instant::now(),
             last_uncompressed_rects: None,
             last_uncompressed_sent: None,
@@ -985,6 +989,10 @@ impl RdpServerDisplay for MacDisplay {
             needs_full_bitmap_seed: true,
             forced_full_bitmap_updates_remaining: 1,
             pending_bitmap_updates: VecDeque::new(),
+            deferred_bitmap_frame: None,
+            bitmap_pacing: bitmap_pacing::BitmapPacing::default(),
+            bitmap_perf_dispatches: 0,
+            bitmap_perf_bytes: 0,
             last_full_bitmap_sent: None,
             needs_full_gfx_seed: true,
             logged_gfx_uncompressed_mode: false,
@@ -1054,6 +1062,7 @@ struct MacDisplayUpdates {
     last_frame_cache: Option<CachedFrame>,
     /// Fingerprint of the last cursor shape emitted to the client.
     last_cursor_fingerprint: Option<u64>,
+    cursor_capture: CursorCapture,
     /// Deadline for the next host cursor-shape poll.
     next_cursor_poll_at: Instant,
     /// Last uncompressed rect set sent, used to suppress duplicate bursts.
@@ -1088,6 +1097,12 @@ struct MacDisplayUpdates {
     /// Additional bitmap updates derived from the last captured frame when
     /// sparse damage is cheaper to send as multiple smaller regions.
     pending_bitmap_updates: VecDeque<BitmapUpdate>,
+    /// New damage waits until the old batch is delivered, while its unsent
+    /// regions are refreshed from these newer pixels to avoid visual lag.
+    deferred_bitmap_frame: Option<CapturedFrame>,
+    bitmap_pacing: bitmap_pacing::BitmapPacing,
+    bitmap_perf_dispatches: u64,
+    bitmap_perf_bytes: u64,
     /// Timestamp of the last literal full-frame bitmap update emission.
     last_full_bitmap_sent: Option<Instant>,
     /// Force one full-frame GFX update before relying on incremental/pipelined paths.
@@ -1137,8 +1152,26 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 impl MacDisplayUpdates {
     async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
         'updates: loop {
-            if let Some(bitmap) = self.pending_bitmap_updates.pop_front() {
-                self.record_bitmap_update_metrics(bitmap.data.len() as u32);
+            self.sync_bitmap_pacing();
+            if !self.pending_bitmap_updates.is_empty() || self.deferred_bitmap_frame.is_some() {
+                if let Some(mut latest) = self.capturer.try_latest_image() {
+                    self.record_capture_delivery();
+                    if let Some(previous) = self.deferred_bitmap_frame.take() {
+                        bitmap_freshness::accumulate_frame(&mut latest, &previous);
+                    }
+                    self.deferred_bitmap_frame = Some(latest);
+                }
+            }
+            if let Some(mut bitmap) = self.pending_bitmap_updates.pop_front() {
+                if let Some(latest) = &self.deferred_bitmap_frame {
+                    // Finish this batch in order to avoid starving its older
+                    // regions. New damage remains queued in the deferred frame.
+                    if !bitmap_freshness::refresh_region(&mut bitmap, latest) {
+                        self.pending_bitmap_updates.clear();
+                        self.request_full_bitmap_updates(1);
+                        continue;
+                    }
+                }
                 self.record_bitmap_audit(&bitmap, "queued-bitmap-region");
                 return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
             }
@@ -1184,6 +1217,7 @@ impl MacDisplayUpdates {
                         // Invalidation waits for outstanding codec work before
                         // dropping its callback context or retained pixel data.
                         self.encoder = None;
+                        self.gfx_state.lock().unwrap().active_encoder = None;
                         self.has_pending_submit = false;
                         self.pending_frame_time = None;
                         self.pending_visible_size = None;
@@ -1226,43 +1260,41 @@ impl MacDisplayUpdates {
                 continue;
             }
             let cursor_deadline = self.cursor_poll_timeout();
-            let event = match event_wait::next_event(
-                self.capturer.next_frame(),
-                idle_deadline,
-                cursor_deadline,
-            )
-            .await
-            {
-                DisplayWake::Capture(Some(event)) => event,
-                DisplayWake::Capture(None) => {
-                    if let Some(update) = self.run_coregraphics_fallback_until_recovered().await? {
-                        return Ok(Some(update));
+            let preserve_accumulated_damage = self.deferred_bitmap_frame.is_some();
+            let event = if let Some(frame) = self.deferred_bitmap_frame.take() {
+                macrdp_capture::CaptureEvent::Frame(frame)
+            } else {
+                match event_wait::next_event(
+                    self.capturer.next_frame(),
+                    idle_deadline,
+                    cursor_deadline,
+                )
+                .await
+                {
+                    DisplayWake::Capture(Some(event)) => {
+                        if matches!(&event, macrdp_capture::CaptureEvent::Frame(_)) {
+                            self.record_capture_delivery();
+                        }
+                        event
                     }
-                    continue 'updates;
+                    DisplayWake::Capture(None) => {
+                        if let Some(update) =
+                            self.run_coregraphics_fallback_until_recovered().await?
+                        {
+                            return Ok(Some(update));
+                        }
+                        continue 'updates;
+                    }
+                    DisplayWake::Cursor => continue 'updates,
+                    // Re-evaluate current recovery state and rate-limit attempts in
+                    // the same outer-loop path used by capture and cursor wakes.
+                    DisplayWake::Idle => continue 'updates,
                 }
-                DisplayWake::Cursor => continue 'updates,
-                // Re-evaluate current recovery state and rate-limit attempts in
-                // the same outer-loop path used by capture and cursor wakes.
-                DisplayWake::Idle => continue 'updates,
             };
             let frame = {
                 // Handle idle events (desktop unchanged)
                 let frame = match event {
                     macrdp_capture::CaptureEvent::Frame(f) => {
-                        let delivery = self.capturer.last_delivery_stats();
-                        {
-                            let mut gfx = self.gfx_state.lock().unwrap();
-                            gfx.capture_queue_ms = delivery.queue_ms;
-                            gfx.capture_frames_coalesced = gfx
-                                .capture_frames_coalesced
-                                .saturating_add(delivery.coalesced_frames);
-                        }
-                        if let Some(stats) = &self.perf_stats {
-                            stats
-                                .lock()
-                                .unwrap()
-                                .record_capture(delivery.queue_ms, delivery.coalesced_frames);
-                        }
                         if let Some(idle_since) = self.idle_since.take() {
                             let idle_for = idle_since.elapsed();
                             let action = idle_policy::resume_action(
@@ -1321,7 +1353,11 @@ impl MacDisplayUpdates {
                 // accumulates all overwritten damage relative to our last read.
                 // Draining here would discard that accumulated damage.
                 let mut latest = frame;
-                self.refine_capture_dirty_rects(&mut latest);
+                Self::refine_capture_dirty_rects(
+                    &mut latest,
+                    self.last_frame_cache.as_ref(),
+                    preserve_accumulated_damage,
+                );
                 latest
             };
 
@@ -1396,12 +1432,20 @@ impl MacDisplayUpdates {
         }
     }
 
-    fn refine_capture_dirty_rects(&self, frame: &mut CapturedFrame) {
-        if frame.dirty_rects.is_empty() {
+    fn refine_capture_dirty_rects(
+        frame: &mut CapturedFrame,
+        previous: Option<&CachedFrame>,
+        preserve_accumulated_damage: bool,
+    ) {
+        // Refreshed queued regions may already contain an intermediate image.
+        // Comparing their accumulated damage with the older capture cache can
+        // suppress a pixel that changed and reverted. Only the wire encoder's
+        // framebuffer tracks those partial deliveries accurately.
+        if preserve_accumulated_damage || frame.dirty_rects.is_empty() {
             return;
         }
 
-        let previous = match self.last_frame_cache.as_ref() {
+        let previous = match previous {
             Some(previous) => previous,
             None => return,
         };
@@ -1529,6 +1573,7 @@ impl MacDisplayUpdates {
         // into captured frames. When it is off, we need RDP pointer updates.
         if self.capture_config.show_cursor {
             self.last_cursor_fingerprint = None;
+            self.cursor_capture.reset();
             return None;
         }
 
@@ -1539,8 +1584,9 @@ impl MacDisplayUpdates {
 
         self.next_cursor_poll_at = now + CURSOR_POLL_INTERVAL;
 
-        match capture_current_cursor_shape() {
-            Ok(Some(shape)) => {
+        match self.cursor_capture.capture_if_changed() {
+            Ok(CursorUpdate::Unchanged) => None,
+            Ok(CursorUpdate::Shape(shape)) => {
                 let fingerprint = fingerprint_cursor_shape(&shape);
                 if self.last_cursor_fingerprint == Some(fingerprint) {
                     return None;
@@ -1549,7 +1595,7 @@ impl MacDisplayUpdates {
                 self.last_cursor_fingerprint = Some(fingerprint);
                 Some(DisplayUpdate::ColorPointer(cursor_shape_to_pointer(shape)))
             }
-            Ok(None) => {
+            Ok(CursorUpdate::Hidden) => {
                 if self.last_cursor_fingerprint.take().is_some() {
                     Some(DisplayUpdate::DefaultPointer)
                 } else {
@@ -1603,12 +1649,6 @@ impl MacDisplayUpdates {
             DisplayUpdate::HidePointer
         } else {
             DisplayUpdate::DefaultPointer
-        }
-    }
-
-    fn record_bitmap_update_metrics(&mut self, bytes_sent: u32) {
-        if let Some(ps) = &self.perf_stats {
-            ps.lock().unwrap().record_frame(0.0, bytes_sent, false);
         }
     }
 
@@ -1736,7 +1776,6 @@ impl MacDisplayUpdates {
             }
         } else if !session_uses_gfx {
             if let Some(bitmap) = self.cached_full_frame_bitmap_update() {
-                self.record_bitmap_update_metrics(bitmap.data.len() as u32);
                 self.record_bitmap_audit(&bitmap, "bitmap-cached-full-frame-recovery");
                 self.last_full_bitmap_sent = Some(Instant::now());
                 self.needs_full_bitmap_seed = false;
@@ -1893,6 +1932,60 @@ impl MacDisplayUpdates {
                 encoder.set_bitrate(bitrate);
             }
             tracing::info!(bitrate_bps = bitrate, "Encoder bitrate hot-update applied");
+        }
+    }
+
+    fn record_capture_delivery(&self) {
+        let delivery = self.capturer.last_delivery_stats();
+        let mut gfx = self.gfx_state.lock().unwrap();
+        gfx.capture_queue_ms = delivery.queue_ms;
+        gfx.capture_frames_coalesced = gfx
+            .capture_frames_coalesced
+            .saturating_add(delivery.coalesced_frames);
+        drop(gfx);
+        if let Some(stats) = &self.perf_stats {
+            stats
+                .lock()
+                .unwrap()
+                .record_capture(delivery.queue_ms, delivery.coalesced_frames);
+        }
+    }
+
+    fn sync_bitmap_pacing(&mut self) {
+        let costs = {
+            let gfx = self.gfx_state.lock().unwrap();
+            if gfx.bitmap_dispatches != self.bitmap_perf_dispatches {
+                let bytes = gfx.bitmap_wire_bytes.saturating_sub(self.bitmap_perf_bytes);
+                if bytes > 0 {
+                    if let Some(stats) = &self.perf_stats {
+                        stats.lock().unwrap().record_frame(
+                            gfx.last_encode_ms,
+                            u32::try_from(bytes).unwrap_or(u32::MAX),
+                            false,
+                        );
+                    }
+                }
+                self.bitmap_perf_dispatches = gfx.bitmap_dispatches;
+                self.bitmap_perf_bytes = gfx.bitmap_wire_bytes;
+            }
+            if gfx.session_uses_gfx && !gfx.bitmap_fallback_mode {
+                return;
+            }
+            bitmap_pacing::BitmapCosts {
+                dispatches: gfx.bitmap_dispatches,
+                encode_ms: gfx.bitmap_encode_ms_total,
+                write_ms: gfx.bitmap_write_ms_total,
+            }
+        };
+        self.sync_runtime_encoder_overrides();
+        if let Some(fps) = self.bitmap_pacing.observe(
+            costs,
+            self.pending_bitmap_updates.is_empty(),
+            self.bitrate_ctrl.target_fps(),
+            self.last_applied_fps,
+            Instant::now(),
+        ) {
+            self.apply_capture_fps(fps, "bitmap-service-time");
         }
     }
 
@@ -3498,7 +3591,6 @@ impl MacDisplayUpdates {
             }
 
             if let Some(bitmap) = updates.into_iter().next() {
-                self.record_bitmap_update_metrics(bitmap.data.len() as u32);
                 self.record_bitmap_audit(
                     &bitmap,
                     if emitted_full_frame {

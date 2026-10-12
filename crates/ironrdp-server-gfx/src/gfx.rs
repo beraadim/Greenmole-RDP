@@ -330,6 +330,10 @@ pub struct GfxState {
     pub total_bytes_sent: u64,
     /// Total compressed fast-path bytes sent for classic bitmap updates.
     pub bitmap_wire_bytes: u64,
+    /// Completed bitmap dispatches, including identical updates with no wire data.
+    pub bitmap_dispatches: u64,
+    pub bitmap_encode_ms_total: f64,
+    pub bitmap_write_ms_total: f64,
     /// Time of first frame sent
     pub start_time: Option<std::time::Instant>,
     /// Client peer IP address (set after TCP connection is established)
@@ -351,6 +355,8 @@ pub struct GfxState {
     pub resolution: Option<String>,
     /// Hot-updatable: encoder preference (set via ConfigUpdate)
     pub encoder_pref: Option<String>,
+    /// Backend instantiated by capture, rather than the configured preference.
+    pub active_encoder: Option<&'static str>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
     pub chroma_mode: Option<String>,
     /// Whether to force negotiated GFX sessions into uncompressed validation mode.
@@ -396,6 +402,9 @@ impl GfxState {
             last_frame_bytes: 0,
             total_bytes_sent: 0,
             bitmap_wire_bytes: 0,
+            bitmap_dispatches: 0,
+            bitmap_encode_ms_total: 0.0,
+            bitmap_write_ms_total: 0.0,
             start_time: None,
             peer_addr: None,
             bitrate_samples: Vec::new(),
@@ -408,6 +417,7 @@ impl GfxState {
             show_cursor: None,
             resolution: None,
             encoder_pref: None,
+            active_encoder: None,
             chroma_mode: None,
             gfx_validation_mode,
             avc_fallback_to_uncompressed: false,
@@ -558,6 +568,10 @@ impl GfxState {
         self.last_frame_bytes = 0;
         self.total_bytes_sent = 0;
         self.bitmap_wire_bytes = 0;
+        self.bitmap_dispatches = 0;
+        self.bitmap_encode_ms_total = 0.0;
+        self.bitmap_write_ms_total = 0.0;
+        self.active_encoder = None;
         self.start_time = None;
         self.bitrate_samples.clear();
         self.bitrate_max = 0.0;

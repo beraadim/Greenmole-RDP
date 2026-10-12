@@ -46,6 +46,9 @@ pub enum Quality {
 
 /// Video encoder trait
 pub trait VideoEncoder: Send {
+    /// Backend actually instantiated, including any initialization fallback.
+    fn backend_name(&self) -> &'static str;
+
     /// AVC420 encode (existing)
     fn encode_bgra(
         &mut self,

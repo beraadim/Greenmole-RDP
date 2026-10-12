@@ -76,9 +76,9 @@ impl Drop for FrameSender {
     }
 }
 
-impl FrameMailbox {
-    pub fn try_recv(&self) -> Option<CaptureEvent> {
-        let mut pending = self.pending.lock().unwrap();
+impl Pending {
+    fn take_frame(&mut self) -> Option<CapturedFrame> {
+        let pending = self;
         if let Some(frame) = pending.frame.take() {
             pending.last_delivery = CaptureDeliveryStats {
                 queue_ms: pending
@@ -94,10 +94,24 @@ impl FrameMailbox {
                 "Delivered latest captured frame"
             );
             pending.coalesced = 0;
-            Some(CaptureEvent::Frame(frame))
+            Some(frame)
         } else {
-            pending.status.take()
+            None
         }
+    }
+}
+
+impl FrameMailbox {
+    pub fn try_recv_frame(&self) -> Option<CapturedFrame> {
+        self.pending.lock().unwrap().take_frame()
+    }
+
+    pub fn try_recv(&self) -> Option<CaptureEvent> {
+        let mut pending = self.pending.lock().unwrap();
+        pending
+            .take_frame()
+            .map(CaptureEvent::Frame)
+            .or_else(|| pending.status.take())
     }
 
     pub fn last_delivery_stats(&self) -> CaptureDeliveryStats {
@@ -144,6 +158,24 @@ mod tests {
             }],
             content_rect: None,
         }
+    }
+
+    #[test]
+    fn pixel_refresh_preserves_capture_status_and_delivery_accounting() {
+        let mailbox = Arc::new(FrameMailbox::default());
+        let sender = FrameSender(mailbox.clone());
+        sender.send(CaptureEvent::Frame(frame(1, 1)));
+        sender.send(CaptureEvent::Frame(frame(2, 2)));
+        sender.send(CaptureEvent::Unavailable);
+        let latest = mailbox.try_recv_frame().unwrap();
+        assert_eq!(latest.timestamp_us, 2);
+        assert_eq!(latest.dirty_rects.len(), 2);
+        assert_eq!(mailbox.last_delivery_stats().coalesced_frames, 1);
+        assert!(mailbox.try_recv_frame().is_none());
+        assert!(matches!(
+            mailbox.try_recv(),
+            Some(CaptureEvent::Unavailable)
+        ));
     }
 
     #[tokio::test]

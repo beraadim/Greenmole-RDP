@@ -1,5 +1,6 @@
 mod commands;
 mod database;
+mod diagnostics;
 mod event_bridge;
 #[cfg(target_os = "macos")]
 mod own_windows;
@@ -142,6 +143,7 @@ pub fn run() {
             commands::get_tls_status,
             commands::set_config,
             commands::get_logs,
+            diagnostics::export_diagnostics,
             commands::get_connection_history,
             commands::get_traffic_stats,
             commands::check_for_updates,

@@ -7,6 +7,8 @@ use serde::Serialize;
 pub struct ServerStatus {
     pub running: bool,
     pub state: String,
+    /// Detailed local failure cause; excluded from exported diagnostic bundles.
+    pub error_details: Option<String>,
     pub uptime_secs: u64,
     pub port: Option<u16>,
     pub bind_address: Option<String>,
@@ -17,6 +19,7 @@ impl Default for ServerStatus {
         Self {
             running: false,
             state: "stopped".to_string(),
+            error_details: None,
             uptime_secs: 0,
             port: None,
             bind_address: None,
@@ -54,10 +57,16 @@ pub struct Metrics {
     pub pending_acks: u32,
     /// Effective transport path for the active session.
     pub transport_mode: String,
-    /// Current encoder preference/config context.
+    /// Instantiated backend and active graphics path, including fallback.
     pub encoder_mode: String,
     /// Human-readable note for how bitrate should be interpreted in this mode.
     pub bitrate_mode: String,
+    pub audio_dropped_frames: u64,
+    pub audio_stale_frames: u64,
+    pub audio_discontinuities: u64,
+    pub audio_invalid_frames: u64,
+    pub audio_queue_age_ms: f64,
+    pub audio_queued_ms: f64,
 }
 
 /// Connection event

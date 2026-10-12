@@ -95,6 +95,22 @@ impl MouseCoordMapper {
         (x, y)
     }
 
+    /// Apply RDP pixel deltas to a global CoreGraphics point position. Relative
+    /// motion uses the same content scale as absolute motion, including Retina
+    /// capture and letterboxing, and stays within the selected display.
+    pub fn map_relative(&self, current: (f64, f64), dx: i32, dy: i32) -> (f64, f64) {
+        let s = self.0.lock().unwrap();
+        let apply = |value: f64, delta: i32, origin: f64, extent: f64, pixels: f64| {
+            let current = if value.is_finite() { value } else { origin };
+            (current + f64::from(delta) * extent / pixels)
+                .clamp(origin, origin + (extent - 1.0).max(0.0))
+        };
+        (
+            apply(current.0, dx, s.origin_x, s.logical_w, s.content.width),
+            apply(current.1, dy, s.origin_y, s.logical_h, s.content.height),
+        )
+    }
+
     /// Set the selected display's global bounds before activating its capture stream.
     /// Invalid or unrepresentable bounds leave the previous mapping intact.
     pub fn update_display_bounds(
@@ -505,5 +521,40 @@ mod tests {
             mapper.update_display_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
             assert_point(mapper.map(960, 600), (-960.0, 840.0));
         }
+    }
+}
+
+#[cfg(test)]
+mod relative_tests {
+    use super::*;
+
+    #[test]
+    fn relative_motion_scales_retina_letterboxing_and_clamps_negative_display() {
+        let mapper = MouseCoordMapper::new(1000, 600, 2400, 1200);
+        mapper.update_display_bounds(-1000.0, -600.0, 1000.0, 600.0);
+        mapper.update_frame_content_rect(
+            2400,
+            1200,
+            Some(&ContentRect {
+                x: 200.0,
+                y: 0.0,
+                width: 2000.0,
+                height: 1200.0,
+            }),
+        );
+        assert_eq!(
+            mapper.map_relative((-500.0, -300.0), 20, -10),
+            (-490.0, -305.0)
+        );
+        assert_eq!(
+            mapper.map_relative((-500.0, -300.0), i32::MAX, i32::MIN),
+            (-1.0, -600.0)
+        );
+        assert_eq!(
+            mapper.map_relative((f64::NAN, f64::NAN), 20, 10),
+            (-990.0, -595.0)
+        );
+        mapper.update_display_bounds(0.0, 0.0, 1000.0, 600.0);
+        assert_eq!(mapper.map_relative((-500.0, -300.0), 0, 0), (0.0, 0.0));
     }
 }

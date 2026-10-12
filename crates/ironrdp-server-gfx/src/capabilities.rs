@@ -2,7 +2,10 @@ use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 
 use crate::{DesktopSize, RdpServerOptions};
 
-pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<capability_sets::CapabilitySet> {
+pub(crate) fn capabilities(
+    opts: &RdpServerOptions,
+    size: DesktopSize,
+) -> Vec<capability_sets::CapabilitySet> {
     vec![
         capability_sets::CapabilitySet::General(general_capabilities()),
         capability_sets::CapabilitySet::Bitmap(bitmap_capabilities(&size)),
@@ -62,6 +65,7 @@ fn input_capabilities() -> capability_sets::Input {
         input_flags: capability_sets::InputFlags::SCANCODES
             | capability_sets::InputFlags::MOUSE_RELATIVE
             | capability_sets::InputFlags::MOUSEX
+            | capability_sets::InputFlags::TS_MOUSE_HWHEEL
             | capability_sets::InputFlags::FASTPATH_INPUT
             | capability_sets::InputFlags::UNICODE
             | capability_sets::InputFlags::FASTPATH_INPUT_2,
@@ -85,5 +89,18 @@ fn multifragment_update() -> capability_sets::MultifragmentUpdate {
         // FIXME(#318): use an acceptable value for msctc.
         // What is the actual server max size?
         max_request_size: 16_777_215,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_capabilities_advertise_implemented_extended_mouse_features() {
+        let flags = input_capabilities().input_flags;
+        assert!(flags.contains(capability_sets::InputFlags::TS_MOUSE_HWHEEL));
+        assert!(flags.contains(capability_sets::InputFlags::MOUSE_RELATIVE));
+        assert!(flags.contains(capability_sets::InputFlags::MOUSEX));
     }
 }

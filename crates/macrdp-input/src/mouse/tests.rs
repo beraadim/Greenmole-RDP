@@ -1,10 +1,10 @@
-use super::{normalize_scroll_lines, MouseButton, MouseState};
+use super::{MouseButton, MouseState};
 use anyhow::Result;
-use core_graphics::event::{CGEventType, CGMouseButton};
+use core_graphics::event::CGEventType;
 use core_graphics::geometry::CGPoint;
 
 #[derive(Debug)]
-struct RecordedEvent(CGEventType, CGMouseButton, f64, f64);
+struct RecordedEvent(CGEventType, u32, f64, f64);
 
 impl PartialEq for RecordedEvent {
     fn eq(&self, other: &Self) -> bool {
@@ -18,7 +18,7 @@ impl PartialEq for RecordedEvent {
 
 fn record(
     events: &mut Vec<RecordedEvent>,
-) -> impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()> + '_ {
+) -> impl FnMut(CGEventType, u32, CGPoint) -> Result<()> + '_ {
     move |event_type, button, point| {
         events.push(RecordedEvent(event_type, button, point.x, point.y));
         Ok(())
@@ -30,21 +30,21 @@ fn posts_drag_events_between_each_button_down_and_up() {
     for (button, cg_button, down, dragged, up) in [
         (
             MouseButton::Left,
-            CGMouseButton::Left,
+            MouseButton::Left as u32,
             CGEventType::LeftMouseDown,
             CGEventType::LeftMouseDragged,
             CGEventType::LeftMouseUp,
         ),
         (
             MouseButton::Right,
-            CGMouseButton::Right,
+            MouseButton::Right as u32,
             CGEventType::RightMouseDown,
             CGEventType::RightMouseDragged,
             CGEventType::RightMouseUp,
         ),
         (
             MouseButton::Middle,
-            CGMouseButton::Center,
+            MouseButton::Middle as u32,
             CGEventType::OtherMouseDown,
             CGEventType::OtherMouseDragged,
             CGEventType::OtherMouseUp,
@@ -67,12 +67,22 @@ fn posts_drag_events_between_each_button_down_and_up() {
         assert_eq!(
             events,
             vec![
-                RecordedEvent(CGEventType::MouseMoved, CGMouseButton::Left, -100.5, 20.25),
+                RecordedEvent(
+                    CGEventType::MouseMoved,
+                    MouseButton::Left as u32,
+                    -100.5,
+                    20.25
+                ),
                 RecordedEvent(down, cg_button, -100.5, 20.25),
                 RecordedEvent(dragged, cg_button, -80.0, 25.0),
                 RecordedEvent(dragged, cg_button, -30.0, 50.0),
                 RecordedEvent(up, cg_button, -30.0, 50.0),
-                RecordedEvent(CGEventType::MouseMoved, CGMouseButton::Left, 10.0, 60.0),
+                RecordedEvent(
+                    CGEventType::MouseMoved,
+                    MouseButton::Left as u32,
+                    10.0,
+                    60.0
+                ),
             ],
             "incorrect drag sequence for {button:?}"
         );
@@ -84,19 +94,19 @@ fn stationary_clicks_do_not_emit_drag_events() {
     for (button, cg_button, down, up) in [
         (
             MouseButton::Left,
-            CGMouseButton::Left,
+            MouseButton::Left as u32,
             CGEventType::LeftMouseDown,
             CGEventType::LeftMouseUp,
         ),
         (
             MouseButton::Right,
-            CGMouseButton::Right,
+            MouseButton::Right as u32,
             CGEventType::RightMouseDown,
             CGEventType::RightMouseUp,
         ),
         (
             MouseButton::Middle,
-            CGMouseButton::Center,
+            MouseButton::Middle as u32,
             CGEventType::OtherMouseDown,
             CGEventType::OtherMouseUp,
         ),
@@ -116,7 +126,7 @@ fn stationary_clicks_do_not_emit_drag_events() {
                     .button_event(button, false, x, y, record(&mut events))
                     .unwrap();
                 expected.extend([
-                    RecordedEvent(CGEventType::MouseMoved, CGMouseButton::Left, x, y),
+                    RecordedEvent(CGEventType::MouseMoved, MouseButton::Left as u32, x, y),
                     RecordedEvent(down, cg_button, x, y),
                     RecordedEvent(up, cg_button, x, y),
                 ]);
@@ -163,29 +173,34 @@ fn releasing_one_button_preserves_other_buttons_and_duplicate_events_are_idempot
         vec![
             RecordedEvent(
                 CGEventType::LeftMouseDragged,
-                CGMouseButton::Left,
+                MouseButton::Left as u32,
                 11.0,
                 20.0
             ),
             RecordedEvent(
                 CGEventType::RightMouseDragged,
-                CGMouseButton::Right,
+                MouseButton::Right as u32,
                 12.0,
                 20.0
             ),
             RecordedEvent(
                 CGEventType::RightMouseDragged,
-                CGMouseButton::Right,
+                MouseButton::Right as u32,
                 13.0,
                 20.0
             ),
             RecordedEvent(
                 CGEventType::OtherMouseDragged,
-                CGMouseButton::Center,
+                MouseButton::Middle as u32,
                 14.0,
                 20.0
             ),
-            RecordedEvent(CGEventType::MouseMoved, CGMouseButton::Left, 15.0, 20.0),
+            RecordedEvent(
+                CGEventType::MouseMoved,
+                MouseButton::Left as u32,
+                15.0,
+                20.0
+            ),
         ]
     );
 }
@@ -220,7 +235,7 @@ fn rejects_nonfinite_positions_before_posting_or_changing_state() {
         events,
         vec![RecordedEvent(
             CGEventType::LeftMouseUp,
-            CGMouseButton::Left,
+            MouseButton::Left as u32,
             -42.5,
             80.25
         )]
@@ -252,7 +267,7 @@ fn failed_posts_do_not_start_or_end_drags_or_change_cleanup_position() {
         events.last(),
         Some(&RecordedEvent(
             CGEventType::LeftMouseUp,
-            CGMouseButton::Left,
+            MouseButton::Left as u32,
             10.0,
             20.0
         ))
@@ -282,19 +297,19 @@ fn cleanup_releases_every_held_button_at_last_successful_move_and_is_repeatable(
         vec![
             RecordedEvent(
                 CGEventType::LeftMouseUp,
-                CGMouseButton::Left,
+                MouseButton::Left as u32,
                 -100.5,
                 300.25
             ),
             RecordedEvent(
                 CGEventType::RightMouseUp,
-                CGMouseButton::Right,
+                MouseButton::Right as u32,
                 -100.5,
                 300.25
             ),
             RecordedEvent(
                 CGEventType::OtherMouseUp,
-                CGMouseButton::Center,
+                MouseButton::Middle as u32,
                 -100.5,
                 300.25
             ),
@@ -315,7 +330,7 @@ fn cleanup_continues_after_failures_and_retries_only_failed_buttons() {
     let mut attempts = Vec::new();
     let result = mouse.release_all(|event_type, button, point| {
         attempts.push(RecordedEvent(event_type, button, point.x, point.y));
-        if matches!(button, CGMouseButton::Left | CGMouseButton::Center) {
+        if button == MouseButton::Left as u32 || button == MouseButton::Middle as u32 {
             anyhow::bail!("failed release for {button:?}");
         }
         Ok(())
@@ -324,9 +339,24 @@ fn cleanup_continues_after_failures_and_retries_only_failed_buttons() {
     assert_eq!(
         attempts,
         vec![
-            RecordedEvent(CGEventType::LeftMouseUp, CGMouseButton::Left, 15.0, 25.0),
-            RecordedEvent(CGEventType::RightMouseUp, CGMouseButton::Right, 15.0, 25.0),
-            RecordedEvent(CGEventType::OtherMouseUp, CGMouseButton::Center, 15.0, 25.0),
+            RecordedEvent(
+                CGEventType::LeftMouseUp,
+                MouseButton::Left as u32,
+                15.0,
+                25.0
+            ),
+            RecordedEvent(
+                CGEventType::RightMouseUp,
+                MouseButton::Right as u32,
+                15.0,
+                25.0
+            ),
+            RecordedEvent(
+                CGEventType::OtherMouseUp,
+                MouseButton::Middle as u32,
+                15.0,
+                25.0
+            ),
         ]
     );
     let mut retries = Vec::new();
@@ -335,8 +365,18 @@ fn cleanup_continues_after_failures_and_retries_only_failed_buttons() {
     assert_eq!(
         retries,
         vec![
-            RecordedEvent(CGEventType::LeftMouseUp, CGMouseButton::Left, 15.0, 25.0),
-            RecordedEvent(CGEventType::OtherMouseUp, CGMouseButton::Center, 15.0, 25.0),
+            RecordedEvent(
+                CGEventType::LeftMouseUp,
+                MouseButton::Left as u32,
+                15.0,
+                25.0
+            ),
+            RecordedEvent(
+                CGEventType::OtherMouseUp,
+                MouseButton::Middle as u32,
+                15.0,
+                25.0
+            ),
         ]
     );
     mouse.move_to(1.0, 2.0, record(&mut retries)).unwrap();
@@ -351,16 +391,35 @@ fn cleanup_without_held_buttons_does_not_post() {
 }
 
 #[test]
-fn keeps_small_scroll_values() {
-    assert_eq!(normalize_scroll_lines(0), 0);
-    assert_eq!(normalize_scroll_lines(1), 1);
-    assert_eq!(normalize_scroll_lines(-3), -3);
+fn side_buttons_use_native_numbers_and_cleanup_ends_their_drags() {
+    for button in [MouseButton::Button4, MouseButton::Button5] {
+        let mut state = MouseState::default();
+        let mut events = Vec::new();
+        state
+            .button_event(button, true, 10.0, 20.0, record(&mut events))
+            .unwrap();
+        state.move_to(11.0, 21.0, record(&mut events)).unwrap();
+        state.release_all(record(&mut events)).unwrap();
+        state
+            .release_all(|_, _, _| panic!("repeat cleanup posted"))
+            .unwrap();
+        assert_eq!(
+            events,
+            [
+                RecordedEvent(CGEventType::OtherMouseDown, button as u32, 10.0, 20.0),
+                RecordedEvent(CGEventType::OtherMouseDragged, button as u32, 11.0, 21.0),
+                RecordedEvent(CGEventType::OtherMouseUp, button as u32, 11.0, 21.0),
+            ]
+        );
+    }
 }
 
 #[test]
-fn converts_windows_wheel_detents_to_lines() {
-    assert_eq!(normalize_scroll_lines(120), 1);
-    assert_eq!(normalize_scroll_lines(-120), -1);
-    assert_eq!(normalize_scroll_lines(240), 2);
-    assert_eq!(normalize_scroll_lines(-241), -3);
+fn release_for_unowned_button_does_not_affect_local_mouse() {
+    let mut state = MouseState::default();
+    for button in MouseButton::ALL {
+        state
+            .button_event(button, false, 0.0, 0.0, |_, _, _| panic!("unowned release"))
+            .unwrap();
+    }
 }

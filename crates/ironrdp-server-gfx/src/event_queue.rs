@@ -1,8 +1,10 @@
 //! Bounded producer queues scoped to one connection. Overflow fails the
-//! connection instead of silently losing an audio/clipboard protocol message.
+//! connection instead of silently losing a reliable protocol message. PCM audio
+//! has a separate duration budget and deadline, so stalls do not replay old sound.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_rdpsnd::server::RdpsndServerMessage;
@@ -13,6 +15,50 @@ use super::{Credentials, ServerEvent};
 const DATA_CAPACITY: usize = 256;
 const DATA_BYTES: usize = 32 * 1024 * 1024;
 const CONTROL_CAPACITY: usize = 32;
+const AUDIO_BUDGET_US: u32 = 200_000;
+const MAX_AUDIO_AGE: Duration = Duration::from_millis(200);
+
+#[derive(Default)]
+pub struct AudioQueueStats {
+    dropped: AtomicU64,
+    stale: AtomicU64,
+    queue_age_us: AtomicU64,
+    queued_us: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioQueueSnapshot {
+    pub dropped_frames: u64,
+    pub stale_frames: u64,
+    pub queue_age_ms: f64,
+    pub queued_ms: f64,
+}
+
+impl AudioQueueStats {
+    pub fn snapshot(&self) -> AudioQueueSnapshot {
+        AudioQueueSnapshot {
+            dropped_frames: self.dropped.load(Ordering::Relaxed),
+            stale_frames: self.stale.load(Ordering::Relaxed),
+            queue_age_ms: self.queue_age_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            queued_ms: self.queued_us.load(Ordering::Relaxed) as f64 / 1000.0,
+        }
+    }
+}
+
+struct QueuedAudio {
+    captured_at: Instant,
+    duration_us: u32,
+    stats: Arc<AudioQueueStats>,
+    _duration: OwnedSemaphorePermit,
+}
+
+impl Drop for QueuedAudio {
+    fn drop(&mut self) {
+        self.stats
+            .queued_us
+            .fetch_sub(u64::from(self.duration_us), Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionStatus {
@@ -47,15 +93,49 @@ impl Session {
     }
 }
 
-struct QueuedEvent {
+pub(super) struct QueuedEvent {
     event: ServerEvent,
+    admission: EventAdmission,
+}
+
+/// Retain queue budgets and capture age until the event has passed both the
+/// server lock and serialized socket-write admission.
+pub(super) struct EventAdmission {
     session: Arc<Session>,
     _bytes: OwnedSemaphorePermit,
+    audio: Option<QueuedAudio>,
+}
+
+impl QueuedEvent {
+    pub(super) fn into_parts(self) -> (ServerEvent, EventAdmission) {
+        (self.event, self.admission)
+    }
+}
+
+impl EventAdmission {
+    pub(super) fn is_deliverable_at(&self, now: Instant) -> bool {
+        if !self.session.active.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(audio) = &self.audio {
+            let age = now.saturating_duration_since(audio.captured_at);
+            audio.stats.queue_age_us.store(
+                age.as_micros().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            if age > MAX_AUDIO_AGE {
+                audio.stats.stale.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Synchronous, bounded event sender usable from native callbacks. Producers
 /// receive a connection-scoped clone; a disconnected producer cannot enqueue
-/// into the next client's session. Any rejected data message fails its session.
+/// into the next client's session. Reliable messages rejected by `send` fail
+/// their session; disposable PCM uses `send_audio_wave` with a freshness limit.
 #[derive(Clone)]
 pub struct ServerEventTx {
     data: mpsc::Sender<QueuedEvent>,
@@ -63,6 +143,8 @@ pub struct ServerEventTx {
     credentials: watch::Sender<Option<Credentials>>,
     quit: watch::Sender<bool>,
     budget: Arc<Semaphore>,
+    audio_budget: Arc<Semaphore>,
+    audio_stats: Arc<AudioQueueStats>,
     current: Arc<Mutex<Arc<Session>>>,
     scope: Option<Arc<Session>>,
 }
@@ -119,6 +201,8 @@ fn channel_with_limits(capacity: usize, bytes: usize) -> (ServerEventTx, ServerE
             credentials: credentials_tx,
             quit: quit_tx,
             budget: Arc::new(Semaphore::new(bytes)),
+            audio_budget: Arc::new(Semaphore::new(AUDIO_BUDGET_US as usize)),
+            audio_stats: Arc::default(),
             current: Arc::new(Mutex::new(Session::new())),
             scope: None,
         },
@@ -134,6 +218,78 @@ fn channel_with_limits(capacity: usize, bytes: usize) -> (ServerEventTx, ServerE
 }
 
 impl ServerEventTx {
+    pub fn audio_stats(&self) -> Arc<AudioQueueStats> {
+        self.audio_stats.clone()
+    }
+
+    /// Enqueue disposable PCM with its original local capture time. `false`
+    /// means this packet was intentionally dropped to preserve live playback;
+    /// reliable channel messages still use `send` and fail on overflow.
+    pub fn send_audio_wave(
+        &self,
+        data: Vec<u8>,
+        timestamp_ms: u32,
+        duration: Duration,
+        captured_at: Instant,
+    ) -> Result<bool, ServerEventSendError> {
+        if self.data.is_closed() {
+            return Err(ServerEventSendError("session is closed"));
+        }
+        let current = self.current.lock().unwrap();
+        let session = self.scope.clone().unwrap_or_else(|| current.clone());
+        if !session.active.load(Ordering::Acquire) {
+            return Err(ServerEventSendError("session is closed"));
+        }
+        if captured_at.elapsed() > MAX_AUDIO_AGE {
+            self.audio_stats.stale.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let duration_us = u32::try_from(duration.as_nanos().div_ceil(1000))
+            .ok()
+            .filter(|value| (1..=AUDIO_BUDGET_US).contains(value));
+        let permit =
+            duration_us.and_then(|us| self.audio_budget.clone().try_acquire_many_owned(us).ok());
+        let Some(duration_permit) = permit else {
+            self.audio_stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        let event = ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp_ms));
+        let bytes = event_bytes(&event)
+            .and_then(|n| u32::try_from(n).ok())
+            .and_then(|n| self.budget.clone().try_acquire_many_owned(n).ok());
+        let Some(bytes) = bytes else {
+            self.audio_stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        let duration_us = duration_us.unwrap();
+        self.audio_stats
+            .queued_us
+            .fetch_add(u64::from(duration_us), Ordering::Relaxed);
+        let queued = QueuedEvent {
+            event,
+            admission: EventAdmission {
+                session,
+                _bytes: bytes,
+                audio: Some(QueuedAudio {
+                    captured_at,
+                    duration_us,
+                    stats: self.audio_stats.clone(),
+                    _duration: duration_permit,
+                }),
+            },
+        };
+        match self.data.try_send(queued) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.audio_stats.dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(ServerEventSendError("session is closed"))
+            }
+        }
+    }
+
     fn session(&self) -> Arc<Session> {
         self.scope
             .clone()
@@ -237,8 +393,11 @@ impl ServerEventTx {
                 self.data
                     .try_send(QueuedEvent {
                         event,
-                        session: session.clone(),
-                        _bytes: permit,
+                        admission: EventAdmission {
+                            session: session.clone(),
+                            _bytes: permit,
+                            audio: None,
+                        },
                     })
                     .map_err(|_| {
                         session.fail("output event queue full or closed");
@@ -302,10 +461,10 @@ impl ControlReceiver {
 }
 
 impl DataReceiver {
-    pub(super) async fn recv(&mut self) -> Option<ServerEvent> {
+    pub(super) async fn recv(&mut self) -> Option<QueuedEvent> {
         while let Some(queued) = self.data.recv().await {
-            if queued.session.active.load(Ordering::Acquire) {
-                return Some(queued.event);
+            if queued.admission.is_deliverable_at(Instant::now()) {
+                return Some(queued);
             }
         }
         None
@@ -314,7 +473,7 @@ impl DataReceiver {
     fn try_recv(&mut self) -> Result<ServerEvent, mpsc::error::TryRecvError> {
         loop {
             let queued = self.data.try_recv()?;
-            if queued.session.active.load(Ordering::Acquire) {
+            if queued.admission.is_deliverable_at(Instant::now()) {
                 return Ok(queued.event);
             }
         }
@@ -331,9 +490,9 @@ impl ServerEventRx {
             biased;
             event = self.controls.recv() => match event {
                 Some(event) => Some(event),
-                None => self.data.recv().await,
+                None => self.data.recv().await.map(|queued| queued.event),
             },
-            event = self.data.recv() => event,
+            event = self.data.recv() => event.map(|queued| queued.event),
         }
     }
 
@@ -351,6 +510,112 @@ mod tests {
 
     fn wave(bytes: usize) -> ServerEvent {
         ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(vec![0; bytes], 0))
+    }
+
+    #[tokio::test]
+    async fn dequeue_retains_deadline_and_budget_until_dispatch_finishes() {
+        let (sender, mut receiver) = channel();
+        let now = Instant::now();
+        sender
+            .send_audio_wave(vec![0; 3840], 0, Duration::from_millis(20), now)
+            .unwrap();
+        let (event, admission) = receiver.data.recv().await.unwrap().into_parts();
+        assert!(matches!(event, ServerEvent::Rdpsnd(_)));
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 20.0);
+        assert!(admission.is_deliverable_at(now));
+        // This interval represents waiting for the server state lock.
+        assert!(!admission.is_deliverable_at(now + Duration::from_millis(201)));
+        assert_eq!(sender.audio_stats().snapshot().stale_frames, 1);
+        drop(admission);
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+    }
+
+    #[test]
+    fn live_pcm_duration_budget_drops_audio_without_failing_reliable_channels() {
+        let (sender, mut receiver) = channel();
+        let now = Instant::now();
+        for timestamp in 0..10 {
+            assert!(sender
+                .send_audio_wave(
+                    vec![0; 3840],
+                    timestamp * 20,
+                    Duration::from_millis(20),
+                    now
+                )
+                .unwrap());
+        }
+        assert!(!sender
+            .send_audio_wave(vec![0; 3840], 200, Duration::from_millis(20), now)
+            .unwrap());
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 200.0);
+        assert_eq!(sender.audio_stats().snapshot().dropped_frames, 1);
+        assert!(!sender.is_closed());
+        assert!(matches!(receiver.try_recv(), Ok(ServerEvent::Rdpsnd(_))));
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 180.0);
+        assert!(sender
+            .send_audio_wave(vec![0; 3840], 220, Duration::from_millis(20), now)
+            .unwrap());
+        receiver.data.discard_pending();
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+    }
+
+    #[test]
+    fn stale_pcm_never_reaches_client_and_budget_is_reclaimed() {
+        let (sender, mut receiver) = channel();
+        let now = Instant::now();
+        sender
+            .send_audio_wave(vec![0; 3840], 0, Duration::from_millis(20), now)
+            .unwrap();
+        // Move only the synthetic packet clock, avoiding slow/flaky sleeps.
+        let mut queued = receiver.data.data.try_recv().unwrap();
+        queued.admission.audio.as_mut().unwrap().captured_at = now - Duration::from_secs(1);
+        sender
+            .data
+            .try_send(queued)
+            .unwrap_or_else(|_| panic!("test queue unexpectedly full"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(sender.audio_stats().snapshot().stale_frames, 1);
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+        assert!(!sender.is_closed());
+        assert!(sender
+            .send_audio_wave(
+                vec![0; 3840],
+                1000,
+                Duration::from_millis(20),
+                Instant::now()
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn audio_cannot_exhaust_count_or_byte_budgets_and_disconnect_next_client() {
+        let (sender, mut receiver) = channel_with_limits(1, 4096);
+        let (old_guard, old_sender) = sender.start_session();
+        let now = Instant::now();
+        assert!(!old_sender
+            .send_audio_wave(vec![0; 4096], 0, Duration::from_millis(20), now)
+            .unwrap());
+        assert!(!old_sender.is_closed());
+        assert!(old_sender
+            .send_audio_wave(vec![0; 100], 20, Duration::from_millis(20), now)
+            .unwrap());
+        assert!(!old_sender
+            .send_audio_wave(vec![0; 100], 40, Duration::from_millis(20), now)
+            .unwrap());
+        drop(old_guard);
+        let (_new_guard, new_sender) = sender.start_session();
+        receiver.data.discard_pending();
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+        assert!(old_sender
+            .send_audio_wave(vec![0; 100], 60, Duration::from_millis(20), now)
+            .is_err());
+        assert!(new_sender
+            .send_audio_wave(vec![0; 100], 80, Duration::from_millis(20), now)
+            .unwrap());
+        assert!(!new_sender.is_closed());
     }
 
     #[tokio::test]

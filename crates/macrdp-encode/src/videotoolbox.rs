@@ -1493,6 +1493,10 @@ impl VtEncoder {
 }
 
 impl VideoEncoder for VtEncoder {
+    fn backend_name(&self) -> &'static str {
+        "videotoolbox"
+    }
+
     fn encode_bgra(
         &mut self,
         data: &[u8],

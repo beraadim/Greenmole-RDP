@@ -5,6 +5,7 @@ import { useConnections } from "../hooks/useConnections";
 import { useMetricHistory } from "../hooks/useFpsHistory";
 import { api } from "../lib/ipc";
 import StatusBar from "../components/StatusBar";
+import ServerError from "../components/ServerError";
 import MoveWindowsControl from "../components/MoveWindowsControl";
 import MetricCard from "../components/MetricCard";
 import { ChartPanel } from "../components/ChartPanel";
@@ -18,6 +19,7 @@ function Dashboard() {
   const { metrics, stale, error } = useMetrics();
   const connections = useConnections();
   const [loading, setLoading] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [config, setConfig] = useState<UiConfig | null>(null);
   const [inputDebug, setInputDebug] = useState<InputDebugState | null>(null);
 
@@ -60,6 +62,7 @@ function Dashboard() {
 
   // Clear loading when backend state actually changes
   useEffect(() => {
+    if (status.running) setActionError(null);
     if (loading && (status.state === "running" || status.state.startsWith("error"))) {
       setLoading(false);
     }
@@ -73,10 +76,11 @@ function Dashboard() {
   const handleStart = async () => {
     if (loading) return;
     setLoading(true);
+    setActionError(null);
     try {
       await api.startServer();
     } catch (err: unknown) {
-      console.error("Failed to start server:", err);
+      setActionError(String(err));
       setLoading(false);
     }
   };
@@ -84,10 +88,11 @@ function Dashboard() {
   const handleStop = async () => {
     if (loading) return;
     setLoading(true);
+    setActionError(null);
     try {
       await api.stopServer();
     } catch (err: unknown) {
-      console.error("Failed to stop server:", err);
+      setActionError(String(err));
       setLoading(false);
     }
   };
@@ -116,6 +121,8 @@ function Dashboard() {
         onStart={handleStart}
         onStop={handleStop}
       />
+
+      <ServerError message={actionError ?? status.error_details} />
 
       <MoveWindowsControl />
 
@@ -181,6 +188,11 @@ function Dashboard() {
             <div>Encode delivery: {metrics.completion_queue_ms.toFixed(1)} ms</div>
             <div>Socket write: {metrics.write_ms.toFixed(1)} ms</div>
             <div>Frames combined: {metrics.capture_frames_coalesced}</div>
+            <div>Audio queue: {metrics.audio_queued_ms.toFixed(0)} ms</div>
+            <div>Last audio wait: {metrics.audio_queue_age_ms.toFixed(0)} ms</div>
+            <div>Audio drops: {metrics.audio_dropped_frames}</div>
+            <div>Stale audio drops: {metrics.audio_stale_frames}</div>
+            <div>Audio resyncs: {metrics.audio_discontinuities}</div>
             <div title="Time from sending graphics to client decode acknowledgement; includes client processing.">
               Graphics ACK: {metrics.ack_suspended ? "not reported" : `${metrics.latency_ms.toFixed(1)} ms`}
             </div>

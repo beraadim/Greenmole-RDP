@@ -78,6 +78,7 @@ use crate::config::ServerConfig;
 use crate::permissions;
 use crate::tls;
 
+mod audio_metrics;
 mod metrics;
 mod startup;
 use metrics::MetricsSnapshot;
@@ -102,6 +103,7 @@ mod tests {
 
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
+    audio_stats: Arc<macrdp_audio::AudioStats>,
     tls_certificate: tls::TlsCertificateInfo,
     terminal_result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
     display_backend: macrdp_display::DisplayBackend,
@@ -187,6 +189,12 @@ impl ServerHandle {
                     "stopped"
                 }
                 .to_string(),
+                error_details: self
+                    .terminal_result
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err().cloned()),
                 uptime_secs: 0,
                 port: Some(self.port),
                 bind_address: Some(self.bind_addr.ip().to_string()),
@@ -195,6 +203,7 @@ impl ServerHandle {
             ServerStatus {
                 running: true,
                 state: "running".to_string(),
+                error_details: None,
                 uptime_secs: self.started_at.elapsed().as_secs(),
                 port: Some(self.port),
                 bind_address: Some(self.bind_addr.ip().to_string()),
@@ -205,7 +214,9 @@ impl ServerHandle {
     /// Current performance metrics.
     pub fn metrics(&self) -> Metrics {
         let gfx = self.gfx_state.lock().unwrap();
-        self.metrics_snapshot.lock().unwrap().sample(&gfx)
+        let mut metrics = self.metrics_snapshot.lock().unwrap().sample(&gfx);
+        audio_metrics::enrich(&mut metrics, &self.audio_stats);
+        metrics
     }
 
     /// Total successfully written display bytes without advancing rate sampling.
@@ -311,6 +322,7 @@ impl Drop for ServerHandle {
 /// Arguments that are Send-safe, passed to the server thread.
 /// RdpServer itself is !Send, so we pass everything needed to construct it.
 struct ServerThreadArgs {
+    audio_stats: Arc<macrdp_audio::AudioStats>,
     terminal_result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
     listener: TcpListener,
     perf_stats: Option<crate::perf_stats::SharedPerfStats>,
@@ -381,6 +393,7 @@ pub async fn start_server_with_perf(
         tracing::error!(%error, "RDP server startup failed");
         handler.on_status_change(ServerStatus {
             state: "error: RDP server startup failed".into(),
+            error_details: Some(format!("{error:#}")),
             ..ServerStatus::default()
         });
     }
@@ -397,6 +410,7 @@ async fn start_server_inner(
     handler.on_status_change(ServerStatus {
         running: false,
         state: "starting".to_string(),
+        error_details: None,
         uptime_secs: 0,
         port: None,
         bind_address: None,
@@ -485,8 +499,10 @@ async fn start_server_inner(
     let (config_tx, config_rx) = tokio::sync::mpsc::channel::<ConfigUpdate>(32);
 
     let terminal_result = Arc::new(Mutex::new(None));
+    let audio_stats = Arc::new(macrdp_audio::AudioStats::default());
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
+        audio_stats: audio_stats.clone(),
         terminal_result: Arc::clone(&terminal_result),
         listener,
         perf_stats,
@@ -525,6 +541,7 @@ async fn start_server_inner(
         .context("Failed to spawn RDP server thread")?;
 
     let handle = Arc::new(ServerHandle {
+        audio_stats,
         tls_certificate,
         terminal_result,
         display_backend: backend,
@@ -552,6 +569,7 @@ async fn start_server_inner(
     cancellation.0 = None;
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&handle.gfx_state);
+    let metrics_audio = Arc::clone(&handle.audio_stats);
     let handler_for_metrics = Arc::clone(&handler);
     let worker_done = Arc::clone(&handle.terminal_result);
     let metrics_task = tokio::spawn(async move {
@@ -562,7 +580,8 @@ async fn start_server_inner(
             if worker_done.lock().unwrap().is_some() {
                 break;
             }
-            let metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
+            let mut metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
+            audio_metrics::enrich(&mut metrics, &metrics_audio);
             handler_for_metrics.on_metrics(metrics);
         }
     });
@@ -599,6 +618,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                 args.handler.on_status_change(ServerStatus {
                     running: false,
                     state: "error: TLS certificate initialization failed".to_string(),
+                    error_details: Some(format!("{e:#}")),
                     uptime_secs: 0,
                     port: Some(args.bind_addr.port()),
                     bind_address: Some(args.bind_addr.ip().to_string()),
@@ -613,6 +633,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                 args.handler.on_status_change(ServerStatus {
                     running: false,
                     state: "error: TLS configuration failed".to_string(),
+                    error_details: Some(format!("{e:#}")),
                     uptime_secs: 0,
                     port: Some(args.bind_addr.port()),
                     bind_address: Some(args.bind_addr.ip().to_string()),
@@ -643,11 +664,14 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
         // Create audio factory
         let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
             if let Some(ref shared_tx) = shared_audio_tx {
-                Some(Box::new(macrdp_audio::MacAudioFactory::new(
-                    shared_tx.clone(),
-                    args.config.audio.sample_rate,
-                    args.config.audio.channels,
-                )))
+                Some(Box::new(
+                    macrdp_audio::MacAudioFactory::new(
+                        shared_tx.clone(),
+                        args.config.audio.sample_rate,
+                        args.config.audio.channels,
+                    )
+                    .with_stats(args.audio_stats.clone()),
+                ))
             } else {
                 None
             };
@@ -783,6 +807,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             args.handler.on_status_change(ServerStatus {
                 running: true,
                 state: "running".into(),
+                error_details: None,
                 uptime_secs: 0,
                 port: Some(args.bind_addr.port()),
                 bind_address: Some(args.bind_addr.ip().to_string()),
@@ -799,6 +824,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                     args.handler.on_status_change(ServerStatus {
                         running: false,
                         state: "error: RDP server stopped unexpectedly".to_string(),
+                        error_details: Some(format!("{e:#}")),
                         uptime_secs: 0,
                         port: Some(args.bind_addr.port()),
                         bind_address: Some(args.bind_addr.ip().to_string()),

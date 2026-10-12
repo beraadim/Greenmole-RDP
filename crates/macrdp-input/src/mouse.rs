@@ -1,10 +1,16 @@
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
 
 extern "C" {
+    fn CGEventCreateMouseEvent(
+        source: *mut core_graphics::sys::CGEventSource,
+        event_type: CGEventType,
+        point: CGPoint,
+        button: u32,
+    ) -> *mut core_graphics::sys::CGEvent;
     fn CGEventCreateScrollWheelEvent2(
         source: *mut core_graphics::sys::CGEventSource,
         units: u32,
@@ -17,30 +23,17 @@ extern "C" {
 
 /// ScrollEventUnit::Line
 const SCROLL_UNIT_LINE: u32 = 1;
-const WINDOWS_WHEEL_DELTA: i32 = 120;
-
-fn normalize_scroll_lines(vertical: i16) -> i32 {
-    let raw = i32::from(vertical);
-    if raw == 0 {
-        return 0;
-    }
-
-    let magnitude = raw.abs();
-    if magnitude >= WINDOWS_WHEEL_DELTA {
-        let detents = (magnitude + WINDOWS_WHEEL_DELTA - 1) / WINDOWS_WHEEL_DELTA;
-        raw.signum() * detents
-    } else {
-        raw
-    }
-}
+mod scroll;
+use scroll::ScrollState;
 
 pub struct MouseInjector {
     state: MouseState,
+    scroll: ScrollState,
 }
 
 #[derive(Default)]
 struct MouseState {
-    pressed: [bool; 3],
+    pressed: [bool; 5],
     position: (f64, f64),
 }
 
@@ -51,6 +44,7 @@ impl MouseInjector {
         })?;
         Ok(Self {
             state: MouseState::default(),
+            scroll: ScrollState::default(),
         })
     }
 
@@ -77,43 +71,55 @@ impl MouseInjector {
 
     /// Release only buttons held by this remote session, at its last posted position.
     pub fn release_all(&mut self) -> Result<()> {
+        self.scroll = ScrollState::default();
         self.state.release_all(Self::post_mouse_event)
     }
 
-    fn post_mouse_event(
-        event_type: CGEventType,
-        button: CGMouseButton,
-        point: CGPoint,
-    ) -> Result<()> {
+    fn post_mouse_event(event_type: CGEventType, button: u32, point: CGPoint) -> Result<()> {
         let source = Self::source()?;
-        let event = CGEvent::new_mouse_event(source, event_type, point, button)
-            .map_err(|_| anyhow::anyhow!("Failed to create mouse event: {event_type:?}"))?;
+        // The Rust CGMouseButton enum only exposes 0..=2. CoreGraphics accepts
+        // other button numbers through its C API; never manufacture invalid enums.
+        let event_ref =
+            unsafe { CGEventCreateMouseEvent(source.as_ptr(), event_type, point, button) };
+        anyhow::ensure!(
+            !event_ref.is_null(),
+            "Failed to create mouse event: {event_type:?}"
+        );
+        let event = unsafe { CGEvent::from_ptr(event_ref) };
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
 
-    pub fn scroll(&self, vertical: i16) -> Result<()> {
-        let normalized = normalize_scroll_lines(vertical);
-        if normalized == 0 {
-            return Ok(());
-        }
+    /// Read the host cursor once when establishing a relative-input session.
+    pub fn current_position(&self) -> Result<(f64, f64)> {
+        let event = CGEvent::new(Self::source()?)
+            .map_err(|_| anyhow::anyhow!("Failed to read cursor position"))?;
+        let point = event.location();
+        Ok((point.x, point.y))
+    }
 
+    /// RDP uses 120 rotation units per detent for both Guacamole and mstsc.
+    pub fn scroll(&mut self, horizontal: i32, vertical: i32) -> Result<()> {
+        self.scroll.scroll(horizontal, vertical, Self::post_scroll)
+    }
+
+    /// FreeRDP AINPUT uses signed 16.16 rotation units rather than integer units.
+    pub fn scroll_high_resolution(&mut self, horizontal: i32, vertical: i32) -> Result<()> {
+        self.scroll.scroll_fixed(
+            i64::from(horizontal),
+            i64::from(vertical),
+            Self::post_scroll,
+        )
+    }
+
+    fn post_scroll(x: i32, y: i32) -> Result<()> {
         unsafe {
-            let event_ref = CGEventCreateScrollWheelEvent2(
-                std::ptr::null_mut(),
-                SCROLL_UNIT_LINE,
-                1,
-                normalized,
-                0,
-                0,
-            );
-            if event_ref.is_null() {
-                return Err(anyhow::anyhow!("Failed to create scroll event"));
-            }
+            let event_ref =
+                CGEventCreateScrollWheelEvent2(std::ptr::null_mut(), SCROLL_UNIT_LINE, 2, y, x, 0);
+            anyhow::ensure!(!event_ref.is_null(), "Failed to create scroll event");
             let event = CGEvent::from_ptr(event_ref);
             event.post(CGEventTapLocation::HID);
         }
-        tracing::trace!(vertical, normalized, "Mouse scroll");
         Ok(())
     }
 }
@@ -131,7 +137,7 @@ impl MouseState {
         &mut self,
         x: f64,
         y: f64,
-        mut post: impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()>,
+        mut post: impl FnMut(CGEventType, u32, CGPoint) -> Result<()>,
     ) -> Result<()> {
         anyhow::ensure!(
             x.is_finite() && y.is_finite(),
@@ -147,13 +153,20 @@ impl MouseState {
         // Track remote buttons independently of the local hardware mouse. Prefer
         // the left button for chords so another held button cannot stop selection.
         let (event_type, button) = if self.pressed[MouseButton::Left as usize] {
-            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+            (CGEventType::LeftMouseDragged, MouseButton::Left as u32)
         } else if self.pressed[MouseButton::Right as usize] {
-            (CGEventType::RightMouseDragged, CGMouseButton::Right)
-        } else if self.pressed[MouseButton::Middle as usize] {
-            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+            (CGEventType::RightMouseDragged, MouseButton::Right as u32)
+        } else if let Some(button) = [
+            MouseButton::Middle,
+            MouseButton::Button4,
+            MouseButton::Button5,
+        ]
+        .into_iter()
+        .find(|button| self.pressed[*button as usize])
+        {
+            (CGEventType::OtherMouseDragged, button as u32)
         } else {
-            (CGEventType::MouseMoved, CGMouseButton::Left)
+            (CGEventType::MouseMoved, MouseButton::Left as u32)
         };
         post(event_type, button, point)?;
         self.position = (x, y);
@@ -167,20 +180,23 @@ impl MouseState {
         pressed: bool,
         x: f64,
         y: f64,
-        mut post: impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()>,
+        mut post: impl FnMut(CGEventType, u32, CGPoint) -> Result<()>,
     ) -> Result<()> {
         anyhow::ensure!(
             x.is_finite() && y.is_finite(),
             "Mouse position must be finite"
         );
+        if !pressed && !self.pressed[button as usize] {
+            return Ok(());
+        }
         let point = CGPoint::new(x, y);
         let (event_type, cg_button) = match (button, pressed) {
-            (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-            (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-            (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-            (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-            (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-            (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+            (MouseButton::Left, true) => (CGEventType::LeftMouseDown, MouseButton::Left as u32),
+            (MouseButton::Left, false) => (CGEventType::LeftMouseUp, MouseButton::Left as u32),
+            (MouseButton::Right, true) => (CGEventType::RightMouseDown, MouseButton::Right as u32),
+            (MouseButton::Right, false) => (CGEventType::RightMouseUp, MouseButton::Right as u32),
+            (other, true) => (CGEventType::OtherMouseDown, other as u32),
+            (other, false) => (CGEventType::OtherMouseUp, other as u32),
         };
 
         post(event_type, cg_button, point)?;
@@ -193,11 +209,11 @@ impl MouseState {
 
     fn release_all(
         &mut self,
-        mut post: impl FnMut(CGEventType, CGMouseButton, CGPoint) -> Result<()>,
+        mut post: impl FnMut(CGEventType, u32, CGPoint) -> Result<()>,
     ) -> Result<()> {
         let mut first_error = None;
         let mut released = 0;
-        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+        for button in MouseButton::ALL {
             if self.pressed[button as usize] {
                 let (x, y) = self.position;
                 match self.button_event(button, false, x, y, &mut post) {
@@ -223,6 +239,18 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+    Button4,
+    Button5,
+}
+
+impl MouseButton {
+    const ALL: [Self; 5] = [
+        Self::Left,
+        Self::Right,
+        Self::Middle,
+        Self::Button4,
+        Self::Button5,
+    ];
 }
 
 #[cfg(test)]

@@ -25,7 +25,13 @@ fn derive_transport_mode(gfx: &GfxState) -> String {
         return "bitmap-fallback".to_string();
     }
 
-    if gfx.avc_fallback_to_uncompressed {
+    if gfx.gfx_validation_mode && gfx.caps_confirmed {
+        return "gfx-uncompressed".to_string();
+    }
+
+    if gfx.avc_fallback_to_uncompressed
+        || (gfx.caps_confirmed && gfx.avc420_supported && gfx.active_encoder.is_none())
+    {
         return "gfx-uncompressed-fallback".to_string();
     }
 
@@ -43,19 +49,14 @@ fn derive_transport_mode(gfx: &GfxState) -> String {
 }
 
 fn derive_encoder_mode(gfx: &GfxState, transport_mode: &str) -> String {
-    let encoder = gfx.encoder_pref.as_deref().unwrap_or("auto");
-    let chroma = gfx.chroma_mode.as_deref().unwrap_or("avc420");
+    let encoder = gfx.active_encoder.unwrap_or("unavailable");
 
     match transport_mode {
         "gfx-avc444" => format!("{encoder} / avc444"),
         "gfx-avc420" => format!("{encoder} / avc420"),
-        "gfx-uncompressed" | "gfx-uncompressed-fallback" => {
-            format!("{encoder} / {chroma} configured, uncompressed active")
-        }
-        "bitmap" | "bitmap-fallback" => {
-            format!("{encoder} / {chroma} configured, bitmap active")
-        }
-        _ => format!("{encoder} / {chroma}"),
+        "gfx-uncompressed" | "gfx-uncompressed-fallback" => "uncompressed".to_string(),
+        "bitmap" | "bitmap-fallback" => "bitmap".to_string(),
+        _ => "negotiating".to_string(),
     }
 }
 
@@ -127,6 +128,7 @@ impl MetricsSnapshot {
             transport_mode,
             encoder_mode,
             bitrate_mode,
+            ..Metrics::default()
         }
     }
 }
@@ -134,6 +136,46 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_instantiated_backend_and_actual_fallback_transport() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.encoder_pref = Some("hardware".into());
+        gfx.session_uses_gfx = true;
+        gfx.caps_confirmed = true;
+        gfx.avc420_supported = true;
+        gfx.active_encoder = Some("openh264");
+        assert_eq!(
+            MetricsSnapshot::default().sample(&gfx).encoder_mode,
+            "openh264 / avc420"
+        );
+        gfx.active_encoder = None;
+        let metrics = MetricsSnapshot::default().sample(&gfx);
+        assert_eq!(metrics.transport_mode, "gfx-uncompressed-fallback");
+        assert_eq!(metrics.encoder_mode, "uncompressed");
+        gfx.bitmap_fallback_mode = true;
+        assert_eq!(
+            MetricsSnapshot::default().sample(&gfx).encoder_mode,
+            "bitmap"
+        );
+    }
+
+    #[test]
+    fn validation_mode_reports_uncompressed_even_when_avc_was_negotiated() {
+        let mut gfx = GfxState::new(1920, 1080, true, true);
+        gfx.session_uses_gfx = true;
+        gfx.caps_confirmed = true;
+        gfx.avc420_supported = true;
+        gfx.avc444_supported = true;
+        gfx.active_encoder = Some("videotoolbox");
+        let metrics = MetricsSnapshot::default().sample(&gfx);
+        assert_eq!(metrics.transport_mode, "gfx-uncompressed");
+        assert_eq!(metrics.encoder_mode, "uncompressed");
+        assert_eq!(
+            metrics.bitrate_mode,
+            "Wire throughput only (uncompressed GFX)"
+        );
+    }
 
     #[test]
     fn ack_latency_is_not_reduced_by_encoder_time() {

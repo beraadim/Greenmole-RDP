@@ -55,7 +55,9 @@ use connection_control::{wait_for_idle_timeout, DEFAULT_HANDSHAKE_TIMEOUT};
 
 #[path = "event_queue.rs"]
 mod event_queue;
-pub use event_queue::{ServerEventRx, ServerEventSendError, ServerEventTx};
+pub use event_queue::{
+    AudioQueueSnapshot, AudioQueueStats, ServerEventRx, ServerEventSendError, ServerEventTx,
+};
 #[path = "output.rs"]
 mod output;
 use output::{SharedWriter, DEFAULT_WRITE_TIMEOUT};
@@ -124,7 +126,7 @@ impl RdpServerSecurity {
 }
 
 struct AInputHandler {
-    pending: mpsc::Sender<crate::MouseEvent>,
+    pending: mpsc::Sender<ironrdp_ainput::MousePdu>,
     worker: task::JoinHandle<()>,
     activity: watch::Sender<tokio::time::Instant>,
 }
@@ -140,7 +142,7 @@ impl AInputHandler {
         let (pending, mut receiver) = mpsc::channel(128);
         let worker = task::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                handler.lock().await.mouse(event);
+                handler.lock().await.ainput_pdu(event);
             }
         });
         Self {
@@ -179,7 +181,7 @@ impl dvc::DvcProcessor for AInputHandler {
 
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
-                self.pending.try_send(pdu.into()).map_err(|_| {
+                self.pending.try_send(pdu).map_err(|_| {
                     decode_err!(std::io::Error::other(
                         "additional input queue is full or closed"
                     ))
@@ -742,8 +744,12 @@ impl RdpServer {
         let mut encoder_iter = encoder.update(update);
         let mut bytes_written = 0usize;
         let mut write_ms = 0.0;
+        let mut encode_ms = 0.0;
         loop {
-            let Some(fragmenter) = encoder_iter.next().await else {
+            let encode_started = std::time::Instant::now();
+            let fragmenter = encoder_iter.next().await;
+            encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+            let Some(fragmenter) = fragmenter else {
                 break;
             };
 
@@ -765,6 +771,10 @@ impl RdpServer {
 
         if is_bitmap_update {
             let mut state = gfx_state.lock().unwrap();
+            state.last_encode_ms = encode_ms;
+            state.bitmap_dispatches = state.bitmap_dispatches.saturating_add(1);
+            state.bitmap_encode_ms_total += encode_ms;
+            state.bitmap_write_ms_total += write_ms;
             state.bitmap_wire_bytes = state.bitmap_wire_bytes.saturating_add(bytes_written as u64);
             if bytes_written > 0 {
                 state.record_display_write(bytes_written, write_ms);
@@ -823,6 +833,9 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    // Encode the complete logical audio event into one write,
+                    // including both legacy WaveInfo/WaveData and SVC fragments.
+                    // Freshness admission must never drop only half of a wave.
                     let data =
                         server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
@@ -1019,13 +1032,22 @@ impl RdpServer {
         let dispatch_events = async move {
             let mut events = Vec::with_capacity(1);
             loop {
-                let Some(event) = data.recv().await else {
+                let Some(queued) = data.recv().await else {
                     break Ok(RunState::Disconnect);
                 };
-                events.push(event);
+                let (event, admission) = queued.into_parts();
                 let mut this = this.lock().await;
+                if !admission.is_deliverable_at(std::time::Instant::now()) {
+                    continue;
+                }
+                events.push(event);
+                // Display output can hold the socket lock after we acquire the
+                // server lock. Keep capture metadata and budgets until the
+                // writer rechecks admission immediately before any bytes.
+                let mut admitted_writer = event_writer
+                    .with_admission(|| admission.is_deliverable_at(std::time::Instant::now()));
                 match this
-                    .dispatch_server_events(&mut events, &mut event_writer, user_channel_id)
+                    .dispatch_server_events(&mut events, &mut admitted_writer, user_channel_id)
                     .await?
                 {
                     RunState::Continue => continue,
@@ -1452,7 +1474,7 @@ impl RdpServer {
                 }
 
                 ironrdp_pdu::input::InputEvent::MouseRel(mouse) => {
-                    handler.mouse(mouse.into());
+                    handler.mouse_rel_pdu(mouse);
                 }
 
                 ironrdp_pdu::input::InputEvent::Unused(_) => {}

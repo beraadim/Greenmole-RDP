@@ -1,6 +1,10 @@
 use anyhow::Result;
+use std::cell::RefCell;
+
+mod state;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use state::{InjectedKey, KeyboardState};
 
 use crate::keymap::scancode_to_keycode;
 
@@ -8,26 +12,20 @@ unsafe extern "C" {
     fn CGEventSourceFlagsState(state_id: CGEventSourceStateID) -> CGEventFlags;
 }
 
-pub struct KeyboardInjector;
+/// Tracks successfully posted keys independently of local hardware state.
+pub struct KeyboardInjector {
+    state: RefCell<KeyboardState>,
+}
 
 impl KeyboardInjector {
-    const TRANSIENT_MODIFIERS: &'static [(u8, bool)] = &[
-        (0x2A, false), // Left Shift
-        (0x36, false), // Right Shift
-        (0x1D, false), // Left Ctrl
-        (0x1D, true),  // Right Ctrl
-        (0x38, false), // Left Alt / Command mapping
-        (0x38, true),  // Right Alt / Command mapping
-        (0x5B, true),  // Left Win / Option mapping
-        (0x5C, true),  // Right Win / Option mapping
-    ];
-
     pub fn new() -> Result<Self> {
         // Verify we can create an event source (permission check)
         let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
             anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
         })?;
-        Ok(Self)
+        Ok(Self {
+            state: RefCell::new(KeyboardState::default()),
+        })
     }
 
     fn source() -> Result<CGEventSource> {
@@ -41,6 +39,18 @@ impl KeyboardInjector {
     }
 
     pub fn inject_keycode(&self, keycode: u16, pressed: bool) -> Result<()> {
+        self.state
+            .borrow_mut()
+            .inject(InjectedKey::Physical(keycode), pressed, Self::post)
+    }
+
+    fn post(key: InjectedKey, pressed: bool) -> Result<()> {
+        let InjectedKey::Physical(keycode) = key else {
+            let InjectedKey::Unicode(ch) = key else {
+                unreachable!()
+            };
+            return Self::post_unicode(ch, pressed);
+        };
         let source = Self::source()?;
         let event = CGEvent::new_keyboard_event(source, keycode as CGKeyCode, pressed)
             .map_err(|_| anyhow::anyhow!("Failed to create keyboard event"))?;
@@ -70,29 +80,20 @@ impl KeyboardInjector {
         self.inject_key(scancode, extended, false)
     }
 
+    /// Release only modifiers successfully pressed by this injector. Never emit
+    /// blanket key-ups for local modifiers when a remote session synchronizes.
     pub fn release_transient_modifiers(&self) -> Result<()> {
-        for (scancode, extended) in Self::TRANSIENT_MODIFIERS {
-            self.inject_key(*scancode, *extended, false)?;
-        }
-
-        // Release both right-side macOS modifiers explicitly so session-specific
-        // AltGr handling cannot leave a stuck key behind after sync.
-        self.inject_keycode(0x36, false)?; // Right Command
-        self.inject_keycode(0x3D, false)?; // Right Option
-
-        Ok(())
+        self.state
+            .borrow_mut()
+            .release_matching(InjectedKey::is_modifier, Self::post)
     }
 
-    pub fn hard_reset_state(&self) -> Result<()> {
-        self.release_transient_modifiers()?;
-        self.inject_keycode(0x37, false)?; // Left Command
-        self.inject_keycode(0x3A, false)?; // Left Option
-        self.inject_keycode(0x3B, false)?; // Left Control
-        self.inject_keycode(0x38, false)?; // Left Shift
-        self.inject_keycode(0x3C, false)?; // Right Shift
-        self.inject_keycode(0x3E, false)?; // Right Control
-        self.inject_keycode(0x3F, false)?; // Function
-        Ok(())
+    /// Release physical keys and Unicode events, including failed earlier key-ups.
+    /// Successful releases are removed; a later cleanup retries only failures.
+    pub fn release_all(&self) -> Result<()> {
+        self.state
+            .borrow_mut()
+            .release_matching(|_| true, Self::post)
     }
 
     pub fn current_modifier_flags(&self) -> (Vec<String>, u64) {
@@ -126,6 +127,12 @@ impl KeyboardInjector {
 
     /// Inject a unicode character press/release
     pub fn inject_unicode(&self, ch: u16, pressed: bool) -> Result<()> {
+        self.state
+            .borrow_mut()
+            .inject(InjectedKey::Unicode(ch), pressed, Self::post)
+    }
+
+    fn post_unicode(ch: u16, pressed: bool) -> Result<()> {
         // Use an isolated event source here so translated text injection does
         // not inherit or feed back into the live HID modifier state.
         let source = Self::private_source()?;
@@ -139,5 +146,13 @@ impl KeyboardInjector {
 
         event.post(CGEventTapLocation::HID);
         Ok(())
+    }
+}
+
+impl Drop for KeyboardInjector {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_all() {
+            tracing::warn!(%error, "Failed to release held remote keys on injector drop");
+        }
     }
 }

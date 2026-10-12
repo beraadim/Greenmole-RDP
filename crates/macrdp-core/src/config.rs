@@ -149,14 +149,10 @@ impl ServerConfig {
                 .map_or(true, |value| value > 0 && value <= 1000),
             "bitrate_mbps must be between 1 and 1000"
         );
-        anyhow::ensure!(
-            matches!(self.audio.channels, 1 | 2),
-            "audio channels must be 1 or 2"
-        );
-        anyhow::ensure!(
-            (8000..=192000).contains(&self.audio.sample_rate),
-            "Invalid audio sample rate"
-        );
+        if self.audio.enabled {
+            anyhow::ensure!(self.audio.sample_rate == 48000 && self.audio.channels == 2,
+                "Audio capture supports 48000 Hz stereo only; set audio.sample_rate=48000 and audio.channels=2, or disable audio");
+        }
         Ok(())
     }
 
@@ -220,6 +216,25 @@ fn config_dir_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_audio_requires_the_native_capture_format() {
+        let mut config = ServerConfig::default();
+        config.username = Some("fixture-user".into());
+        config.password = Some("fixture-secret".into());
+        assert!(config.validate().is_ok());
+        config.audio.sample_rate = 44100;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("48000 Hz stereo"));
+        config.audio.sample_rate = 48000;
+        config.audio.channels = 1;
+        assert!(config.validate().is_err());
+        config.audio.enabled = false;
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn test_default_config() {

@@ -17,6 +17,22 @@ pub(super) struct SharedWriter<'w, W: FramedWrite> {
     timeout: Duration,
 }
 
+pub(super) struct AdmittedWriter<'a, 'w, W: FramedWrite, F> {
+    writer: &'a mut SharedWriter<'w, W>,
+    admit: F,
+}
+
+impl<W: FramedWrite, F: Fn() -> bool> FramedWrite for AdmittedWriter<'_, '_, W, F> {
+    type WriteAllFut<'write>
+        = core::pin::Pin<Box<dyn core::future::Future<Output = io::Result<()>> + 'write>>
+    where
+        Self: 'write;
+
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+        self.writer.write_all_if(buf, &self.admit)
+    }
+}
+
 impl<W: FramedWrite> Clone for SharedWriter<'_, W> {
     fn clone(&self) -> Self {
         Self {
@@ -47,6 +63,28 @@ impl<W: FramedWrite> FramedWrite for SharedWriter<'_, W> {
         Self: 'write;
 
     fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+        self.write_all_if(buf, || true)
+    }
+}
+
+impl<'w, W: FramedWrite> SharedWriter<'w, W> {
+    /// Check freshness after acquiring the socket lock, immediately before the
+    /// first byte. Expiring an unstarted PCM packet does not poison the stream.
+    pub(super) fn with_admission<F: Fn() -> bool>(
+        &mut self,
+        admit: F,
+    ) -> AdmittedWriter<'_, 'w, W, F> {
+        AdmittedWriter {
+            writer: self,
+            admit,
+        }
+    }
+
+    fn write_all_if<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+        admit: impl Fn() -> bool + 'a,
+    ) -> <Self as FramedWrite>::WriteAllFut<'a> {
         Box::pin(async move {
             let result = tokio::time::timeout(self.timeout, async {
                 let mut writer = self.writer.lock().await;
@@ -55,6 +93,9 @@ impl<W: FramedWrite> FramedWrite for SharedWriter<'_, W> {
                         io::ErrorKind::BrokenPipe,
                         "RDP output stream is poisoned",
                     ));
+                }
+                if !admit() {
+                    return Ok(());
                 }
                 let mut guard = PartialWriteGuard {
                     poisoned: &self.poisoned,
@@ -94,6 +135,60 @@ mod tests {
     use super::*;
     use ironrdp_tokio::{split_tokio_framed, TokioFramed};
     use tokio::io::AsyncReadExt as _;
+
+    #[tokio::test(start_paused = true)]
+    async fn audio_expiring_behind_socket_lock_writes_nothing_and_keeps_stream_usable() {
+        let (sender, mut receiver) = super::super::event_queue::channel();
+        let now = std::time::Instant::now();
+        sender
+            .send_audio_wave(b"stale".to_vec(), 0, Duration::from_millis(20), now)
+            .unwrap();
+        let (event, admission) = receiver.data.recv().await.unwrap().into_parts();
+        let super::super::ServerEvent::Rdpsnd(ironrdp_rdpsnd::server::RdpsndServerMessage::Wave(
+            data,
+            _,
+        )) = event
+        else {
+            panic!("missing audio");
+        };
+        let clock = Cell::new(now);
+        let checks = Cell::new(0);
+        let (stream, mut peer) = tokio::io::duplex(32);
+        let (_, mut native_writer) = split_tokio_framed(TokioFramed::new(stream));
+        let mut writer = SharedWriter::new(&mut native_writer, Duration::from_secs(10));
+        let serialization = writer.writer.clone();
+        let display_lock = serialization.lock().await;
+        let mut admitted = writer.with_admission(|| {
+            checks.set(checks.get() + 1);
+            admission.is_deliverable_at(clock.get())
+        });
+        let (result, ()) = tokio::join!(admitted.write_all(&data), async {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                checks.get(),
+                0,
+                "freshness must be checked after lock acquisition"
+            );
+            assert_eq!(sender.audio_stats().snapshot().queued_ms, 20.0);
+            clock.set(now + Duration::from_millis(201));
+            drop(display_lock);
+        });
+        result.unwrap();
+        drop(admitted);
+        assert_eq!(checks.get(), 1);
+        assert_eq!(sender.audio_stats().snapshot().stale_frames, 1);
+        drop(admission);
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+        let mut bytes = [0; 5];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), peer.read(&mut bytes))
+                .await
+                .is_err()
+        );
+        writer.write_all(b"fresh").await.unwrap();
+        peer.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"fresh");
+    }
 
     #[tokio::test(start_paused = true)]
     async fn nonreading_peer_times_out_after_partial_write_and_poisons_clones() {

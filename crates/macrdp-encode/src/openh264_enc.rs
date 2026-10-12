@@ -241,6 +241,10 @@ fn bgra_to_yuv420_padded(
 }
 
 impl VideoEncoder for OpenH264Encoder {
+    fn backend_name(&self) -> &'static str {
+        "openh264"
+    }
+
     fn encode_bgra(
         &mut self,
         data: &[u8],

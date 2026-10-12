@@ -1,5 +1,6 @@
 use ironrdp_ainput as ainput;
-use ironrdp_pdu::input::fast_path::{self, SynchronizeFlags};
+use ironrdp_pdu::input::fast_path;
+pub use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_pdu::input::mouse::PointerFlags;
 use ironrdp_pdu::input::mouse_rel::PointerRelFlags;
 use ironrdp_pdu::input::mouse_x::PointerXFlags;
@@ -25,7 +26,10 @@ pub enum KeyboardEvent {
 ///
 #[derive(Debug, PartialEq, Eq)]
 pub enum MouseEvent {
-    Move { x: u16, y: u16 },
+    Move {
+        x: u16,
+        y: u16,
+    },
     RightPressed,
     RightReleased,
     LeftPressed,
@@ -36,9 +40,22 @@ pub enum MouseEvent {
     Button4Released,
     Button5Pressed,
     Button5Released,
-    VerticalScroll { value: i16 },
-    Scroll { x: i32, y: i32 },
-    RelMove { x: i32, y: i32 },
+    VerticalScroll {
+        value: i16,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+    },
+    /// Additional input wheel units in signed 16.16 fixed-point format.
+    ScrollHighResolution {
+        x: i32,
+        y: i32,
+    },
+    RelMove {
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +182,119 @@ pub trait RdpServerInputHandler: Send {
             }
         }
     }
+
+    /// Relative packets can combine movement with several button transitions.
+    fn mouse_rel_pdu(&mut self, event: MouseRelPdu) {
+        let actions = PointerRelFlags::MOVE
+            | PointerRelFlags::BUTTON1
+            | PointerRelFlags::BUTTON2
+            | PointerRelFlags::BUTTON3
+            | PointerRelFlags::XBUTTON1
+            | PointerRelFlags::XBUTTON2;
+        if !event.flags.intersects(actions) {
+            return;
+        }
+        if event.x_delta != 0 || event.y_delta != 0 {
+            self.mouse(MouseEvent::RelMove {
+                x: event.x_delta.into(),
+                y: event.y_delta.into(),
+            });
+        }
+        let down = event.flags.contains(PointerRelFlags::DOWN);
+        for (flag, pressed, released) in [
+            (
+                PointerRelFlags::BUTTON1,
+                MouseEvent::LeftPressed,
+                MouseEvent::LeftReleased,
+            ),
+            (
+                PointerRelFlags::BUTTON2,
+                MouseEvent::RightPressed,
+                MouseEvent::RightReleased,
+            ),
+            (
+                PointerRelFlags::BUTTON3,
+                MouseEvent::MiddlePressed,
+                MouseEvent::MiddleReleased,
+            ),
+            (
+                PointerRelFlags::XBUTTON1,
+                MouseEvent::Button4Pressed,
+                MouseEvent::Button4Released,
+            ),
+            (
+                PointerRelFlags::XBUTTON2,
+                MouseEvent::Button5Pressed,
+                MouseEvent::Button5Released,
+            ),
+        ] {
+            if event.flags.contains(flag) {
+                self.mouse(if down { pressed } else { released });
+            }
+        }
+    }
+
+    /// Preserve all additional-input packet components and never interpret wheel
+    /// rotation units as cursor coordinates or warp an unknown event to (0, 0).
+    fn ainput_pdu(&mut self, event: ainput::MousePdu) {
+        use ainput::MouseEventFlags as F;
+        if event.flags.contains(F::WHEEL) {
+            self.mouse(MouseEvent::ScrollHighResolution {
+                x: event.x,
+                y: event.y,
+            });
+            return;
+        }
+        let buttons = F::BUTTON1 | F::BUTTON2 | F::BUTTON3 | F::XBUTTON1 | F::XBUTTON2;
+        if !event.flags.intersects(F::MOVE | buttons) {
+            return;
+        }
+        if event.flags.contains(F::REL) {
+            if event.x != 0 || event.y != 0 {
+                self.mouse(MouseEvent::RelMove {
+                    x: event.x,
+                    y: event.y,
+                });
+            }
+        } else if event.flags.intersects(F::MOVE | buttons) {
+            self.mouse(MouseEvent::Move {
+                x: event.x.clamp(0, i32::from(u16::MAX)) as u16,
+                y: event.y.clamp(0, i32::from(u16::MAX)) as u16,
+            });
+        }
+        let down = event.flags.contains(F::DOWN);
+        for (flag, pressed, released) in [
+            (
+                F::BUTTON1,
+                MouseEvent::LeftPressed,
+                MouseEvent::LeftReleased,
+            ),
+            (
+                F::BUTTON2,
+                MouseEvent::RightPressed,
+                MouseEvent::RightReleased,
+            ),
+            (
+                F::BUTTON3,
+                MouseEvent::MiddlePressed,
+                MouseEvent::MiddleReleased,
+            ),
+            (
+                F::XBUTTON1,
+                MouseEvent::Button4Pressed,
+                MouseEvent::Button4Released,
+            ),
+            (
+                F::XBUTTON2,
+                MouseEvent::Button5Pressed,
+                MouseEvent::Button5Released,
+            ),
+        ] {
+            if event.flags.contains(flag) {
+                self.mouse(if down { pressed } else { released });
+            }
+        }
+    }
 }
 
 impl From<(u8, fast_path::KeyboardFlags)> for KeyboardEvent {
@@ -244,17 +374,28 @@ impl From<SyncToggleFlags> for KeyboardEvent {
     }
 }
 
+/// ironrdp-pdu 0.7 decodes the sign bit as sign-magnitude and drops the raw
+/// low-byte flags. Recover the protocol's signed nine-bit value at the adapter.
+/// Wire fixtures below intentionally fail if that dependency changes behavior.
+fn wheel_rotation_units(value: &MousePdu) -> i16 {
+    if value.flags.contains(PointerFlags::WHEEL_NEGATIVE) {
+        (-256 - i32::from(value.number_of_wheel_rotation_units)).clamp(-256, -1) as i16
+    } else {
+        value.number_of_wheel_rotation_units
+    }
+}
+
 impl From<MousePdu> for MouseEvent {
     fn from(value: MousePdu) -> Self {
         // Wheel packets ignore other flags and their position fields. Use mouse_pdu
         // when forwarding a whole packet: a single event cannot also carry a button's position.
         if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
             MouseEvent::VerticalScroll {
-                value: value.number_of_wheel_rotation_units,
+                value: wheel_rotation_units(&value),
             }
         } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
             MouseEvent::Scroll {
-                x: i32::from(value.number_of_wheel_rotation_units),
+                x: i32::from(wheel_rotation_units(&value)),
                 y: 0,
             }
         } else if value.flags.contains(PointerFlags::LEFT_BUTTON) {
@@ -371,7 +512,7 @@ impl From<ainput::MousePdu> for MouseEvent {
                 MouseEvent::MiddleReleased
             }
         } else if value.flags.contains(MouseEventFlags::WHEEL) {
-            MouseEvent::Scroll {
+            MouseEvent::ScrollHighResolution {
                 x: value.x,
                 y: value.y,
             }
@@ -577,5 +718,113 @@ mod tests {
         });
 
         assert!(handler.events.is_empty());
+    }
+
+    #[test]
+    fn wire_wheel_values_use_signed_nine_bit_rotation_for_both_axes() {
+        // Guacamole's concrete +/-120 packets are 0x0278 and 0x0388.
+        // Cover every legal wire value, including high-resolution +/-1.
+        for delta in -256i16..=255 {
+            for wheel in [PointerFlags::VERTICAL_WHEEL, PointerFlags::HORIZONTAL_WHEEL] {
+                let mut bytes = [0u8; 6];
+                let flags = wheel.bits() | ((delta as u16) & 0x01FF);
+                bytes[..2].copy_from_slice(&flags.to_le_bytes());
+                let pdu: MousePdu = ironrdp_core::decode(&bytes).unwrap();
+                let mut handler = RecordingHandler::default();
+                handler.mouse_pdu(pdu);
+                let expected = if wheel == PointerFlags::VERTICAL_WHEEL {
+                    MouseEvent::VerticalScroll { value: delta }
+                } else {
+                    MouseEvent::Scroll {
+                        x: i32::from(delta),
+                        y: 0,
+                    }
+                };
+                assert_eq!(handler.events, [expected], "wire delta {delta}");
+            }
+        }
+    }
+
+    #[test]
+    fn relative_packet_preserves_motion_and_all_button_transitions() {
+        use super::{MouseRelPdu, PointerRelFlags as F};
+        let mut handler = RecordingHandler::default();
+        handler.mouse_rel_pdu(MouseRelPdu {
+            flags: F::DOWN | F::BUTTON1 | F::XBUTTON1 | F::XBUTTON2,
+            x_delta: -10,
+            y_delta: 20,
+        });
+        handler.mouse_rel_pdu(MouseRelPdu {
+            flags: F::BUTTON1 | F::XBUTTON1 | F::XBUTTON2,
+            x_delta: 0,
+            y_delta: 0,
+        });
+        handler.mouse_rel_pdu(MouseRelPdu {
+            flags: F::empty(),
+            x_delta: 100,
+            y_delta: 100,
+        });
+        assert_eq!(
+            handler.events,
+            [
+                MouseEvent::RelMove { x: -10, y: 20 },
+                MouseEvent::LeftPressed,
+                MouseEvent::Button4Pressed,
+                MouseEvent::Button5Pressed,
+                MouseEvent::LeftReleased,
+                MouseEvent::Button4Released,
+                MouseEvent::Button5Released,
+            ]
+        );
+    }
+
+    #[test]
+    fn advanced_packets_preserve_combined_motion_buttons_and_wheel_units() {
+        use super::ainput::{MouseEventFlags as F, MousePdu as Pdu};
+        let mut handler = RecordingHandler::default();
+        handler.ainput_pdu(Pdu {
+            time: 0,
+            flags: F::REL | F::DOWN | F::BUTTON1 | F::XBUTTON2,
+            x: -10,
+            y: 20,
+        });
+        handler.ainput_pdu(Pdu {
+            time: 0,
+            flags: F::XBUTTON2,
+            x: 200,
+            y: 300,
+        });
+        handler.ainput_pdu(Pdu {
+            time: 0,
+            flags: F::WHEEL | F::MOVE | F::BUTTON1,
+            x: 120 << 16,
+            y: -120 << 16,
+        });
+        handler.ainput_pdu(Pdu {
+            time: 0,
+            flags: F::empty(),
+            x: 999,
+            y: 999,
+        });
+        handler.ainput_pdu(Pdu {
+            time: 0,
+            flags: F::REL,
+            x: 999,
+            y: 999,
+        });
+        assert_eq!(
+            handler.events,
+            [
+                MouseEvent::RelMove { x: -10, y: 20 },
+                MouseEvent::LeftPressed,
+                MouseEvent::Button5Pressed,
+                MouseEvent::Move { x: 200, y: 300 },
+                MouseEvent::Button5Released,
+                MouseEvent::ScrollHighResolution {
+                    x: 120 << 16,
+                    y: -120 << 16
+                },
+            ]
+        );
     }
 }

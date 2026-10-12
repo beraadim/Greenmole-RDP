@@ -28,6 +28,7 @@ export const api = {
   getTlsStatus: () => invoke<TlsStatus>("get_tls_status"),
   setConfig: (key: string, value: unknown) =>
     invoke<{ restart_required: boolean }>("set_config", { key, value }),
+  exportDiagnostics: () => invoke<{ path: string }>("export_diagnostics"),
   getLogs: (limit?: number) =>
     invoke<LogEntry[]>("get_logs", { limit: limit ?? 500 }),
   getConnectionHistory: (limit: number, offset: number) =>

@@ -1,7 +1,15 @@
 //! macOS screen capture via ScreenCaptureKit
 
+mod audio;
+mod cursor;
 mod geometry;
+pub use cursor::{CursorCapture, CursorUpdate};
 mod mailbox;
+use audio::AudioOutputHandler;
+pub use audio::{
+    audio_channel, AudioCaptureSnapshot, AudioCaptureStats, AudioFrame, AudioFrameReceiver,
+    AudioFrameSender, MAX_AUDIO_AGE,
+};
 pub use geometry::{ContentRect, MouseCoordMapper};
 pub use mailbox::CaptureDeliveryStats;
 
@@ -12,18 +20,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
-use image::{imageops::FilterType, ImageFormat, RgbaImage};
-use objc2::AnyThread;
-use objc2_app_kit::{NSBitmapImageRep, NSCursor};
-use objc2_foundation::{NSData, NSPoint};
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
-use tokio::sync::mpsc;
 
 static UNEXPECTED_BGRA_LAYOUT_WARNINGS: AtomicU64 = AtomicU64::new(0);
 static INVALID_FRAME_GEOMETRY_WARNINGS: AtomicU64 = AtomicU64::new(0);
-const MAX_RDP_CURSOR_EDGE: u16 = 32;
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
@@ -112,17 +114,6 @@ pub struct CapturedFrame {
     pub content_rect: Option<ContentRect>,
 }
 
-/// Raw audio frame from ScreenCaptureKit audio callback.
-/// Data is interleaved Float32 PCM (L0,R0, L1,R1, ...).
-#[derive(Clone)]
-pub struct AudioFrame {
-    pub data: Vec<f32>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub num_samples: usize,
-    pub timestamp_ms: u64,
-}
-
 #[derive(Clone, Debug)]
 pub struct CursorShape {
     pub width: u16,
@@ -160,10 +151,6 @@ struct VideoOutputHandler {
     pixel_format: CapturePixelFormat,
 }
 
-struct AudioOutputHandler {
-    audio_tx: Arc<mpsc::Sender<AudioFrame>>,
-}
-
 impl SCStreamOutputTrait for VideoOutputHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
         if of_type != SCStreamOutputType::Screen {
@@ -177,86 +164,6 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         let Some(event) = event else { return };
 
         self.frame_tx.send(event);
-    }
-}
-
-impl SCStreamOutputTrait for AudioOutputHandler {
-    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
-        if of_type != SCStreamOutputType::Audio {
-            return;
-        }
-
-        let Some(audio_buffer_list) = sample.audio_buffer_list() else {
-            return;
-        };
-
-        let timestamp = sample.presentation_timestamp();
-        let timestamp_ms = if timestamp.timescale > 0 {
-            ((timestamp.value as u128 * 1000) / timestamp.timescale as u128) as u64
-        } else {
-            0
-        };
-
-        // Get sample rate and channel count from format description
-        let (sample_rate, channels) = if let Some(fmt) = sample.format_description() {
-            let sr = fmt.audio_sample_rate().unwrap_or(48000.0) as u32;
-            let ch = fmt.audio_channel_count().unwrap_or(2) as u16;
-            (sr, ch)
-        } else {
-            (48000u32, 2u16)
-        };
-
-        let num_buffers = audio_buffer_list.num_buffers();
-
-        // SCK delivers stereo as a single interleaved buffer (num_buffers == 1, number_channels == 2)
-        // or as separate per-channel buffers (num_buffers == 2, number_channels == 1 each).
-        let interleaved_data = if num_buffers <= 1 {
-            if let Some(buf) = audio_buffer_list.get(0) {
-                let raw = buf.data();
-                let samples: &[f32] = unsafe {
-                    std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4)
-                };
-                samples.to_vec()
-            } else {
-                return;
-            }
-        } else {
-            // Non-interleaved: one buffer per channel — interleave manually
-            let channel_bufs: Vec<&[f32]> = (0..num_buffers)
-                .filter_map(|i| audio_buffer_list.get(i))
-                .map(|buf| {
-                    let raw = buf.data();
-                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4) }
-                })
-                .collect();
-
-            if channel_bufs.is_empty() {
-                return;
-            }
-            let n = channel_bufs[0].len();
-            let mut out = Vec::with_capacity(n * channel_bufs.len());
-            for i in 0..n {
-                for ch in &channel_bufs {
-                    out.push(ch[i]);
-                }
-            }
-            out
-        };
-
-        let num_samples = if channels > 0 {
-            interleaved_data.len() / channels as usize
-        } else {
-            interleaved_data.len()
-        };
-
-        let frame = AudioFrame {
-            data: interleaved_data,
-            sample_rate,
-            channels,
-            num_samples,
-            timestamp_ms,
-        };
-        let _ = self.audio_tx.try_send(frame);
     }
 }
 
@@ -282,94 +189,6 @@ fn build_stream_config(
         .with_sample_rate(AudioSampleRate::Rate48000)
         .with_channel_count(AudioChannelCount::Stereo)
         .with_excludes_current_process_audio(true)
-}
-
-pub fn capture_current_cursor_shape() -> Result<Option<CursorShape>> {
-    let cursor = NSCursor::currentSystemCursor().unwrap_or_else(NSCursor::currentCursor);
-    let image = cursor.image();
-    let Some(cg_image) =
-        (unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) })
-    else {
-        return Ok(None);
-    };
-
-    decode_cursor_cgimage(&cg_image, cursor.hotSpot())
-}
-
-fn decode_cursor_cgimage(
-    cg_image: &objc2_core_graphics::CGImage,
-    hot_spot: NSPoint,
-) -> Result<Option<CursorShape>> {
-    let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), cg_image);
-    let Some(tiff) = bitmap.TIFFRepresentation() else {
-        return Ok(None);
-    };
-
-    decode_cursor_tiff(&tiff, hot_spot)
-}
-
-fn decode_cursor_tiff(tiff: &NSData, hot_spot: NSPoint) -> Result<Option<CursorShape>> {
-    let decoded = image::load_from_memory_with_format(&tiff.to_vec(), ImageFormat::Tiff)
-        .context("Failed to decode cursor TIFF")?
-        .to_rgba8();
-
-    let width = u16::try_from(decoded.width()).context("Cursor width exceeds RDP pointer limit")?;
-    let height =
-        u16::try_from(decoded.height()).context("Cursor height exceeds RDP pointer limit")?;
-    if width == 0 || height == 0 {
-        return Ok(None);
-    }
-
-    let hot_x = hot_spot
-        .x
-        .round()
-        .clamp(0.0, f64::from(width.saturating_sub(1))) as u16;
-    let hot_y = hot_spot
-        .y
-        .round()
-        .clamp(0.0, f64::from(height.saturating_sub(1))) as u16;
-
-    Ok(Some(clamp_cursor_shape(CursorShape {
-        width,
-        height,
-        hot_x,
-        hot_y,
-        rgba: decoded.into_raw(),
-    })))
-}
-
-fn clamp_cursor_shape(shape: CursorShape) -> CursorShape {
-    if shape.width <= MAX_RDP_CURSOR_EDGE && shape.height <= MAX_RDP_CURSOR_EDGE {
-        return shape;
-    }
-
-    let old_width = u32::from(shape.width);
-    let old_height = u32::from(shape.height);
-    let scale = f32::min(
-        f32::from(MAX_RDP_CURSOR_EDGE) / old_width as f32,
-        f32::from(MAX_RDP_CURSOR_EDGE) / old_height as f32,
-    );
-    let new_width =
-        ((old_width as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
-    let new_height =
-        ((old_height as f32 * scale).round() as u32).clamp(1, u32::from(MAX_RDP_CURSOR_EDGE));
-
-    let resized = RgbaImage::from_raw(old_width, old_height, shape.rgba)
-        .expect("cursor RGBA length should match dimensions");
-    let resized = image::imageops::resize(&resized, new_width, new_height, FilterType::Triangle);
-
-    let hot_x = ((f32::from(shape.hot_x) * (new_width as f32 / old_width as f32)).round() as u16)
-        .min(new_width.saturating_sub(1) as u16);
-    let hot_y = ((f32::from(shape.hot_y) * (new_height as f32 / old_height as f32)).round() as u16)
-        .min(new_height.saturating_sub(1) as u16);
-
-    CursorShape {
-        width: new_width as u16,
-        height: new_height as u16,
-        hot_x,
-        hot_y,
-        rgba: resized.into_raw(),
-    }
 }
 
 /// Normalize metadata at the capture boundary so downstream paths always use pixels.
@@ -620,10 +439,7 @@ impl ScreenCapturer {
     ///
     /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
     /// to the provided channel as `AudioFrame` (interleaved Float32 PCM, 48 kHz stereo).
-    pub async fn new(
-        config: CaptureConfig,
-        audio_tx: Option<mpsc::Sender<AudioFrame>>,
-    ) -> Result<Self> {
+    pub async fn new(config: CaptureConfig, audio_tx: Option<AudioFrameSender>) -> Result<Self> {
         // SCShareableContent::get() is synchronous, run in blocking task
         let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
             .await?
@@ -673,9 +489,7 @@ impl ScreenCapturer {
 
         // Register audio handler only if a sender was provided
         if let Some(tx) = audio_tx {
-            let audio_handler = AudioOutputHandler {
-                audio_tx: Arc::new(tx),
-            };
+            let audio_handler = AudioOutputHandler { audio_tx: tx };
             stream.add_output_handler(audio_handler, SCStreamOutputType::Audio);
         }
 
@@ -710,6 +524,11 @@ impl ScreenCapturer {
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
     pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
         self.frame_rx.try_recv()
+    }
+
+    /// Refresh queued bitmap pixels without consuming capture status events.
+    pub fn try_latest_image(&mut self) -> Option<CapturedFrame> {
+        self.frame_rx.try_recv_frame()
     }
 
     pub fn last_delivery_stats(&self) -> CaptureDeliveryStats {
@@ -1065,35 +884,6 @@ impl SafePixelBuffer {
             width: y_stride, // conservative: callers should clamp to actual width
             height: y_height,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{clamp_cursor_shape, CursorShape, MAX_RDP_CURSOR_EDGE};
-
-    #[test]
-    fn clamp_cursor_shape_resizes_oversized_cursor_and_hotspot() {
-        let shape = CursorShape {
-            width: 56,
-            height: 80,
-            hot_x: 5,
-            hot_y: 5,
-            rgba: vec![255; 56 * 80 * 4],
-        };
-
-        let resized = clamp_cursor_shape(shape);
-
-        assert!(resized.width <= MAX_RDP_CURSOR_EDGE);
-        assert!(resized.height <= MAX_RDP_CURSOR_EDGE);
-        assert_eq!(resized.width, 22);
-        assert_eq!(resized.height, 32);
-        assert_eq!(resized.hot_x, 2);
-        assert_eq!(resized.hot_y, 2);
-        assert_eq!(
-            resized.rgba.len(),
-            usize::from(resized.width) * usize::from(resized.height) * 4
-        );
     }
 }
 

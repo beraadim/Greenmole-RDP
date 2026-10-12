@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo } from "react";
 import { useLogs } from "../hooks/useLogs";
 import LogEntryRow from "../components/LogEntry";
 import EmptyState from "../components/EmptyState";
+import DiagnosticsExport from "../components/DiagnosticsExport";
 import type { LogEntry } from "../lib/types";
 
 type LevelFilter = "all" | LogEntry["level"];
@@ -67,6 +68,8 @@ function Logs() {
           )}
         </span>
       </div>
+
+      <DiagnosticsExport />
 
       {/* Toolbar */}
       <div className="flex gap-1.5 items-center">

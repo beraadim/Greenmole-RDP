@@ -33,6 +33,7 @@ pub async fn ensure_server_running(
         let mut status = state.status.lock().await;
         status.running = false;
         status.state = "starting".to_string();
+        status.error_details = None;
     }
     let _ = app.emit("server-status", &*state.status.lock().await);
 
@@ -47,11 +48,12 @@ pub async fn ensure_server_running(
             let mut status = state.status.lock().await;
             *status = macrdp_core::ServerStatus {
                 state: "error: RDP server startup failed".into(),
+                error_details: Some(format!("{error:#}")),
                 ..Default::default()
             };
             let _ = app.emit("server-status", &*status);
             crate::tray::update_tray_status(app, "stopped", &macrdp_core::Metrics::default());
-            return Err(format!("Failed to start server: {error}"));
+            return Err(format!("Failed to start server: {error:#}"));
         }
     };
 
@@ -113,6 +115,7 @@ async fn stop_running_server(app: &tauri::AppHandle, state: &Arc<AppState>) -> R
         let mut status = state.status.lock().await;
         status.running = false;
         status.state = "stopped".to_string();
+        status.error_details = stop_result.as_ref().err().cloned();
         status.uptime_secs = 0;
         status.port = None;
         status.bind_address = None;
@@ -158,11 +161,12 @@ pub async fn get_metrics(state: State<'_, Arc<AppState>>) -> Result<serde_json::
     // if an event update was missed.
     {
         let guard = state.server_handle.lock().await;
-        if let Some(ref handle) = *guard {
-            let live_metrics = handle.metrics();
-            let mut metrics = state.metrics.lock().await;
-            *metrics = live_metrics;
-        }
+        let live_metrics = guard
+            .as_ref()
+            .filter(|handle| handle.status().running)
+            .map(|handle| handle.metrics())
+            .unwrap_or_default();
+        *state.metrics.lock().await = live_metrics;
     }
     let metrics = state.metrics.lock().await.clone();
     serde_json::to_value(&metrics).map_err(|e| e.to_string())

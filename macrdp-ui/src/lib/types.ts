@@ -1,6 +1,7 @@
 export interface ServerStatus {
   running: boolean;
   state: string;
+  error_details?: string | null;
   uptime_secs: number;
   port?: number | null;
   bind_address?: string | null;
@@ -27,6 +28,12 @@ export interface Metrics {
   transport_mode: string;
   encoder_mode: string;
   bitrate_mode: string;
+  audio_dropped_frames: number;
+  audio_stale_frames: number;
+  audio_discontinuities: number;
+  audio_invalid_frames: number;
+  audio_queue_age_ms: number;
+  audio_queued_ms: number;
 }
 
 export interface Connection {

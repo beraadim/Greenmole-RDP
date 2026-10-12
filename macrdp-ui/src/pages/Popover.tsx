@@ -11,6 +11,7 @@ import { useServerStatus } from "../hooks/useServerStatus";
 import { useMetrics } from "../hooks/useMetrics";
 import { useConnections } from "../hooks/useConnections";
 import { api } from "../lib/ipc";
+import ServerError from "../components/ServerError";
 import { formatBytes, formatDuration } from "../lib/format";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -27,11 +28,13 @@ function Popover() {
   const { metrics, stale, error } = useMetrics();
   const connections = useConnections();
   const [toggling, setToggling] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const metricsAvailable = metrics && !stale;
+  const metricsAvailable = status.running && metrics && !stale;
 
   const handleToggle = async () => {
     setToggling(true);
+    setActionError(null);
     try {
       if (status.running) {
         await api.stopServer();
@@ -39,7 +42,7 @@ function Popover() {
         await api.startServer();
       }
     } catch (err) {
-      console.error("Failed to toggle server:", err);
+      setActionError(String(err));
     } finally {
       setToggling(false);
     }
@@ -65,11 +68,12 @@ function Popover() {
   return (
     <div className="min-h-screen bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
       <div className="flex flex-col p-3.5 gap-3">
+        <ServerError message={!status.running ? actionError ?? status.error_details : null} />
         {/* Header row */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div
-              className={`h-2 w-2 rounded-full ${statusDotColor[status.state] ?? "bg-muted-foreground"}`}
+              className={`h-2 w-2 rounded-full ${statusDotColor[status.state.startsWith("error") ? "error" : status.state] ?? "bg-muted-foreground"}`}
             />
             <span className="text-sm font-semibold text-foreground">
               macrdp
