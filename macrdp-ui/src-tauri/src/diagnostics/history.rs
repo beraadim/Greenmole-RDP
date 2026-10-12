@@ -45,7 +45,14 @@ impl DiagnosticHistory {
         if metrics.bytes_sent == 0 && metrics.connection_outcome.is_none() {
             return;
         }
-        let key = (generation, metrics.timestamp);
+        let key = (
+            generation,
+            if metrics.sample_id > 0 {
+                metrics.sample_id
+            } else {
+                metrics.timestamp
+            },
+        );
         // A terminal transition can share a second with the last live sample.
         // Retain it before deduplicating subsequent inactive polls.
         if terminal.is_none() && self.last_sample == Some(key) {
@@ -92,6 +99,24 @@ impl DiagnosticHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_samples_in_one_second_survive_duplicate_polls() {
+        let mut history = DiagnosticHistory::default();
+        let mut metrics = Metrics {
+            timestamp: 10,
+            timestamp_ms: 10000,
+            sample_id: 1,
+            bytes_sent: 100,
+            ..Default::default()
+        };
+        history.record_metrics(1, &metrics);
+        history.record_metrics(1, &metrics);
+        metrics.sample_id = 2;
+        metrics.timestamp_ms = 10999;
+        history.record_metrics(1, &metrics);
+        assert_eq!(history.snapshot()["samples"].as_array().unwrap().len(), 2);
+    }
 
     #[test]
     fn terminal_transition_is_retained_within_the_last_sampled_second() {

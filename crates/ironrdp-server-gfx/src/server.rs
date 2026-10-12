@@ -9,7 +9,7 @@ use ironrdp_async::Framed;
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsRequest, OwnedFileContentsResponse};
 use ironrdp_cliprdr::CliprdrServer;
-use ironrdp_core::{decode, encode_vec, impl_as_any};
+use ironrdp_core::{decode, encode_vec};
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
@@ -19,7 +19,7 @@ use ironrdp_pdu::rdp::capability_sets::{
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
-use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
+use ironrdp_pdu::{mcs, nego, rdp, Action};
 use ironrdp_svc::{
     server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage,
     SvcProcessor,
@@ -30,8 +30,7 @@ use ironrdp_tokio::{
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
-use tokio::task;
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
 use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
@@ -77,6 +76,9 @@ use output::{ChannelOutput, MessagePermit, SharedWriter, DEFAULT_WRITE_TIMEOUT};
 #[path = "pending_input.rs"]
 mod pending_input;
 use pending_input::PendingInput;
+#[path = "additional_input.rs"]
+mod additional_input;
+use additional_input::{AInputHandler, AdditionalInputQueue};
 
 #[derive(Clone)]
 pub struct RdpServerOptions {
@@ -140,77 +142,6 @@ impl RdpServerSecurity {
         }
     }
 }
-
-struct AInputHandler {
-    pending: mpsc::Sender<ironrdp_ainput::MousePdu>,
-    worker: task::JoinHandle<()>,
-    activity: watch::Sender<tokio::time::Instant>,
-}
-
-impl AInputHandler {
-    fn new(
-        handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
-        activity: watch::Sender<tokio::time::Instant>,
-    ) -> Self {
-        // A single ordered worker replaces one blocking task per peer packet.
-        // Overflow terminates the channel/session instead of retaining an
-        // unbounded queue or silently dropping a button release.
-        let (pending, mut receiver) = mpsc::channel(128);
-        let worker = task::spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                handler.lock().await.ainput_pdu(event);
-            }
-        });
-        Self {
-            pending,
-            worker,
-            activity,
-        }
-    }
-}
-
-impl Drop for AInputHandler {
-    fn drop(&mut self) {
-        self.worker.abort();
-    }
-}
-
-impl_as_any!(AInputHandler);
-
-impl dvc::DvcProcessor for AInputHandler {
-    fn channel_name(&self) -> &str {
-        ironrdp_ainput::CHANNEL_NAME
-    }
-
-    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<dvc::DvcMessage>> {
-        use ironrdp_ainput::{ServerPdu, VersionPdu};
-
-        let pdu = ServerPdu::Version(VersionPdu::default());
-
-        Ok(vec![Box::new(pdu)])
-    }
-
-    fn close(&mut self, _channel_id: u32) {}
-
-    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<dvc::DvcMessage>> {
-        use ironrdp_ainput::ClientPdu;
-
-        match decode(payload).map_err(|e| decode_err!(e))? {
-            ClientPdu::Mouse(pdu) => {
-                self.pending.try_send(pdu).map_err(|_| {
-                    decode_err!(std::io::Error::other(
-                        "additional input queue is full or closed"
-                    ))
-                })?;
-                self.activity.send_replace(tokio::time::Instant::now());
-            }
-        }
-
-        Ok(Vec::new())
-    }
-}
-
-impl dvc::DvcServerProcessor for AInputHandler {}
 
 /// RDP Server
 ///
@@ -297,6 +228,7 @@ pub struct RdpServer {
     input_activity: watch::Sender<tokio::time::Instant>,
     quit_requested: bool,
     deferred_input: PendingInput,
+    additional_input: AdditionalInputQueue,
 }
 
 #[derive(Debug)]
@@ -375,6 +307,7 @@ impl RdpServer {
             input_activity: watch::channel(tokio::time::Instant::now()).0,
             quit_requested: false,
             deferred_input: PendingInput::default(),
+            additional_input: AdditionalInputQueue::default(),
         }
     }
 
@@ -432,7 +365,7 @@ impl RdpServer {
             .with_dynamic_channel(DisplayControlChannel::new(Arc::clone(&self.display)));
         if self.gfx_enabled {
             dvc = dvc.with_dynamic_channel(AInputHandler::new(
-                Arc::clone(&self.handler),
+                self.additional_input.clone(),
                 self.input_activity.clone(),
             ));
             let gfx_handler = GfxHandler::new(Arc::clone(&self.gfx_state));
@@ -467,6 +400,7 @@ impl RdpServer {
         self.gfx_state.lock().unwrap().connection_outcome = None;
         let result = self.run_connection_inner(stream).await;
         self.deferred_input = PendingInput::default();
+        self.additional_input.clear();
         self.ev_receiver.lock().await.data.discard_pending();
         self.handshake_deadline = None;
         if self.connection_authenticated {
@@ -502,6 +436,7 @@ impl RdpServer {
 
     async fn run_connection_inner(&mut self, stream: TcpStream) -> Result<()> {
         self.deferred_input = PendingInput::default();
+        self.additional_input.clear();
         transport::configure_stream(&stream)?;
         let (_session_guard, sender) = self.ev_sender.start_session();
         self.ev_receiver.lock().await.data.discard_pending();
@@ -1502,7 +1437,21 @@ impl RdpServer {
         Ok(state)
     }
 
+    async fn drain_additional_input(&mut self) {
+        // The connection dispatcher is the only consumer. Complete each PDU's
+        // input under its message permit before a resize can change geometry.
+        // No independent task survives disconnect or overtakes keyboard input.
+        if let Some(first) = self.additional_input.pop() {
+            let mut handler = self.handler.lock().await;
+            handler.ainput_pdu(first);
+            while let Some(event) = self.additional_input.pop() {
+                handler.ainput_pdu(event);
+            }
+        }
+    }
+
     async fn handle_fastpath(&mut self, input: FastPathInput) {
+        self.drain_additional_input().await;
         if input
             .input_events()
             .iter()
@@ -1535,7 +1484,7 @@ impl RdpServer {
                 }
 
                 FastPathInputEvent::MouseEventRel(mouse) => {
-                    handler.mouse(mouse.into());
+                    handler.mouse_rel_pdu(mouse);
                 }
 
                 FastPathInputEvent::QoeEvent(quality) => {
@@ -1592,6 +1541,10 @@ impl RdpServer {
                         data.channel_id,
                         user_channel_id,
                     )?;
+                    // DVC callbacks cannot await the input handler. Drain their
+                    // staged events before processing another PDU or releasing
+                    // this message's resize barrier permit.
+                    self.drain_additional_input().await;
                     return Ok((
                         false,
                         Some(ChannelOutput {
@@ -1625,6 +1578,7 @@ impl RdpServer {
     }
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
+        self.drain_additional_input().await;
         if input
             .0
             .iter()
@@ -1733,6 +1687,7 @@ impl RdpServer {
         // negotiate against this display. Reactivation stays inside the loop
         // above and preserves those channels until the connection actually ends.
         self.static_channels = StaticChannelSet::new();
+        self.additional_input.clear();
         if client_connected {
             if let Err(error) = &result {
                 if self.gfx_state.lock().unwrap().connection_outcome.is_none() {

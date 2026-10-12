@@ -20,6 +20,10 @@ pub struct OpenH264Encoder {
     yuv_buf: Vec<u8>,
     /// Current target bitrate
     target_bitrate: u32,
+    bitrate_applied: bool,
+    main_initialized: bool,
+    aux_initialized: bool,
+    fps: f32,
     mode_444: bool,
     /// vImage SIMD accelerated BGRA→I420 converter (macOS Accelerate.framework)
     vimage: Option<VImageConverter>,
@@ -189,6 +193,10 @@ impl OpenH264Encoder {
             force_keyframe: false,
             yuv_buf: vec![0u8; yuv_size],
             target_bitrate: bitrate,
+            bitrate_applied: false,
+            main_initialized: false,
+            aux_initialized: false,
+            fps,
             mode_444,
             vimage,
             yuv444_bufs,
@@ -332,6 +340,10 @@ impl VideoEncoder for OpenH264Encoder {
         bitstream.write_vec(&mut nal_data);
 
         let is_keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
+        if !self.main_initialized {
+            self.main_initialized = true;
+            self.bitrate_applied = true;
+        }
 
         Ok(EncodedFrame {
             data: Bytes::from(nal_data),
@@ -398,6 +410,10 @@ impl VideoEncoder for OpenH264Encoder {
         let mut main_nal = Vec::new();
         main_bitstream.write_vec(&mut main_nal);
         let main_keyframe = matches!(main_bitstream.frame_type(), FrameType::IDR | FrameType::I);
+        if !self.main_initialized {
+            self.main_initialized = true;
+            self.bitrate_applied = true;
+        }
 
         let aux_yuv = YUVSlices::new(
             (&bufs.aux_view.y, &bufs.aux_view.u, &bufs.aux_view.v),
@@ -410,6 +426,7 @@ impl VideoEncoder for OpenH264Encoder {
         let mut aux_nal = Vec::new();
         aux_bitstream.write_vec(&mut aux_nal);
         let aux_keyframe = matches!(aux_bitstream.frame_type(), FrameType::IDR | FrameType::I);
+        self.aux_initialized = true;
 
         tracing::debug!(
             main_bytes = main_nal.len(),
@@ -435,47 +452,74 @@ impl VideoEncoder for OpenH264Encoder {
         })
     }
 
-    fn set_bitrate(&mut self, bitrate_bps: u32) {
-        if self.target_bitrate == bitrate_bps {
-            return;
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
+        anyhow::ensure!(
+            (1..=crate::MAX_BITRATE_BPS).contains(&bitrate_bps),
+            "Invalid bitrate"
+        );
+        if self.target_bitrate == bitrate_bps && (!self.main_initialized || self.bitrate_applied) {
+            return Ok(());
         }
-        self.target_bitrate = bitrate_bps;
+        // The Rust wrapper initializes each native encoder lazily on its first
+        // frame. Configure an unused view instead of calling SetOption on an
+        // uninitialized codec, preserving every already-running reference chain.
+        let configured_aux = if self.encoder_aux.is_some() && !self.aux_initialized {
+            Some(create_oh264_encoder(
+                self.width,
+                self.height,
+                self.fps,
+                ((bitrate_bps as f64 * 0.7) as u32).max(1),
+            )?)
+        } else {
+            None
+        };
+        if !self.main_initialized {
+            let configured_main =
+                create_oh264_encoder(self.width, self.height, self.fps, bitrate_bps)?;
+            self.encoder = configured_main;
+            if let Some(aux) = configured_aux {
+                self.encoder_aux = Some(aux);
+            }
+            self.target_bitrate = bitrate_bps;
+            self.bitrate_applied = false;
+            return Ok(());
+        }
+        // If an auxiliary update fails after the main update, the two views no
+        // longer have a confirmed common target. Retrying must not be skipped.
+        self.bitrate_applied = false;
         unsafe {
-            let raw = self.encoder.raw_api();
             let mut bitrate_info = openh264_sys2::SBitrateInfo {
                 iLayer: openh264_sys2::SPATIAL_LAYER_ALL as i32,
                 iBitrate: bitrate_bps as i32,
             };
-            let ret = raw.set_option(
+            let status = self.encoder.raw_api().set_option(
                 openh264_sys2::ENCODER_OPTION_BITRATE,
                 &mut bitrate_info as *mut _ as *mut c_void,
             );
-            if ret != 0 {
-                tracing::warn!(
-                    ret,
-                    "OpenH264 set_option(BITRATE) failed, bitrate change deferred"
-                );
-            } else {
-                tracing::info!(
-                    bitrate_mbps = bitrate_bps as f64 / 1_000_000.0,
-                    "Bitrate updated via SetOption"
-                );
-            }
-        }
-        if let Some(ref mut aux) = self.encoder_aux {
-            let aux_bitrate = (bitrate_bps as f64 * 0.7) as u32;
-            unsafe {
-                let raw = aux.raw_api();
-                let mut bitrate_info = openh264_sys2::SBitrateInfo {
-                    iLayer: openh264_sys2::SPATIAL_LAYER_ALL as i32,
-                    iBitrate: aux_bitrate as i32,
-                };
-                let _ = raw.set_option(
+            anyhow::ensure!(status == 0, "OpenH264 main bitrate update failed: {status}");
+            if let Some(aux) = self.encoder_aux.as_mut().filter(|_| self.aux_initialized) {
+                bitrate_info.iBitrate = ((bitrate_bps as f64 * 0.7) as i32).max(1);
+                let status = aux.raw_api().set_option(
                     openh264_sys2::ENCODER_OPTION_BITRATE,
                     &mut bitrate_info as *mut _ as *mut c_void,
                 );
+                anyhow::ensure!(
+                    status == 0,
+                    "OpenH264 auxiliary bitrate update failed: {status}"
+                );
             }
         }
+        if let Some(aux) = configured_aux {
+            self.encoder_aux = Some(aux);
+        }
+        self.target_bitrate = bitrate_bps;
+        self.bitrate_applied = true;
+        tracing::debug!(bitrate_bps, "OpenH264 accepted bitrate update");
+        Ok(())
+    }
+
+    fn applied_bitrate(&self) -> Option<u32> {
+        self.bitrate_applied.then_some(self.target_bitrate)
     }
 
     fn force_keyframe(&mut self) {
@@ -490,6 +534,42 @@ impl VideoEncoder for OpenH264Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitrate_tracks_only_accepted_values_and_valid_updates_still_encode() {
+        let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 1_000_000, true).unwrap();
+        assert_eq!(encoder.applied_bitrate(), None);
+        assert!(encoder.set_bitrate(0).is_err());
+        assert_eq!(encoder.applied_bitrate(), None);
+        encoder.set_bitrate(2_000_000).unwrap();
+        assert_eq!(encoder.applied_bitrate(), None);
+        let output = encoder
+            .encode_bgra_444(&vec![128; 64 * 64 * 4], 64, 64, 256)
+            .unwrap();
+        assert!(!output.main_view.data.is_empty());
+        assert!(!output.aux_view.data.is_empty());
+        assert_eq!(encoder.applied_bitrate(), Some(2_000_000));
+        encoder.set_bitrate(1_000_000).unwrap();
+        assert_eq!(encoder.applied_bitrate(), Some(1_000_000));
+        encoder.set_bitrate(2_000_000).unwrap();
+        assert_eq!(encoder.applied_bitrate(), Some(2_000_000));
+    }
+
+    #[test]
+    fn bitrate_update_preserves_initialized_main_and_configures_unused_auxiliary() {
+        let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 2_000_000, true).unwrap();
+        let bgra = vec![128; 64 * 64 * 4];
+        encoder.encode_bgra(&bgra, 64, 64, 256).unwrap();
+        assert!(encoder.main_initialized);
+        assert!(!encoder.aux_initialized);
+        encoder.set_bitrate(1_000_000).unwrap();
+        assert_eq!(encoder.applied_bitrate(), Some(1_000_000));
+        assert!(encoder.main_initialized);
+        let output = encoder.encode_bgra_444(&bgra, 64, 64, 256).unwrap();
+        assert!(!output.main_view.data.is_empty());
+        assert!(!output.aux_view.data.is_empty());
+        assert!(encoder.aux_initialized);
+    }
 
     #[test]
     fn test_encode_frame() {

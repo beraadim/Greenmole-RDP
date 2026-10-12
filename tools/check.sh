@@ -9,5 +9,6 @@ cargo test --manifest-path macrdp-ui/src-tauri/Cargo.toml --lib --locked
 cargo build -p macrdp-server --locked
 python3 -m unittest discover -s tools -p 'test_client_benchmark.py'
 node --test tools/client_benchmark_workload_test.js
+node --test tools/ui_metrics_test.mjs
 (cd macrdp-ui && npm run build)
 echo "All checks passed."

@@ -13,8 +13,12 @@
 use std::path::PathBuf;
 
 use objc2::rc::Retained;
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
-use objc2_foundation::{NSData, NSString};
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardItem, NSPasteboardTypePNG, NSPasteboardTypeString,
+    NSPasteboardWriting,
+};
+use objc2_foundation::{NSArray, NSData, NSString, NSUTF8StringEncoding};
 use tracing::{debug, warn};
 
 /// Stateless wrapper around the general pasteboard. Objective-C handles are
@@ -85,7 +89,21 @@ impl PasteboardBridge {
                 debug!("pasteboard: no string data");
                 None
             }
-            Some(ns_str) => Some(ns_str.to_string()),
+            Some(ns_str) => {
+                // Check native lengths before allocating the Rust UTF-8 copy or
+                // the later UTF-16 response (which includes a NUL terminator).
+                let units = ns_str.length();
+                if !crate::text::valid_unicode_lengths(units, 0)
+                    || !crate::text::valid_unicode_lengths(
+                        units,
+                        ns_str.lengthOfBytesUsingEncoding(NSUTF8StringEncoding),
+                    )
+                {
+                    warn!("pasteboard: text exceeds clipboard limit");
+                    return None;
+                }
+                Some(ns_str.to_string())
+            }
         }
     }
 
@@ -123,7 +141,18 @@ impl PasteboardBridge {
                 debug!("pasteboard: no HTML data");
                 None
             }
-            Some(ns_str) => Some(ns_str.to_string()),
+            Some(ns_str) => {
+                let limit = crate::html::MAX_HTML_FRAGMENT_BYTES;
+                // UTF-8 cannot be shorter than the UTF-16 unit count. The cheap
+                // first check also bounds work needed to measure UTF-8 length.
+                if ns_str.length() > limit
+                    || ns_str.lengthOfBytesUsingEncoding(NSUTF8StringEncoding) > limit
+                {
+                    warn!("pasteboard: HTML exceeds clipboard limit");
+                    return None;
+                }
+                Some(ns_str.to_string())
+            }
         }
     }
 
@@ -131,18 +160,38 @@ impl PasteboardBridge {
     ///
     /// Returns the new change count, or -1 on failure.
     pub fn write_html(&self, html: &str) -> i64 {
-        let pb = self.board();
-        let change_count = pb.clearContents();
+        self.write_rich_text(html, None)
+    }
 
-        let ns_str = NSString::from_str(html);
-        let html_type = NSString::from_str("public.html");
-
-        if !pb.setString_forType(&ns_str, &html_type) {
-            warn!("pasteboard: setString:forType: (HTML) returned false");
+    /// Prepare both flavors in one item before replacing the clipboard. The
+    /// native write publishes them together, so clients never observe HTML with
+    /// a plain-text flavor belonging to a different copy.
+    pub(crate) fn write_rich_text(&self, html: &str, text: Option<&str>) -> i64 {
+        let item = NSPasteboardItem::new();
+        if !item.setString_forType(
+            &NSString::from_str(html),
+            &NSString::from_str("public.html"),
+        ) {
+            warn!("pasteboard: preparing HTML flavor failed");
             return -1;
         }
-
-        change_count as i64
+        if let Some(text) = text {
+            if !item.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
+            {
+                warn!("pasteboard: preparing plain-text flavor failed");
+                return -1;
+            }
+        }
+        let objects = NSArray::from_retained_slice(&[
+            ProtocolObject::<dyn NSPasteboardWriting>::from_retained(item),
+        ]);
+        let pb = self.board();
+        pb.clearContents();
+        if !pb.writeObjects(&objects) {
+            warn!("pasteboard: publishing rich text failed");
+            return -1;
+        }
+        pb.changeCount() as i64
     }
 
     /// Write file URLs to the pasteboard.

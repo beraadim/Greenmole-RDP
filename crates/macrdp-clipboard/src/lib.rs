@@ -6,6 +6,7 @@ pub mod pasteboard;
 mod publication;
 mod remote_formats;
 mod runtime;
+mod text;
 pub mod transfer;
 mod work_queue;
 mod worker;
@@ -18,7 +19,7 @@ use ironrdp_core::{impl_as_any, IntoOwned};
 use ironrdp_server::{CliprdrServerFactory, ServerEventSender, ServerEventTx};
 use pasteboard::PasteboardBridge;
 use publication::{PublicationState, RemoteOffer};
-use remote_formats::preferred_format;
+use remote_formats::{preferred_format, text_fallback};
 use runtime::{ClipboardRuntime, Command};
 use std::{fmt, path::PathBuf, sync::Arc};
 
@@ -92,9 +93,11 @@ impl CliprdrBackend for MacClipboardBackend {
         self.runtime.enqueue(0, || Command::RequestFormatList);
     }
     fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+        let format = preferred_format(formats, self.file_transfer);
         let offer = RemoteOffer {
             token: self.shared.remote_copy(&self.pasteboard),
-            format: preferred_format(formats, self.file_transfer),
+            format,
+            text_fallback: text_fallback(formats, format),
         };
         self.runtime.enqueue(0, || Command::RemoteCopy(offer));
     }

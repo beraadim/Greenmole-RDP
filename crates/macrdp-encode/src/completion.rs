@@ -25,7 +25,10 @@ impl Default for EncodeCompletion {
 
 impl EncodeCompletion {
     pub fn begin(&self) {
-        *self.started_at.lock().unwrap() = Some(Instant::now());
+        *self
+            .started_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         self.ready.send_replace(None);
     }
 
@@ -34,7 +37,7 @@ impl EncodeCompletion {
         let encode_duration = self
             .started_at
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .map(|started| completed_at.saturating_duration_since(started))
             .unwrap_or_default();

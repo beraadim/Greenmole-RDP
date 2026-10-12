@@ -1,6 +1,9 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+mod client_backlog;
+use client_backlog::ClientBacklog;
+
 /// Determine if an IP address belongs to a private/local network.
 pub fn is_private_ip(addr: IpAddr) -> bool {
     match addr {
@@ -72,6 +75,7 @@ pub struct BitrateController {
     network: NetworkQuality,
     write_ewma_ms: f64,
     pending_acks: Option<u32>,
+    client_backlog: ClientBacklog,
 }
 
 impl BitrateController {
@@ -90,6 +94,7 @@ impl BitrateController {
             network,
             write_ewma_ms: 0.0,
             pending_acks: None,
+            client_backlog: ClientBacklog::default(),
         }
     }
 
@@ -140,6 +145,13 @@ impl BitrateController {
         self.pending_acks = pending_acks;
     }
 
+    /// The decoded-frame counter identifies fresh ACK reports, so polling the
+    /// same metrics on every capture frame cannot manufacture a backlog trend.
+    pub fn update_client_backlog(&mut self, bytes: Option<u32>, decoded_frames: u32) {
+        self.client_backlog
+            .observe(bytes, decoded_frames, Instant::now());
+    }
+
     pub fn on_idle_recovery(&mut self) {
         self.eval_window.clear();
         self.current_bitrate = self.initial_bitrate;
@@ -147,6 +159,7 @@ impl BitrateController {
         self.last_eval_time = Instant::now();
         self.write_ewma_ms = 0.0;
         self.pending_acks = None;
+        self.client_backlog = ClientBacklog::default();
     }
 
     pub fn evaluate(&mut self) -> AdaptiveDecision {
@@ -185,6 +198,9 @@ impl BitrateController {
 
         let mut new_bitrate = self.current_bitrate;
         let mut new_fps_tier = self.current_fps_tier;
+        let client_pressure = self
+            .client_backlog
+            .evaluate(self.current_bitrate, Instant::now());
 
         // Degradation: encode overload takes priority; frame size check only when encode is healthy.
         // Even on a great LAN, slow encode must still trigger adaptation or latency balloons.
@@ -197,8 +213,11 @@ impl BitrateController {
         let ack_backlogged = self
             .pending_acks
             .is_some_and(|pending| pending > normal_in_flight.saturating_mul(2));
-        let transport_overloaded = self.write_ewma_ms > frame_interval_ms * 0.8 || ack_backlogged;
+        let transport_overloaded = self.write_ewma_ms > frame_interval_ms * 0.8
+            || ack_backlogged
+            || client_pressure.overloaded;
         let severe_transport_overload = self.write_ewma_ms > frame_interval_ms * 1.5
+            || client_pressure.severe
             || self
                 .pending_acks
                 .is_some_and(|pending| pending > normal_in_flight.saturating_mul(4));
@@ -225,7 +244,10 @@ impl BitrateController {
         }
 
         // Recovery (PRIORITY: fps first, then bitrate), but only when encode headroom is clearly back.
-        if avg_encode_ms < frame_interval_ms * 0.25 && !transport_overloaded {
+        if avg_encode_ms < frame_interval_ms * 0.25
+            && !transport_overloaded
+            && !client_pressure.elevated
+        {
             if new_fps_tier > 0 {
                 new_fps_tier -= 1; // fps first
             } else if new_bitrate < ceiling {
@@ -233,6 +255,20 @@ impl BitrateController {
             }
         }
 
+        if self.current_bitrate != new_bitrate || self.current_fps_tier != new_fps_tier {
+            tracing::debug!(
+                previous_bitrate_bps = self.current_bitrate,
+                bitrate_bps = new_bitrate,
+                previous_fps = current_fps,
+                fps_tier = new_fps_tier,
+                client_queue_bytes = ?client_pressure.bytes,
+                estimated_client_queue_ms = client_pressure.estimated_ms,
+                client_decode_overloaded = client_pressure.overloaded,
+                write_ewma_ms = self.write_ewma_ms,
+                pending_acks = ?self.pending_acks,
+                "Adaptive stream rate changed"
+            );
+        }
         self.current_bitrate = new_bitrate;
         self.current_fps_tier = new_fps_tier;
         self.eval_window.clear();
@@ -257,6 +293,76 @@ impl BitrateController {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn record_fast_frame(ctrl: &mut BitrateController) {
+        ctrl.record_frame(FrameStats {
+            encode_ms: 1.0,
+            frame_bytes: 1_000,
+            is_keyframe: false,
+        });
+        ctrl.update_transport(1.0, Some(1));
+    }
+
+    #[test]
+    fn sustained_client_decode_backlog_reduces_rate_with_fast_socket_and_encoder() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        ctrl.update_client_backlog(Some(1_000_000), 1);
+        record_fast_frame(&mut ctrl);
+        let burst = ctrl.evaluate();
+        assert_eq!(burst.fps, 60);
+        assert_eq!(burst.bitrate_bps, 10_000_000);
+        ctrl.update_client_backlog(Some(2_000_000), 2);
+        record_fast_frame(&mut ctrl);
+        let sustained = ctrl.evaluate();
+        assert_eq!(sustained.fps, 30);
+        assert!(sustained.bitrate_bps < burst.bitrate_bps);
+        for decoded in 3..30 {
+            ctrl.update_client_backlog(Some(u32::MAX - 1), decoded);
+            record_fast_frame(&mut ctrl);
+            let decision = ctrl.evaluate();
+            assert!(decision.bitrate_bps >= 3_000_000);
+            assert!(decision.bitrate_bps <= macrdp_encode::MAX_BITRATE_BPS);
+            assert!(decision.fps >= 15);
+        }
+    }
+
+    #[test]
+    fn client_backlog_recovery_waits_for_drain_then_recovers_fps_before_bitrate() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        for decoded in 1..=2 {
+            ctrl.update_client_backlog(Some(2_000_000), decoded);
+            record_fast_frame(&mut ctrl);
+            ctrl.evaluate();
+        }
+        assert_eq!(ctrl.current_fps(), 30);
+        let throttled_bitrate = ctrl.current_bitrate();
+        ctrl.update_client_backlog(Some(500_000), 3);
+        record_fast_frame(&mut ctrl);
+        let draining = ctrl.evaluate();
+        assert_eq!(draining.fps, 30);
+        assert_eq!(draining.bitrate_bps, throttled_bitrate);
+        ctrl.update_client_backlog(Some(1_000), 4);
+        record_fast_frame(&mut ctrl);
+        let recovered = ctrl.evaluate();
+        assert_eq!(recovered.fps, 60);
+        assert_eq!(recovered.bitrate_bps, throttled_bitrate);
+    }
+
+    #[test]
+    fn suspended_or_unavailable_client_backlog_does_not_throttle() {
+        let mut ctrl = make_controller(10_000_000, true, 60);
+        for decoded in 1..=2 {
+            ctrl.update_client_backlog(Some(2_000_000), decoded);
+            record_fast_frame(&mut ctrl);
+            ctrl.evaluate();
+        }
+        ctrl.update_client_backlog(None, 3);
+        record_fast_frame(&mut ctrl);
+        assert_eq!(ctrl.evaluate().fps, 60);
+        ctrl.update_client_backlog(Some(0), 4);
+        record_fast_frame(&mut ctrl);
+        assert_eq!(ctrl.evaluate().fps, 60);
+    }
 
     #[test]
     fn bitrate_override_rebases_adaptation_and_idle_recovery() {

@@ -104,6 +104,11 @@ impl ServerEventHandler for TauriEventBridge {
                 ) {
                     return;
                 }
+                // Callback tasks may acquire the lock out of order. Cached polling
+                // must never expose an older snapshot after a newer event.
+                if metrics.sample_id > 0 && metrics.sample_id <= guard.sample_id {
+                    return;
+                }
                 *guard = metrics.clone();
                 state
                     .diagnostic_history

@@ -62,6 +62,10 @@ pub struct Metrics {
     pub rtt_ms: f64,
     pub bytes_sent: u64,
     pub timestamp: u64,
+    /// Process-wide sample order, shared by events and polling snapshots.
+    pub sample_id: u64,
+    /// Wall-clock sample time in milliseconds; legacy timestamp remains seconds.
+    pub timestamp_ms: u64,
     /// Time spent encoding the last frame (milliseconds)
     pub encode_ms: f64,
     pub capture_queue_ms: f64,
@@ -75,6 +79,9 @@ pub struct Metrics {
     /// Failed frame-rate configuration attempts for the current capture owner.
     pub capture_frame_rate_update_failures: u64,
     pub capture_frame_rate_retry_exhausted: bool,
+    pub requested_encoder_bitrate: Option<u32>,
+    pub applied_encoder_bitrate: Option<u32>,
+    pub encoder_bitrate_update_failures: u64,
     pub client_queue_depth_bytes: Option<u32>,
     pub ack_suspended: bool,
     /// Legacy alias of ACK latency. Network-only latency is not measured by GFX ACKs.

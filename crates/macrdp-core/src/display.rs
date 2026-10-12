@@ -7,6 +7,7 @@ mod damage;
 mod native_capture;
 use native_capture::NativeCapture;
 mod event_wait;
+mod idle_encode;
 mod idle_policy;
 use damage::FrameDamage;
 use event_wait::DisplayWake;
@@ -846,7 +847,12 @@ impl RdpServerDisplay for MacDisplay {
         )
         .ok();
 
-        self.gfx_state.lock().unwrap().active_encoder = encoder.as_ref().map(|e| e.backend_name());
+        {
+            let mut state = self.gfx_state.lock().unwrap();
+            state.active_encoder = encoder.as_ref().map(|e| e.backend_name());
+            state.applied_encoder_bitrate = encoder.as_ref().and_then(|e| e.applied_bitrate());
+            state.requested_encoder_bitrate = encoder.as_ref().map(|_| configured_bitrate);
+        }
         if encoder.is_some() {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
@@ -1177,10 +1183,14 @@ impl MacDisplayUpdates {
                     Ok(DisplayWake::Cursor | DisplayWake::Idle) => {}
                     Err(_) => {
                         tracing::warn!("Async encoder did not complete within two seconds; recovering with uncompressed graphics");
-                        // Invalidation waits for outstanding codec work before
-                        // dropping its callback context or retained pixel data.
+                        // The codec moves native invalidation to its bounded
+                        // retirement worker, retaining callbacks and input there.
                         self.encoder = None;
-                        self.gfx_state.lock().unwrap().active_encoder = None;
+                        {
+                            let mut state = self.gfx_state.lock().unwrap();
+                            state.active_encoder = None;
+                            state.applied_encoder_bitrate = None;
+                        }
                         self.has_pending_submit = false;
                         self.pending_frame_time = None;
                         self.pending_visible_size = None;
@@ -1280,9 +1290,7 @@ impl MacDisplayUpdates {
                             }
                             if action.reset_adaptation {
                                 self.bitrate_ctrl.on_idle_recovery();
-                                if let Some(enc) = &mut self.encoder {
-                                    enc.set_bitrate(self.bitrate_ctrl.current_bitrate());
-                                }
+                                self.apply_encoder_bitrate(self.bitrate_ctrl.current_bitrate());
                                 self.apply_capture_fps(
                                     self.bitrate_ctrl.target_fps(),
                                     "idle-recovery",
@@ -1701,6 +1709,11 @@ impl MacDisplayUpdates {
                 self.clear_client_stale_flag("cached-avc-convergence");
                 return Some(update);
             }
+            if self.has_pending_submit {
+                // Wait for the submitted refresh; mixing in another recovery
+                // while its callback is pending would duplicate convergence.
+                return None;
+            }
         }
 
         if gfx_channel_ready {
@@ -1897,10 +1910,11 @@ impl MacDisplayUpdates {
             configured_bitrate.filter(|bps| *bps != self.bitrate_ctrl.base_bitrate())
         {
             self.bitrate_ctrl.set_target_bitrate(bitrate);
-            if let Some(encoder) = &mut self.encoder {
-                encoder.set_bitrate(bitrate);
-            }
-            tracing::info!(bitrate_bps = bitrate, "Encoder bitrate hot-update applied");
+            self.apply_encoder_bitrate(bitrate);
+            tracing::info!(
+                bitrate_bps = bitrate,
+                "Configured encoder bitrate target updated"
+            );
         }
     }
 
@@ -2008,15 +2022,36 @@ impl MacDisplayUpdates {
 
         if let Some(enc) = &mut self.encoder {
             enc.force_keyframe();
-            enc.set_bitrate(self.bitrate_ctrl.current_bitrate());
         }
+        self.apply_encoder_bitrate(self.bitrate_ctrl.current_bitrate());
 
         Ok(())
+    }
+
+    fn apply_encoder_bitrate(&mut self, bitrate: u32) {
+        let Some(encoder) = &mut self.encoder else {
+            return;
+        };
+        let result = encoder.set_bitrate(bitrate);
+        let mut state = self.gfx_state.lock().unwrap();
+        state.requested_encoder_bitrate = Some(bitrate);
+        state.applied_encoder_bitrate = encoder.applied_bitrate();
+        if let Err(error) = result {
+            state.encoder_bitrate_update_failures =
+                state.encoder_bitrate_update_failures.saturating_add(1);
+            tracing::warn!(%error, requested_bitrate = bitrate,
+                applied_bitrate = ?state.applied_encoder_bitrate,
+                failures = state.encoder_bitrate_update_failures,
+                backend = encoder.backend_name(), "Encoder bitrate update was not applied");
+        }
     }
 
     /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
     /// Returns `None` if no cached frame or GFX is not ready.
     fn send_idle_idr(&mut self) -> Option<DisplayUpdate> {
+        if self.has_pending_submit {
+            return None;
+        }
         let cache = self.last_frame_cache.as_ref()?;
         let encoder = self.encoder.as_mut()?;
 
@@ -2029,6 +2064,20 @@ impl MacDisplayUpdates {
         }
 
         let t0 = Instant::now();
+        if encoder.supports_pipelining() {
+            match idle_encode::submit(encoder.as_mut(), cache) {
+                Ok(size) => {
+                    self.has_pending_submit = true;
+                    self.pending_visible_size = Some(size);
+                    self.pending_frame_time = Some(t0);
+                    self.display_frame_count += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Idle IDR submission failed");
+                }
+            }
+            return None;
+        }
         let result = match cache {
             CachedFrame::Bgra {
                 data,
@@ -2096,11 +2145,23 @@ impl MacDisplayUpdates {
     fn apply_adaptive_decision(&mut self) {
         // Observe transport independently from actual codec completion timing.
         {
-            let gfx = self.gfx_state.lock().unwrap();
+            let mut gfx = self.gfx_state.lock().unwrap();
+            gfx.applied_encoder_bitrate = self
+                .encoder
+                .as_ref()
+                .and_then(|encoder| encoder.applied_bitrate());
             self.bitrate_ctrl.update_transport(
                 gfx.last_write_ms,
                 (!gfx.frame_acknowledgements_suspended && gfx.last_ack_frame != 0)
                     .then_some(gfx.pending_acks),
+            );
+            self.bitrate_ctrl.update_client_backlog(
+                if gfx.frame_acknowledgements_suspended {
+                    None
+                } else {
+                    gfx.client_queue_depth_bytes
+                },
+                gfx.client_total_frames_decoded,
             );
             if gfx.rtt_ewma_ms > 0.0 {
                 self.bitrate_ctrl.update_network_rtt(gfx.rtt_ewma_ms);
@@ -2116,9 +2177,7 @@ impl MacDisplayUpdates {
 
         let decision = self.bitrate_ctrl.evaluate();
 
-        if let Some(ref mut enc) = self.encoder {
-            enc.set_bitrate(decision.bitrate_bps);
-        }
+        self.apply_encoder_bitrate(decision.bitrate_bps);
 
         if decision.fps != self.last_applied_fps {
             self.apply_capture_fps(decision.fps, "adaptive");

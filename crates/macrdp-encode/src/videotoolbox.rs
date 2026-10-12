@@ -11,6 +11,14 @@ use std::sync::Arc;
 use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
+mod callback;
+mod ownership;
+use callback::encode_callback;
+use ownership::{NativeSession, OwnedCf, OwnedPixelBuffer};
+
+static RETIREMENTS: std::sync::OnceLock<crate::retirement::RetirementPool> =
+    std::sync::OnceLock::new();
+
 // --- FFI declarations ---
 
 type CVPixelBufferRef = *mut c_void;
@@ -201,6 +209,9 @@ extern "C" {
 
     static kCFBooleanTrue: CFTypeRef;
     static kCFBooleanFalse: CFTypeRef;
+    // Callback tables are opaque here: only their exported addresses are used.
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
 
     fn CFNumberCreate(allocator: CFAllocatorRef, the_type: i64, value: *const c_void) -> CFTypeRef;
     fn CFDictionaryCreate(
@@ -266,6 +277,63 @@ fn cf_f64(v: f64) -> CFTypeRef {
     }
 }
 
+fn check_status(status: OSStatus, operation: &str) -> Result<()> {
+    anyhow::ensure!(status == 0, "{operation} failed: {status}");
+    Ok(())
+}
+
+fn validate_bgra_layout(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    encoder_width: u32,
+    encoder_height: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        width > 0 && height > 0 && width <= encoder_width && height <= encoder_height,
+        "BGRA dimensions do not fit the encoder"
+    );
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("BGRA row size overflow"))?;
+    anyhow::ensure!(stride >= row_bytes, "BGRA stride is shorter than a row");
+    let required = (height as usize - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .ok_or_else(|| anyhow::anyhow!("BGRA layout overflow"))?;
+    anyhow::ensure!(
+        data.len() >= required,
+        "BGRA input is shorter than its layout"
+    );
+    Ok(())
+}
+
+unsafe fn set_required_property(
+    session: VTCompressionSessionRef,
+    key: CFStringRef,
+    value: CFTypeRef,
+    name: &str,
+) -> Result<()> {
+    check_status(VTSessionSetProperty(session, key, value), name)
+}
+
+unsafe fn set_optional_property(
+    session: VTCompressionSessionRef,
+    key: CFStringRef,
+    value: CFTypeRef,
+    name: &str,
+) {
+    let status = VTSessionSetProperty(session, key, value);
+    if status != 0 {
+        tracing::warn!(
+            property = name,
+            status,
+            "Optional VideoToolbox property was not applied"
+        );
+    }
+}
+
 // --- Callback context (shared between encoder thread and VT callback thread) ---
 
 #[derive(Default)]
@@ -281,7 +349,11 @@ struct CallbackFinished<'a>(&'a CallbackCtx);
 
 impl Drop for CallbackFinished<'_> {
     fn drop(&mut self) {
-        let _output = self.0.output.lock().unwrap();
+        let _output = self
+            .0
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.0
             .has_data
             .store(true, std::sync::atomic::Ordering::Release);
@@ -298,163 +370,6 @@ fn low_latency_wait_budget(fps: f32) -> std::time::Duration {
 
 fn post_flush_wait_budget(timeout: std::time::Duration) -> std::time::Duration {
     timeout.min(std::time::Duration::from_millis(8))
-}
-
-extern "C" fn encode_callback(
-    ref_con: *mut c_void,
-    _source: *mut c_void,
-    status: OSStatus,
-    _info_flags: VTEncodeInfoFlags,
-    sample_buffer: CMSampleBufferRef,
-) {
-    let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
-    let _finished = CallbackFinished(ctx);
-
-    if status != 0 || sample_buffer.is_null() {
-        // Signal has_data so encoder doesn't timeout waiting — it will get empty data
-        tracing::warn!(
-            status,
-            null_buf = sample_buffer.is_null(),
-            "VT encode callback error"
-        );
-        return;
-    }
-
-    let mut annex_b = Vec::new();
-    let mut is_keyframe = false;
-
-    unsafe {
-        let format_desc = CMSampleBufferGetFormatDescription(sample_buffer);
-        let block_buf = CMSampleBufferGetDataBuffer(sample_buffer);
-        if block_buf.is_null() {
-            return;
-        }
-
-        let total_len = CMBlockBufferGetDataLength(block_buf);
-        let mut data_ptr: *mut u8 = std::ptr::null_mut();
-        let mut length: usize = 0;
-        if CMBlockBufferGetDataPointer(
-            block_buf,
-            0,
-            &mut length,
-            std::ptr::null_mut(),
-            &mut data_ptr,
-        ) != 0
-        {
-            return;
-        }
-        let data = std::slice::from_raw_parts(data_ptr, total_len);
-
-        // First pass: check if any NAL is IDR (type 5) to determine keyframe
-        let mut nal_header_len: i32 = 4;
-        {
-            let mut param_count: usize = 0;
-            let _ = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                format_desc,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut param_count,
-                &mut nal_header_len,
-            );
-        }
-        let nal_len_size = if nal_header_len > 0 {
-            nal_header_len as usize
-        } else {
-            4
-        };
-
-        // Scan for IDR NAL to determine if this is a keyframe
-        {
-            let mut scan_offset = 0;
-            while scan_offset + nal_len_size <= total_len {
-                let nal_len = u32::from_be_bytes([
-                    data[scan_offset],
-                    data[scan_offset + 1],
-                    data[scan_offset + 2],
-                    data[scan_offset + 3],
-                ]) as usize;
-                scan_offset += nal_len_size;
-                if scan_offset + nal_len > total_len {
-                    break;
-                }
-                if nal_len > 0 {
-                    let nal_type = data[scan_offset] & 0x1F;
-                    if nal_type == 5 {
-                        is_keyframe = true;
-                        break;
-                    }
-                }
-                scan_offset += nal_len;
-            }
-        }
-
-        // SPS/PPS: only prepend for IDR frames (start of new coded video sequence).
-        // Sending SPS/PPS before P-frames can cause decoders to reset their
-        // reference picture buffer, breaking temporal prediction.
-        if is_keyframe {
-            let mut param_count: usize = 0;
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                format_desc,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut param_count,
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                for i in 0..param_count {
-                    let mut ptr: *const u8 = std::ptr::null();
-                    let mut size: usize = 0;
-                    if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        format_desc,
-                        i,
-                        &mut ptr,
-                        &mut size,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    ) == 0
-                    {
-                        annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                        let param_data = std::slice::from_raw_parts(ptr, size);
-                        annex_b.extend_from_slice(param_data);
-                    }
-                }
-            }
-        }
-
-        // AVCC → Annex B conversion
-        // Only keep VCL NALs (1=P-slice, 5=IDR) and parameter sets (7=SPS, 8=PPS).
-        // Strip ALL other NAL types (SEI, AUD, filler, etc.) — VT's SEI may contain
-        // Recovery Point info that causes Windows DXVA decoder to reset reference buffers.
-        let mut offset = 0;
-        while offset + nal_len_size <= total_len {
-            let nal_len = u32::from_be_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as usize;
-            offset += nal_len_size;
-            if offset + nal_len > total_len {
-                break;
-            }
-            if nal_len > 0 {
-                let nal_type = data[offset] & 0x1F;
-                if matches!(nal_type, 1 | 5 | 7 | 8) {
-                    annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                    annex_b.extend_from_slice(&data[offset..offset + nal_len]);
-                }
-            }
-            offset += nal_len;
-        }
-    }
-
-    // Signal data ready
-    {
-        let mut guard = ctx.output.lock().unwrap();
-        *guard = Some((annex_b, is_keyframe));
-    }
 }
 
 // --- YUV444 reusable buffers for AVC444 mode ---
@@ -510,10 +425,8 @@ impl SendPtrMut {
 // --- Encoder ---
 
 pub struct VtEncoder {
-    session: VTCompressionSessionRef,
-    session_aux: Option<VTCompressionSessionRef>,
-    callback_ctx: Arc<CallbackCtx>,
-    callback_ctx_aux: Option<Arc<CallbackCtx>>,
+    native: NativeSession,
+    applied_bitrate: u32,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -523,8 +436,6 @@ pub struct VtEncoder {
     pending_force_keyframe: bool,
     /// vImage SIMD converter for BGRA→NV12 acceleration.
     vimage: Option<VImageConverter>,
-    /// Keeps the submitted input buffer alive until async collection completes.
-    pending_input_buffer: Option<CVPixelBufferRef>,
 }
 
 // VTCompressionSession is thread-safe per Apple docs
@@ -538,44 +449,11 @@ impl VtEncoder {
         height: u32,
         stride: usize,
     ) -> Result<()> {
-        if width > self.width || height > self.height {
-            anyhow::bail!(
-                "AVC444 frame too large: frame={}x{}, encoder={}x{}",
-                width,
-                height,
-                self.width,
-                self.height
-            );
-        }
-        if width % 2 != 0 || height % 2 != 0 {
-            anyhow::bail!(
-                "AVC444 requires even frame dimensions, got {}x{}",
-                width,
-                height
-            );
-        }
-        let min_stride = width as usize * 4;
-        if stride < min_stride {
-            anyhow::bail!(
-                "AVC444 BGRA stride too small: stride={}, expected at least {} for width={}",
-                stride,
-                min_stride,
-                width
-            );
-        }
-        let required_len = (height as usize - 1)
-            .saturating_mul(stride)
-            .saturating_add(min_stride);
-        if data.len() < required_len {
-            anyhow::bail!(
-                "AVC444 BGRA buffer too short: len={}, required={}, width={}, height={}, stride={}",
-                data.len(),
-                required_len,
-                width,
-                height,
-                stride
-            );
-        }
+        validate_bgra_layout(data, width, height, stride, self.width, self.height)?;
+        anyhow::ensure!(
+            width % 2 == 0 && height % 2 == 0,
+            "AVC444 requires even frame dimensions, got {width}x{height}"
+        );
         Ok(())
     }
 
@@ -595,7 +473,7 @@ impl VtEncoder {
 
         // NV12 full-range input for both AVC420 and AVC444.
         // BGRA input produces video range (16-235) causing washed-out colors.
-        let session = Self::create_session(
+        let native = Self::create_session(
             width,
             height,
             fps,
@@ -603,11 +481,6 @@ impl VtEncoder {
             &callback_ctx,
             K_CV_PIXEL_FORMAT_420F,
         )?;
-
-        // AVC444: single session, no aux session. Both streams use the same encoder
-        // per MS-RDPEGFX requirement: "MUST be encoded using the same encoder".
-        let (session_aux, callback_ctx_aux) =
-            (None::<VTCompressionSessionRef>, None::<Arc<CallbackCtx>>);
 
         let yuv444_buf = if mode_444 {
             Some(Yuv444Buffers::new(width, height))
@@ -629,10 +502,8 @@ impl VtEncoder {
         );
 
         Ok(Self {
-            session,
-            session_aux,
-            callback_ctx,
-            callback_ctx_aux,
+            native,
+            applied_bitrate: bitrate,
             width,
             height,
             frame_count: 0,
@@ -641,7 +512,6 @@ impl VtEncoder {
             yuv444_buf,
             pending_force_keyframe: false,
             vimage,
-            pending_input_buffer: None,
         })
     }
 
@@ -654,160 +524,140 @@ impl VtEncoder {
         bitrate: u32,
         callback_ctx: &Arc<CallbackCtx>,
         pixel_format: u32,
-    ) -> Result<VTCompressionSessionRef> {
-        let mut session: VTCompressionSessionRef = std::ptr::null_mut();
-
+    ) -> Result<NativeSession> {
+        let retirement = RETIREMENTS
+            .get_or_init(|| crate::retirement::RetirementPool::new(2))
+            .reserve()?;
+        let mut session = std::ptr::null_mut();
         unsafe {
-            // Hardware acceleration + low-latency rate control.
-            // Low-latency RC produces clean first keyframes and adapts QP per-frame.
-            // AverageBitRate serves as a target hint for its internal algorithm.
             let spec_keys = [
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
                 kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
             ];
             let spec_values = [kCFBooleanTrue, kCFBooleanTrue];
-            let encoder_spec = CFDictionaryCreate(
-                std::ptr::null(),
-                spec_keys.as_ptr(),
-                spec_values.as_ptr(),
-                2,
-                std::ptr::null(),
-                std::ptr::null(),
-            );
-
-            // Source image buffer attributes — tell VT what pixel format to expect.
-            // This allows VT to create a compatible pixel buffer pool.
-            let src_keys: [CFTypeRef; 3] = [
-                kCVPixelBufferPixelFormatTypeKey as CFTypeRef,
-                kCVPixelBufferWidthKey as CFTypeRef,
-                kCVPixelBufferHeightKey as CFTypeRef,
+            let encoder_spec = OwnedCf::dictionary(&spec_keys, &spec_values)?;
+            let src_keys = [
+                kCVPixelBufferPixelFormatTypeKey,
+                kCVPixelBufferWidthKey,
+                kCVPixelBufferHeightKey,
             ];
-            let fmt_num = cf_i32(pixel_format as i32);
-            let w_num = cf_i32(width as i32);
-            let h_num = cf_i32(height as i32);
-            let src_values: [CFTypeRef; 3] = [fmt_num, w_num, h_num];
-            let src_attrs = CFDictionaryCreate(
-                std::ptr::null(),
-                src_keys.as_ptr(),
-                src_values.as_ptr(),
-                3,
-                std::ptr::null(),
-                std::ptr::null(),
-            );
-
+            let fmt_num = OwnedCf::new(cf_i32(pixel_format as i32))?;
+            let w_num = OwnedCf::new(cf_i32(width as i32))?;
+            let h_num = OwnedCf::new(cf_i32(height as i32))?;
+            let src_values = [fmt_num.as_ptr(), w_num.as_ptr(), h_num.as_ptr()];
+            let src_attrs = OwnedCf::dictionary(&src_keys, &src_values)?;
             let status = VTCompressionSessionCreate(
                 std::ptr::null(),
                 width as i32,
                 height as i32,
                 K_CM_VIDEO_CODEC_TYPE_H264,
-                encoder_spec,
-                src_attrs, // source image buffer attributes
+                encoder_spec.as_ptr(),
+                src_attrs.as_ptr(),
                 std::ptr::null(),
                 Some(encode_callback),
                 Arc::as_ptr(callback_ctx) as *mut c_void,
                 &mut session,
             );
-
-            CFRelease(encoder_spec as *const _);
-            CFRelease(src_attrs as *const _);
-            CFRelease(fmt_num);
-            CFRelease(w_num);
-            CFRelease(h_num);
-
-            if status != 0 || session.is_null() {
-                anyhow::bail!("VTCompressionSessionCreate failed: {status}");
-            }
-
-            // Constrained Baseline Profile — compatible with Apple Silicon hardware encoder
-            // in low-latency mode. High Profile causes null sample_buffer (frame drops) on
-            // Apple Silicon with RequireHardwareAccelerated + EnableLowLatencyRateControl.
-            VTSessionSetProperty(
+            anyhow::ensure!(
+                !session.is_null(),
+                "VTCompressionSessionCreate failed: {status}"
+            );
+            // Own the session before checking status/configuration. A failed
+            // initialization follows the same nonblocking retirement as teardown.
+            let native = NativeSession {
+                session,
+                callback_ctx: callback_ctx.clone(),
+                pending_input_buffer: None,
+                retirement: Some(retirement),
+            };
+            check_status(status, "VTCompressionSessionCreate")?;
+            set_required_property(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
                 kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
-            );
-            // Explicit CAVLC entropy mode (required for Constrained Baseline)
-            VTSessionSetProperty(
+                "ProfileLevel",
+            )?;
+            set_required_property(
                 session,
-                kVTCompressionPropertyKey_H264EntropyMode,
-                kVTH264EntropyMode_CAVLC,
-            );
-            // Low-latency: no frame reordering, no B-frames, zero delay
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-            VTSessionSetProperty(
+                kVTCompressionPropertyKey_RealTime,
+                kCFBooleanTrue,
+                "RealTime",
+            )?;
+            set_required_property(
                 session,
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 kCFBooleanFalse,
+                "AllowFrameReordering",
+            )?;
+            set_optional_property(
+                session,
+                kVTCompressionPropertyKey_H264EntropyMode,
+                kVTH264EntropyMode_CAVLC,
+                "H264EntropyMode",
             );
-            VTSessionSetProperty(
+            set_optional_property(
                 session,
                 kVTCompressionPropertyKey_AllowOpenGOP,
                 kCFBooleanFalse,
+                "AllowOpenGOP",
             );
-            VTSessionSetProperty(
+            let delay = OwnedCf::new(cf_i32(0))?;
+            set_optional_property(
                 session,
                 kVTCompressionPropertyKey_MaxFrameDelayCount,
-                cf_i32(0),
+                delay.as_ptr(),
+                "MaxFrameDelayCount",
             );
-            // Temporal compression (P-frames) — do NOT set ReferenceBufferCount
-            // (on Apple Silicon, setting it to 1 forces all-IDR)
-            VTSessionSetProperty(
+            set_optional_property(
                 session,
                 kVTCompressionPropertyKey_AllowTemporalCompression,
                 kCFBooleanTrue,
+                "AllowTemporalCompression",
             );
-            // Force full-range video output (Y: 0-255) to avoid washed-out colors.
-            // Without this, VT defaults to video range (Y: 16-235) which looks gray.
-            VTSessionSetProperty(
+            set_optional_property(
                 session,
                 kCMFormatDescriptionExtension_FullRangeVideo,
                 kCFBooleanTrue,
+                "FullRangeVideo",
             );
-
-            // Rate control: AverageBitRate only (soft target).
-            // VT will aim for this average but allow bursts for keyframes.
-            // No DataRateLimits — hard ceiling starves first keyframe causing blur.
-            // No EnableLowLatencyRateControl — it ignores AverageBitRate entirely.
-            VTSessionSetProperty(
+            let expected_fps = OwnedCf::new(cf_f64(fps as f64))?;
+            set_optional_property(
                 session,
                 kVTCompressionPropertyKey_ExpectedFrameRate,
-                cf_f64(fps as f64),
+                expected_fps.as_ptr(),
+                "ExpectedFrameRate",
             );
-            VTSessionSetProperty(
+            let average_bitrate = OwnedCf::new(cf_i32(bitrate as i32))?;
+            set_required_property(
                 session,
                 kVTCompressionPropertyKey_AverageBitRate,
-                cf_i32(bitrate as i32),
-            );
-            tracing::info!(
-                bitrate_mbps = bitrate as f64 / 1_000_000.0,
-                fps,
-                "VT session bitrate set"
-            );
-            // IDR every 5 seconds — less frequent keyframes reduce bandwidth spikes
-            VTSessionSetProperty(
+                average_bitrate.as_ptr(),
+                "AverageBitRate",
+            )?;
+            let interval = OwnedCf::new(cf_i32(fps as i32 * 5))?;
+            set_optional_property(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                cf_i32(fps as i32 * 5),
+                interval.as_ptr(),
+                "MaxKeyFrameInterval",
             );
-
-            // PrioritizeEncodingSpeedOverQuality (macOS 14+) — reduce encode latency
-            {
-                let key_bytes = b"PrioritizeEncodingSpeedOverQuality\0";
-                let key = CFStringCreateWithCString(
-                    std::ptr::null(),
-                    key_bytes.as_ptr() as *const i8,
-                    0x08000100, // kCFStringEncodingUTF8
-                );
-                if !key.is_null() {
-                    VTSessionSetProperty(session, key, kCFBooleanTrue);
-                    CFRelease(key);
-                }
-            }
-
-            VTCompressionSessionPrepareToEncodeFrames(session);
+            let speed_key = OwnedCf::new(CFStringCreateWithCString(
+                std::ptr::null(),
+                b"PrioritizeEncodingSpeedOverQuality\0".as_ptr().cast(),
+                0x08000100,
+            ))?;
+            set_optional_property(
+                session,
+                speed_key.as_ptr(),
+                kCFBooleanTrue,
+                "PrioritizeEncodingSpeedOverQuality",
+            );
+            check_status(
+                VTCompressionSessionPrepareToEncodeFrames(session),
+                "VTCompressionSessionPrepareToEncodeFrames",
+            )?;
+            Ok(native)
         }
-
-        Ok(session)
     }
 
     /// Fast BGRA→NV12 full-range conversion via session pool buffer.
@@ -820,7 +670,7 @@ impl VtEncoder {
         src_w: u32,
         src_h: u32,
         stride: usize,
-    ) -> Result<CVPixelBufferRef> {
+    ) -> Result<OwnedPixelBuffer> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
         let sw = src_w.min(enc_w) as usize;
         let sh = src_h.min(enc_h) as usize;
@@ -835,15 +685,14 @@ impl VtEncoder {
                 anyhow::bail!("Pool alloc failed: {status}");
             }
 
-            CVPixelBufferLockBaseAddress(pb, 0);
+            let mut pixel_buffer = OwnedPixelBuffer::new(pb)?;
+            pixel_buffer.lock()?;
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
             let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
             let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
             let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
 
             if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("NV12 plane is null");
             }
 
@@ -888,9 +737,9 @@ impl VtEncoder {
                 }
             }
 
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+            pixel_buffer.unlock();
+            Ok(pixel_buffer)
         }
-        Ok(pb)
     }
 
     /// Create NV12 CVPixelBuffer using vImage SIMD acceleration directly into
@@ -905,7 +754,7 @@ impl VtEncoder {
         src_w: u32,
         src_h: u32,
         stride: usize,
-    ) -> Result<CVPixelBufferRef> {
+    ) -> Result<OwnedPixelBuffer> {
         let vimage = match &self.vimage {
             Some(v) => v,
             None => {
@@ -928,15 +777,14 @@ impl VtEncoder {
                 anyhow::bail!("Pool alloc failed: {status}");
             }
 
-            CVPixelBufferLockBaseAddress(pb, 0);
+            let mut pixel_buffer = OwnedPixelBuffer::new(pb)?;
+            pixel_buffer.lock()?;
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
             let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
             let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
             let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
 
             if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("NV12 plane is null");
             }
 
@@ -948,14 +796,12 @@ impl VtEncoder {
             if let Err(e) = vimage.bgra_to_nv12_with_strides(
                 data, src_w, src_h, stride, y_bpr, uv_bpr, y_plane, uv_plane,
             ) {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 return Err(anyhow::anyhow!("vImage bgra_to_nv12 failed: {e}"));
             }
 
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+            pixel_buffer.unlock();
+            Ok(pixel_buffer)
         }
-        Ok(pb)
     }
 
     /// Create a BGRA CVPixelBuffer with VT-managed memory and copy frame data into it.
@@ -966,7 +812,7 @@ impl VtEncoder {
         src_w: u32,
         src_h: u32,
         stride: usize,
-    ) -> Result<CVPixelBufferRef> {
+    ) -> Result<OwnedPixelBuffer> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
         unsafe {
             let status = CVPixelBufferCreate(
@@ -981,8 +827,10 @@ impl VtEncoder {
                 anyhow::bail!("CVPixelBufferCreate BGRA failed: {status}");
             }
 
-            CVPixelBufferLockBaseAddress(pb, 0);
+            let mut pixel_buffer = OwnedPixelBuffer::new(pb)?;
+            pixel_buffer.lock()?;
             let base = CVPixelBufferGetBaseAddress(pb) as *mut u8;
+            anyhow::ensure!(!base.is_null(), "BGRA pixel buffer has no base address");
             let bpr = CVPixelBufferGetBytesPerRow(pb);
             let copy_rows = (src_h as usize).min(enc_h as usize);
             let copy_cols_bytes = (src_w as usize * 4).min(bpr);
@@ -997,9 +845,10 @@ impl VtEncoder {
                     );
                 }
             }
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+
+            pixel_buffer.unlock();
+            Ok(pixel_buffer)
         }
-        Ok(pb)
     }
 
     /// Convert I420 (YUV420) frame to BGRA using BT.601 reverse transform.
@@ -1046,7 +895,7 @@ impl VtEncoder {
         src_w: u32,
         src_h: u32,
         stride: usize,
-    ) -> Result<CVPixelBufferRef> {
+    ) -> Result<OwnedPixelBuffer> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
         let w = enc_w as usize;
         let h = enc_h as usize;
@@ -1063,7 +912,8 @@ impl VtEncoder {
                 anyhow::bail!("CVPixelBufferPoolCreatePixelBuffer failed: {status}");
             }
 
-            CVPixelBufferLockBaseAddress(pb, 0);
+            let mut pixel_buffer = OwnedPixelBuffer::new(pb)?;
+            pixel_buffer.lock()?;
 
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
             let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
@@ -1071,8 +921,6 @@ impl VtEncoder {
             let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
 
             if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("NV12 plane address is null");
             }
 
@@ -1125,9 +973,9 @@ impl VtEncoder {
                 }
             }
 
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+            pixel_buffer.unlock();
+            Ok(pixel_buffer)
         }
-        Ok(pb)
     }
 
     /// Allocate NV12 pixel buffer from VT session's pool (IOSurface-backed, hardware compatible)
@@ -1139,7 +987,7 @@ impl VtEncoder {
         y_plane: &[u8],
         u_plane: &[u8],
         v_plane: &[u8],
-    ) -> Result<CVPixelBufferRef> {
+    ) -> Result<OwnedPixelBuffer> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
         let w = width as usize;
         let h = height as usize;
@@ -1155,14 +1003,13 @@ impl VtEncoder {
                 anyhow::bail!("CVPixelBufferPoolCreatePixelBuffer failed: {status}");
             }
 
-            CVPixelBufferLockBaseAddress(pb, 0);
+            let mut pixel_buffer = OwnedPixelBuffer::new(pb)?;
+            pixel_buffer.lock()?;
 
             // Plane 0: Y
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
             let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
             if y_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("Pool NV12 Y plane is null");
             }
             for row in 0..h {
@@ -1181,8 +1028,6 @@ impl VtEncoder {
             let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
             let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
             if uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("Pool NV12 UV plane is null");
             }
             let uv_w = w / 2;
@@ -1198,10 +1043,9 @@ impl VtEncoder {
                 }
             }
 
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+            pixel_buffer.unlock();
+            Ok(pixel_buffer)
         }
-
-        Ok(pb)
     }
 
     /// Create an IOSurface-backed NV12 CVPixelBuffer from I420 planes.
@@ -1213,7 +1057,7 @@ impl VtEncoder {
         y_plane: &[u8],
         u_plane: &[u8],
         v_plane: &[u8],
-    ) -> Result<CVPixelBufferRef> {
+    ) -> Result<OwnedPixelBuffer> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
         let w = width as usize;
         let h = height as usize;
@@ -1234,14 +1078,13 @@ impl VtEncoder {
                 anyhow::bail!("CVPixelBufferCreate NV12 failed: status={status}");
             }
 
-            CVPixelBufferLockBaseAddress(pb, 0);
+            let mut pixel_buffer = OwnedPixelBuffer::new(pb)?;
+            pixel_buffer.lock()?;
 
             // Plane 0: Y (full resolution)
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
             let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
             if y_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("NV12 Y plane is null");
             }
             for row in 0..h {
@@ -1260,8 +1103,6 @@ impl VtEncoder {
             let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
             let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
             if uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
                 anyhow::bail!("NV12 UV plane is null");
             }
             let uv_w = w / 2;
@@ -1277,10 +1118,9 @@ impl VtEncoder {
                 }
             }
 
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+            pixel_buffer.unlock();
+            Ok(pixel_buffer)
         }
-
-        Ok(pb)
     }
 
     /// Encode a single frame through a VT session and wait for the callback.
@@ -1392,56 +1232,22 @@ impl VtEncoder {
         Ok(())
     }
 
-    /// Collect the result from a previous submit. Blocks up to `timeout`.
-    /// CRITICAL: MutexGuard is dropped BEFORE calling VTCompressionSessionCompleteFrames
-    /// to avoid deadlock (the callback needs the lock).
+    /// Wait only for the callback. A timeout preserves the submitted input;
+    /// native flushing could block indefinitely and belongs outside this API.
     fn collect_session_frame(
-        session: VTCompressionSessionRef,
         ctx: &Arc<CallbackCtx>,
         timeout: std::time::Duration,
     ) -> Result<Option<(Vec<u8>, bool)>> {
-        // First wait
-        let timed_out;
-        {
-            let guard = ctx.output.lock().unwrap();
-            let (guard2, wait_result) = ctx
-                .ready
-                .wait_timeout_while(guard, timeout, |_| {
-                    !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
-                })
-                .unwrap();
-            timed_out = wait_result.timed_out();
-            drop(guard2); // MUST drop before CompleteFrames
-        }
-
-        if timed_out {
-            tracing::warn!("VT collect timeout — forcing CompleteFrames");
-            unsafe {
-                let pts = CMTime {
-                    value: 0,
-                    timescale: 1,
-                    flags: 0,
-                    epoch: 0,
-                };
-                VTCompressionSessionCompleteFrames(session, pts);
-            }
-            // Second wait
-            let guard = ctx.output.lock().unwrap();
-            let (guard2, _) = ctx
-                .ready
-                .wait_timeout_while(guard, post_flush_wait_budget(timeout), |_| {
-                    !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
-                })
-                .unwrap();
-            drop(guard2);
-        }
-
-        // Retrieve result
-        let mut guard = ctx.output.lock().unwrap();
+        let guard = ctx.output.lock().unwrap();
+        let (mut guard, _) = ctx
+            .ready
+            .wait_timeout_while(guard, timeout, |_| {
+                !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
+            })
+            .unwrap();
         if ctx.has_data.load(std::sync::atomic::Ordering::Acquire) {
             Ok(guard.take())
         } else {
-            tracing::warn!("VT collect: no data after timeout + CompleteFrames");
             Ok(None)
         }
     }
@@ -1454,40 +1260,23 @@ impl VtEncoder {
         (pts, duration)
     }
 
-    fn replace_pending_input_buffer(&mut self, pixel_buffer: CVPixelBufferRef) {
-        if let Some(prev) = self.pending_input_buffer.replace(pixel_buffer) {
-            unsafe {
-                CVPixelBufferRelease(prev);
-            }
-        }
+    fn replace_pending_input_buffer(&mut self, pixel_buffer: OwnedPixelBuffer) {
+        self.native.pending_input_buffer = Some(pixel_buffer);
     }
 
     fn clear_pending_input_buffer(&mut self) {
-        if let Some(prev) = self.pending_input_buffer.take() {
-            unsafe {
-                CVPixelBufferRelease(prev);
-            }
-        }
+        self.native.pending_input_buffer = None;
     }
 
-    /// Build a force-keyframe properties dict if pending, otherwise return null.
-    fn make_force_keyframe_props(&mut self) -> CFDictionaryRef {
-        if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
+    /// Keep the keyframe request pending until native submission succeeds.
+    fn make_force_keyframe_props(pending: bool) -> Result<Option<OwnedCf>> {
+        if !pending {
+            return Ok(None);
+        }
+        unsafe {
+            let keys = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+            let values = [kCFBooleanTrue];
+            Ok(Some(OwnedCf::dictionary(&keys, &values)?))
         }
     }
 }
@@ -1504,13 +1293,14 @@ impl VideoEncoder for VtEncoder {
         height: u32,
         stride: usize,
     ) -> Result<EncodedFrame> {
+        validate_bgra_layout(data, width, height, stride, self.width, self.height)?;
         let frame_duration = (600.0 / self.fps as f64) as i64;
         let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let duration = CMTime::make(frame_duration, 600);
 
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
         let pixel_buffer = self.create_nv12_vimage(
-            self.session,
+            self.native.session,
             self.width,
             self.height,
             data,
@@ -1519,45 +1309,22 @@ impl VideoEncoder for VtEncoder {
             stride,
         )?;
 
-        // Build frame properties dict to force IDR when requested
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
 
         let (nal_data, is_keyframe) = Self::encode_session_frame(
-            self.session,
-            &self.callback_ctx,
-            pixel_buffer,
+            self.native.session,
+            &self.native.callback_ctx,
+            pixel_buffer.as_ptr(),
             pts,
             duration,
             self.frame_count,
-            frame_props,
+            frame_props
+                .as_ref()
+                .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
         )?;
 
-        if !frame_props.is_null() {
-            unsafe {
-                CFRelease(frame_props);
-            }
-        }
-        unsafe {
-            CVPixelBufferRelease(pixel_buffer);
-        }
-
+        self.pending_force_keyframe = false;
         self.frame_count += 1;
 
         // NAL type diagnostic for first 10 frames
@@ -1637,6 +1404,10 @@ impl VideoEncoder for VtEncoder {
         pixel_buffer_ptr: *mut c_void,
         force_keyframe: bool,
     ) -> Result<EncodedFrame> {
+        anyhow::ensure!(
+            !pixel_buffer_ptr.is_null(),
+            "Cannot encode a null pixel buffer"
+        );
         if force_keyframe {
             self.pending_force_keyframe = true;
         }
@@ -1645,43 +1416,23 @@ impl VideoEncoder for VtEncoder {
         let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let duration = CMTime::make(frame_duration, 600);
 
-        // Build frame properties for force keyframe if needed
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
 
         // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
         let (nal_data, is_keyframe) = Self::encode_session_frame(
-            self.session,
-            &self.callback_ctx,
+            self.native.session,
+            &self.native.callback_ctx,
             pixel_buffer_ptr,
             pts,
             duration,
             self.frame_count,
-            frame_props,
+            frame_props
+                .as_ref()
+                .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
         )?;
 
-        if !frame_props.is_null() {
-            unsafe {
-                CFRelease(frame_props);
-            }
-        }
-
+        self.pending_force_keyframe = false;
         self.frame_count += 1;
 
         Ok(EncodedFrame {
@@ -1735,29 +1486,12 @@ impl VideoEncoder for VtEncoder {
         let frame_duration = (600.0 / self.fps as f64) as i64;
         let duration = CMTime::make(frame_duration, 600);
 
-        // Build frame properties dict to force IDR on both streams when requested
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
 
         // Step 2: Encode main view — standard YUV420 from B-area split
         let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let main_pb = Self::create_nv12_from_session_pool(
-            self.session,
+            self.native.session,
             w,
             h,
             &bufs.main_view.y,
@@ -1765,25 +1499,24 @@ impl VideoEncoder for VtEncoder {
             &bufs.main_view.v,
         )?;
         let (main_nal, main_keyframe) = Self::encode_session_frame(
-            self.session,
-            &self.callback_ctx,
-            main_pb,
+            self.native.session,
+            &self.native.callback_ctx,
+            main_pb.as_ptr(),
             main_pts,
             duration,
             self.frame_count,
-            frame_props,
+            frame_props
+                .as_ref()
+                .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
         )?;
-        unsafe {
-            CVPixelBufferRelease(main_pb);
-        }
 
         // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
         // Force IDR on aux too if main was forced, to keep both streams in sync
         self.frame_count += 1;
         let aux_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let aux_pb = Self::create_nv12_from_session_pool(
-            self.session,
+            self.native.session,
             w,
             h,
             &bufs.aux_view.y,
@@ -1791,25 +1524,19 @@ impl VideoEncoder for VtEncoder {
             &bufs.aux_view.v,
         )?;
         let (aux_nal, aux_keyframe) = Self::encode_session_frame(
-            self.session,
-            &self.callback_ctx,
-            aux_pb,
+            self.native.session,
+            &self.native.callback_ctx,
+            aux_pb.as_ptr(),
             aux_pts,
             duration,
             self.frame_count,
-            frame_props,
+            frame_props
+                .as_ref()
+                .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
         )?;
-        unsafe {
-            CVPixelBufferRelease(aux_pb);
-        }
 
-        if !frame_props.is_null() {
-            unsafe {
-                CFRelease(frame_props);
-            }
-        }
-
+        self.pending_force_keyframe = false;
         self.frame_count += 1;
 
         tracing::debug!(
@@ -1835,18 +1562,30 @@ impl VideoEncoder for VtEncoder {
         })
     }
 
-    fn set_bitrate(&mut self, bitrate_bps: u32) {
-        unsafe {
-            VTSessionSetProperty(
-                self.session,
-                kVTCompressionPropertyKey_AverageBitRate,
-                cf_i32(bitrate_bps as i32),
-            );
-        }
-        tracing::debug!(
-            bitrate_mbps = bitrate_bps as f64 / 1_000_000.0,
-            "VideoToolbox bitrate updated"
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
+        anyhow::ensure!(
+            (1..=crate::MAX_BITRATE_BPS).contains(&bitrate_bps),
+            "Invalid bitrate"
         );
+        if self.applied_bitrate == bitrate_bps {
+            return Ok(());
+        }
+        unsafe {
+            let bitrate = OwnedCf::new(cf_i32(bitrate_bps as i32))?;
+            set_required_property(
+                self.native.session,
+                kVTCompressionPropertyKey_AverageBitRate,
+                bitrate.as_ptr(),
+                "AverageBitRate",
+            )?;
+        }
+        self.applied_bitrate = bitrate_bps;
+        tracing::debug!(bitrate_bps, "VideoToolbox accepted bitrate update");
+        Ok(())
+    }
+
+    fn applied_bitrate(&self) -> Option<u32> {
+        Some(self.applied_bitrate)
     }
 
     fn force_keyframe(&mut self) {
@@ -1868,21 +1607,22 @@ impl VideoEncoder for VtEncoder {
     fn encode_completion(
         &self,
     ) -> Option<tokio::sync::watch::Receiver<Option<crate::EncodeTiming>>> {
-        Some(self.callback_ctx.completion.subscribe())
+        Some(self.native.callback_ctx.completion.subscribe())
     }
 
     fn last_encode_timing(&self) -> Option<crate::EncodeTiming> {
-        self.callback_ctx.completion.timing()
+        self.native.callback_ctx.completion.timing()
     }
 
     fn submit_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<()> {
+        validate_bgra_layout(data, width, height, stride, self.width, self.height)?;
         anyhow::ensure!(
-            self.pending_input_buffer.is_none(),
+            self.native.pending_input_buffer.is_none(),
             "Previous async encode is still pending"
         );
-        self.callback_ctx.completion.begin();
+        self.native.callback_ctx.completion.begin();
         let pixel_buffer = self.create_nv12_vimage(
-            self.session,
+            self.native.session,
             self.width,
             self.height,
             data,
@@ -1891,77 +1631,60 @@ impl VideoEncoder for VtEncoder {
             stride,
         )?;
         let (pts, duration) = self.make_pts_duration();
-        let frame_props = self.make_force_keyframe_props();
+        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
 
         let result = Self::submit_session_frame(
-            self.session,
-            &self.callback_ctx,
-            pixel_buffer,
+            self.native.session,
+            &self.native.callback_ctx,
+            pixel_buffer.as_ptr(),
             pts,
             duration,
-            frame_props,
+            frame_props
+                .as_ref()
+                .map_or(std::ptr::null(), OwnedCf::as_ptr),
         );
 
-        if !frame_props.is_null() {
-            unsafe {
-                CFRelease(frame_props);
-            }
-        }
         match result {
             Ok(()) => {
                 self.replace_pending_input_buffer(pixel_buffer);
+                self.pending_force_keyframe = false;
                 self.frame_count += 1;
                 Ok(())
             }
-            Err(e) => {
-                unsafe {
-                    CVPixelBufferRelease(pixel_buffer);
-                }
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
     fn submit_pixel_buffer(&mut self, ptr: *mut std::ffi::c_void) -> Result<()> {
         anyhow::ensure!(
-            self.pending_input_buffer.is_none(),
+            self.native.pending_input_buffer.is_none(),
             "Previous async encode is still pending"
         );
-        self.callback_ctx.completion.begin();
+        self.native.callback_ctx.completion.begin();
         let (pts, duration) = self.make_pts_duration();
-        let frame_props = self.make_force_keyframe_props();
-        let pixel_buffer = ptr as CVPixelBufferRef;
-
-        unsafe {
-            CVPixelBufferRetain(pixel_buffer);
-        }
+        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
+        anyhow::ensure!(!ptr.is_null(), "Cannot encode a null pixel buffer");
+        let pixel_buffer = unsafe { OwnedPixelBuffer::new(CVPixelBufferRetain(ptr))? };
 
         let result = Self::submit_session_frame(
-            self.session,
-            &self.callback_ctx,
-            pixel_buffer,
+            self.native.session,
+            &self.native.callback_ctx,
+            pixel_buffer.as_ptr(),
             pts,
             duration,
-            frame_props,
+            frame_props
+                .as_ref()
+                .map_or(std::ptr::null(), OwnedCf::as_ptr),
         );
 
-        if !frame_props.is_null() {
-            unsafe {
-                CFRelease(frame_props);
-            }
-        }
         match result {
             Ok(()) => {
                 self.replace_pending_input_buffer(pixel_buffer);
+                self.pending_force_keyframe = false;
                 self.frame_count += 1;
                 Ok(())
             }
-            Err(e) => {
-                unsafe {
-                    CVPixelBufferRelease(pixel_buffer);
-                }
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1970,14 +1693,22 @@ impl VideoEncoder for VtEncoder {
         // hardware codec or release an input buffer still being encoded.
         if timeout.is_zero()
             && !self
+                .native
                 .callback_ctx
                 .has_data
                 .load(std::sync::atomic::Ordering::Acquire)
         {
             return Ok(None);
         }
-        let collected = Self::collect_session_frame(self.session, &self.callback_ctx, timeout)?;
-        self.clear_pending_input_buffer();
+        let collected = Self::collect_session_frame(&self.native.callback_ctx, timeout)?;
+        if self
+            .native
+            .callback_ctx
+            .has_data
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.clear_pending_input_buffer();
+        }
         match collected {
             Some((nal_data, is_keyframe)) => Ok(Some(EncodedFrame {
                 data: Bytes::from(nal_data),
@@ -1986,6 +1717,7 @@ impl VideoEncoder for VtEncoder {
                 height: self.height,
             })),
             None if self
+                .native
                 .callback_ctx
                 .has_data
                 .load(std::sync::atomic::Ordering::Acquire) =>
@@ -2002,23 +1734,45 @@ impl VideoEncoder for VtEncoder {
     }
 }
 
-impl Drop for VtEncoder {
-    fn drop(&mut self) {
-        unsafe {
-            VTCompressionSessionInvalidate(self.session);
-            CFRelease(self.session);
-            if let Some(aux) = self.session_aux {
-                VTCompressionSessionInvalidate(aux);
-                CFRelease(aux);
-            }
-        }
-        self.clear_pending_input_buffer();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_bgra_layouts_are_rejected_before_native_conversion() {
+        let bytes = vec![0; 16 * 16 * 4];
+        for (width, height, stride) in [
+            (0, 16, 64),
+            (16, 0, 64),
+            (17, 16, 68),
+            (16, 16, 63),
+            (16, 16, 65),
+            (16, 16, usize::MAX),
+        ] {
+            assert!(validate_bgra_layout(&bytes, width, height, stride, 16, 16).is_err());
+        }
+        assert!(validate_bgra_layout(&bytes, 16, 16, 64, 16, 16).is_ok());
+        // The final row need not carry trailing stride padding.
+        assert!(validate_bgra_layout(&vec![0; 15 * 80 + 64], 16, 16, 80, 16, 16).is_ok());
+    }
+
+    #[test]
+    fn timed_collection_does_not_complete_or_discard_an_outstanding_callback() {
+        let ctx = Arc::new(CallbackCtx::default());
+        ctx.completion.begin();
+        assert!(
+            VtEncoder::collect_session_frame(&ctx, std::time::Duration::from_millis(1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(ctx.completion.timing().is_none());
+        *ctx.output.lock().unwrap() = Some((vec![1, 2, 3], true));
+        drop(CallbackFinished(&ctx));
+        assert_eq!(
+            VtEncoder::collect_session_frame(&ctx, std::time::Duration::ZERO).unwrap(),
+            Some((vec![1, 2, 3], true))
+        );
+    }
 
     #[tokio::test]
     async fn failed_native_callback_wakes_async_consumer() {

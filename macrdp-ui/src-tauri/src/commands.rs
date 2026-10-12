@@ -157,18 +157,14 @@ pub async fn get_server_status(
 
 #[tauri::command]
 pub async fn get_metrics(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    // If we have a live handle, refresh from it so polling fallback works even
-    // if an event update was missed.
-    {
-        let guard = state.server_handle.lock().await;
-        let live_metrics = guard
-            .as_ref()
-            .filter(|handle| handle.status().running)
-            .map(|handle| handle.metrics())
-            .unwrap_or_default();
-        *state.metrics.lock().await = live_metrics;
-    }
-    let metrics = state.metrics.lock().await.clone();
+    // Return the live ticker snapshot without writing the callback cache: an
+    // event can publish a newer sample while this polling request is in flight.
+    let guard = state.server_handle.lock().await;
+    let metrics = guard
+        .as_ref()
+        .filter(|handle| handle.status().running)
+        .map(|handle| handle.metrics())
+        .unwrap_or_default();
     serde_json::to_value(&metrics).map_err(|e| e.to_string())
 }
 

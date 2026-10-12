@@ -361,6 +361,10 @@ pub struct GfxState {
     pub target_frame_rate: Option<u32>,
     /// Most recent native capture target after adaptive pacing.
     pub requested_capture_frame_rate: Option<u32>,
+    /// Adaptive codec target and last confirmed backend application.
+    pub requested_encoder_bitrate: Option<u32>,
+    pub applied_encoder_bitrate: Option<u32>,
+    pub encoder_bitrate_update_failures: u64,
     /// Currently applied capture frame rate after hot updates/adaptation.
     pub applied_frame_rate: Option<u32>,
     /// Failed native configuration attempts for the current capture owner.
@@ -434,6 +438,9 @@ impl GfxState {
             target_bitrate: None,
             target_frame_rate: None,
             requested_capture_frame_rate: None,
+            requested_encoder_bitrate: None,
+            applied_encoder_bitrate: None,
+            encoder_bitrate_update_failures: 0,
             applied_frame_rate: None,
             capture_frame_rate_update_failures: 0,
             capture_frame_rate_retry_exhausted: false,
@@ -605,6 +612,9 @@ impl GfxState {
         self.capture_queue_ms = 0.0;
         self.capture_frames_coalesced = 0;
         self.requested_capture_frame_rate = None;
+        self.requested_encoder_bitrate = None;
+        self.applied_encoder_bitrate = None;
+        self.encoder_bitrate_update_failures = 0;
         self.applied_frame_rate = None;
         self.capture_frame_rate_update_failures = 0;
         self.capture_frame_rate_retry_exhausted = false;

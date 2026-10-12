@@ -1,6 +1,7 @@
 use super::*;
 use crate::{KeyboardEvent, MouseEvent, RdpServerDisplayUpdates};
 use std::sync::Mutex as StdMutex;
+use tokio::sync::mpsc;
 
 fn admission_test_server() -> RdpServer {
     RdpServer::builder()
@@ -9,6 +10,199 @@ fn admission_test_server() -> RdpServer {
         .with_no_input()
         .with_no_display()
         .build()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OrderedInputEvent {
+    Mouse(MouseEvent),
+    Key(bool, u8),
+}
+
+struct OrderedInput(Arc<StdMutex<Vec<OrderedInputEvent>>>);
+
+impl RdpServerInputHandler for OrderedInput {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        let key = match event {
+            KeyboardEvent::Pressed { code, .. } => Some((true, code)),
+            KeyboardEvent::Released { code, .. } => Some((false, code)),
+            _ => None,
+        };
+        if let Some((pressed, code)) = key {
+            self.0
+                .lock()
+                .unwrap()
+                .push(OrderedInputEvent::Key(pressed, code));
+        }
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        self.0.lock().unwrap().push(OrderedInputEvent::Mouse(event));
+    }
+}
+
+fn ordered_input_server() -> (RdpServer, Arc<StdMutex<Vec<OrderedInputEvent>>>) {
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_input_handler(OrderedInput(Arc::clone(&events)))
+        .with_no_display()
+        .build();
+    (server, events)
+}
+
+#[tokio::test]
+async fn fastpath_relative_wire_packets_preserve_motion_and_every_button() {
+    use ironrdp_pdu::input::{mouse_rel::PointerRelFlags as F, MouseRelPdu};
+    let (mut server, events) = ordered_input_server();
+    for flags in [F::DOWN | F::BUTTON1 | F::XBUTTON2, F::BUTTON1 | F::XBUTTON2] {
+        let relative = MouseRelPdu {
+            flags,
+            x_delta: -10,
+            y_delta: 20,
+        };
+        let payload = encode_vec(&relative).unwrap();
+        // One event, FASTPATH_INPUT_EVENT_MOUSEREL (5), followed by the
+        // protocol encoder's pointer flags and signed relative deltas.
+        let mut packet = vec![0x04, (3 + payload.len()) as u8, 0xa0];
+        packet.extend(payload);
+        server
+            .dispatch_pdu(Action::FastPath, packet.as_slice().into(), 1003, 1002)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            OrderedInputEvent::Mouse(MouseEvent::RelMove { x: -10, y: 20 }),
+            OrderedInputEvent::Mouse(MouseEvent::LeftPressed),
+            OrderedInputEvent::Mouse(MouseEvent::Button5Pressed),
+            OrderedInputEvent::Mouse(MouseEvent::RelMove { x: -10, y: 20 }),
+            OrderedInputEvent::Mouse(MouseEvent::LeftReleased),
+            OrderedInputEvent::Mouse(MouseEvent::Button5Released),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn additional_mouse_input_cannot_be_overtaken_by_fastpath_keyboard() {
+    use ironrdp_ainput::{ClientPdu, MouseEventFlags as F, MousePdu};
+    use ironrdp_dvc::DvcProcessor as _;
+    let (mut server, events) = ordered_input_server();
+    let mut additional = AInputHandler::new(
+        server.additional_input.clone(),
+        server.input_activity.clone(),
+    );
+    let press = encode_vec(&ClientPdu::Mouse(MousePdu {
+        time: 0,
+        flags: F::BUTTON1 | F::DOWN,
+        x: 10,
+        y: 20,
+    }))
+    .unwrap();
+    additional.process(7, &press).unwrap();
+    // Intentionally do not yield to any worker between the two wire events.
+    server
+        .dispatch_pdu(
+            Action::FastPath,
+            [0x04, 0x04, 0x00, 0x1e].as_slice().into(),
+            1003,
+            1002,
+        )
+        .await
+        .unwrap();
+    let release = encode_vec(&ClientPdu::Mouse(MousePdu {
+        time: 0,
+        flags: F::BUTTON1,
+        x: 30,
+        y: 40,
+    }))
+    .unwrap();
+    additional.process(7, &release).unwrap();
+    server
+        .dispatch_pdu(
+            Action::FastPath,
+            [0x04, 0x04, 0x01, 0x1e].as_slice().into(),
+            1003,
+            1002,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            OrderedInputEvent::Mouse(MouseEvent::Move { x: 10, y: 20 }),
+            OrderedInputEvent::Mouse(MouseEvent::LeftPressed),
+            OrderedInputEvent::Key(true, 0x1e),
+            OrderedInputEvent::Mouse(MouseEvent::Move { x: 30, y: 40 }),
+            OrderedInputEvent::Mouse(MouseEvent::LeftReleased),
+            OrderedInputEvent::Key(false, 0x1e),
+        ]
+    );
+    assert!(server.additional_input.pop().is_none());
+}
+
+#[tokio::test]
+async fn resize_barrier_waits_for_ordered_mouse_and_keyboard_injection() {
+    use ironrdp_ainput::{ClientPdu, MouseEventFlags as F, MousePdu};
+    use ironrdp_dvc::DvcProcessor as _;
+    use std::future::Future as _;
+    let (mut server, events) = ordered_input_server();
+    let mut additional = AInputHandler::new(
+        server.additional_input.clone(),
+        server.input_activity.clone(),
+    );
+    let packet = encode_vec(&ClientPdu::Mouse(MousePdu {
+        time: 0,
+        flags: F::BUTTON1 | F::DOWN,
+        x: 10,
+        y: 20,
+    }))
+    .unwrap();
+    additional.process(7, &packet).unwrap();
+    let handler = server.handler.clone();
+    let held_handler = handler.lock().await;
+    let server = Mutex::new(&mut server);
+    let (stream, _peer) = tokio::io::duplex(64);
+    let (_, mut native_writer) = split_tokio_framed(TokioFramed::new(stream));
+    let mut writer = SharedWriter::new(&mut native_writer, Duration::from_secs(10));
+    let mut barrier_writer = writer.clone();
+    let permit = writer.try_begin_message().unwrap();
+    let dispatch = RdpServer::dispatch_input_pdu(
+        &server,
+        Action::FastPath,
+        [0x04, 0x04, 0x00, 0x1e].as_slice().into(),
+        &mut writer,
+        permit,
+        1003,
+        1002,
+    );
+    let barrier = barrier_writer.write_barrier(b"deactivate");
+    tokio::pin!(dispatch, barrier);
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(dispatch.as_mut().poll(cx).is_pending())
+        })
+        .await
+    );
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(barrier.as_mut().poll(cx).is_pending())
+        })
+        .await
+    );
+    assert!(events.lock().unwrap().is_empty());
+    drop(held_handler);
+    dispatch.await.unwrap();
+    barrier.await.unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            OrderedInputEvent::Mouse(MouseEvent::Move { x: 10, y: 20 }),
+            OrderedInputEvent::Mouse(MouseEvent::LeftPressed),
+            OrderedInputEvent::Key(true, 0x1e),
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -1,9 +1,13 @@
 //! Video encoding abstraction (H.264 via VideoToolbox / OpenH264)
 
+#[cfg(any(target_os = "macos", test))]
+mod avcc;
 #[cfg(target_os = "macos")]
 pub mod color_convert;
 mod completion;
 mod openh264_enc;
+#[cfg(any(target_os = "macos", test))]
+mod retirement;
 pub use completion::EncodeTiming;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
@@ -78,7 +82,12 @@ pub trait VideoEncoder: Send {
         anyhow::bail!("encode_pixel_buffer not supported by this encoder")
     }
 
-    fn set_bitrate(&mut self, bitrate_bps: u32);
+    /// Confirm that the backend accepted the bitrate; errors must not be
+    /// reported as an applied setting.
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()>;
+    fn applied_bitrate(&self) -> Option<u32> {
+        None
+    }
     fn force_keyframe(&mut self);
 
     /// Whether this encoder supports AVC444 dual-stream encoding

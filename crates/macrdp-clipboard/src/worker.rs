@@ -5,7 +5,7 @@ use crate::{
     formats::{dib_to_png, png_to_dib, uti_to_rdp_format_id, FORMAT_ID_FILE_LIST, FORMAT_ID_HTML},
     pasteboard::PasteboardBridge,
     publication::{CopyToken, PublicationState, RemoteOffer},
-    remote_formats::{preferred_format, FormatKind},
+    remote_formats::{preferred_format, text_fallback, FormatKind},
     transfer::FileTransferManager,
 };
 use ironrdp_cliprdr::{
@@ -15,6 +15,9 @@ use ironrdp_cliprdr::{
 use ironrdp_core::{impl_as_any, IntoOwned};
 use ironrdp_server::{ServerEvent, ServerEventTx};
 use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
+
+#[path = "rich_text.rs"]
+mod rich_text;
 
 pub(crate) struct ClipboardWorker {
     event_sender: ServerEventTx,
@@ -29,6 +32,7 @@ pub(crate) struct ClipboardWorker {
     // CLIPRDR responses carry no format ID. Serialize requests and coalesce newer
     // offers instead of decoding an older response with the newest format.
     queued_paste_format: Option<RemoteOffer>,
+    pending_html: Option<rich_text::PendingHtml>,
     file_transfer: bool,
 }
 
@@ -62,15 +66,18 @@ impl ClipboardWorker {
             pending_descriptor_lock: None,
             pending_paste_format: None,
             queued_paste_format: None,
+            pending_html: None,
             file_transfer,
         }
     }
 
     fn request_remote_format(&mut self, offer: RemoteOffer) {
         let Some(format) = offer.format else {
+            self.pending_html = None;
             return;
         };
         if !self.shared.is_current(offer.token, &self.pasteboard) {
+            self.pending_html = None;
             return;
         }
         // Arm before sending so a response or deadline cannot race the request.
@@ -87,10 +94,12 @@ impl ClipboardWorker {
             self.pending_paste_format = Some(offer);
         } else {
             self.shared.finish_request();
+            self.pending_html = None;
         }
     }
 
     pub(crate) fn remote_copy(&mut self, offer: RemoteOffer) {
+        self.pending_html = None;
         self.transfer_manager.set_incoming_descriptors(Vec::new());
         self.incoming_token = None;
         if self.pending_paste_format.is_some() {
@@ -101,6 +110,7 @@ impl ClipboardWorker {
     }
 
     pub(crate) fn tick(&mut self) {
+        self.expire_pending_html();
         if self
             .incoming_token
             .is_some_and(|token| !self.shared.is_current(token, &self.pasteboard))
@@ -207,8 +217,10 @@ impl CliprdrBackend for ClipboardWorker {
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         let token = self.shared.remote_copy(&self.pasteboard);
+        let format = preferred_format(available_formats, self.file_transfer);
         self.remote_copy(RemoteOffer {
-            format: preferred_format(available_formats, self.file_transfer),
+            format,
+            text_fallback: text_fallback(available_formats, format),
             token,
         });
     }
@@ -238,13 +250,11 @@ impl CliprdrBackend for ClipboardWorker {
                     None => FormatDataResponse::new_error(),
                 }
             }
-            id if id == FORMAT_ID_HTML => match pb.read_html() {
-                Some(html_content) => {
-                    let data = crate::html::wrap_html_format(&html_content);
-                    FormatDataResponse::new_data(data)
-                }
-                None => FormatDataResponse::new_error(),
-            },
+            id if id == FORMAT_ID_HTML => pb
+                .read_html()
+                .and_then(|html| crate::html::wrap_html_format(&html))
+                .map(FormatDataResponse::new_data)
+                .unwrap_or_else(FormatDataResponse::new_error),
             id if id == FORMAT_ID_FILE_LIST && self.file_transfer => {
                 let file_list = if let Some(id) = self.pending_descriptor_lock.take() {
                     self.transfer_manager.locked_file_list(id)
@@ -282,6 +292,7 @@ impl CliprdrBackend for ClipboardWorker {
         if let Some(next) = self.queued_paste_format.take() {
             // The response belongs to a superseded copy; never publish it or
             // reinterpret it as the format selected by the latest advertisement.
+            self.pending_html = None;
             self.request_remote_format(next);
             return;
         }
@@ -290,6 +301,14 @@ impl CliprdrBackend for ClipboardWorker {
             return;
         };
         if !self.shared.is_current(offer.token, &self.pasteboard) {
+            self.pending_html = None;
+            return;
+        }
+        if matches!(
+            offer.format.map(|format| format.kind),
+            Some(FormatKind::Html | FormatKind::Text)
+        ) {
+            self.handle_rich_text_response(offer, response);
             return;
         }
         if response.is_error() {
@@ -298,12 +317,6 @@ impl CliprdrBackend for ClipboardWorker {
         }
 
         match offer.format.map(|format| format.kind) {
-            Some(FormatKind::Text) => {
-                if let Ok(text) = response.to_unicode_string() {
-                    self.shared
-                        .publish(offer.token, &self.pasteboard, |pb| pb.write_string(&text));
-                }
-            }
             Some(FormatKind::Dib) => match dib_to_png(response.data()) {
                 Ok(png_data) => {
                     self.shared.publish(offer.token, &self.pasteboard, |pb| {
@@ -312,13 +325,6 @@ impl CliprdrBackend for ClipboardWorker {
                 }
                 Err(error) => tracing::warn!(%error, "Rejected clipboard image"),
             },
-            Some(FormatKind::Html) => {
-                if let Some(html_content) = crate::html::unwrap_html_format(response.data()) {
-                    self.shared.publish(offer.token, &self.pasteboard, |pb| {
-                        pb.write_html(&html_content)
-                    });
-                }
-            }
             Some(FormatKind::Files) if self.file_transfer => {
                 if !crate::file::valid_file_list_payload(response.data()) {
                     tracing::warn!("Rejected malformed or oversized clipboard file list");

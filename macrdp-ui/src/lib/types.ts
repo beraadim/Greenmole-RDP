@@ -21,6 +21,8 @@ export interface Metrics {
   latency_ms: number;  // JSON field name (backend uses serde rename from rtt_ms)
   bytes_sent: number;
   timestamp: number;
+  timestamp_ms: number;
+  sample_id: number;
   // New fields
   encode_ms: number;
   capture_queue_ms: number;
@@ -31,6 +33,9 @@ export interface Metrics {
   applied_frame_rate: number | null;
   capture_frame_rate_update_failures: number;
   capture_frame_rate_retry_exhausted: boolean;
+  requested_encoder_bitrate: number | null;
+  applied_encoder_bitrate: number | null;
+  encoder_bitrate_update_failures: number;
   client_queue_depth_bytes: number | null;
   ack_suspended: boolean;
   net_ms: number;

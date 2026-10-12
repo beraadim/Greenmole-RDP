@@ -18,6 +18,9 @@ pub(crate) struct CopyToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteOffer {
     pub format: Option<RemoteFormat>,
+    /// Optional second flavor of the same copy. It is requested only after the
+    /// first response, because CLIPRDR format responses have no request ID.
+    pub text_fallback: Option<RemoteFormat>,
     pub token: CopyToken,
 }
 

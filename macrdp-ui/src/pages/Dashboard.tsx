@@ -3,6 +3,7 @@ import { useServerStatus } from "../hooks/useServerStatus";
 import { useMetrics } from "../hooks/useMetrics";
 import { useConnections } from "../hooks/useConnections";
 import { useMetricHistory } from "../hooks/useFpsHistory";
+import { sampleAverage } from "../lib/metricHistory";
 import { api } from "../lib/ipc";
 import StatusBar from "../components/StatusBar";
 import ServerError from "../components/ServerError";
@@ -26,10 +27,12 @@ function Dashboard() {
 
   const metricsAvailable = status.running && metrics && !stale;
   const bitrateHistory = useMetricHistory(
-    metricsAvailable ? metrics.bitrate_kbps / 1000 : null
+    metricsAvailable ? metrics.bitrate_kbps / 1000 : null,
+    metrics?.sample_id ?? 0, metrics?.timestamp_ms ?? 0,
   );
   const encodeHistory = useMetricHistory(
-    metricsAvailable ? metrics.encode_ms : null
+    metricsAvailable ? metrics.encode_ms : null,
+    metrics?.sample_id ?? 0, metrics?.timestamp_ms ?? 0,
   );
   const port = status.port ?? config?.port ?? 3389;
 
@@ -101,11 +104,11 @@ function Dashboard() {
   const chartsEmpty = !metricsAvailable || bitrateHistory.length === 0;
 
   const avgBitrate = !chartsEmpty && bitrateHistory.length > 0
-    ? (bitrateHistory.reduce((a, b) => a + b, 0) / bitrateHistory.length).toFixed(1)
+    ? sampleAverage(bitrateHistory)?.toFixed(1)
     : null;
 
   const avgEncode = !chartsEmpty && encodeHistory.length > 0
-    ? (encodeHistory.reduce((a, b) => a + b, 0) / encodeHistory.length).toFixed(1)
+    ? sampleAverage(encodeHistory)?.toFixed(1)
     : null;
   const currentTransport = metricsAvailable ? metrics.transport_mode : null;
   const currentEncoder = metricsAvailable ? metrics.encoder_mode : null;
@@ -129,8 +132,8 @@ function Dashboard() {
 
       <div className="flex gap-3">
         <ChartPanel
-          title="Network throughput (Mbps)"
-          value={avgBitrate != null ? `${avgBitrate} Mbps` : undefined}
+          title="Network throughput · last 60s"
+          value={avgBitrate != null ? `Avg ${avgBitrate} Mbps` : undefined}
           valueColor="var(--color-green)"
           empty={chartsEmpty}
           emptyText="Waiting for data..."
@@ -139,8 +142,8 @@ function Dashboard() {
         </ChartPanel>
 
         <ChartPanel
-          title="Encode latency (ms)"
-          value={avgEncode != null ? `${avgEncode} ms` : undefined}
+          title="Encode latency · last 60s"
+          value={avgEncode != null ? `Avg ${avgEncode} ms` : undefined}
           valueColor="var(--color-orange)"
           empty={chartsEmpty}
           emptyText="Waiting for data..."
@@ -191,6 +194,9 @@ function Dashboard() {
             <div>Capture requested: {metrics.requested_capture_frame_rate ?? "--"} fps</div>
             <div>Capture applied: {metrics.applied_frame_rate ?? "--"} fps</div>
             <div>Capture update failures: {metrics.capture_frame_rate_update_failures}</div>
+            <div>Encoder requested: {metrics.requested_encoder_bitrate === null ? "--" : `${(metrics.requested_encoder_bitrate / 1_000_000).toFixed(1)} Mbps`}</div>
+            <div>Encoder applied: {metrics.applied_encoder_bitrate === null ? "not confirmed" : `${(metrics.applied_encoder_bitrate / 1_000_000).toFixed(1)} Mbps`}</div>
+            <div>Encoder update failures: {metrics.encoder_bitrate_update_failures}</div>
             {metrics.capture_frame_rate_retry_exhausted && <div role="status" className="text-amber-600">Capture rate change failed; reconnect to retry.</div>}
             <div>Frames combined: {metrics.capture_frames_coalesced}</div>
             <div>Audio queue: {metrics.audio_queued_ms.toFixed(0)} ms</div>

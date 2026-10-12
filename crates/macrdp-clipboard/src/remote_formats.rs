@@ -47,6 +47,24 @@ pub(crate) fn preferred_format(
     None
 }
 
+/// Rich copies retain the peer's plain text too; no HTML-to-text conversion can
+/// reproduce all source application whitespace, table or selection semantics.
+pub(crate) fn text_fallback(
+    formats: &[ClipboardFormat],
+    preferred: Option<RemoteFormat>,
+) -> Option<RemoteFormat> {
+    if preferred?.kind != FormatKind::Html {
+        return None;
+    }
+    formats
+        .iter()
+        .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT)
+        .then_some(RemoteFormat {
+            id: ClipboardFormatId::CF_UNICODETEXT,
+            kind: FormatKind::Text,
+        })
+}
+
 fn registered_name_matches(format: &ClipboardFormat, expected: ClipboardFormatName) -> bool {
     // Standard IDs have fixed meanings and cannot be redefined by a format name.
     (0xc000..=0xffff).contains(&format.id().value())

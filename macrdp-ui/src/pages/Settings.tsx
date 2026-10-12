@@ -37,6 +37,11 @@ const restartLabels: Record<string, string> = {
   clipboard_max_file_size_mb: "file size limit", resolution: "resolution",
 };
 const settingLabel = (key: string) => restartLabels[key] ?? "service setting";
+const bitratePresets = [2, 4, 8, 16, 32, 50];
+const frameRatePresets = [15, 30, 60, 120];
+const resolutionPresets = ["3840x2160", "2560x1600", "2560x1440", "2048x1536",
+  "1920x1440", "1920x1200", "1920x1080", "1680x1050", "1600x1200",
+  "1600x1024", "1600x900", "1440x1080", "1366x768"];
 
 function Settings() {
   const [config, setConfig] = useState<UiConfig | null>(null);
@@ -47,7 +52,8 @@ function Settings() {
 
   useEffect(() => {
     let cancelled = false;
-    api.getConfig().then((value) => { if (!cancelled) setConfig(value); }).catch(console.error);
+    api.getConfig().then((value) => { if (!cancelled) setConfig(value); })
+      .catch(error => { if (!cancelled) setSettingsError(String(error)); });
     const refreshStatus = async () => {
       try {
         const value = await api.getConfigurationStatus();
@@ -87,10 +93,13 @@ function Settings() {
   if (!config) {
     return (
       <div className="flex items-center justify-center py-20 text-sm text-text-muted">
-        Loading configuration...
+        {settingsError ?? "Loading configuration..."}
       </div>
     );
   }
+
+  const resolutions = config.display_backend === "main"
+    ? ["7680x4320", "5120x2880", ...resolutionPresets] : resolutionPresets;
 
   return (
     <div className="flex h-full">
@@ -141,6 +150,7 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="auto">Auto</SelectItem>
                   <SelectItem value="software">Software encoding</SelectItem>
                   <SelectItem value="hardware">Hardware acceleration</SelectItem>
                 </SelectContent>
@@ -156,11 +166,10 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="2">2 Mbps</SelectItem>
-                  <SelectItem value="4">4 Mbps</SelectItem>
-                  <SelectItem value="8">8 Mbps</SelectItem>
-                  <SelectItem value="16">16 Mbps</SelectItem>
-                  <SelectItem value="32">32 Mbps</SelectItem>
+                  {!bitratePresets.includes(config.bitrate_mbps) && (
+                    <SelectItem value={String(config.bitrate_mbps)}>{config.bitrate_mbps} Mbps (custom)</SelectItem>
+                  )}
+                  {bitratePresets.map(value => <SelectItem key={value} value={String(value)}>{value} Mbps</SelectItem>)}
                 </SelectContent>
               </Select>
             </SettingRow>
@@ -174,10 +183,10 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="15">15 fps</SelectItem>
-                  <SelectItem value="30">30 fps</SelectItem>
-                  <SelectItem value="60">60 fps</SelectItem>
-                  <SelectItem value="120">120 fps</SelectItem>
+                  {!frameRatePresets.includes(config.frame_rate) && (
+                    <SelectItem value={String(config.frame_rate)}>{config.frame_rate} fps (custom)</SelectItem>
+                  )}
+                  {frameRatePresets.map(value => <SelectItem key={value} value={String(value)}>{value} fps</SelectItem>)}
                 </SelectContent>
               </Select>
             </SettingRow>
@@ -202,11 +211,10 @@ function Settings() {
         {activeCategory === "network" && (
           <CategorySection title="Network">
             <SettingRow label="Port" description="Requires service restart">
-              <Input
-                type="number"
+              <NumericSettingInput
+                label="Port" min={1} max={65535}
                 value={config.port}
-                onChange={(e) => updateConfig("port", parseInt(e.target.value, 10))}
-                className="h-7 w-[120px] text-xs"
+                save={value => updateConfig("port", value)}
               />
             </SettingRow>
 
@@ -230,13 +238,10 @@ function Settings() {
             </SettingRow>
 
             <SettingRow label="Idle timeout (seconds)" description="Requires service restart">
-              <Input
-                type="number"
+              <NumericSettingInput
+                label="Idle timeout" min={0} max={Number.MAX_SAFE_INTEGER}
                 value={config.idle_timeout_secs}
-                onChange={(e) =>
-                  updateConfig("idle_timeout_secs", parseInt(e.target.value, 10))
-                }
-                className="h-7 w-[120px] text-xs"
+                save={value => updateConfig("idle_timeout_secs", value)}
               />
             </SettingRow>
           </CategorySection>
@@ -316,25 +321,10 @@ function Settings() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="auto">Auto</SelectItem>
-                  {config.display_backend === "main" && (
-                    <>
-                      <SelectItem value="7680x4320">7680 × 4320</SelectItem>
-                      <SelectItem value="5120x2880">5120 × 2880</SelectItem>
-                    </>
+                  {config.resolution && config.resolution !== "auto" && !resolutions.includes(config.resolution) && (
+                    <SelectItem value={config.resolution}>{config.resolution.replace("x", " × ")} (custom)</SelectItem>
                   )}
-                  <SelectItem value="3840x2160">3840 × 2160</SelectItem>
-                  <SelectItem value="2560x1600">2560 × 1600</SelectItem>
-                  <SelectItem value="2560x1440">2560 × 1440</SelectItem>
-                  <SelectItem value="2048x1536">2048 × 1536</SelectItem>
-                  <SelectItem value="1920x1440">1920 × 1440</SelectItem>
-                  <SelectItem value="1920x1200">1920 × 1200</SelectItem>
-                  <SelectItem value="1920x1080">1920 × 1080</SelectItem>
-                  <SelectItem value="1680x1050">1680 × 1050</SelectItem>
-                  <SelectItem value="1600x1200">1600 × 1200</SelectItem>
-                  <SelectItem value="1600x1024">1600 × 1024</SelectItem>
-                  <SelectItem value="1600x900">1600 × 900</SelectItem>
-                  <SelectItem value="1440x1080">1440 × 1080</SelectItem>
-                  <SelectItem value="1366x768">1366 × 768</SelectItem>
+                  {resolutions.map(value => <SelectItem key={value} value={value}>{value.replace("x", " × ")}</SelectItem>)}
                 </SelectContent>
               </Select>
             </SettingRow>
@@ -415,6 +405,40 @@ function Settings() {
       </div>
     </div>
   );
+}
+
+function NumericSettingInput({ label, value, min, max, save }: {
+  label: string; value: number; min: number; max: number;
+  save: (value: number) => Promise<boolean>;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => { setDraft(String(value)); }, [value]);
+  const commit = async () => {
+    if (saving || draft === String(value)) return;
+    const next = /^\d+$/.test(draft) ? Number(draft) : NaN;
+    if (!Number.isSafeInteger(next) || next < min || next > max) {
+      setError(`${label} must be a whole number between ${min} and ${max}.`);
+      return;
+    }
+    setError(null);
+    setSaving(true);
+    try {
+      if (!(await save(next))) setDraft(String(value));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <div className="w-[120px]">
+    <Input type="number" aria-label={label} aria-invalid={error !== null}
+      min={min} max={max} step={1} value={draft} disabled={saving}
+      onChange={event => { setDraft(event.target.value); setError(null); }}
+      onBlur={() => void commit()}
+      onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }}
+      className="h-7 w-full text-xs" />
+    {error && <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">{error}</p>}
+  </div>;
 }
 
 function CategorySection({

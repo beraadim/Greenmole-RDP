@@ -14,6 +14,7 @@ fn test_backend(
 fn pending(backend: &ClipboardWorker, id: ClipboardFormatId, kind: FormatKind) -> RemoteOffer {
     RemoteOffer {
         format: Some(crate::remote_formats::RemoteFormat { id, kind }),
+        text_fallback: None,
         token: backend.shared.remote_copy(&backend.pasteboard),
     }
 }

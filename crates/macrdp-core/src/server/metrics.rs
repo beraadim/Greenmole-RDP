@@ -1,5 +1,7 @@
 use super::*;
 
+static NEXT_SAMPLE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn sanitize_f64(value: f64) -> f64 {
     if value.is_finite() {
         value
@@ -105,16 +107,19 @@ impl MetricsSnapshot {
         let encoder_mode = derive_encoder_mode(gfx, &transport_mode);
         let bitrate_mode = derive_bitrate_mode(&transport_mode);
         let ack_ms = sanitize_f64(gfx.rtt_ewma_ms);
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Metrics {
             fps: updates_per_sec,
             bitrate_kbps,
             rtt_ms: ack_ms,
             net_ms: ack_ms,
             bytes_sent: gfx.total_bytes_sent,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: timestamp_ms / 1000,
+            timestamp_ms,
+            sample_id: NEXT_SAMPLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             encode_ms: sanitize_f64(gfx.last_encode_ms),
             capture_queue_ms: sanitize_f64(gfx.capture_queue_ms),
             completion_queue_ms: sanitize_f64(gfx.completion_queue_ms),
@@ -124,6 +129,9 @@ impl MetricsSnapshot {
             applied_frame_rate: gfx.applied_frame_rate,
             capture_frame_rate_update_failures: gfx.capture_frame_rate_update_failures,
             capture_frame_rate_retry_exhausted: gfx.capture_frame_rate_retry_exhausted,
+            requested_encoder_bitrate: gfx.requested_encoder_bitrate,
+            applied_encoder_bitrate: gfx.applied_encoder_bitrate,
+            encoder_bitrate_update_failures: gfx.encoder_bitrate_update_failures,
             client_queue_depth_bytes: gfx.client_queue_depth_bytes,
             ack_suspended: gfx.frame_acknowledgements_suspended,
             last_frame_bytes: gfx.last_frame_bytes,
@@ -147,6 +155,33 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn samples_keep_order_across_service_restarts_and_snapshot_instances() {
+        let gfx = GfxState::new(1920, 1080, false, false);
+        let first = MetricsSnapshot::default().sample(&gfx);
+        let second = MetricsSnapshot::default().sample(&gfx);
+        assert!(first.sample_id > 0);
+        assert!(second.sample_id > first.sample_id);
+        assert_eq!(second.timestamp, second.timestamp_ms / 1000);
+    }
+
+    #[test]
+    fn encoder_metrics_show_rejected_target_and_clear_with_connection() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.requested_encoder_bitrate = Some(8_000_000);
+        gfx.applied_encoder_bitrate = Some(10_000_000);
+        gfx.encoder_bitrate_update_failures = 1;
+        let mut snapshot = MetricsSnapshot::default();
+        let metrics = snapshot.sample(&gfx);
+        assert_eq!(metrics.requested_encoder_bitrate, Some(8_000_000));
+        assert_eq!(metrics.applied_encoder_bitrate, Some(10_000_000));
+        assert_eq!(metrics.encoder_bitrate_update_failures, 1);
+        gfx.reset_connection_state(false);
+        let metrics = snapshot.sample(&gfx);
+        assert_eq!(metrics.applied_encoder_bitrate, None);
+        assert_eq!(metrics.encoder_bitrate_update_failures, 0);
+    }
 
     #[test]
     fn capture_rate_metrics_distinguish_requested_applied_and_exhausted_updates() {

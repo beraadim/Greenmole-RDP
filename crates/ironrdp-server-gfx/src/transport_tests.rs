@@ -4,6 +4,7 @@ use super::*;
 use crate::{KeyboardEvent, MouseEvent, RdpServerDisplayUpdates};
 use ironrdp_cliprdr::pdu::FileContentsFlags;
 use tokio::io::AsyncReadExt as _;
+use tokio::sync::mpsc;
 
 struct KeyboardSignal(mpsc::UnboundedSender<KeyboardEvent>);
 
