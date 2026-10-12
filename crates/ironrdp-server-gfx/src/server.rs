@@ -41,7 +41,7 @@ use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::display_control::DisplayControlChannel;
 use crate::dynamic_channels::DynamicChannels;
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
-use crate::gfx::{GfxHandler, GfxState};
+use crate::gfx::{ConnectionOutcome, GfxHandler, GfxState};
 use crate::handler::{ClientInputContext, RdpServerInputHandler};
 use crate::{builder, capabilities, SoundServerFactory};
 
@@ -51,7 +51,14 @@ mod tests;
 
 #[path = "connection_control.rs"]
 mod connection_control;
-use connection_control::{wait_for_idle_timeout, DEFAULT_HANDSHAKE_TIMEOUT};
+use connection_control::{
+    error_outcome, wait_for_idle_timeout, DEFAULT_HANDSHAKE_TIMEOUT,
+    DEFAULT_TOTAL_HANDSHAKE_TIMEOUT,
+};
+#[path = "admission.rs"]
+mod admission;
+#[path = "transport.rs"]
+mod transport;
 
 #[path = "event_queue.rs"]
 mod event_queue;
@@ -272,6 +279,10 @@ pub struct RdpServer {
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
     handshake_timeout: Duration,
+    total_handshake_timeout: Duration,
+    handshake_deadline: Option<tokio::time::Instant>,
+    connection_authenticated: bool,
+    admission: admission::AdmissionLimiter,
     idle_timeout: Option<Duration>,
     write_timeout: Duration,
     input_activity: watch::Sender<tokio::time::Instant>,
@@ -345,6 +356,10 @@ impl RdpServer {
             gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false, false))),
             gfx_enabled: true,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            total_handshake_timeout: DEFAULT_TOTAL_HANDSHAKE_TIMEOUT,
+            handshake_deadline: None,
+            connection_authenticated: false,
+            admission: admission::AdmissionLimiter::default(),
             idle_timeout: None,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             input_activity: watch::channel(tokio::time::Instant::now()).0,
@@ -421,6 +436,59 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        let peer = stream
+            .peer_addr()
+            .context("Failed to identify accepted RDP peer")?
+            .ip();
+        if let Some(delay) = self
+            .admission
+            .retry_after(peer, tokio::time::Instant::now())
+        {
+            self.record_outcome(ConnectionOutcome::AdmissionThrottled);
+            debug!(
+                retry_after_ms = delay.as_millis() as u64,
+                "Connection admission throttled"
+            );
+            return Ok(());
+        }
+        self.connection_authenticated = false;
+        self.handshake_deadline = Some(tokio::time::Instant::now() + self.total_handshake_timeout);
+        self.gfx_state.lock().unwrap().connection_outcome = None;
+        let result = self.run_connection_inner(stream).await;
+        self.handshake_deadline = None;
+        if self.connection_authenticated {
+            self.admission.succeeded(peer);
+        } else if result.is_err() {
+            let outcome = self.gfx_state.lock().unwrap().connection_outcome;
+            if !matches!(
+                outcome,
+                Some(
+                    ConnectionOutcome::ServerShutdown
+                        | ConnectionOutcome::CredentialsChanged
+                        | ConnectionOutcome::OutputOverflow
+                )
+            ) {
+                self.admission.failed(peer, tokio::time::Instant::now());
+            }
+        }
+        if let Err(error) = &result {
+            if self.gfx_state.lock().unwrap().connection_outcome.is_none() {
+                self.record_outcome(error_outcome(error, ConnectionOutcome::HandshakeRejected));
+            }
+        }
+        let outcome = self.gfx_state.lock().unwrap().connection_outcome;
+        info!(
+            reason = outcome
+                .map(ConnectionOutcome::as_str)
+                .unwrap_or("client_disconnect"),
+            authenticated = self.connection_authenticated,
+            "Connection outcome"
+        );
+        result
+    }
+
+    async fn run_connection_inner(&mut self, stream: TcpStream) -> Result<()> {
+        transport::configure_stream(&stream)?;
         let (_session_guard, sender) = self.ev_sender.start_session();
         self.ev_receiver.lock().await.data.discard_pending();
         if let Some(factory) = self.cliprdr_factory.as_mut() {
@@ -515,6 +583,7 @@ impl RdpServer {
                         .map_err(Into::into)
                     })
                     .await?;
+                    self.connection_authenticated = true;
                 }
 
                 let framed = self.accept_finalize(framed, acceptor, size).await?;
@@ -570,7 +639,12 @@ impl RdpServer {
                         }
                     }
                 },
-                accepted = listener.accept() => {
+                accepted = async {
+                    // A global failure burst delays admission without holding
+                    // up local status queries, credential changes or shutdown.
+                    tokio::time::sleep_until(self.admission.global_retry_at()).await;
+                    listener.accept().await
+                } => {
                     let (stream, peer) = accepted.context("Failed to accept RDP connection")?;
                     debug!(?peer, "Received connection");
                     drop(ev_receiver);
@@ -771,7 +845,7 @@ impl RdpServer {
 
         if is_bitmap_update {
             let mut state = gfx_state.lock().unwrap();
-            state.last_encode_ms = encode_ms;
+            state.record_encode_timing(encode_ms);
             state.bitmap_dispatches = state.bitmap_dispatches.saturating_add(1);
             state.bitmap_encode_ms_total += encode_ms;
             state.bitmap_write_ms_total += write_ms;
@@ -918,7 +992,10 @@ impl RdpServer {
         let mut display_updates = {
             let mut display = self.display.lock().await;
             display.activate_size(desktop_size);
-            display.updates().await?
+            display.updates().await.map_err(|error| {
+                self.record_outcome(ConnectionOutcome::CaptureError);
+                error
+            })?
         };
         let mut writer = SharedWriter::new(writer, self.write_timeout);
         let mut display_writer = writer.clone();
@@ -998,7 +1075,10 @@ impl RdpServer {
                         break Ok(RunState::Disconnect);
                     }
                     Err(error) => {
-                        warn!(error = format!("{error:#}"), "next_updated failed");
+                        // The display implementation owns bounded recovery.
+                        // Retrying a terminal failure here can spin forever and
+                        // leave the client connected to an unusable desktop.
+                        break Err(error.context("display update failed"));
                     }
                 }
             }
@@ -1076,6 +1156,26 @@ impl RdpServer {
             s.lock().await.set_credentials(Some(credentials));
         }
 
+        // Publish the terminal outcome while the handler still owns its
+        // connection; its disconnect callback snapshots this structured reason.
+        if !matches!(state, Ok(RunState::DeactivationReactivation { .. })) {
+            let fallback = match source {
+                "control" if quit_received.get() => ConnectionOutcome::ServerShutdown,
+                "control" => ConnectionOutcome::CredentialsChanged,
+                "output-queue" => ConnectionOutcome::OutputOverflow,
+                "idle-timeout" => ConnectionOutcome::IdleTimeout,
+                "display" if state.is_ok() => ConnectionOutcome::CaptureEnded,
+                "display" => ConnectionOutcome::CaptureError,
+                _ if state.is_ok() => ConnectionOutcome::ClientDisconnect,
+                _ => ConnectionOutcome::ProtocolError,
+            };
+            let reason = match &state {
+                Err(error) => error_outcome(error, fallback),
+                Ok(_) => fallback,
+            };
+            s.lock().await.record_outcome(reason);
+        }
+
         match &state {
             Ok(run_state) => {
                 info!(source, ?run_state, "Client loop ended");
@@ -1109,6 +1209,8 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
+
+        self.connection_authenticated = true;
 
         if !result.reactivation {
             // Authentication time is not part of a connected user's idle
@@ -1278,6 +1380,10 @@ impl RdpServer {
         let desktop_size = activation_size;
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs)
             .context("failed to initialize update encoder")?;
+
+        // A resize reactivation retains its own stage timeout, but must not
+        // inherit the expired deadline of the initial connection handshake.
+        self.handshake_deadline = None;
 
         let state = self
             .client_loop(
@@ -1551,6 +1657,11 @@ impl RdpServer {
         // above and preserves those channels until the connection actually ends.
         self.static_channels = StaticChannelSet::new();
         if client_connected {
+            if let Err(error) = &result {
+                if self.gfx_state.lock().unwrap().connection_outcome.is_none() {
+                    self.record_outcome(error_outcome(error, ConnectionOutcome::ProtocolError));
+                }
+            }
             self.handler.lock().await.on_disconnect();
         }
 

@@ -34,11 +34,14 @@ pub struct MacInputHandler {
 struct SessionEvents {
     handler: Arc<dyn crate::callbacks::ServerEventHandler>,
     gfx: Arc<Mutex<ironrdp_server::gfx::GfxState>>,
+    audio_stats: Arc<macrdp_audio::AudioStats>,
     started_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct ModifierState {
+    caps_lock: bool,
+    caps_lock_pressed: bool,
     left_shift: bool,
     right_shift: bool,
     left_ctrl: bool,
@@ -120,10 +123,12 @@ impl MacInputHandler {
         mut self,
         handler: Arc<dyn crate::callbacks::ServerEventHandler>,
         gfx: Arc<Mutex<ironrdp_server::gfx::GfxState>>,
+        audio_stats: Arc<macrdp_audio::AudioStats>,
     ) -> Self {
         self.session_events = Some(SessionEvents {
             handler,
             gfx,
+            audio_stats,
             started_at: None,
         });
         self
@@ -267,6 +272,15 @@ impl MacInputHandler {
 
     fn update_modifier_state(&mut self, code: u8, extended: bool, pressed: bool) {
         match (code, extended) {
+            (0x3A, false) => {
+                if pressed && !self.modifier_state.caps_lock_pressed {
+                    self.modifier_state.caps_lock = !self.modifier_state.caps_lock;
+                    if let Some(bits) = &mut self.last_sync_lock_bits {
+                        *bits = (*bits & !0x04) | (u8::from(self.modifier_state.caps_lock) << 2);
+                    }
+                }
+                self.modifier_state.caps_lock_pressed = pressed;
+            }
             (0x2A, false) => self.modifier_state.left_shift = pressed,
             (0x36, false) => self.modifier_state.right_shift = pressed,
             (0x1D, false) => self.modifier_state.left_ctrl = pressed,
@@ -286,6 +300,9 @@ impl MacInputHandler {
 
     fn refresh_debug_state(&self, last_event: Option<String>) {
         let mut active_modifiers = Vec::new();
+        if self.modifier_state.caps_lock {
+            active_modifiers.push("caps_lock".to_string());
+        }
         if self.modifier_state.left_shift {
             active_modifiers.push("left_shift".to_string());
         }
@@ -418,7 +435,7 @@ impl RdpServerInputHandler for MacInputHandler {
             // based on this connection's stale availability check.
             let mut active_connection = self.active_connection.lock().unwrap();
             if let Some(display) = &self.display_controller {
-                if let Err(error) = display.end_remote_session_async() {
+                if let Err(error) = crate::display::capture_lifecycle::queue_restoration(display) {
                     tracing::warn!(%error, "Failed to schedule physical display restoration");
                 }
             }
@@ -429,7 +446,17 @@ impl RdpServerInputHandler for MacInputHandler {
                 .started_at
                 .take()
                 .map_or(0, |start| start.elapsed().as_secs());
-            let bytes_total = events.gfx.lock().unwrap().total_bytes_sent;
+            let (bytes_total, reason, final_metrics) = {
+                let gfx = events.gfx.lock().unwrap();
+                (
+                    gfx.total_bytes_sent,
+                    gfx.connection_outcome
+                        .map(|outcome| outcome.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    crate::server::final_metrics(&gfx, &events.audio_stats),
+                )
+            };
             events
                 .handler
                 .on_connection(crate::callbacks::ConnectionEvent::Disconnected(
@@ -440,6 +467,8 @@ impl RdpServerInputHandler for MacInputHandler {
                         disconnected_at: chrono::Utc::now().to_rfc3339(),
                         duration_secs,
                         bytes_total,
+                        reason,
+                        final_metrics,
                     },
                 ));
         }
@@ -476,9 +505,17 @@ impl RdpServerInputHandler for MacInputHandler {
         let event_label = format!("{event:?}");
         let result = match event {
             KeyboardEvent::Pressed { code, extended } => {
+                let caps_repeat =
+                    code == 0x3A && !extended && self.modifier_state.caps_lock_pressed;
                 self.update_modifier_state(code, extended, true);
 
-                if extended
+                if caps_repeat
+                    || (code == 0x3A && !extended && self.translation_profile().is_some())
+                {
+                    // Unicode translation owns the remote lock state; toggling
+                    // the host's global lock would double-apply it to text.
+                    Ok(())
+                } else if extended
                     && code == 0x38
                     && matches!(
                         self.translation_profile(),
@@ -512,7 +549,9 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.update_modifier_state(code, extended, false);
                 let kb = self.keyboard.as_deref().expect("keyboard checked above");
 
-                if code == 0x1D
+                if code == 0x3A && !extended && self.translation_profile().is_some() {
+                    Ok(())
+                } else if code == 0x1D
                     && ((extended && self.suppressed_ctrl_for_altgr.right)
                         || (!extended && self.suppressed_ctrl_for_altgr.left))
                 {
@@ -553,7 +592,8 @@ impl RdpServerInputHandler for MacInputHandler {
                 if let Some(previous_bits) = self.last_sync_lock_bits {
                     let changed = previous_bits ^ sync_bits;
 
-                    if result.is_ok() && changed & 0x04 != 0 {
+                    if result.is_ok() && changed & 0x04 != 0 && self.translation_profile().is_none()
+                    {
                         result = kb.tap_key(0x3A, false); // Caps Lock
                     }
                     if result.is_ok() && changed & 0x02 != 0 {
@@ -570,11 +610,27 @@ impl RdpServerInputHandler for MacInputHandler {
                         );
                     }
                 } else {
+                    // The first synchronization is authoritative too. Only
+                    // physical profiles use the host lock; translated text
+                    // keeps its Caps state entirely inside this session.
+                    if result.is_ok() && self.translation_profile().is_none() {
+                        let native_caps = kb
+                            .current_modifier_flags()
+                            .0
+                            .iter()
+                            .any(|name| name == "caps_lock");
+                        if native_caps != (sync_bits & 0x04 != 0) {
+                            result = kb.tap_key(0x3A, false);
+                        }
+                    }
                     tracing::debug!(sync_bits, "Captured initial keyboard synchronize state");
                 }
 
                 self.last_sync_lock_bits = Some(sync_bits);
-                self.modifier_state = ModifierState::default();
+                self.modifier_state = ModifierState {
+                    caps_lock: sync_bits & 0x04 != 0,
+                    ..ModifierState::default()
+                };
                 self.suppressed_ctrl_for_altgr = SuppressedCtrlState::default();
                 self.pending_dead_key = None;
                 self.translated_key_releases.clear();

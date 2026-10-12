@@ -180,6 +180,7 @@ mod tests {
             disconnected_at: "2026-01-02T00:00:10Z".into(),
             duration_secs: 30,
             bytes_total: 12345,
+            ..Default::default()
         }
     }
 

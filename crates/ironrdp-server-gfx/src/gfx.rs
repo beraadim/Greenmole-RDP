@@ -20,6 +20,14 @@ use tracing::{debug, info};
 
 use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
 
+#[path = "timings.rs"]
+mod timings;
+pub use timings::{StageTimings, TimingSummary};
+
+#[path = "connection_outcome.rs"]
+mod connection_outcome;
+pub use connection_outcome::ConnectionOutcome;
+
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
 /// Guacamole/FreeRDP interop is more reliable when uncompressed surface
@@ -283,6 +291,8 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 /// Shared state between GfxHandler and the server
 #[derive(Debug)]
 pub struct GfxState {
+    /// Stable terminal reason, published before disconnect callbacks run.
+    pub connection_outcome: Option<ConnectionOutcome>,
     /// Whether this connection negotiated the GFX/DVC path at all.
     pub session_uses_gfx: bool,
     pub channel_id: Option<u32>,
@@ -318,6 +328,8 @@ pub struct GfxState {
     pub last_encode_ms: f64,
     /// Most recent display update's socket/write-lock wait, excluding encoding.
     pub last_write_ms: f64,
+    /// Last 1024 real samples for each stage, independently of UI polling.
+    pub timings: StageTimings,
     /// Successfully delivered GFX frames or classic bitmap updates. Bitmap
     /// regions may split one captured frame, so this is an update-rate counter.
     pub total_frames_sent: u64,
@@ -373,6 +385,7 @@ pub struct GfxState {
 impl GfxState {
     pub fn new(width: u16, height: u16, avc444_enabled: bool, gfx_validation_mode: bool) -> Self {
         Self {
+            connection_outcome: None,
             session_uses_gfx: false,
             channel_id: None,
             surface_created: false,
@@ -395,6 +408,7 @@ impl GfxState {
             rtt_ewma_ms: 0.0,
             last_encode_ms: 0.0,
             last_write_ms: 0.0,
+            timings: StageTimings::default(),
             total_frames_sent: 0,
             capture_queue_ms: 0.0,
             capture_frames_coalesced: 0,
@@ -446,6 +460,21 @@ impl GfxState {
         self.frame_id
     }
 
+    pub fn record_capture_queue(&mut self, ms: f64) {
+        self.capture_queue_ms = ms;
+        self.timings.capture.record(ms);
+    }
+
+    pub fn record_encode_timing(&mut self, ms: f64) {
+        self.last_encode_ms = ms;
+        self.timings.encode.record(ms);
+    }
+
+    pub fn record_completion_queue(&mut self, ms: f64) {
+        self.completion_queue_ms = ms;
+        self.timings.completion.record(ms);
+    }
+
     /// Account only for display data whose entire transport write succeeded.
     /// `bytes` includes RDP framing; `write_ms` excludes capture and encoding.
     pub fn record_display_write(&mut self, bytes: usize, write_ms: f64) {
@@ -453,6 +482,7 @@ impl GfxState {
         self.total_frames_sent = self.total_frames_sent.saturating_add(1);
         self.last_frame_bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
         self.last_write_ms = write_ms;
+        self.timings.write.record(write_ms);
         if self.start_time.is_none() {
             self.start_time = Some(std::time::Instant::now());
         }
@@ -561,6 +591,7 @@ impl GfxState {
         self.rtt_ewma_ms = 0.0;
         self.last_encode_ms = 0.0;
         self.last_write_ms = 0.0;
+        self.timings = StageTimings::default();
         self.total_frames_sent = 0;
         self.capture_queue_ms = 0.0;
         self.capture_frames_coalesced = 0;

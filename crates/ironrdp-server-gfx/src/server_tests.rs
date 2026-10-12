@@ -2,6 +2,114 @@ use super::*;
 use crate::{KeyboardEvent, MouseEvent, RdpServerDisplayUpdates};
 use std::sync::Mutex as StdMutex;
 
+fn admission_test_server() -> RdpServer {
+    RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build()
+}
+
+#[tokio::test(start_paused = true)]
+async fn stage_success_does_not_refresh_total_handshake_budget() {
+    let mut server = admission_test_server();
+    server.set_handshake_timeout(Duration::from_millis(100));
+    server.set_total_handshake_timeout(Duration::from_millis(150));
+    let begin = tokio::time::Instant::now();
+    server.handshake_deadline = Some(begin + server.total_handshake_timeout);
+    server
+        .await_connection_stage("RDP negotiation", async {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = server
+        .await_connection_stage("TLS handshake", async {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("overall connection handshake deadline"));
+    assert_eq!(
+        tokio::time::Instant::now() - begin,
+        Duration::from_millis(150)
+    );
+    assert_eq!(
+        server.gfx_state.lock().unwrap().connection_outcome,
+        Some(ConnectionOutcome::HandshakeTimeout)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn individual_stage_timeout_still_applies_before_total_budget() {
+    let mut server = admission_test_server();
+    server.set_handshake_timeout(Duration::from_millis(20));
+    server.handshake_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+    let error = server
+        .await_connection_stage("TLS handshake", std::future::pending::<Result<()>>())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "TLS handshake timed out");
+}
+
+#[tokio::test(start_paused = true)]
+async fn global_failure_backoff_keeps_controls_responsive() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut server = admission_test_server();
+    let begin = tokio::time::Instant::now();
+    for _ in 0..20 {
+        server.admission.failed(address.ip(), begin);
+    }
+    assert!(server.admission.global_retry_at() > begin);
+    let sender = server.event_sender().clone();
+    let (reply, received) = oneshot::channel();
+    sender.send(ServerEvent::GetLocalAddr(reply)).unwrap();
+    let (served, ()) = tokio::join!(server.run_with_listener(listener), async {
+        assert_eq!(received.await.unwrap(), Some(address));
+        sender
+            .send(ServerEvent::Quit("stop during cooldown".into()))
+            .unwrap();
+    });
+    served.unwrap();
+    assert_eq!(
+        tokio::time::Instant::now(),
+        begin,
+        "controls should not wait for the admission timer"
+    );
+}
+
+#[tokio::test]
+async fn credential_change_during_authentication_has_structured_nonfailure_outcome() {
+    let mut server = admission_test_server();
+    server
+        .event_sender()
+        .send(ServerEvent::SetCredentials(Credentials {
+            username: "replacement".into(),
+            password: "not-logged".into(),
+            domain: None,
+        }))
+        .unwrap();
+    assert!(server
+        .await_connection_stage(
+            "CredSSP authentication",
+            std::future::pending::<Result<()>>()
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        server.gfx_state.lock().unwrap().connection_outcome,
+        Some(ConnectionOutcome::CredentialsChanged)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn silent_peer_cannot_hold_the_listener_indefinitely() {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -308,6 +416,70 @@ impl RdpServerDisplay for CaptureUnavailable {
         // callbacks, without requiring a real client or platform capture API.
         bail!("capture deliberately unavailable")
     }
+}
+
+struct CaptureUpdateFailure(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for CaptureUpdateFailure {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: 800,
+            height: 600,
+        }
+    }
+
+    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        Ok(Box::new(Self(Arc::clone(&self.0))))
+    }
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for CaptureUpdateFailure {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        // A retry must fail this regression immediately instead of hanging in
+        // the old busy loop, which could also starve an async timeout.
+        assert_eq!(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed), 0);
+        bail!("terminal capture failure")
+    }
+}
+
+#[tokio::test]
+async fn capture_initialization_and_terminal_update_failures_end_the_session() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let displays: Vec<Box<dyn RdpServerDisplay>> = vec![
+        Box::new(CaptureUnavailable),
+        Box::new(CaptureUpdateFailure(Arc::clone(&calls))),
+    ];
+    for display in displays {
+        let mut server = resize_test_server(display);
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+        let size = DesktopSize {
+            width: 800,
+            height: 600,
+        };
+        let encoder =
+            UpdateEncoder::new(size, CmdFlags::empty(), UpdateEncoderCodecs::new()).unwrap();
+        let error = server
+            .client_loop(
+                &mut reader,
+                &mut writer,
+                1003,
+                1002,
+                encoder,
+                size,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("capture"));
+        assert_eq!(
+            server.gfx_state.lock().unwrap().connection_outcome,
+            Some(ConnectionOutcome::CaptureError)
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

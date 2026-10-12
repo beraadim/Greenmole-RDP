@@ -7,6 +7,14 @@ export interface ServerStatus {
   bind_address?: string | null;
 }
 
+export interface TimingPercentiles {
+  samples: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
+  max_ms: number | null;
+}
+
 export interface Metrics {
   fps: number; // Delivered updates/s; bitmap regions count individually.
   bitrate_kbps: number;
@@ -34,6 +42,11 @@ export interface Metrics {
   audio_invalid_frames: number;
   audio_queue_age_ms: number;
   audio_queued_ms: number;
+  capture_timings: TimingPercentiles;
+  encode_timings: TimingPercentiles;
+  completion_timings: TimingPercentiles;
+  write_timings: TimingPercentiles;
+  connection_outcome: string | null;
 }
 
 export interface Connection {

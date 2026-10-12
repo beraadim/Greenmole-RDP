@@ -17,6 +17,9 @@ const LOG_BYTES: u64 = 1024 * 1024;
 const MAX_EVENTS: usize = 200;
 const EXPORT_BYTES: usize = 2 * 1024 * 1024;
 
+mod history;
+pub(crate) use history::DiagnosticHistory;
+
 #[derive(Serialize)]
 pub struct ExportResult {
     path: String,
@@ -25,6 +28,7 @@ pub struct ExportResult {
 #[tauri::command]
 pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<ExportResult, String> {
     let config = state.ui_config.lock().await.clone();
+    let history = state.diagnostic_history.lock().await.snapshot();
     let (status, metrics, connection_count) = {
         let handles = state.server_handle.lock().await;
         match handles.as_ref() {
@@ -51,7 +55,7 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
             },
         );
         let report = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -63,6 +67,7 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
             "configuration": safe_configuration(&config),
             "permissions": permissions,
             "metrics": safe_metrics(&metrics),
+            "history": history,
             "recent_events": logs,
             "privacy": "Only selected operational fields are included. Credentials, input text, clipboard contents, addresses, client names, paths, raw log messages and free-form error details are excluded."
         });
@@ -172,7 +177,48 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
             ]
         )),
     );
+    for (name, timing) in [
+        ("capture_timings", &metrics.capture_timings),
+        ("encode_timings", &metrics.encode_timings),
+        ("completion_timings", &metrics.completion_timings),
+        ("write_timings", &metrics.write_timings),
+    ] {
+        selected.insert(
+            name.into(),
+            json!({"samples": timing.samples,
+            "p50_ms": timing.p50_ms, "p95_ms": timing.p95_ms,
+            "p99_ms": timing.p99_ms, "max_ms": timing.max_ms}),
+        );
+    }
+    selected.insert(
+        "connection_outcome".into(),
+        json!(metrics.connection_outcome.as_deref().map(safe_outcome)),
+    );
     Value::Object(selected)
+}
+
+fn safe_outcome(value: &str) -> &str {
+    selection(
+        value,
+        &[
+            "client_disconnect",
+            "peer_closed",
+            "protocol_error",
+            "transport_error",
+            "write_timeout",
+            "idle_timeout",
+            "server_shutdown",
+            "credentials_changed",
+            "handshake_timeout",
+            "handshake_rejected",
+            "authentication_failed",
+            "activation_failed",
+            "admission_throttled",
+            "capture_ended",
+            "capture_error",
+            "output_overflow",
+        ],
+    )
 }
 
 fn event_category(message: &str) -> &'static str {
@@ -194,6 +240,8 @@ fn event_category(message: &str) -> &'static str {
         ("Desktop resumed after idle", "desktop_resumed"),
         ("Capture frame rate updated", "capture_pacing"),
         ("Audio recovery counters", "audio_recovery"),
+        ("Connection outcome", "connection_outcome"),
+        ("Connection admission throttled", "admission_throttled"),
         ("Keyboard injection failed", "keyboard_injection_failed"),
         ("Mouse injection failed", "mouse_injection_failed"),
     ] {
@@ -249,6 +297,7 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             "encode_ms",
             "write_ms",
             "queue_age_ms",
+            "retry_after_ms",
             "queued_ms",
             "dropped_frames",
             "stale_frames",
@@ -258,6 +307,17 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
         ] {
             if let Some(value) = event["fields"].get(key).filter(|v| v.is_number()) {
                 fields.insert(key.into(), value.clone());
+            }
+        }
+        if category == "connection_outcome" {
+            fields.insert(
+                "reason".into(),
+                json!(safe_outcome(
+                    event["fields"]["reason"].as_str().unwrap_or("")
+                )),
+            );
+            if let Some(authenticated) = event["fields"]["authenticated"].as_bool() {
+                fields.insert("authenticated".into(), json!(authenticated));
             }
         }
         if events.len() == MAX_EVENTS {

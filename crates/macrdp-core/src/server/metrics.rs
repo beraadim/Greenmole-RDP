@@ -128,6 +128,13 @@ impl MetricsSnapshot {
             transport_mode,
             encoder_mode,
             bitrate_mode,
+            capture_timings: gfx.timings.capture.summary().into(),
+            encode_timings: gfx.timings.encode.summary().into(),
+            completion_timings: gfx.timings.completion.summary().into(),
+            write_timings: gfx.timings.write.summary().into(),
+            connection_outcome: gfx
+                .connection_outcome
+                .map(|reason| reason.as_str().to_owned()),
             ..Metrics::default()
         }
     }
@@ -136,6 +143,28 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_summaries_include_stage_events_without_polling_duplication() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.record_capture_queue(30.0);
+        gfx.record_encode_timing(12.0);
+        gfx.record_completion_queue(4.0);
+        gfx.record_display_write(1024, 250.0);
+        let mut snapshot = MetricsSnapshot::default();
+        for _ in 0..3 {
+            let metrics = snapshot.sample(&gfx);
+            assert_eq!(metrics.encode_timings.samples, 1);
+            assert_eq!(metrics.encode_timings.p95_ms, Some(12.0));
+            assert_eq!(metrics.write_timings.max_ms, Some(250.0));
+            assert_eq!(metrics.capture_timings.max_ms, Some(30.0));
+            assert_eq!(metrics.completion_timings.max_ms, Some(4.0));
+        }
+        gfx.reset_connection_state(false);
+        let metrics = snapshot.sample(&gfx);
+        assert_eq!(metrics.write_timings.samples, 0);
+        assert_eq!(metrics.encode_timings.p95_ms, None);
+    }
 
     #[test]
     fn reports_instantiated_backend_and_actual_fallback_transport() {

@@ -8,14 +8,46 @@ use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
 
 use super::{RdpServer, ServerEvent};
+use crate::gfx::ConnectionOutcome;
 
 pub(super) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const DEFAULT_TOTAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) fn error_outcome(
+    error: &anyhow::Error,
+    fallback: ConnectionOutcome,
+) -> ConnectionOutcome {
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::TimedOut => ConnectionOutcome::WriteTimeout,
+                std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe => ConnectionOutcome::PeerClosed,
+                _ => ConnectionOutcome::TransportError,
+            };
+        }
+    }
+    fallback
+}
 
 impl RdpServer {
     /// Limit each negotiation, TLS, CredSSP and activation stage. A stage's
     /// deadline is fixed, so a peer cannot extend it by slowly sending bytes.
     pub fn set_handshake_timeout(&mut self, timeout: Duration) {
         self.handshake_timeout = timeout.max(Duration::from_millis(1));
+    }
+
+    /// Bound the entire initial negotiation, TLS, authentication and activation
+    /// sequence. Completing a stage cannot replenish this budget.
+    pub fn set_total_handshake_timeout(&mut self, timeout: Duration) {
+        self.total_handshake_timeout =
+            timeout.clamp(Duration::from_millis(1), Duration::from_secs(300));
+    }
+
+    pub(super) fn record_outcome(&self, outcome: ConnectionOutcome) {
+        self.gfx_state.lock().unwrap().connection_outcome = Some(outcome);
     }
 
     /// Disconnect after this much keyboard/mouse inactivity. Graphics ACKs,
@@ -32,19 +64,32 @@ impl RdpServer {
     ) -> Result<T> {
         let receiver = self.ev_receiver.clone();
         let mut receiver = receiver.lock().await;
-        let deadline = Instant::now()
+        let stage_deadline = Instant::now()
             .checked_add(self.handshake_timeout)
             .context("Handshake timeout exceeds the clock's supported range")?;
+        let deadline = self
+            .handshake_deadline
+            .map_or(stage_deadline, |total| total.min(stage_deadline));
         let sender = self.ev_sender.clone();
         tokio::pin!(future);
         loop {
             tokio::select! {
                 biased;
-                reason = sender.failure() => bail!("{stage}: {reason}"),
-                _ = sleep_until(deadline) => bail!("{stage} timed out"),
+                reason = sender.failure() => {
+                    self.record_outcome(ConnectionOutcome::OutputOverflow);
+                    bail!("{stage}: {reason}");
+                },
+                _ = sleep_until(deadline) => {
+                    self.record_outcome(ConnectionOutcome::HandshakeTimeout);
+                    if self.handshake_deadline.is_some_and(|total| total <= stage_deadline) {
+                        bail!("{stage} timed out (overall connection handshake deadline)");
+                    }
+                    bail!("{stage} timed out");
+                },
                 event = receiver.controls.recv() => match event {
                     Some(ServerEvent::Quit(_)) => {
                         self.quit_requested = true;
+                        self.record_outcome(ConnectionOutcome::ServerShutdown);
                         bail!("server stopped during {stage}");
                     }
                     Some(ServerEvent::GetLocalAddr(reply)) => {
@@ -52,14 +97,28 @@ impl RdpServer {
                     }
                     Some(ServerEvent::SetCredentials(credentials)) => {
                         self.set_credentials(Some(credentials));
+                        self.record_outcome(ConnectionOutcome::CredentialsChanged);
                         // The acceptor holds a credential snapshot. Cancel it
                         // rather than allowing revoked credentials to log in.
                         bail!("credentials changed during {stage}");
                     }
                     Some(_) => unreachable!("only server controls use this lane"),
-                    None => bail!("server control channel closed during {stage}"),
+                    None => {
+                        self.record_outcome(ConnectionOutcome::ServerShutdown);
+                        bail!("server control channel closed during {stage}");
+                    },
                 },
-                result = &mut future => return result.with_context(|| format!("{stage} failed")),
+                result = &mut future => {
+                    if let Err(error) = &result {
+                        let fallback = match stage {
+                            "CredSSP authentication" => ConnectionOutcome::AuthenticationFailed,
+                            "RDP activation" => ConnectionOutcome::ActivationFailed,
+                            _ => ConnectionOutcome::HandshakeRejected,
+                        };
+                        self.record_outcome(error_outcome(error, fallback));
+                    }
+                    return result.with_context(|| format!("{stage} failed"));
+                },
             }
         }
     }

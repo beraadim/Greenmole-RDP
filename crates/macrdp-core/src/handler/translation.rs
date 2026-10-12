@@ -239,7 +239,7 @@ impl MacInputHandler {
         }
 
         let profile = self.translation_profile()?;
-        let shifted = self.modifier_state.shift();
+        let mut shifted = self.modifier_state.shift();
         let altgr = self.modifier_state.right_alt;
         let ctrl_blocks_text = self.modifier_state.left_ctrl
             || (self.modifier_state.right_ctrl
@@ -250,6 +250,24 @@ impl MacInputHandler {
 
         if ctrl_blocks_text || other_blocks_text {
             return None;
+        }
+
+        // Caps changes only the base letter mapping. Number-row symbols,
+        // dead-key selection and Norwegian AltGr characters keep Shift's
+        // normal meaning; composing a dead key then uses the cased letter.
+        if self.modifier_state.caps_lock {
+            let unshifted = match profile {
+                KeyboardTranslationProfile::GuacamoleUs => {
+                    self.translate_guacamole_us_text_key(code, false)
+                }
+                KeyboardTranslationProfile::NorwegianPhysical if !altgr => {
+                    self.translate_norwegian_text_key(code, false, false)
+                }
+                KeyboardTranslationProfile::NorwegianPhysical => None,
+            };
+            if matches!(unshifted, Some(TextTranslation::Unicode(ch)) if ch.is_alphabetic()) {
+                shifted = !shifted;
+            }
         }
 
         match profile {
@@ -275,6 +293,7 @@ impl MacInputHandler {
             ('¨', 'I') => Some('Ï'),
             ('¨', 'O') => Some('Ö'),
             ('¨', 'U') => Some('Ü'),
+            ('¨', 'Y') => Some('Ÿ'),
             ('¨', ' ') => Some('¨'),
             ('^', 'a') => Some('â'),
             ('^', 'e') => Some('ê'),

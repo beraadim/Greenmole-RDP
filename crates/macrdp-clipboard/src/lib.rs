@@ -1,7 +1,9 @@
 pub mod file;
+mod file_urls;
 pub mod formats;
 pub mod html;
 pub mod pasteboard;
+mod remote_formats;
 pub mod transfer;
 
 use std::fmt;
@@ -20,6 +22,7 @@ use crate::formats::{
     dib_to_png, png_to_dib, uti_to_rdp_format_id, FORMAT_ID_FILE_LIST, FORMAT_ID_HTML,
 };
 use crate::pasteboard::PasteboardBridge;
+use crate::remote_formats::{preferred_format, FormatKind, RemoteFormat};
 use crate::transfer::FileTransferManager;
 
 /// macOS clipboard backend implementing the CLIPRDR protocol.
@@ -31,13 +34,15 @@ use crate::transfer::FileTransferManager;
 pub struct MacClipboardBackend {
     event_sender: ServerEventTx,
     last_change_count: Arc<AtomicI64>,
-    remote_formats: Vec<ClipboardFormat>,
     transfer_manager: FileTransferManager,
     temp_dir: PathBuf,
     poll_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
     locked: bool,
-    pending_paste_format: Option<u32>,
+    pending_paste_format: Option<RemoteFormat>,
+    // CLIPRDR responses carry no format ID. Serialize requests and coalesce newer
+    // offers instead of decoding an older response with the newest format.
+    queued_paste_format: Option<Option<RemoteFormat>>,
     file_transfer: bool,
 }
 
@@ -62,14 +67,30 @@ impl MacClipboardBackend {
         Self {
             event_sender,
             last_change_count: Arc::new(AtomicI64::new(0)),
-            remote_formats: Vec::new(),
             transfer_manager: FileTransferManager::new(temp_dir.clone(), max_file_size),
             temp_dir,
             poll_handle: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
             locked: false,
             pending_paste_format: None,
+            queued_paste_format: None,
             file_transfer,
+        }
+    }
+
+    fn request_remote_format(&mut self, format: Option<RemoteFormat>) {
+        let Some(format) = format else {
+            return;
+        };
+        if self
+            .event_sender
+            .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                format.id,
+            )))
+            .is_ok()
+        {
+            tracing::debug!(format_id = format.id.value(), kind = ?format.kind, "Requesting remote clipboard format");
+            self.pending_paste_format = Some(format);
         }
     }
 
@@ -186,21 +207,14 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        self.remote_formats = available_formats.to_vec();
-
-        // Request the highest-fidelity format available, in order of preference
-        let preferred = [FORMAT_ID_FILE_LIST, FORMAT_ID_HTML, 8, 13];
-        for &fmt_id in &preferred {
-            if fmt_id == FORMAT_ID_FILE_LIST && !self.file_transfer {
-                continue;
-            }
-            if available_formats.iter().any(|f| f.id().value() == fmt_id) {
-                self.pending_paste_format = Some(fmt_id);
-                let _ = self.event_sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(fmt_id)),
-                ));
-                return;
-            }
+        // A new offer supersedes incomplete file downloads as well as the old
+        // format data. Outstanding file responses are ignored by their stream IDs.
+        self.transfer_manager.set_incoming_descriptors(Vec::new());
+        let format = preferred_format(available_formats, self.file_transfer);
+        if self.pending_paste_format.is_some() {
+            self.queued_paste_format = Some(format);
+        } else {
+            self.request_remote_format(format);
         }
     }
 
@@ -265,20 +279,26 @@ impl CliprdrBackend for MacClipboardBackend {
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
         let format = self.pending_paste_format.take();
+        if let Some(next) = self.queued_paste_format.take() {
+            // The response belongs to a superseded copy; never publish it or
+            // reinterpret it as the format selected by the latest advertisement.
+            self.request_remote_format(next);
+            return;
+        }
         if response.is_error() {
             tracing::warn!("Received error format data response from client");
             return;
         }
 
-        match format {
-            Some(13) => {
+        match format.map(|format| format.kind) {
+            Some(FormatKind::Text) => {
                 if let Ok(text) = response.to_unicode_string() {
                     let pb = PasteboardBridge::new();
                     let new_count = pb.write_string(&text);
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
-            Some(8) => match dib_to_png(response.data()) {
+            Some(FormatKind::Dib) => match dib_to_png(response.data()) {
                 Ok(png_data) => {
                     let pb = PasteboardBridge::new();
                     let new_count = pb.write_image(&png_data);
@@ -286,14 +306,18 @@ impl CliprdrBackend for MacClipboardBackend {
                 }
                 Err(error) => tracing::warn!(%error, "Rejected clipboard image"),
             },
-            Some(id) if id == FORMAT_ID_HTML => {
+            Some(FormatKind::Html) => {
                 if let Some(html_content) = crate::html::unwrap_html_format(response.data()) {
                     let pb = PasteboardBridge::new();
                     let new_count = pb.write_html(&html_content);
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
-            Some(id) if id == FORMAT_ID_FILE_LIST && self.file_transfer => {
+            Some(FormatKind::Files) if self.file_transfer => {
+                if !crate::file::valid_file_list_payload(response.data()) {
+                    tracing::warn!("Rejected malformed or oversized clipboard file list");
+                    return;
+                }
                 if let Ok(file_list) = response.to_file_list() {
                     self.transfer_manager
                         .set_incoming_descriptors(file_list.files);
@@ -336,8 +360,10 @@ impl CliprdrBackend for MacClipboardBackend {
             if !paths.is_empty() {
                 let pb = PasteboardBridge::new();
                 let new_count = pb.write_file_urls(&paths);
-                self.last_change_count.store(new_count, Ordering::SeqCst);
-                tracing::info!(count = paths.len(), "Wrote incoming files to pasteboard");
+                if new_count >= 0 {
+                    self.last_change_count.store(new_count, Ordering::SeqCst);
+                    tracing::info!(count = paths.len(), "Wrote incoming files to pasteboard");
+                }
             }
         }
     }
@@ -409,68 +435,4 @@ impl ServerEventSender for MacClipboardFactory {
 impl CliprdrServerFactory for MacClipboardFactory {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn malformed_images_unsolicited_responses_and_errors_do_not_touch_pasteboard() {
-        let dir = tempfile::tempdir().unwrap();
-        let (sender, mut receiver) = ServerEvent::create_channel();
-        let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, false);
-        let initial = backend.last_change_count.load(Ordering::SeqCst);
-        backend.pending_paste_format = Some(8);
-        backend.on_format_data_response(FormatDataResponse::new_data(vec![0; 40]));
-        assert!(backend.pending_paste_format.is_none());
-        backend.on_format_data_response(FormatDataResponse::new_data(vec![65, 0, 0, 0]));
-        backend.pending_paste_format = Some(8);
-        backend.on_format_data_response(FormatDataResponse::new_error());
-        assert!(backend.pending_paste_format.is_none());
-        assert_eq!(backend.last_change_count.load(Ordering::SeqCst), initial);
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn short_file_response_schedules_bounded_remainder_on_clipboard_channel() {
-        let dir = tempfile::tempdir().unwrap();
-        let (sender, mut receiver) = ServerEvent::create_channel();
-        let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
-        backend
-            .transfer_manager
-            .set_incoming_descriptors(vec![FileDescriptor {
-                name: "test.txt".to_string(),
-                file_size: Some(5),
-                attributes: None,
-                last_write_time: None,
-            }]);
-        let requests = backend.transfer_manager.generate_contents_requests();
-        backend.on_file_contents_response(FileContentsResponse::new_data_response(
-            requests[1].stream_id,
-            b"he".to_vec(),
-        ));
-        let ServerEvent::ClipboardFileContentsRequest(remainder) = receiver.try_recv().unwrap()
-        else {
-            panic!("Expected missing-range request");
-        };
-        assert_eq!(remainder.position, 2);
-        assert_eq!(remainder.requested_size, 3);
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn disabling_file_transfer_disables_capability_and_ignores_remote_file_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let (sender, mut receiver) = ServerEvent::create_channel();
-        let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, false);
-        assert!(!backend
-            .client_capabilities()
-            .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED));
-        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::new(
-            FORMAT_ID_FILE_LIST,
-        ))]);
-        assert!(receiver.try_recv().is_err());
-        assert!(backend.pending_paste_format.is_none());
-        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::new(13))]);
-        assert_eq!(backend.pending_paste_format, Some(13));
-        assert!(receiver.try_recv().is_ok());
-    }
-}
+mod tests;

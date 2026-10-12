@@ -6,6 +6,7 @@ import { useMetricHistory } from "../hooks/useFpsHistory";
 import { api } from "../lib/ipc";
 import StatusBar from "../components/StatusBar";
 import ServerError from "../components/ServerError";
+import TimingDetails from "../components/TimingDetails";
 import MoveWindowsControl from "../components/MoveWindowsControl";
 import MetricCard from "../components/MetricCard";
 import { ChartPanel } from "../components/ChartPanel";
@@ -200,6 +201,7 @@ function Dashboard() {
             <div>Client queue: {metrics.client_queue_depth_bytes === null ? "not reported" : `${Math.round(metrics.client_queue_depth_bytes / 1024)} KiB`}</div>
           </div>
         )}
+        {metricsAvailable && <TimingDetails metrics={metrics} />}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px]">
           <div className="rounded-[6px] bg-black/10 px-2 py-2">
             <div className="text-text-muted mb-1">Transport</div>

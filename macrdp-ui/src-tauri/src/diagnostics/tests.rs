@@ -28,7 +28,19 @@ fn exports_selected_operational_fields_without_credentials_or_input_text() {
     metrics.encoder_mode = secret.into();
     metrics.transport_mode = secret.into();
     metrics.bitrate_mode = secret.into();
+    metrics.connection_outcome = Some(secret.into());
     assert!(!safe_metrics(&metrics).to_string().contains(secret));
+}
+
+#[test]
+fn outcome_logs_export_only_known_reasons_and_typed_authentication_state() {
+    let secret = "private-untrusted-error";
+    let event = json!({"level": "info", "message": "Connection outcome",
+        "fields": {"reason": secret, "authenticated": true, "peer": secret}});
+    let value = summarize_bytes(format!("{event}\n").as_bytes(), false);
+    assert!(!value.to_string().contains(secret));
+    assert_eq!(value["events"][0]["fields"]["reason"], "unknown");
+    assert_eq!(value["events"][0]["fields"]["authenticated"], true);
 }
 
 #[test]

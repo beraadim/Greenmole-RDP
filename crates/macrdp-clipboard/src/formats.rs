@@ -6,10 +6,10 @@ pub use self::bounded_image::{
     dib_to_png, png_to_dib, BITMAPINFOHEADER_SIZE, MAX_IMAGE_PAYLOAD_BYTES,
 };
 
-/// Registered format ID for Windows "HTML Format"
+/// Locally advertised format ID for Windows "HTML Format"
 pub const FORMAT_ID_HTML: u32 = 0xD010;
 
-/// Registered format ID for FileGroupDescriptorW
+/// Locally advertised format ID for FileGroupDescriptorW
 pub const FORMAT_ID_FILE_LIST: u32 = 0xD011;
 
 /// Convert UTF-8 string to UTF-16LE bytes with null terminator.

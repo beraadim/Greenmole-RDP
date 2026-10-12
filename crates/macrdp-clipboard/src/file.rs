@@ -2,6 +2,19 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// Maximum files advertised or accepted in one clipboard copy.
+pub(crate) const MAX_CLIPBOARD_FILES: usize = 256;
+
+/// Validate count and fixed descriptor bytes before IronRDP allocates its file
+/// vector from the peer-supplied count. MS-RDPECLIP descriptors occupy 592 bytes.
+pub(crate) fn valid_file_list_payload(data: &[u8]) -> bool {
+    let Some(count) = data.get(..4) else {
+        return false;
+    };
+    let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
+    count <= MAX_CLIPBOARD_FILES && data.len() == 4 + count * 592
+}
+
 /// Maximum allocation for one remote file-range request, independent of advertised file size.
 pub const FILE_TRANSFER_CHUNK_SIZE: u32 = 64 * 1024;
 
@@ -33,6 +46,22 @@ pub fn read_file_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_list_validation_rejects_hostile_counts_and_incomplete_descriptors() {
+        assert!(!valid_file_list_payload(&[]));
+        assert!(!valid_file_list_payload(&u32::MAX.to_le_bytes()));
+        assert!(!valid_file_list_payload(&1u32.to_le_bytes()));
+        assert!(valid_file_list_payload(&0u32.to_le_bytes()));
+        let mut data = vec![0u8; 4 + 592 * MAX_CLIPBOARD_FILES];
+        data[..4].copy_from_slice(&(MAX_CLIPBOARD_FILES as u32).to_le_bytes());
+        assert!(valid_file_list_payload(&data));
+        data.push(0);
+        assert!(!valid_file_list_payload(&data));
+        data.resize(4 + 592 * (MAX_CLIPBOARD_FILES + 1), 0);
+        data[..4].copy_from_slice(&(MAX_CLIPBOARD_FILES as u32 + 1).to_le_bytes());
+        assert!(!valid_file_list_payload(&data));
+    }
 
     #[test]
     fn read_range_basic() {

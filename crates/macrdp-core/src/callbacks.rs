@@ -27,7 +27,30 @@ impl Default for ServerStatus {
     }
 }
 
-/// Real-time performance metrics
+/// Event-level stage durations; absent values mean no measurements are available.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TimingPercentiles {
+    pub samples: usize,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+}
+
+impl From<ironrdp_server::gfx::TimingSummary> for TimingPercentiles {
+    fn from(value: ironrdp_server::gfx::TimingSummary) -> Self {
+        Self {
+            samples: value.samples,
+            p50_ms: value.p50_ms,
+            p95_ms: value.p95_ms,
+            p99_ms: value.p99_ms,
+            max_ms: value.max_ms,
+        }
+    }
+}
+
+/// Independent windows: capture deliveries, encode completions and wire updates
+/// can have different counts. These are stage durations, not end-to-end latency.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     /// Delivered graphics updates per second; bitmap updates may be subregions.
@@ -67,6 +90,12 @@ pub struct Metrics {
     pub audio_invalid_frames: u64,
     pub audio_queue_age_ms: f64,
     pub audio_queued_ms: f64,
+    pub capture_timings: TimingPercentiles,
+    pub encode_timings: TimingPercentiles,
+    pub completion_timings: TimingPercentiles,
+    pub write_timings: TimingPercentiles,
+    /// Fixed operational label, never a free-form error or client identifier.
+    pub connection_outcome: Option<String>,
 }
 
 /// Connection event
@@ -88,7 +117,7 @@ pub struct ConnectionInfo {
 }
 
 /// Disconnection info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct DisconnectionInfo {
     pub client_ip: String,
     pub client_name: String,
@@ -96,6 +125,8 @@ pub struct DisconnectionInfo {
     pub disconnected_at: String,
     pub duration_secs: u64,
     pub bytes_total: u64,
+    pub reason: String,
+    pub final_metrics: Metrics,
 }
 
 /// A single log entry

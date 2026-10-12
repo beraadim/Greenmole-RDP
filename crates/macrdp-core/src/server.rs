@@ -101,6 +101,13 @@ mod tests {
     }
 }
 
+/// Final stage timings and totals; no interval rate is inferred at disconnect.
+pub(crate) fn final_metrics(gfx: &GfxState, audio: &macrdp_audio::AudioStats) -> Metrics {
+    let mut metrics = MetricsSnapshot::default().sample(gfx);
+    audio_metrics::enrich(&mut metrics, audio);
+    metrics
+}
+
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
     audio_stats: Arc<macrdp_audio::AudioStats>,
@@ -120,7 +127,7 @@ pub struct ServerHandle {
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
-    metrics_snapshot: Mutex<MetricsSnapshot>,
+    latest_metrics: Arc<Mutex<Metrics>>,
     config_tx: tokio::sync::mpsc::Sender<ConfigUpdate>,
 }
 
@@ -213,10 +220,9 @@ impl ServerHandle {
 
     /// Current performance metrics.
     pub fn metrics(&self) -> Metrics {
-        let gfx = self.gfx_state.lock().unwrap();
-        let mut metrics = self.metrics_snapshot.lock().unwrap().sample(&gfx);
-        audio_metrics::enrich(&mut metrics, &self.audio_stats);
-        metrics
+        // All observers share the ticker's interval. Reading/exporting a report
+        // must not restart rate sampling for another window or the CLI recorder.
+        self.latest_metrics.lock().unwrap().clone()
     }
 
     /// Total successfully written display bytes without advancing rate sampling.
@@ -557,7 +563,7 @@ async fn start_server_inner(
         stop_lock: tokio::sync::Mutex::new(()),
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(None),
-        metrics_snapshot: Mutex::new(MetricsSnapshot::default()),
+        latest_metrics: Arc::new(Mutex::new(Metrics::default())),
         config_tx,
     });
 
@@ -570,6 +576,7 @@ async fn start_server_inner(
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&handle.gfx_state);
     let metrics_audio = Arc::clone(&handle.audio_stats);
+    let latest_metrics = Arc::clone(&handle.latest_metrics);
     let handler_for_metrics = Arc::clone(&handler);
     let worker_done = Arc::clone(&handle.terminal_result);
     let metrics_task = tokio::spawn(async move {
@@ -582,6 +589,7 @@ async fn start_server_inner(
             }
             let mut metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
             audio_metrics::enrich(&mut metrics, &metrics_audio);
+            *latest_metrics.lock().unwrap() = metrics.clone();
             handler_for_metrics.on_metrics(metrics);
         }
     });
@@ -652,7 +660,11 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             Arc::clone(&args.active_connection),
             Some(display_controller.clone()),
         )
-        .with_events(Arc::clone(&args.handler), Arc::clone(&args.gfx_state));
+        .with_events(
+            Arc::clone(&args.handler),
+            Arc::clone(&args.gfx_state),
+            Arc::clone(&args.audio_stats),
+        );
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
         let shared_audio_tx = if args.config.audio.enabled {
@@ -816,6 +828,8 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             biased;
             _ = args.shutdown_notify.notified() => {
                 tracing::info!("Shutdown signal received, stopping server");
+                args.gfx_state.lock().unwrap().connection_outcome =
+                    Some(ironrdp_server::gfx::ConnectionOutcome::ServerShutdown);
                 Ok(())
             }
             result = server.run_with_listener(listener) => {
@@ -848,11 +862,12 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
         // Restore the physical display layout explicitly in that path too.
         // Keep the virtual display alive until restoration has completed.
         drop(server);
-        if let Err(error) =
-            tokio::task::spawn_blocking(move || display_controller.end_remote_session())
-                .await
-                .context("Display restoration task failed")
-                .and_then(|result| result)
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            crate::display::capture_lifecycle::restore_after_capture(display_controller)
+        })
+        .await
+        .context("Display restoration task failed")
+        .and_then(|result| result)
         {
             tracing::warn!(%error, "Physical display restoration failed during shutdown");
         }

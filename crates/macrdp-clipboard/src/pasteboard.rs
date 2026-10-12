@@ -16,20 +16,9 @@ use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
 use objc2_foundation::{NSData, NSString};
 use tracing::{debug, warn};
 
-/// Safe wrapper around `NSPasteboard.generalPasteboard`.
-///
-/// # Safety
-///
-/// `NSPasteboard` is not `Send` by default in objc2 because ObjC objects are
-/// typically bound to a thread via autorelease pools. However, `PasteboardBridge`
-/// is accessed exclusively from a single dedicated polling thread, so it is safe
-/// to mark it as `Send`. The caller must ensure no concurrent access from
-/// multiple threads.
+/// Stateless wrapper around the general pasteboard. Objective-C handles are
+/// obtained within each call and are never retained across threads.
 pub struct PasteboardBridge;
-
-// SAFETY: PasteboardBridge accesses NSPasteboard from a single dedicated
-// polling thread only. No concurrent access from multiple threads occurs.
-unsafe impl Send for PasteboardBridge {}
 
 impl PasteboardBridge {
     /// Create a new `PasteboardBridge`.
@@ -102,38 +91,7 @@ impl PasteboardBridge {
     /// Iterates all pasteboard items to support multi-file copies.
     /// Falls back to a single `stringForType` read if no items are found.
     pub fn read_file_urls(&self) -> Vec<PathBuf> {
-        use objc2_app_kit::NSPasteboardTypeFileURL;
-
-        let pb = NSPasteboard::generalPasteboard();
-        let file_url_type: &NSString = unsafe { NSPasteboardTypeFileURL };
-
-        let mut result = Vec::new();
-
-        // Iterate pasteboard items for multi-file support.
-        if let Some(items) = pb.pasteboardItems() {
-            let count = items.count();
-            for i in 0..count {
-                let item = items.objectAtIndex(i);
-                if let Some(url_str) = item.stringForType(file_url_type) {
-                    let s = url_str.to_string();
-                    if let Some(path) = file_url_str_to_path(&s) {
-                        result.push(path);
-                    }
-                }
-            }
-        }
-
-        // Fallback: single string read (common case: one file copied).
-        if result.is_empty() {
-            if let Some(url_str) = pb.stringForType(file_url_type) {
-                let s = url_str.to_string();
-                if let Some(path) = file_url_str_to_path(&s) {
-                    result.push(path);
-                }
-            }
-        }
-
-        result
+        crate::file_urls::read_file_urls(&NSPasteboard::generalPasteboard())
     }
 
     /// Read HTML content from the pasteboard (public.html UTI).
@@ -170,37 +128,8 @@ impl PasteboardBridge {
     /// Write file URLs to the pasteboard.
     ///
     /// Returns the new change count, or -1 on failure.
-    /// Currently writes only the first file URL (multi-file requires NSURL writeObjects).
     pub fn write_file_urls(&self, paths: &[PathBuf]) -> i64 {
-        use objc2_app_kit::NSPasteboardTypeFileURL;
-
-        if paths.is_empty() {
-            return -1;
-        }
-
-        let pb = NSPasteboard::generalPasteboard();
-        let change_count = pb.clearContents();
-
-        let file_url_type: &NSString = unsafe { NSPasteboardTypeFileURL };
-
-        let url = format!("file://{}", paths[0].display());
-        let ns_str = NSString::from_str(&url);
-        if !pb.setString_forType(&ns_str, file_url_type) {
-            warn!(
-                "pasteboard: failed to write file URL: {}",
-                paths[0].display()
-            );
-            return -1;
-        }
-
-        if paths.len() > 1 {
-            warn!(
-                count = paths.len(),
-                "Multiple files received but only first written to pasteboard (multi-file paste not yet supported)"
-            );
-        }
-
-        change_count as i64
+        crate::file_urls::write_file_urls(&NSPasteboard::generalPasteboard(), paths)
     }
 
     /// Write a plain-text string to the pasteboard.
@@ -251,48 +180,5 @@ impl PasteboardBridge {
 impl Default for PasteboardBridge {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Convert a `file://` URL string into a `PathBuf`.
-fn file_url_str_to_path(url: &str) -> Option<PathBuf> {
-    if let Some(path) = url.strip_prefix("file://") {
-        // Percent-decode the path.
-        let decoded = percent_decode(path);
-        Some(PathBuf::from(decoded))
-    } else {
-        None
-    }
-}
-
-/// Minimal percent-decoder for file paths (handles %XX escapes).
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                out.push((h * 16 + l) as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
     }
 }

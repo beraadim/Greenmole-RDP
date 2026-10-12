@@ -105,6 +105,11 @@ impl ServerEventHandler for TauriEventBridge {
                     return;
                 }
                 *guard = metrics.clone();
+                state
+                    .diagnostic_history
+                    .lock()
+                    .await
+                    .record_metrics(generation, &metrics);
                 crate::tray::update_tray_status(
                     &app,
                     if metrics.bitrate_kbps > 0 {
@@ -193,6 +198,13 @@ async fn process_connection_event(
     running: &AtomicBool,
 ) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
+        if let ConnectionEvent::Disconnected(info) = &event {
+            state
+                .diagnostic_history
+                .lock()
+                .await
+                .record_disconnect(generation, info);
+        }
         let mut connections = state.connections.lock().await;
         if connection_is_current(
             generation,
@@ -292,6 +304,7 @@ mod tests {
                 disconnected_at: "2026-01-01T00:00:59Z".into(),
                 duration_secs: 59,
                 bytes_total: 100,
+                ..Default::default()
             }),
         );
         assert_eq!(connections.len(), 1);

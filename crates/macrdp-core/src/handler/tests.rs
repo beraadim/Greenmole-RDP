@@ -300,6 +300,200 @@ impl KeyboardDevice for RecordingKeyboard {
 }
 
 #[test]
+fn caps_lock_sync_repeat_and_reconnect_follow_remote_state_without_host_toggles() {
+    let mut handler = handler_for("Guacamole RDP", 0x0409);
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    handler.keyboard = Some(Box::new(RecordingKeyboard(actions.clone())));
+    handler.keyboard(KeyboardEvent::Synchronize(
+        ironrdp_server::SynchronizeFlags::from_bits_truncate(4),
+    ));
+    assert_eq!(
+        handler.translate_text_key(0x1E, false),
+        Some(TextTranslation::Unicode('A'))
+    );
+    // A press toggles once, even if the client repeats the key-down.
+    for _ in 0..3 {
+        handler.keyboard(KeyboardEvent::Pressed {
+            code: 0x3A,
+            extended: false,
+        });
+    }
+    assert_eq!(
+        handler.translate_text_key(0x1E, false),
+        Some(TextTranslation::Unicode('a'))
+    );
+    handler.keyboard(KeyboardEvent::Released {
+        code: 0x3A,
+        extended: false,
+    });
+    handler.keyboard(KeyboardEvent::Pressed {
+        code: 0x3A,
+        extended: false,
+    });
+    handler.keyboard(KeyboardEvent::Released {
+        code: 0x3A,
+        extended: false,
+    });
+    assert_eq!(handler.last_sync_lock_bits, Some(4));
+    handler.keyboard(KeyboardEvent::Synchronize(
+        ironrdp_server::SynchronizeFlags::from_bits_truncate(4),
+    ));
+    assert_eq!(
+        handler.translate_text_key(0x1E, false),
+        Some(TextTranslation::Unicode('A'))
+    );
+    assert!(!actions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|action| matches!(action, KeyAction::Key(0x39, _))));
+    handler.on_disconnect();
+    handler.on_connect(
+        ClientInputContext {
+            client_name: "Guacamole RDP".into(),
+            keyboard_layout: 0x0409,
+        },
+        None,
+    );
+    assert_eq!(
+        handler.translate_text_key(0x1E, false),
+        Some(TextTranslation::Unicode('a'))
+    );
+    handler.keyboard(KeyboardEvent::Synchronize(
+        ironrdp_server::SynchronizeFlags::from_bits_truncate(4),
+    ));
+    assert_eq!(
+        handler.translate_text_key(0x1E, false),
+        Some(TextTranslation::Unicode('A'))
+    );
+}
+
+#[test]
+fn caps_lock_xor_shift_applies_to_letters_not_symbols_or_altgr() {
+    for (name, layout, letters) in [
+        ("Guacamole RDP", 0x0409, vec![(0x1E, 'a', 'A')]),
+        (
+            "Windows App",
+            0x0414,
+            vec![
+                (0x1E, 'a', 'A'),
+                (0x1A, 'å', 'Å'),
+                (0x27, 'ø', 'Ø'),
+                (0x28, 'æ', 'Æ'),
+            ],
+        ),
+    ] {
+        let mut handler = handler_for(name, layout);
+        handler.modifier_state.caps_lock = true;
+        for (code, lower, upper) in letters {
+            handler.modifier_state.left_shift = false;
+            assert_eq!(
+                handler.translate_text_key(code, false),
+                Some(TextTranslation::Unicode(upper))
+            );
+            handler.modifier_state.left_shift = true;
+            assert_eq!(
+                handler.translate_text_key(code, false),
+                Some(TextTranslation::Unicode(lower))
+            );
+        }
+        handler.modifier_state.left_shift = false;
+        assert_eq!(
+            handler.translate_text_key(0x02, false),
+            Some(TextTranslation::Unicode('1'))
+        );
+        handler.modifier_state.left_shift = true;
+        assert_eq!(
+            handler.translate_text_key(0x02, false),
+            Some(TextTranslation::Unicode('!'))
+        );
+    }
+    let mut handler = handler_for("Windows App", 0x0414);
+    handler.modifier_state.caps_lock = true;
+    handler.modifier_state.right_alt = true;
+    assert_eq!(
+        handler.translate_text_key(0x03, false),
+        Some(TextTranslation::Unicode('@'))
+    );
+    assert_eq!(
+        handler.translate_text_key(0x32, false),
+        Some(TextTranslation::Unicode('µ'))
+    );
+    assert_eq!(
+        handler.translate_text_key(0x0D, false),
+        Some(TextTranslation::Dead('´'))
+    );
+}
+
+#[test]
+fn caps_lock_composes_uppercase_dead_keys_and_releases_the_original_character() {
+    let mut handler = handler_for("Windows App", 0x0414);
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    handler.keyboard = Some(Box::new(RecordingKeyboard(actions.clone())));
+    handler.keyboard(KeyboardEvent::Synchronize(
+        ironrdp_server::SynchronizeFlags::from_bits_truncate(4),
+    ));
+    // Norwegian diaeresis, then O, must inject Ö under Caps Lock.
+    handler.keyboard(KeyboardEvent::Pressed {
+        code: 0x1B,
+        extended: false,
+    });
+    handler.keyboard(KeyboardEvent::Released {
+        code: 0x1B,
+        extended: false,
+    });
+    handler.keyboard(KeyboardEvent::Pressed {
+        code: 0x18,
+        extended: false,
+    });
+    // Changing Caps before key-up must not change which Unicode key is released.
+    handler.keyboard(KeyboardEvent::Pressed {
+        code: 0x3A,
+        extended: false,
+    });
+    handler.keyboard(KeyboardEvent::Released {
+        code: 0x3A,
+        extended: false,
+    });
+    handler.keyboard(KeyboardEvent::Released {
+        code: 0x18,
+        extended: false,
+    });
+    let unicode: Vec<_> = actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|action| match action {
+            KeyAction::Unicode(ch, pressed) => Some((*ch, *pressed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unicode, vec![('Ö' as u16, true), ('Ö' as u16, false)]);
+    assert_eq!(MacInputHandler::compose_dead_key('¨', 'Y'), Some('Ÿ'));
+}
+
+#[test]
+fn initial_physical_caps_sync_reconciles_host_lock_once() {
+    let mut handler = handler_for("Windows App", 0x0409);
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    handler.keyboard = Some(Box::new(RecordingKeyboard(actions.clone())));
+    let caps = ironrdp_server::SynchronizeFlags::from_bits_truncate(4);
+    handler.keyboard(KeyboardEvent::Synchronize(caps));
+    handler.keyboard(KeyboardEvent::Synchronize(caps));
+    let caps_events: Vec<_> = actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|action| match action {
+            KeyAction::Key(0x39, pressed) => Some(*pressed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(caps_events, vec![true, false]);
+    assert!(handler.modifier_state.caps_lock);
+}
+
+#[test]
 fn disconnect_releases_keyboard_before_reconnect_and_clears_translation_state() {
     let mut handler = handler_for("Windows App", 0x0414);
     let events = Arc::new(Mutex::new(Vec::new()));

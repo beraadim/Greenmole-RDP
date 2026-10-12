@@ -1,5 +1,7 @@
 mod bitmap_freshness;
 mod bitmap_pacing;
+pub(crate) mod capture_lifecycle;
+mod capture_recovery;
 mod event_wait;
 mod idle_policy;
 use event_wait::DisplayWake;
@@ -844,6 +846,9 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        // Fail before any native display mutation when an earlier connection
+        // is still retiring. No control loop waits for a stalled Apple callback.
+        let native_lease = capture_lifecycle::acquire(&self.display_controller)?;
         let size = self.activation_size.take().unwrap_or(DesktopSize {
             width: self.width,
             height: self.height,
@@ -955,7 +960,10 @@ impl RdpServerDisplay for MacDisplay {
             "Activated capture and pointer desktop size"
         );
         Ok(Box::new(MacDisplayUpdates {
-            capturer,
+            capturer: Some(capturer),
+            capture_recovery: None,
+            native_lease: Some(native_lease),
+            display_controller: self.display_controller.clone(),
             capture_config,
             encoder,
             gfx_state: Arc::clone(&self.gfx_state),
@@ -1037,8 +1045,19 @@ impl CachedFrame {
 
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(75);
 
-struct MacDisplayUpdates {
+struct RecoveredCapture {
     capturer: ScreenCapturer,
+    config: CaptureConfig,
+    frame: Option<CapturedFrame>,
+    // Fields drop in declaration order: native capture cleanup precedes unlock.
+    native_lease: capture_lifecycle::NativeCaptureLease,
+}
+
+struct MacDisplayUpdates {
+    capturer: Option<ScreenCapturer>,
+    capture_recovery: Option<capture_recovery::CaptureRecovery<RecoveredCapture>>,
+    native_lease: Option<capture_lifecycle::NativeCaptureLease>,
+    display_controller: macrdp_display::DisplayController,
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     gfx_state: Arc<Mutex<GfxState>>,
@@ -1135,7 +1154,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                             }
                             // Confirm native capture has stopped before reactivation
                             // can change the selected virtual display's mode.
-                            self.capturer.stop()?;
+                            if let Some(recovery) = self.capture_recovery.take() {
+                                recovery.cancel().await?;
+                            }
+                            if let Some(capturer) = &mut self.capturer {
+                                capturer.stop()?;
+                            }
                             tracing::info!(width = size.width, height = size.height,
                                 "Requesting RDP reactivation for display resize");
                             return Ok(Some(DisplayUpdate::Resize(size)));
@@ -1154,7 +1178,11 @@ impl MacDisplayUpdates {
         'updates: loop {
             self.sync_bitmap_pacing();
             if !self.pending_bitmap_updates.is_empty() || self.deferred_bitmap_frame.is_some() {
-                if let Some(mut latest) = self.capturer.try_latest_image() {
+                if let Some(mut latest) = self
+                    .capturer
+                    .as_mut()
+                    .and_then(ScreenCapturer::try_latest_image)
+                {
                     self.record_capture_delivery();
                     if let Some(previous) = self.deferred_bitmap_frame.take() {
                         bitmap_freshness::accumulate_frame(&mut latest, &previous);
@@ -1230,6 +1258,13 @@ impl MacDisplayUpdates {
                 continue;
             }
 
+            if self.capture_recovery.is_some() {
+                if let Some(update) = self.next_recovery_update().await? {
+                    return Ok(Some(update));
+                }
+                continue;
+            }
+
             self.refresh_capture_transport_if_needed().await?;
 
             // Capture events and timers all return to this outer loop. A cursor
@@ -1265,7 +1300,10 @@ impl MacDisplayUpdates {
                 macrdp_capture::CaptureEvent::Frame(frame)
             } else {
                 match event_wait::next_event(
-                    self.capturer.next_frame(),
+                    self.capturer
+                        .as_mut()
+                        .expect("active capture outside recovery")
+                        .next_frame(),
                     idle_deadline,
                     cursor_deadline,
                 )
@@ -1278,11 +1316,7 @@ impl MacDisplayUpdates {
                         event
                     }
                     DisplayWake::Capture(None) => {
-                        if let Some(update) =
-                            self.run_coregraphics_fallback_until_recovered().await?
-                        {
-                            return Ok(Some(update));
-                        }
+                        self.begin_capture_recovery();
                         continue 'updates;
                     }
                     DisplayWake::Cursor => continue 'updates,
@@ -1340,11 +1374,7 @@ impl MacDisplayUpdates {
                         continue 'updates;
                     }
                     macrdp_capture::CaptureEvent::Unavailable => {
-                        if let Some(update) =
-                            self.run_coregraphics_fallback_until_recovered().await?
-                        {
-                            return Ok(Some(update));
-                        }
+                        self.begin_capture_recovery();
                         continue 'updates;
                     }
                 };
@@ -1375,60 +1405,158 @@ impl MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
-    async fn run_coregraphics_fallback_until_recovered(&mut self) -> Result<Option<DisplayUpdate>> {
+    fn begin_capture_recovery(&mut self) {
+        if self.capture_recovery.is_some() {
+            return;
+        }
         self.idle_frame_count = 0;
         self.idle_since = None;
+        self.last_frame_cache = None;
+        self.pending_bitmap_updates.clear();
+        self.deferred_bitmap_frame = None;
+        self.skip_next_frame = false;
         self.request_full_bitmap_updates(1);
-        tracing::warn!("SCStream unavailable — switching to CoreGraphics fallback");
+        self.needs_full_gfx_seed = true;
+        self.mark_client_may_be_stale("capture-unavailable");
+        self.capture_recovery = Some(capture_recovery::CaptureRecovery::new(Instant::now()));
+        tracing::warn!(
+            "SCStream unavailable; starting paced CoreGraphics fallback and capture recovery"
+        );
+    }
+
+    async fn next_recovery_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        let now = Instant::now();
+        let recovery = self.capture_recovery.as_mut().expect("recovery active");
+        if recovery.probe_due(now) {
+            let old_capture = self.capturer.take();
+            let mut config = self.capture_config.clone();
+            // A recovered stream first supplies a complete BGRA baseline;
+            // normal transport selection can return to NV12 after that seed.
+            config.pixel_format = CapturePixelFormat::Bgra;
+            let (config, audio_tx) = capture_recovery::create_with_current_audio(
+                config,
+                &self.shared_audio_tx,
+                |config, audio| Ok((config, audio)),
+            )?;
+            let native_lease = match self.native_lease.take() {
+                Some(lease) => lease,
+                None => capture_lifecycle::acquire(&self.display_controller)?,
+            };
+            recovery.start_probe(
+                move |cancelled| {
+                    // This worker owns its timer and blocking pool, independent of
+                    // service shutdown. Lease ownership survives all native waits.
+                    let native_lease = native_lease;
+                    if let Some(mut old) = old_capture {
+                        old.stop()
+                            .context(capture_recovery::NativeRetirementFailed)?;
+                    }
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("Failed to create native recovery runtime")?;
+                    let mut capturer =
+                        runtime.block_on(ScreenCapturer::new(config.clone(), audio_tx))?;
+                    let event = runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_millis(250), capturer.next_frame())
+                            .await
+                    });
+                    if cancelled.load(Ordering::Acquire) {
+                        capturer
+                            .stop()
+                            .context(capture_recovery::NativeRetirementFailed)?;
+                        return Ok(None);
+                    }
+                    let frame = match event {
+                        Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => Some(frame),
+                        Ok(Some(macrdp_capture::CaptureEvent::Idle)) => None,
+                        _ => {
+                            capturer
+                                .stop()
+                                .context(capture_recovery::NativeRetirementFailed)?;
+                            anyhow::bail!("Recovery probe did not produce usable capture flow");
+                        }
+                    };
+                    Ok(Some(RecoveredCapture {
+                        capturer,
+                        config,
+                        frame,
+                        native_lease,
+                    }))
+                },
+                |mut recovered| {
+                    recovered
+                        .capturer
+                        .stop()
+                        .context(capture_recovery::NativeRetirementFailed)
+                },
+            )?;
+        }
         let fallback = CgFallbackCapturer::new(&self.capture_config);
-        loop {
-            match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                Ok(mut new_capturer) => {
-                    match tokio::time::timeout(
-                        Duration::from_millis(250),
-                        new_capturer.next_frame(),
-                    )
-                    .await
-                    {
-                        Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => {
-                            tracing::info!(
-                                "SCStream recovered with a usable frame — switching back from CoreGraphics"
-                            );
-                            self.capturer = new_capturer;
-                            return self.encode_and_send(frame);
-                        }
-                        Ok(Some(macrdp_capture::CaptureEvent::Idle)) => {
-                            tracing::info!(
-                                "SCStream recovered with idle frame flow — switching back from CoreGraphics"
-                            );
-                            self.capturer = new_capturer;
-                            return Ok(None);
-                        }
-                        Ok(Some(macrdp_capture::CaptureEvent::Unavailable)) | Ok(None) | Err(_) => {
-                            tracing::debug!(
-                                "SCStream probe still unavailable during CoreGraphics fallback"
-                            );
-                        }
-                    }
+        let recovery = self.capture_recovery.as_mut().unwrap();
+        recovery.warn_if_slow(now);
+        if recovery.fallback_due(now) && !recovery.probe_completed() {
+            recovery.fallback_attempted(now, fallback.frame_interval());
+            if let Some(frame) = fallback.capture_frame() {
+                return self.encode_and_send(frame);
+            }
+        }
+        let cursor_wait = self.cursor_poll_timeout();
+        let recovery = self.capture_recovery.as_mut().unwrap();
+        let timer = recovery.next_wake(Instant::now());
+        let result = event_wait::next_event(recovery.wait_probe(), Some(timer), cursor_wait).await;
+        match result {
+            DisplayWake::Capture(Ok(Some(recovered))) => {
+                let desired_fps = self.capture_config.frame_rate;
+                self.capture_recovery = None;
+                self.last_applied_fps = recovered.config.frame_rate;
+                self.capture_config = recovered.config;
+                self.capturer = Some(recovered.capturer);
+                self.native_lease = Some(recovered.native_lease);
+                self.apply_capture_fps(desired_fps, "capture-recovery");
+                self.last_frame_cache = None;
+                self.skip_next_frame = false;
+                self.last_uncompressed_rects = None;
+                self.last_uncompressed_sent = None;
+                self.last_full_frame_sent = None;
+                self.last_large_uncompressed_fingerprint = None;
+                self.last_large_uncompressed_sent = None;
+                self.last_large_uncompressed_rects = None;
+                self.request_full_bitmap_updates(1);
+                self.needs_full_gfx_seed = true;
+                self.mark_client_may_be_stale("capture-recovered");
+                if let Some(encoder) = &mut self.encoder {
+                    encoder.force_keyframe();
                 }
-                Err(_) => {
-                    tracing::debug!("SCStream probe creation failed during CoreGraphics fallback");
+                tracing::info!(
+                    "ScreenCaptureKit recovered with session audio and a fresh graphics baseline"
+                );
+                // Idle proves stream liveness, but not fresh pixels. Use a
+                // current native snapshot if available; never seed from a
+                // cached image belonging to the pre-suspend display.
+                if let Some(frame) = recovered.frame.or_else(|| fallback.capture_frame()) {
+                    self.encode_and_send(frame)
+                } else {
+                    Ok(None)
                 }
             }
-            if let Some(cg_frame) = fallback.capture_frame() {
-                match self.encode_and_send(cg_frame)? {
-                    Some(update) => return Ok(Some(update)),
-                    None => {
-                        if self.has_pending_submit {
-                            return Ok(None);
-                        }
-                        tracing::debug!(
-                            "CoreGraphics fallback frame produced no display update; waiting for next frame"
-                        );
+            DisplayWake::Capture(result) => {
+                if let Err(error) = result {
+                    if error.is::<capture_recovery::NativeRetirementFailed>() {
+                        return Err(error);
                     }
+                    tracing::debug!(%error, "Capture recovery attempt failed; backing off");
                 }
+                self.capture_recovery
+                    .as_mut()
+                    .unwrap()
+                    .failed(Instant::now());
+                Ok(None)
             }
-            tokio::time::sleep(fallback.frame_interval()).await;
+            DisplayWake::Cursor | DisplayWake::Idle => Ok(None),
         }
     }
 
@@ -1893,9 +2021,11 @@ impl MacDisplayUpdates {
             return;
         }
 
-        if let Err(e) = self.capturer.set_frame_rate(target_fps) {
-            tracing::warn!("Failed to update frame rate: {e}");
-            return;
+        if let Some(capturer) = &mut self.capturer {
+            if let Err(e) = capturer.set_frame_rate(target_fps) {
+                tracing::warn!("Failed to update frame rate: {e}");
+                return;
+            }
         }
 
         self.last_applied_fps = target_fps;
@@ -1936,9 +2066,12 @@ impl MacDisplayUpdates {
     }
 
     fn record_capture_delivery(&self) {
-        let delivery = self.capturer.last_delivery_stats();
+        let Some(capturer) = &self.capturer else {
+            return;
+        };
+        let delivery = capturer.last_delivery_stats();
         let mut gfx = self.gfx_state.lock().unwrap();
-        gfx.capture_queue_ms = delivery.queue_ms;
+        gfx.record_capture_queue(delivery.queue_ms);
         gfx.capture_frames_coalesced = gfx
             .capture_frames_coalesced
             .saturating_add(delivery.coalesced_frames);
@@ -2009,7 +2142,7 @@ impl MacDisplayUpdates {
             .and_then(|shared| shared.lock().unwrap().clone());
         let new_capturer = ScreenCapturer::new(new_config.clone(), audio_tx).await?;
 
-        self.capturer = new_capturer;
+        self.capturer = Some(new_capturer);
         self.capture_config = new_config;
         self.has_pending_submit = false;
         self.pending_visible_size = None;
@@ -2182,9 +2315,9 @@ impl MacDisplayUpdates {
                 );
                 {
                     let mut st = self.gfx_state.lock().unwrap();
-                    st.last_encode_ms = encode_ms;
+                    st.record_encode_timing(encode_ms);
                     st.last_frame_bytes = encoded.data.len() as u32;
-                    st.completion_queue_ms = completion_queue_ms;
+                    st.record_completion_queue(completion_queue_ms);
                 }
                 self.bitrate_ctrl
                     .record_frame(crate::bitrate_controller::FrameStats {
@@ -2990,7 +3123,7 @@ impl MacDisplayUpdates {
                                 );
                                 {
                                     let mut st = self.gfx_state.lock().unwrap();
-                                    st.last_encode_ms = encode_ms;
+                                    st.record_encode_timing(encode_ms);
                                     st.last_frame_bytes = encoded.data.len() as u32;
                                 }
                                 self.bitrate_ctrl.record_frame(FrameStats {
@@ -3149,7 +3282,7 @@ impl MacDisplayUpdates {
                             );
                             {
                                 let mut st = self.gfx_state.lock().unwrap();
-                                st.last_encode_ms = encode_ms;
+                                st.record_encode_timing(encode_ms);
                                 st.last_frame_bytes = total_bytes as u32;
                             }
                             self.bitrate_ctrl.record_frame(FrameStats {
@@ -3247,7 +3380,7 @@ impl MacDisplayUpdates {
                                     );
                                     {
                                         let mut st = self.gfx_state.lock().unwrap();
-                                        st.last_encode_ms = encode_ms;
+                                        st.record_encode_timing(encode_ms);
                                         st.last_frame_bytes = total_bytes as u32;
                                     }
                                     self.bitrate_ctrl.record_frame(FrameStats {
@@ -3333,7 +3466,7 @@ impl MacDisplayUpdates {
                                 );
                                 {
                                     let mut st = self.gfx_state.lock().unwrap();
-                                    st.last_encode_ms = encode_ms;
+                                    st.record_encode_timing(encode_ms);
                                     st.last_frame_bytes = encoded.data.len() as u32;
                                 }
                                 self.bitrate_ctrl.record_frame(FrameStats {

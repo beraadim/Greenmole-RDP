@@ -539,7 +539,8 @@ impl ScreenCapturer {
     ///
     /// The upstream API waits for Apple's completion callback and has no timeout.
     /// A failure is returned without marking the stream stopped, so a caller can
-    /// abort reconfiguration and cleanup can retry. No native object crosses threads.
+    /// abort reconfiguration and cleanup can retry. Recovery isolates this wait
+    /// on its single native worker while retaining exclusive capture ownership.
     pub fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Ok(());

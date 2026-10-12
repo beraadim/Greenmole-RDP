@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use ironrdp_cliprdr::pdu::*;
 
-use crate::file::{read_file_range, FILE_TRANSFER_CHUNK_SIZE};
+use crate::file::{read_file_range, FILE_TRANSFER_CHUNK_SIZE, MAX_CLIPBOARD_FILES};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RequestKind {
@@ -12,7 +12,6 @@ enum RequestKind {
     Data,
 }
 
-const MAX_INCOMING_FILES: usize = 256;
 const MAX_INCOMING_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SESSION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SESSION_FILES: usize = 1024;
@@ -79,24 +78,42 @@ impl FileTransferManager {
     }
 
     pub fn set_local_files(&mut self, paths: Vec<PathBuf>) {
-        self.local_files = paths;
+        if paths.len() > MAX_CLIPBOARD_FILES {
+            tracing::warn!(
+                count = paths.len(),
+                "Rejected outgoing clipboard file count"
+            );
+            self.local_files.clear();
+        } else {
+            self.local_files = paths;
+        }
     }
 
-    pub fn build_file_list(&self) -> PackedFileList {
-        let files = self
-            .local_files
-            .iter()
-            .filter_map(|path| {
-                let meta = fs::metadata(path).ok()?;
-                let name = path.file_name()?.to_string_lossy().to_string();
-                Some(FileDescriptor {
-                    name,
-                    file_size: Some(meta.len()),
-                    attributes: None,
-                    last_write_time: None,
-                })
-            })
-            .collect();
+    pub fn build_file_list(&mut self) -> PackedFileList {
+        let mut files = Vec::new();
+        // A contents request indexes the advertised list, not the original
+        // pasteboard list. Filter descriptors and backing paths together.
+        self.local_files.retain(|path| {
+            let Ok(meta) = fs::metadata(path) else {
+                return false;
+            };
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            if !meta.is_file()
+                || meta.len() > self.max_file_size
+                || name.encode_utf16().count() >= 260
+            {
+                return false;
+            }
+            files.push(FileDescriptor {
+                name: name.to_owned(),
+                file_size: Some(meta.len()),
+                attributes: None,
+                last_write_time: None,
+            });
+            true
+        });
         PackedFileList { files }
     }
 
@@ -156,7 +173,7 @@ impl FileTransferManager {
         self.incoming_complete.clear();
         self.incoming_failed.clear();
         self.stream_to_index.clear();
-        if descriptors.len() > MAX_INCOMING_FILES
+        if descriptors.len() > MAX_CLIPBOARD_FILES
             || descriptors.len() > MAX_SESSION_FILES.saturating_sub(self.stored_files)
             || self._directory.is_none()
         {
@@ -481,6 +498,70 @@ impl FileTransferManager {
 mod tests {
     use super::*;
 
+    #[test]
+    fn advertised_indices_match_readable_regular_files_after_filtering() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("Blåbær.txt");
+        let second = directory.path().join("a #1 100%.txt");
+        let oversized = directory.path().join("large.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(&oversized, vec![0; 20]).unwrap();
+        let mut manager = FileTransferManager::new(directory.path().to_path_buf(), 10);
+        manager.set_local_files(vec![
+            directory.path().join("missing.txt"),
+            first.clone(),
+            directory.path().to_path_buf(),
+            oversized,
+            second.clone(),
+        ]);
+        let list = manager.build_file_list();
+        assert_eq!(
+            list.files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Blåbær.txt", "a #1 100%.txt"]
+        );
+        assert_eq!(manager.local_files, vec![first.clone(), second.clone()]);
+        for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
+            .iter()
+            .enumerate()
+        {
+            let request = FileContentsRequest {
+                stream_id: index as u32,
+                index: index as u32,
+                flags: FileContentsFlags::DATA,
+                position: 0,
+                requested_size: 10,
+                data_id: None,
+            };
+            assert_eq!(manager.handle_contents_request(&request).data(), *expected);
+        }
+        // Disappearance after advertisement produces an error, never a shifted index.
+        fs::remove_file(&first).unwrap();
+        let request = FileContentsRequest {
+            stream_id: 10,
+            index: 1,
+            flags: FileContentsFlags::DATA,
+            position: 0,
+            requested_size: 10,
+            data_id: None,
+        };
+        assert_eq!(manager.handle_contents_request(&request).data(), b"second");
+    }
+
+    #[test]
+    fn rejects_outgoing_lists_over_the_file_count_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file.txt");
+        fs::write(&file, b"file").unwrap();
+        let mut manager = FileTransferManager::new(directory.path().to_path_buf(), 10);
+        manager.set_local_files(vec![file; MAX_CLIPBOARD_FILES + 1]);
+        assert!(manager.build_file_list().files.is_empty());
+        assert!(manager.local_files.is_empty());
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "macrdp-transfer-test-{}-{}",
@@ -776,7 +857,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = FileTransferManager::new(dir.path().to_path_buf(), MAX_INCOMING_BYTES);
         mgr.set_incoming_descriptors(
-            (0..=MAX_INCOMING_FILES)
+            (0..=MAX_CLIPBOARD_FILES)
                 .map(|i| descriptor(&format!("{i}"), 1))
                 .collect(),
         );
