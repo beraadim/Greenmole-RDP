@@ -41,11 +41,28 @@ pub struct Avc444EncodedFrame {
 }
 
 /// Quality preset
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
     LowLatency,
     Balanced,
     HighQuality,
+    /// Desktop transport bypasses video encoding to preserve RGB pixels.
+    Lossless,
+}
+
+impl Quality {
+    /// Lower quantizers retain more detail at the cost of larger frames.
+    /// Lossless desktop transport must never silently instantiate a lossy codec.
+    pub(crate) fn quantizer_range(self) -> Result<(u8, u8)> {
+        match self {
+            Self::LowLatency => Ok((20, 40)),
+            Self::Balanced => Ok((16, 34)),
+            // OpenH264 rate control clamps its lower bound to 12. Use the
+            // actual supported range consistently across both backends.
+            Self::HighQuality => Ok((12, 28)),
+            Self::Lossless => anyhow::bail!("Lossless desktop quality bypasses H.264 encoding"),
+        }
+    }
 }
 
 /// Video encoder trait
@@ -146,6 +163,7 @@ pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u3
         Quality::LowLatency => 8.0,
         Quality::Balanced => 16.0,
         Quality::HighQuality => 24.0,
+        Quality::Lossless => return 0,
     };
     let fps_factor = (fps as f64 / 30.0).max(1.0);
     ((pixels * base_bpp * fps_factor) as u32).clamp(1, MAX_BITRATE_BPS)
@@ -183,6 +201,7 @@ pub fn create_encoder(
     mode_444: bool,
     bitrate: u32,
 ) -> Result<Box<dyn VideoEncoder>> {
+    quality.quantizer_range()?;
     let bitrate = bitrate.clamp(1, MAX_BITRATE_BPS);
     let enc_w = align16(width);
     let enc_h = align16(height);
@@ -190,7 +209,7 @@ pub fn create_encoder(
     // Hardware: VideoToolbox GPU encoder
     #[cfg(target_os = "macos")]
     if preference == EncoderPreference::Hardware {
-        match VtEncoder::new(enc_w, enc_h, fps, bitrate, mode_444) {
+        match VtEncoder::new_with_quality(enc_w, enc_h, fps, bitrate, mode_444, quality) {
             Ok(encoder) => {
                 tracing::info!(
                     enc_w,
@@ -213,6 +232,6 @@ pub fn create_encoder(
         mode_444,
         "Using OpenH264 software encoder (CPU)"
     );
-    let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
+    let encoder = OpenH264Encoder::new_with_quality(enc_w, enc_h, fps, bitrate, mode_444, quality)?;
     Ok(Box::new(encoder))
 }

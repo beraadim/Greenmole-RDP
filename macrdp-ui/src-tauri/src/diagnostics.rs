@@ -117,6 +117,7 @@ fn safe_configuration(config: &UiConfig) -> Value {
     json!({
         "frame_rate": config.frame_rate, "bitrate_mbps": config.bitrate_mbps,
         "encoder": selection(&config.encoder, &["auto", "hardware", "software"]),
+        "quality": selection(&config.quality, &["low_latency", "balanced", "high_quality", "lossless"]),
         "chroma": selection(&config.chroma_mode, &["avc420", "avc444"]),
         "display_backend": config.display_backend, "resolution": resolution,
         "automatic_resolution": config.resolution == "auto", "show_cursor": config.show_cursor,
@@ -153,6 +154,7 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
         "requested_encoder_bitrate",
         "applied_encoder_bitrate",
         "encoder_bitrate_update_failures",
+        "negotiated_client_depth",
         "client_queue_depth_bytes",
         "ack_suspended",
         "last_frame_bytes",
@@ -187,6 +189,19 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
                 "inactive"
             ]
         )),
+    );
+    selected.insert(
+        "bitmap_codec".into(),
+        metrics
+            .bitmap_codec
+            .as_deref()
+            .map(|codec| {
+                json!(selection(
+                    codec,
+                    &["remotefx", "rdp6-rle", "surface-raw", "qoi", "qoiz"]
+                ))
+            })
+            .unwrap_or(Value::Null),
     );
     // Encoder mode has a human-readable suffix; never export unvalidated free text.
     selected.insert(

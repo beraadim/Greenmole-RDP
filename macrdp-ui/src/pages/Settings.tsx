@@ -30,6 +30,7 @@ const categories = [
 type CategoryId = (typeof categories)[number]["id"];
 
 const restartLabels: Record<string, string> = {
+  quality: "image quality",
   display_backend: "display", bind_address: "bind address", port: "port",
   idle_timeout_secs: "idle timeout", tls_cert_path: "certificate", tls_key_path: "certificate key",
   tls_server_names: "certificate names", audio_enabled: "system audio",
@@ -141,9 +142,30 @@ function Settings() {
 
         {activeCategory === "rdp" && (
           <CategorySection title="RDP Service">
+            <SettingRow label="Image quality" description="Requires service restart and reconnect">
+              <Select value={config.quality} onValueChange={value => updateConfig("quality", value)}>
+                <SelectTrigger className="h-7 w-[180px] text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="low_latency">Performance</SelectItem>
+                  <SelectItem value="balanced">Balanced</SelectItem>
+                  <SelectItem value="high_quality">High quality</SelectItem>
+                  <SelectItem value="lossless">Lossless desktop</SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            <p className="py-2 text-xs text-text-muted">
+              {config.quality === "lossless"
+                ? "Preserves captured colors with lossless bitmap compression. Uses more bandwidth and may reduce frame rate."
+                : config.quality === "high_quality"
+                  ? "Reduces compression artifacts in video and RemoteFX. Uses more bandwidth and encoding time."
+                  : config.quality === "low_latency"
+                    ? "Prioritizes speed and smaller updates; fine text and gradients may show more artifacts."
+                    : "Balances image detail, bandwidth and responsiveness."}
+              {" "}For Guacamole, also enable its “Force lossless” connection option to prevent browser-side lossy compression.
+            </p>
             <SettingRow label="Encoder">
               <Select
-                value={config.encoder}
+                disabled={config.quality === "lossless"} value={config.encoder}
                 onValueChange={(v) => updateConfig("encoder", v)}
               >
                 <SelectTrigger className="h-7 w-[120px] text-xs">
@@ -157,9 +179,9 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="Bitrate">
+            <SettingRow label="Video bitrate" description="Applies to H.264 video; bitmap updates use their own compression">
               <Select
-                value={String(config.bitrate_mbps)}
+                disabled={config.quality === "lossless"} value={String(config.bitrate_mbps)}
                 onValueChange={(v) => updateConfig("bitrate_mbps", Number(v))}
               >
                 <SelectTrigger className="h-7 w-[120px] text-xs">
@@ -191,17 +213,17 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="Chroma mode">
+            <SettingRow label="Video color detail" description="Full color requires client AVC444 support">
               <Select
-                value={config.chroma_mode}
+                disabled={config.quality === "lossless"} value={config.chroma_mode}
                 onValueChange={(v) => updateConfig("chroma_mode", v)}
               >
                 <SelectTrigger className="h-7 w-[120px] text-xs">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="avc420">avc420</SelectItem>
-                  <SelectItem value="avc444">avc444</SelectItem>
+                  <SelectItem value="avc420">Standard (AVC420)</SelectItem>
+                  <SelectItem value="avc444">Full color (AVC444)</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>

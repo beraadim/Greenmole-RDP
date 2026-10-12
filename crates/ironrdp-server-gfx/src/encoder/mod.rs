@@ -24,7 +24,10 @@ use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
 mod allocation_tests;
 mod bitmap;
 mod fast_path;
+#[cfg(test)]
+mod quality_tests;
 pub(crate) mod rfx;
+mod rfx_rlgr;
 
 pub(crate) use fast_path::*;
 use ironrdp_graphics::rdp6::BitmapEncodeError;
@@ -49,6 +52,8 @@ impl CodecId {
 #[derive(Debug)]
 pub(crate) struct UpdateEncoderCodecs {
     remotefx: Option<(EntropyBits, u8)>,
+    quality: crate::BitmapQuality,
+    allow_skip_alpha: bool,
     #[cfg(feature = "qoi")]
     qoi: Option<u8>,
     #[cfg(feature = "qoiz")]
@@ -60,6 +65,8 @@ impl UpdateEncoderCodecs {
     pub(crate) fn new() -> Self {
         Self {
             remotefx: None,
+            quality: crate::BitmapQuality::default(),
+            allow_skip_alpha: false,
             #[cfg(feature = "qoi")]
             qoi: None,
             #[cfg(feature = "qoiz")]
@@ -70,6 +77,14 @@ impl UpdateEncoderCodecs {
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
     pub(crate) fn set_remotefx(&mut self, remotefx: Option<(EntropyBits, u8)>) {
         self.remotefx = remotefx
+    }
+
+    pub(crate) fn set_quality(&mut self, quality: crate::BitmapQuality) {
+        self.quality = quality;
+    }
+
+    pub(crate) fn set_allow_skip_alpha(&mut self, allowed: bool) {
+        self.allow_skip_alpha = allowed;
     }
 
     #[cfg(feature = "qoi")]
@@ -113,11 +128,18 @@ impl UpdateEncoder {
         surface_flags: CmdFlags,
         codecs: UpdateEncoderCodecs,
     ) -> Result<Self> {
-        let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
+        let bitmap_updater = if codecs.quality != crate::BitmapQuality::Lossless
+            && surface_flags.contains(CmdFlags::SET_SURFACE_BITS)
+        {
             let mut bitmap = BitmapUpdater::None(NoneHandler);
 
             if let Some((algo, id)) = codecs.remotefx {
-                bitmap = BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, id, desktop_size));
+                bitmap = BitmapUpdater::RemoteFx(RemoteFxHandler::new(
+                    algo,
+                    id,
+                    desktop_size,
+                    codecs.quality,
+                ));
             }
 
             #[cfg(feature = "qoi")]
@@ -133,7 +155,9 @@ impl UpdateEncoder {
 
             bitmap
         } else {
-            BitmapUpdater::Bitmap(BitmapHandler::new())
+            let mut bitmap = BitmapHandler::new();
+            bitmap.bitmap.set_skip_alpha(codecs.allow_skip_alpha);
+            BitmapUpdater::Bitmap(bitmap)
         };
 
         Ok(Self {
@@ -141,6 +165,19 @@ impl UpdateEncoder {
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
         })
+    }
+
+    pub(crate) fn bitmap_codec(&self) -> &'static str {
+        match self.bitmap_updater.as_ref() {
+            Some(BitmapUpdater::None(_)) => "surface-raw",
+            Some(BitmapUpdater::Bitmap(_)) => "rdp6-rle",
+            Some(BitmapUpdater::RemoteFx(_)) => "remotefx",
+            #[cfg(feature = "qoi")]
+            Some(BitmapUpdater::Qoi(_)) => "qoi",
+            #[cfg(feature = "qoiz")]
+            Some(BitmapUpdater::Qoiz(_)) => "qoiz",
+            None => "encoding",
+        }
     }
 
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
@@ -634,9 +671,20 @@ struct RemoteFxHandler {
 }
 
 impl RemoteFxHandler {
-    fn new(algo: EntropyBits, codec_id: u8, desktop_size: DesktopSize) -> Self {
+    fn new(
+        algo: EntropyBits,
+        codec_id: u8,
+        desktop_size: DesktopSize,
+        quality: crate::BitmapQuality,
+    ) -> Self {
+        tracing::info!(
+            entropy_algorithm = ?algo,
+            quality = ?quality,
+            codec_id,
+            "Configured RemoteFX bitmap encoder"
+        );
         Self {
-            remotefx: RfxEncoder::new(algo),
+            remotefx: RfxEncoder::new(algo, quality),
             desktop_size: Some(desktop_size),
             codec_id,
         }
@@ -653,18 +701,22 @@ impl BitmapUpdateHandler for RemoteFxHandler {
         let len = loop {
             match self
                 .remotefx
-                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size.take())
+                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size)
             {
                 Err(e) => match e.kind() {
                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
                         buffer.resize(buffer.len() * 2, 0);
-                        debug!("encoder buffer resized to: {}", buffer.len() * 2);
+                        debug!("encoder buffer resized to: {}", buffer.len());
                     }
                     _ => Err(e).context("RemoteFX encode error")?,
                 },
                 Ok(len) => break len,
             }
         };
+
+        // A failed size estimate must not consume the first frame's codec
+        // headers. The client needs them on the successful retry as well.
+        self.desktop_size = None;
 
         set_surface(bitmap, self.codec_id, &buffer[..len])
     }

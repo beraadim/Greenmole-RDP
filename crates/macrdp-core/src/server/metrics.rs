@@ -106,6 +106,7 @@ impl MetricsSnapshot {
         let transport_mode = derive_transport_mode(gfx);
         let encoder_mode = derive_encoder_mode(gfx, &transport_mode);
         let bitrate_mode = derive_bitrate_mode(&transport_mode);
+        let uses_video = matches!(transport_mode.as_str(), "gfx-avc420" | "gfx-avc444");
         let ack_ms = sanitize_f64(gfx.rtt_ewma_ms);
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -129,9 +130,16 @@ impl MetricsSnapshot {
             applied_frame_rate: gfx.applied_frame_rate,
             capture_frame_rate_update_failures: gfx.capture_frame_rate_update_failures,
             capture_frame_rate_retry_exhausted: gfx.capture_frame_rate_retry_exhausted,
-            requested_encoder_bitrate: gfx.requested_encoder_bitrate,
-            applied_encoder_bitrate: gfx.applied_encoder_bitrate,
+            requested_encoder_bitrate: uses_video
+                .then_some(gfx.requested_encoder_bitrate)
+                .flatten(),
+            applied_encoder_bitrate: uses_video.then_some(gfx.applied_encoder_bitrate).flatten(),
             encoder_bitrate_update_failures: gfx.encoder_bitrate_update_failures,
+            bitmap_codec: matches!(transport_mode.as_str(), "bitmap" | "bitmap-fallback")
+                .then_some(gfx.bitmap_codec)
+                .flatten()
+                .map(str::to_owned),
+            negotiated_client_depth: gfx.negotiated_client_depth,
             client_queue_depth_bytes: gfx.client_queue_depth_bytes,
             ack_suspended: gfx.frame_acknowledgements_suspended,
             last_frame_bytes: gfx.last_frame_bytes,
@@ -157,6 +165,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bitmap_metrics_identify_codec_without_claiming_an_active_video_target() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.bitmap_codec = Some("remotefx");
+        gfx.negotiated_client_depth = Some(24);
+        gfx.requested_encoder_bitrate = Some(200_000_000);
+        gfx.applied_encoder_bitrate = Some(200_000_000);
+        let metrics = MetricsSnapshot::default().sample(&gfx);
+        assert_eq!(metrics.bitmap_codec.as_deref(), Some("remotefx"));
+        assert_eq!(metrics.negotiated_client_depth, Some(24));
+        assert_eq!(metrics.requested_encoder_bitrate, None);
+        assert_eq!(metrics.applied_encoder_bitrate, None);
+    }
+
+    #[test]
     fn samples_keep_order_across_service_restarts_and_snapshot_instances() {
         let gfx = GfxState::new(1920, 1080, false, false);
         let first = MetricsSnapshot::default().sample(&gfx);
@@ -169,6 +191,10 @@ mod tests {
     #[test]
     fn encoder_metrics_show_rejected_target_and_clear_with_connection() {
         let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.session_uses_gfx = true;
+        gfx.caps_confirmed = true;
+        gfx.avc420_supported = true;
+        gfx.active_encoder = Some("videotoolbox");
         gfx.requested_encoder_bitrate = Some(8_000_000);
         gfx.applied_encoder_bitrate = Some(10_000_000);
         gfx.encoder_bitrate_update_failures = 1;

@@ -14,6 +14,7 @@ use crate::BitmapUpdate;
 #[derive(Clone)]
 pub(crate) struct BitmapEncoder {
     buffer: Vec<u8>,
+    skip_alpha: bool,
 }
 
 #[cfg(test)]
@@ -22,6 +23,27 @@ mod tests {
     use bytes::Bytes;
     use ironrdp_graphics::rdp6::BitmapStreamDecoder;
     use std::num::NonZeroU16;
+
+    #[test]
+    fn single_row_with_large_trailing_stride_encodes_without_arithmetic_overflow() {
+        let mut bitmap = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(1).unwrap(),
+            height: NonZeroU16::new(1).unwrap(),
+            format: PixelFormat::BgrA32,
+            data: Bytes::from_static(&[10, 20, 30, 255]),
+            stride: NonZeroUsize::new(1usize << (usize::BITS - 1)).unwrap(),
+            dirty_rects: Vec::new(),
+        };
+        let mut output = vec![0; 1024];
+        let len = BitmapEncoder::new().encode(&bitmap, &mut output).unwrap();
+        let decoded: BitmapUpdateData<'_> = ironrdp_core::decode(&output[..len]).unwrap();
+        assert_eq!(decoded.rectangles.len(), 1);
+        assert_eq!(decoded.rectangles[0].height, 1);
+        bitmap.height = NonZeroU16::new(2).unwrap();
+        assert!(BitmapEncoder::new().encode(&bitmap, &mut output).is_err());
+    }
 
     #[test]
     fn odd_widths_and_partial_final_stride_roundtrip_without_losing_pixels() {
@@ -113,7 +135,12 @@ impl BitmapEncoder {
     pub(crate) fn new() -> Self {
         Self {
             buffer: vec![0; usize::from(u16::MAX)],
+            skip_alpha: true,
         }
+    }
+
+    pub(crate) fn set_skip_alpha(&mut self, allowed: bool) {
+        self.skip_alpha = allowed;
     }
 
     pub(crate) fn encode(
@@ -132,7 +159,23 @@ impl BitmapEncoder {
                     "Row exceeds bitmap header bounds"
                 ))
             })?;
-        let chunk_height = u16::MAX / row_len;
+        // RLE adds a control byte per group of up to 15 raw samples. Including
+        // alpha can exceed the old raw-pixel budget for narrow tall regions.
+        // Bound both the uncompressed u16 length and compressed bitmap length
+        // (which also includes the eight-byte compression header).
+        let width = usize::from(bitmap.width.get());
+        let plane_count = if self.skip_alpha { 3 } else { 4 };
+        let compressed_row_bound = plane_count * (width + width.div_ceil(15));
+        let compressed_rows = (usize::from(u16::MAX) - 9) / compressed_row_bound;
+        let chunk_height = (u16::MAX / row_len)
+            .min(u16::try_from(compressed_rows).unwrap_or(u16::MAX))
+            .min(bitmap.height.get());
+        if chunk_height == 0 {
+            return Err(BitmapEncodeError::Encode(invalid_field_err!(
+                "bitmap",
+                "Row exceeds compressed bitmap bounds"
+            )));
+        }
 
         let mut cursor = WriteCursor::new(output);
         let stride = bitmap.stride.get();
@@ -148,7 +191,12 @@ impl BitmapEncoder {
                 "Truncated bitmap rows"
             )));
         }
-        let chunks = bitmap.data[..required].chunks(stride * usize::from(chunk_height));
+        let chunk_bytes = stride
+            .checked_mul(usize::from(chunk_height))
+            .ok_or_else(|| {
+                BitmapEncodeError::Encode(invalid_field_err!("bitmap", "Chunk stride overflow"))
+            })?;
+        let chunks = bitmap.data[..required].chunks(chunk_bytes);
 
         let total = cast_int!("chunks length lower bound", chunks.size_hint().0)
             .map_err(BitmapEncodeError::Encode)?;
@@ -174,7 +222,13 @@ impl BitmapEncoder {
                     .rev()
                     .flat_map(|row| row.chunks(usize::from(bytes_per_pixel)));
 
-                Self::encode_iter(encoder, bitmap.format, pixels, self.buffer.as_mut_slice())?
+                Self::encode_iter(
+                    encoder,
+                    bitmap.format,
+                    pixels,
+                    self.buffer.as_mut_slice(),
+                    self.skip_alpha,
+                )?
             };
 
             let data = BitmapData {
@@ -211,25 +265,60 @@ impl BitmapEncoder {
         format: PixelFormat,
         src: P,
         dst: &mut [u8],
+        skip_alpha: bool,
     ) -> Result<usize, BitmapEncodeError>
     where
         P: Iterator<Item = &'a [u8]> + Clone,
     {
         let written = match format {
             PixelFormat::ARgb32 | PixelFormat::XRgb32 => {
-                encoder.encode_pixels_stream::<_, ARgbChannels>(src, dst, true)?
+                Self::encode_planes::<_, ARgbChannels>(&mut encoder, src, dst, skip_alpha)?
             }
             PixelFormat::RgbA32 | PixelFormat::RgbX32 => {
-                encoder.encode_pixels_stream::<_, RgbAChannels>(src, dst, true)?
+                Self::encode_planes::<_, RgbAChannels>(&mut encoder, src, dst, skip_alpha)?
             }
             PixelFormat::ABgr32 | PixelFormat::XBgr32 => {
-                encoder.encode_pixels_stream::<_, ABgrChannels>(src, dst, true)?
+                Self::encode_planes::<_, ABgrChannels>(&mut encoder, src, dst, skip_alpha)?
             }
             PixelFormat::BgrA32 | PixelFormat::BgrX32 => {
-                encoder.encode_pixels_stream::<_, BgrAChannels>(src, dst, true)?
+                Self::encode_planes::<_, BgrAChannels>(&mut encoder, src, dst, skip_alpha)?
             }
         };
 
         Ok(written)
+    }
+
+    fn encode_planes<'a, P, F>(
+        encoder: &mut BitmapStreamEncoder,
+        src: P,
+        dst: &mut [u8],
+        skip_alpha: bool,
+    ) -> Result<usize, BitmapEncodeError>
+    where
+        P: Iterator<Item = &'a [u8]> + Clone,
+        F: ironrdp_graphics::rdp6::PixelFormat,
+    {
+        if skip_alpha {
+            return encoder.encode_pixels_stream::<_, F>(src, dst, true);
+        }
+        // RDP desktop updates are opaque, including XRGB capture buffers whose
+        // unused fourth byte need not be 255. Only omit this plane if the
+        // client advertises DRAW_ALLOW_SKIP_ALPHA (MS-RDPBCGR 2.2.7.1.2).
+        let r = src.clone().map(F::r);
+        let g = src.clone().map(F::g);
+        let b = src.clone().map(F::b);
+        let alpha = src.map(|_| 255);
+        let len = encoder.encode_channels_stream_alpha((r, g, b, alpha), dst, true)?;
+        // ironrdp-graphics 0.7.0 emits an RGB-only header even from its alpha
+        // encoder. Correct the typed header to describe the four encoded planes.
+        let header = bitmap::rdp6::BitmapStreamHeader {
+            enable_rle_compression: true,
+            use_alpha: true,
+            color_plane_definition: bitmap::rdp6::ColorPlaneDefinition::Argb,
+        };
+        header
+            .encode(&mut WriteCursor::new(dst))
+            .map_err(BitmapEncodeError::Encode)?;
+        Ok(len)
     }
 }

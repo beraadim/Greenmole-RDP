@@ -1,5 +1,7 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
-#![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
+#![doc(
+    html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg"
+)]
 #![allow(clippy::arithmetic_side_effects)] // TODO: should we enable this lint back?
 
 pub use ironrdp_cliprdr::pdu::OwnedFileContentsResponse;
@@ -8,6 +10,7 @@ pub use {tokio, tokio_rustls};
 
 mod macros;
 
+mod bitmap_quality;
 mod builder;
 mod capabilities;
 mod clipboard;
@@ -22,6 +25,7 @@ mod helper;
 mod server;
 mod sound;
 
+pub use bitmap_quality::BitmapQuality;
 pub use clipboard::*;
 pub use display::*;
 pub use handler::*;

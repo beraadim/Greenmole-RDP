@@ -2,6 +2,7 @@
 
 mod audio;
 mod cursor;
+mod fallback_image;
 mod geometry;
 pub use cursor::{CursorCapture, CursorUpdate};
 mod mailbox;
@@ -26,6 +27,7 @@ use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate
 
 static UNEXPECTED_BGRA_LAYOUT_WARNINGS: AtomicU64 = AtomicU64::new(0);
 static INVALID_FRAME_GEOMETRY_WARNINGS: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_IMAGE_WARNINGS: AtomicU64 = AtomicU64::new(0);
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
@@ -706,21 +708,33 @@ impl CgFallbackCapturer {
     pub fn capture_frame(&self) -> Option<CapturedFrame> {
         let display = core_graphics::display::CGDisplay::new(self.display_id);
         let image = display.image()?;
-
-        let w = image.width() as u32;
-        let h = image.height() as u32;
-        let bpr = image.bytes_per_row();
-        let data = image.data();
-        let raw = data.bytes().to_vec();
+        let normalized = match fallback_image::normalize(&image) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                let count = FALLBACK_IMAGE_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 3 || count % 60 == 0 {
+                    tracing::warn!(
+                        warning_count = count,
+                        width = image.width(),
+                        height = image.height(),
+                        bits_per_component = image.bits_per_component(),
+                        bits_per_pixel = image.bits_per_pixel(),
+                        %error,
+                        "Unable to normalize CoreGraphics fallback image to BGRA8"
+                    );
+                }
+                return None;
+            }
+        };
 
         Some(CapturedFrame {
             // Report the actual captured image size. The encoder/display path can
             // pad or scale from a smaller fallback frame, but lying about the
             // visible dimensions causes BGRA out-of-bounds reads downstream.
-            width: w,
-            height: h,
-            data: FrameData::Raw(Bytes::from(raw)),
-            stride: bpr,
+            width: normalized.width,
+            height: normalized.height,
+            data: FrameData::Raw(Bytes::from(normalized.pixels)),
+            stride: normalized.stride,
             timestamp_us: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

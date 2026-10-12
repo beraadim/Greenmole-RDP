@@ -25,6 +25,7 @@ pub(crate) fn configuration_status(
         let running_values = serde_json::to_value(running).expect("UiConfig is serializable");
         for key in [
             "display_backend",
+            "quality",
             "bind_address",
             "port",
             "idle_timeout_secs",
@@ -191,6 +192,19 @@ pub async fn set_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quality_restart_notice_remains_until_applied_or_reverted() {
+        let running = UiConfig::default();
+        let mut saved = running.clone();
+        saved.quality = "lossless".into();
+        assert_eq!(
+            configuration_status(&saved, Some(&running)).pending_restart,
+            ["quality"]
+        );
+        assert!(!configuration_status(&saved, Some(&saved)).restart_required);
+        saved.quality = running.quality.clone();
+        assert!(!configuration_status(&saved, Some(&running)).restart_required);
+    }
     use serde_json::json;
 
     #[test]

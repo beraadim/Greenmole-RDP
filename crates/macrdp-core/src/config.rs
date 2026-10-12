@@ -69,7 +69,8 @@ pub struct ServerConfig {
     pub idle_timeout_secs: u64,
     /// Log level: trace, debug, info, warn, error
     pub log_level: Option<String>,
-    /// Video quality: low_latency, balanced, high_quality (default: high_quality)
+    /// Image quality: low_latency, balanced, high_quality, lossless (default: high_quality).
+    /// Lossless uses full-color bitmap updates without video/RemoteFX quantization.
     pub quality: Option<String>,
     /// H.264 encoder: software, hardware, auto (default: software)
     pub encoder: Option<String>,
@@ -126,6 +127,13 @@ impl ServerConfig {
     /// Reject unsafe/inconsistent settings before initializing the desktop or listener.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.port > 0, "port must be between 1 and 65535");
+        anyhow::ensure!(
+            self.quality.as_deref().map_or(true, |quality| matches!(
+                quality,
+                "low_latency" | "balanced" | "high_quality" | "lossless"
+            )),
+            "quality must be low_latency, balanced, high_quality or lossless"
+        );
         anyhow::ensure!(
             self.cert_path.is_some() == self.key_path.is_some(),
             "cert_path and key_path must both be supplied for a custom TLS identity"

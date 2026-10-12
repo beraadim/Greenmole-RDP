@@ -36,6 +36,8 @@ export interface Metrics {
   requested_encoder_bitrate: number | null;
   applied_encoder_bitrate: number | null;
   encoder_bitrate_update_failures: number;
+  bitmap_codec: string | null;
+  negotiated_client_depth: number | null;
   client_queue_depth_bytes: number | null;
   ack_suspended: boolean;
   net_ms: number;
@@ -133,6 +135,7 @@ export interface UiConfig {
   port: number;
   frame_rate: number;
   bitrate_mbps: number;
+  quality: "low_latency" | "balanced" | "high_quality" | "lossless";
   encoder: string;
   chroma_mode: string;
   bind_address: string;

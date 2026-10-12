@@ -452,6 +452,7 @@ async fn start_server_inner(
     let quality = match config.quality.as_deref() {
         Some("low_latency") => macrdp_encode::Quality::LowLatency,
         Some("balanced") => macrdp_encode::Quality::Balanced,
+        Some("lossless") => macrdp_encode::Quality::Lossless,
         _ => macrdp_encode::Quality::HighQuality,
     };
     let encoder_pref = macrdp_encode::EncoderPreference::from_str_opt(config.encoder.as_deref());
@@ -734,6 +735,12 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             .with_display_handler(display)
             .with_sound_factory(sound_factory)
             .with_cliprdr_factory(cliprdr_factory)
+            .with_bitmap_quality(match args.quality {
+                macrdp_encode::Quality::LowLatency => ironrdp_server::BitmapQuality::Performance,
+                macrdp_encode::Quality::Balanced => ironrdp_server::BitmapQuality::Balanced,
+                macrdp_encode::Quality::HighQuality => ironrdp_server::BitmapQuality::HighQuality,
+                macrdp_encode::Quality::Lossless => ironrdp_server::BitmapQuality::Lossless,
+            })
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));

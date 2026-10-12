@@ -14,6 +14,7 @@ pub struct UiConfig {
     pub port: u16,
     pub frame_rate: u32,
     pub bitrate_mbps: u32,
+    pub quality: String,
     pub encoder: String,
     pub chroma_mode: String,
     pub gfx_validation_mode: bool,
@@ -60,6 +61,7 @@ impl Default for UiConfig {
             port: 3389,
             frame_rate: 60,
             bitrate_mbps: 50,
+            quality: "balanced".into(),
             encoder: "auto".to_string(),
             chroma_mode: "avc420".to_string(),
             gfx_validation_mode: false,
@@ -233,6 +235,16 @@ impl UiConfig {
                     .ok_or("encoder must be a string")?
                     .to_string();
             }
+            "quality" => {
+                let quality = value.as_str().ok_or("quality must be a string")?;
+                if !matches!(
+                    quality,
+                    "low_latency" | "balanced" | "high_quality" | "lossless"
+                ) {
+                    return Err("Unknown image quality preset".into());
+                }
+                self.quality = quality.into();
+            }
             "chroma_mode" => {
                 self.chroma_mode = value
                     .as_str()
@@ -354,6 +366,7 @@ impl UiConfig {
         matches!(
             key,
             "display_backend"
+                | "quality"
                 | "bind_address"
                 | "port"
                 | "idle_timeout_secs"
@@ -389,7 +402,7 @@ impl UiConfig {
             tls_server_names: self.tls_server_names.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
             log_level: Some(self.log_level.clone()),
-            quality: None,
+            quality: Some(self.quality.clone()),
             encoder: Some(self.encoder.clone()),
             chroma_mode: Some(self.chroma_mode.clone()),
             gfx_validation_mode: Some(self.gfx_validation_mode),
@@ -413,6 +426,30 @@ impl UiConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn quality_defaults_migrate_and_presets_persist_into_restart_configuration() {
+        let legacy: UiConfig = toml::from_str("username = 'fixture-user'").unwrap();
+        assert_eq!(legacy.quality, "balanced");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.toml");
+        let mut config = legacy;
+        config.password = "fixture-secret".into();
+        for preset in ["low_latency", "balanced", "high_quality", "lossless"] {
+            assert!(config.set_field("quality", &json!(preset)).unwrap());
+            assert!(config.requires_restart("quality", Some(DisplayBackend::Main)));
+            config
+                .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
+                .unwrap();
+            let saved: UiConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved.quality, preset);
+            assert_eq!(saved.to_server_config().quality.as_deref(), Some(preset));
+        }
+        for value in [json!("unrecognized"), json!(true), json!(null)] {
+            assert!(config.set_field("quality", &value).is_err());
+            assert_eq!(config.quality, "lossless");
+        }
+    }
 
     #[test]
     fn sharing_settings_migrate_persist_and_reach_server_startup() {

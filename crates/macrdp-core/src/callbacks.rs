@@ -82,6 +82,9 @@ pub struct Metrics {
     pub requested_encoder_bitrate: Option<u32>,
     pub applied_encoder_bitrate: Option<u32>,
     pub encoder_bitrate_update_failures: u64,
+    pub bitmap_codec: Option<String>,
+    /// Client's preferred bitmap depth; our emitted RGB bitmap format is 32bpp.
+    pub negotiated_client_depth: Option<u16>,
     pub client_queue_depth_bytes: Option<u32>,
     pub ack_suspended: bool,
     /// Legacy alias of ACK latency. Network-only latency is not measured by GFX ACKs.

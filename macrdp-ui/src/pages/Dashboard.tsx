@@ -194,8 +194,8 @@ function Dashboard() {
             <div>Capture requested: {metrics.requested_capture_frame_rate ?? "--"} fps</div>
             <div>Capture applied: {metrics.applied_frame_rate ?? "--"} fps</div>
             <div>Capture update failures: {metrics.capture_frame_rate_update_failures}</div>
-            <div>Encoder requested: {metrics.requested_encoder_bitrate === null ? "--" : `${(metrics.requested_encoder_bitrate / 1_000_000).toFixed(1)} Mbps`}</div>
-            <div>Encoder applied: {metrics.applied_encoder_bitrate === null ? "not confirmed" : `${(metrics.applied_encoder_bitrate / 1_000_000).toFixed(1)} Mbps`}</div>
+            <div>Video target: {metrics.requested_encoder_bitrate === null ? "not active" : `${(metrics.requested_encoder_bitrate / 1_000_000).toFixed(1)} Mbps`}</div>
+            <div>Video applied: {metrics.requested_encoder_bitrate === null ? "not active" : metrics.applied_encoder_bitrate === null ? "not confirmed" : `${(metrics.applied_encoder_bitrate / 1_000_000).toFixed(1)} Mbps`}</div>
             <div>Encoder update failures: {metrics.encoder_bitrate_update_failures}</div>
             {metrics.capture_frame_rate_retry_exhausted && <div role="status" className="text-amber-600">Capture rate change failed; reconnect to retry.</div>}
             <div>Frames combined: {metrics.capture_frames_coalesced}</div>
@@ -209,6 +209,8 @@ function Dashboard() {
             </div>
             <div>Pending ACKs: {metrics.ack_suspended ? "not reported" : metrics.pending_acks}</div>
             <div>Client queue: {metrics.client_queue_depth_bytes === null ? "not reported" : `${Math.round(metrics.client_queue_depth_bytes / 1024)} KiB`}</div>
+            {metrics.bitmap_codec && <div>Bitmap codec: {metrics.bitmap_codec === "remotefx" ? "RemoteFX (lossy)" : metrics.bitmap_codec === "rdp6-rle" ? "Full-color RGB (lossless)" : metrics.bitmap_codec}</div>}
+            {metrics.negotiated_client_depth !== null && <div>Client depth request: {metrics.negotiated_client_depth} bits</div>}
           </div>
         )}
         {metricsAvailable && <TimingDetails metrics={metrics} />}

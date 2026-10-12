@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::color_convert::VImageConverter;
-use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
+use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 
 mod callback;
 mod ownership;
@@ -468,7 +468,20 @@ impl VtEncoder {
         Ok(())
     }
 
+    /// Create a balanced encoder; callers selecting a preset use new_with_quality.
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
+        Self::new_with_quality(width, height, fps, bitrate, mode_444, Quality::Balanced)
+    }
+
+    pub fn new_with_quality(
+        width: u32,
+        height: u32,
+        fps: f32,
+        bitrate: u32,
+        mode_444: bool,
+        quality: Quality,
+    ) -> Result<Self> {
+        quality.quantizer_range()?;
         let callback_ctx = Arc::new(CallbackCtx::default());
 
         // NV12 full-range input for both AVC420 and AVC444.
@@ -480,6 +493,7 @@ impl VtEncoder {
             bitrate,
             &callback_ctx,
             K_CV_PIXEL_FORMAT_420F,
+            quality,
         )?;
 
         let yuv444_buf = if mode_444 {
@@ -498,6 +512,7 @@ impl VtEncoder {
             fps,
             mode_444,
             bitrate_mbps = bitrate as f64 / 1_000_000.0,
+            ?quality,
             "VideoToolbox hardware encoder created"
         );
 
@@ -524,6 +539,7 @@ impl VtEncoder {
         bitrate: u32,
         callback_ctx: &Arc<CallbackCtx>,
         pixel_format: u32,
+        quality: Quality,
     ) -> Result<NativeSession> {
         let retirement = RETIREMENTS
             .get_or_init(|| crate::retirement::RetirementPool::new(2))
@@ -641,6 +657,35 @@ impl VtEncoder {
                 interval.as_ptr(),
                 "MaxKeyFrameInterval",
             );
+            let (min_qp, max_qp) = quality.quantizer_range()?;
+            // Require the requested quantizer bounds. Unsupported hardware
+            // falls back to software with the same quality policy.
+            for (name, label, qp) in [
+                (
+                    b"MinAllowedFrameQP\0".as_slice(),
+                    "MinAllowedFrameQP",
+                    min_qp,
+                ),
+                (
+                    b"MaxAllowedFrameQP\0".as_slice(),
+                    "MaxAllowedFrameQP",
+                    max_qp,
+                ),
+            ] {
+                let key = OwnedCf::new(CFStringCreateWithCString(
+                    std::ptr::null(),
+                    name.as_ptr().cast(),
+                    0x08000100,
+                ))?;
+                let value = OwnedCf::new(cf_i32(i32::from(qp)))?;
+                set_required_property(session, key.as_ptr(), value.as_ptr(), label)?;
+            }
+            tracing::info!(
+                ?quality,
+                min_qp,
+                max_qp,
+                "VideoToolbox accepted quality quantizer bounds"
+            );
             let speed_key = OwnedCf::new(CFStringCreateWithCString(
                 std::ptr::null(),
                 b"PrioritizeEncodingSpeedOverQuality\0".as_ptr().cast(),
@@ -649,7 +694,11 @@ impl VtEncoder {
             set_optional_property(
                 session,
                 speed_key.as_ptr(),
-                kCFBooleanTrue,
+                if quality == Quality::LowLatency {
+                    kCFBooleanTrue
+                } else {
+                    kCFBooleanFalse
+                },
                 "PrioritizeEncodingSpeedOverQuality",
             );
             check_status(

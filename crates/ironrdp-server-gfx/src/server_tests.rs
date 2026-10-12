@@ -12,6 +12,41 @@ fn admission_test_server() -> RdpServer {
         .build()
 }
 
+#[tokio::test]
+async fn lossless_policy_keeps_resize_and_input_channels_without_advertising_gfx_or_remotefx() {
+    use dvc::pdu::{CapabilitiesResponsePdu, CapsVersion, DrdynvcClientPdu, DrdynvcServerPdu};
+    let server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .with_bitmap_quality(crate::BitmapQuality::Lossless)
+        .build();
+    assert!(!server.opts.has_remote_fx());
+    assert!(!server.opts.has_image_remote_fx());
+    assert!(!server.gfx_channel_enabled());
+    let mut channels = server.dynamic_channels();
+    let caps = encode_vec(&DrdynvcClientPdu::Capabilities(
+        CapabilitiesResponsePdu::new(CapsVersion::V1),
+    ))
+    .unwrap();
+    let creates = decode_dynamic_responses(channels.process(&caps).unwrap());
+    let names: Vec<_> = creates
+        .iter()
+        .map(|pdu| match pdu {
+            DrdynvcServerPdu::Create(create) => create.channel_name(),
+            _ => panic!("expected dynamic channel create request"),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ironrdp_displaycontrol::CHANNEL_NAME,
+            ironrdp_ainput::CHANNEL_NAME
+        ]
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum OrderedInputEvent {
     Mouse(MouseEvent),

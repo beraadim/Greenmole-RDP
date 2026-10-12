@@ -24,6 +24,7 @@ pub struct OpenH264Encoder {
     main_initialized: bool,
     aux_initialized: bool,
     fps: f32,
+    quality: Quality,
     mode_444: bool,
     /// vImage SIMD accelerated BGRA→I420 converter (macOS Accelerate.framework)
     vimage: Option<VImageConverter>,
@@ -53,31 +54,30 @@ impl Yuv444SplitBufs {
     }
 }
 
-/// Calculate optimal bitrate for screen content
-fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
-    let pixels = width as f64 * height as f64;
-    // Screen content needs high bitrate for sharp text and UI edges
-    // Base bits-per-pixel at 30fps, scaled by actual fps
-    let base_bpp = match quality {
-        Quality::LowLatency => 8.0,   // ~16 Mbps for 1080p@30
-        Quality::Balanced => 16.0,    // ~33 Mbps for 1080p@30
-        Quality::HighQuality => 24.0, // ~50 Mbps for 1080p@30
+fn create_oh264_encoder(
+    _width: u32,
+    _height: u32,
+    fps: f32,
+    bitrate: u32,
+    quality: Quality,
+) -> Result<Encoder> {
+    let (min_qp, max_qp) = quality.quantizer_range()?;
+    let complexity = match quality {
+        Quality::LowLatency => openh264::encoder::Complexity::Low,
+        Quality::Balanced => openh264::encoder::Complexity::Medium,
+        Quality::HighQuality => openh264::encoder::Complexity::High,
+        Quality::Lossless => unreachable!("lossless rejected before codec configuration"),
     };
-    let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
-}
-
-fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Result<Encoder> {
     let config = EncoderConfig::new()
         .bitrate(openh264::encoder::BitRate::from_bps(bitrate))
         .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
         .background_detection(false)
         .adaptive_quantization(true)
-        .qp(openh264::encoder::QpRange::new(20, 40))
+        .qp(openh264::encoder::QpRange::new(min_qp, max_qp))
         .skip_frames(false)
         .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
-        .complexity(openh264::encoder::Complexity::Medium)
+        .complexity(complexity)
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
             fps as u32 * 5,
         ))
@@ -148,13 +148,26 @@ impl OpenH264Encoder {
         Ok(())
     }
 
+    /// Create a balanced encoder; callers selecting a preset use new_with_quality.
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
-        let encoder = create_oh264_encoder(width, height, fps, bitrate)?;
+        Self::new_with_quality(width, height, fps, bitrate, mode_444, Quality::Balanced)
+    }
+
+    pub fn new_with_quality(
+        width: u32,
+        height: u32,
+        fps: f32,
+        bitrate: u32,
+        mode_444: bool,
+        quality: Quality,
+    ) -> Result<Self> {
+        let (min_qp, max_qp) = quality.quantizer_range()?;
+        let encoder = create_oh264_encoder(width, height, fps, bitrate, quality)?;
 
         // AVC444: create auxiliary encoder with 70% bitrate
         let encoder_aux = if mode_444 {
             let aux_bitrate = (bitrate as f64 * 0.7) as u32;
-            let aux = create_oh264_encoder(width, height, fps, aux_bitrate)?;
+            let aux = create_oh264_encoder(width, height, fps, aux_bitrate, quality)?;
             tracing::info!(
                 aux_bitrate_mbps = aux_bitrate as f64 / 1_000_000.0,
                 "AVC444 auxiliary OpenH264 encoder created"
@@ -182,7 +195,10 @@ impl OpenH264Encoder {
             fps,
             mode_444,
             bitrate_mbps = bitrate as f64 / 1_000_000.0,
-            "OpenH264 encoder created (screen-optimized)"
+            ?quality,
+            min_qp,
+            max_qp,
+            "OpenH264 encoder configured (quality confirmed on first native frame)"
         );
 
         Ok(Self {
@@ -197,6 +213,7 @@ impl OpenH264Encoder {
             main_initialized: false,
             aux_initialized: false,
             fps,
+            quality,
             mode_444,
             vimage,
             yuv444_bufs,
@@ -343,6 +360,7 @@ impl VideoEncoder for OpenH264Encoder {
         if !self.main_initialized {
             self.main_initialized = true;
             self.bitrate_applied = true;
+            tracing::info!(quality = ?self.quality, "OpenH264 accepted quality on its first native frame");
         }
 
         Ok(EncodedFrame {
@@ -413,6 +431,7 @@ impl VideoEncoder for OpenH264Encoder {
         if !self.main_initialized {
             self.main_initialized = true;
             self.bitrate_applied = true;
+            tracing::info!(quality = ?self.quality, "OpenH264 accepted quality on its first native frame");
         }
 
         let aux_yuv = YUVSlices::new(
@@ -469,13 +488,14 @@ impl VideoEncoder for OpenH264Encoder {
                 self.height,
                 self.fps,
                 ((bitrate_bps as f64 * 0.7) as u32).max(1),
+                self.quality,
             )?)
         } else {
             None
         };
         if !self.main_initialized {
             let configured_main =
-                create_oh264_encoder(self.width, self.height, self.fps, bitrate_bps)?;
+                create_oh264_encoder(self.width, self.height, self.fps, bitrate_bps, self.quality)?;
             self.encoder = configured_main;
             if let Some(aux) = configured_aux {
                 self.encoder_aux = Some(aux);
@@ -535,6 +555,85 @@ impl VideoEncoder for OpenH264Encoder {
 mod tests {
     use super::*;
 
+    fn native_parameters(encoder: &mut Encoder) -> openh264_sys2::SEncParamExt {
+        let mut parameters = openh264_sys2::SEncParamExt::default();
+        let status = unsafe {
+            encoder.raw_api().get_option(
+                openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                &mut parameters as *mut _ as *mut c_void,
+            )
+        };
+        assert_eq!(status, 0, "Cannot read native encoder parameters");
+        parameters
+    }
+
+    #[test]
+    fn quality_presets_reach_both_native_encoders_after_lazy_bitrate_reconfiguration() {
+        for (quality, expected, complexity) in [
+            (Quality::LowLatency, (20, 40), openh264_sys2::LOW_COMPLEXITY),
+            (
+                Quality::Balanced,
+                (16, 34),
+                openh264_sys2::MEDIUM_COMPLEXITY,
+            ),
+            (
+                Quality::HighQuality,
+                (12, 28),
+                openh264_sys2::HIGH_COMPLEXITY,
+            ),
+        ] {
+            let mut encoder =
+                OpenH264Encoder::new_with_quality(64, 64, 30.0, 2_000_000, true, quality).unwrap();
+            // Both native contexts are still uninitialized here. A target
+            // change must retain the selected policy when recreating them.
+            encoder.set_bitrate(1_000_000).unwrap();
+            let output = encoder
+                .encode_bgra_444(&vec![128; 64 * 64 * 4], 64, 64, 256)
+                .unwrap();
+            assert!(!output.main_view.data.is_empty());
+            assert!(!output.aux_view.data.is_empty());
+            for parameters in [
+                native_parameters(&mut encoder.encoder),
+                native_parameters(encoder.encoder_aux.as_mut().unwrap()),
+            ] {
+                assert_eq!((parameters.iMinQp, parameters.iMaxQp), expected);
+                assert_eq!(parameters.iComplexityMode, complexity);
+            }
+        }
+    }
+
+    #[test]
+    fn lossless_quality_cannot_fall_back_to_a_lossy_video_encoder() {
+        for preference in [
+            crate::EncoderPreference::Software,
+            crate::EncoderPreference::Hardware,
+        ] {
+            assert!(crate::create_encoder(
+                64,
+                64,
+                30.0,
+                Quality::Lossless,
+                preference,
+                false,
+                2_000_000
+            )
+            .is_err());
+        }
+        assert!(OpenH264Encoder::new_with_quality(
+            64,
+            64,
+            30.0,
+            2_000_000,
+            false,
+            Quality::Lossless
+        )
+        .is_err());
+        assert_eq!(
+            crate::screen_bitrate(1920, 1080, 60.0, Quality::Lossless),
+            0
+        );
+    }
+
     #[test]
     fn bitrate_tracks_only_accepted_values_and_valid_updates_still_encode() {
         let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 1_000_000, true).unwrap();
@@ -582,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_screen_bitrate() {
-        let br = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
+        let br = crate::screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
         assert!(
             br > 30_000_000,
             "1080p60 HighQuality should be > 30Mbps, got {}",

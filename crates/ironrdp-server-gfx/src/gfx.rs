@@ -342,6 +342,10 @@ pub struct GfxState {
     pub total_bytes_sent: u64,
     /// Total compressed fast-path bytes sent for classic bitmap updates.
     pub bitmap_wire_bytes: u64,
+    /// Bitmap codec chosen from this connection's capability exchange.
+    pub bitmap_codec: Option<&'static str>,
+    /// Client's Confirm Active preferred depth; wire bitmaps currently use 32bpp.
+    pub negotiated_client_depth: Option<u16>,
     /// Completed bitmap dispatches, including identical updates with no wire data.
     pub bitmap_dispatches: u64,
     pub bitmap_encode_ms_total: f64,
@@ -426,6 +430,8 @@ impl GfxState {
             last_frame_bytes: 0,
             total_bytes_sent: 0,
             bitmap_wire_bytes: 0,
+            bitmap_codec: None,
+            negotiated_client_depth: None,
             bitmap_dispatches: 0,
             bitmap_encode_ms_total: 0.0,
             bitmap_write_ms_total: 0.0,
@@ -622,6 +628,8 @@ impl GfxState {
         self.last_frame_bytes = 0;
         self.total_bytes_sent = 0;
         self.bitmap_wire_bytes = 0;
+        self.bitmap_codec = None;
+        self.negotiated_client_depth = None;
         self.bitmap_dispatches = 0;
         self.bitmap_encode_ms_total = 0.0;
         self.bitmap_write_ms_total = 0.0;
@@ -1390,6 +1398,8 @@ mod tests {
         state.last_frame_bytes = 123_456;
         state.total_bytes_sent = 987_654;
         state.bitmap_wire_bytes = 456_789;
+        state.bitmap_codec = Some("remotefx");
+        state.negotiated_client_depth = Some(24);
         state.start_time = Some(std::time::Instant::now());
         state.peer_addr = Some(std::net::IpAddr::from([192, 168, 86, 250]));
         state.avc_fallback_to_uncompressed = true;
@@ -1414,6 +1424,8 @@ mod tests {
         assert_eq!(state.last_frame_bytes, 0);
         assert_eq!(state.total_bytes_sent, 0);
         assert_eq!(state.bitmap_wire_bytes, 0);
+        assert_eq!(state.bitmap_codec, None);
+        assert_eq!(state.negotiated_client_depth, None);
         assert_eq!(state.start_time, None);
         assert!(!state.avc_fallback_to_uncompressed);
         assert!(!state.bitmap_fallback_mode);

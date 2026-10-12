@@ -53,12 +53,15 @@ frame_rate = 60
 
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 
-# Video quality preset
-# Default: high_quality
+# Image quality preset (CLI default: high_quality; desktop default: balanced).
+# Desktop changes require a service restart and reconnect.
 # Options:
-#   "low_latency"  — lower bitrate, fastest encoding (~16 Mbps @ 1080p30)
-#   "balanced"     — moderate quality and bitrate (~33 Mbps @ 1080p30)
-#   "high_quality" — best visual quality, higher bitrate (~50 Mbps @ 1080p30)
+#   "low_latency"  — faster video encoding and smaller RemoteFX updates
+#   "balanced"     — moderate video detail; standard RemoteFX quantization
+#   "high_quality" — sharper video and RemoteFX; higher bandwidth/encoding cost
+#   "lossless"     — exact captured RGB bitmap compression; bypasses video/RemoteFX
+# Guacamole can add lossy browser-side compression independently. Enable its
+# force-lossless connection option when comparing pixel fidelity.
 quality = "high_quality"
 
 # H.264 encoder selection

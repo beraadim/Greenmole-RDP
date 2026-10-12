@@ -836,16 +836,20 @@ impl RdpServerDisplay for MacDisplay {
             .await?;
 
         // Create H.264 encoder with configured quality and encoder preference
-        let encoder = macrdp_encode::create_encoder(
-            width as u32,
-            height as u32,
-            configured_frame_rate as f32,
-            self.quality,
-            self.encoder_pref,
-            self.mode_444,
-            configured_bitrate,
-        )
-        .ok();
+        let encoder = if self.quality == Quality::Lossless {
+            None
+        } else {
+            macrdp_encode::create_encoder(
+                width as u32,
+                height as u32,
+                configured_frame_rate as f32,
+                self.quality,
+                self.encoder_pref,
+                self.mode_444,
+                configured_bitrate,
+            )
+            .ok()
+        };
 
         {
             let mut state = self.gfx_state.lock().unwrap();

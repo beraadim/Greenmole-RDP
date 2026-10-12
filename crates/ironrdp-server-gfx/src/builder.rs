@@ -8,7 +8,7 @@ use super::clipboard::CliprdrServerFactory;
 use super::display::{DesktopSize, RdpServerDisplay};
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{RdpServer, RdpServerOptions, RdpServerSecurity};
-use crate::{DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
+use crate::{BitmapQuality, DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
 
 pub struct WantsAddr {}
 pub struct WantsSecurity {
@@ -27,6 +27,7 @@ pub struct BuilderDone {
     addr: SocketAddr,
     security: RdpServerSecurity,
     codecs: BitmapCodecs,
+    bitmap_quality: BitmapQuality,
     handler: Box<dyn RdpServerInputHandler>,
     display: Box<dyn RdpServerDisplay>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
@@ -39,7 +40,9 @@ pub struct RdpServerBuilder<State> {
 
 impl RdpServerBuilder<WantsAddr> {
     pub fn new() -> Self {
-        Self { state: WantsAddr {} }
+        Self {
+            state: WantsAddr {},
+        }
     }
 
     #[expect(clippy::unused_self)] // ensuring state transition from WantsAddr
@@ -75,7 +78,11 @@ impl RdpServerBuilder<WantsSecurity> {
         }
     }
 
-    pub fn with_hybrid(self, acceptor: impl Into<TlsAcceptor>, pub_key: Vec<u8>) -> RdpServerBuilder<WantsHandler> {
+    pub fn with_hybrid(
+        self,
+        acceptor: impl Into<TlsAcceptor>,
+        pub_key: Vec<u8>,
+    ) -> RdpServerBuilder<WantsHandler> {
         RdpServerBuilder {
             state: WantsHandler {
                 addr: self.state.addr,
@@ -124,6 +131,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 sound_factory: None,
                 cliprdr_factory: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+                bitmap_quality: BitmapQuality::default(),
             },
         }
     }
@@ -138,13 +146,17 @@ impl RdpServerBuilder<WantsDisplay> {
                 sound_factory: None,
                 cliprdr_factory: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+                bitmap_quality: BitmapQuality::default(),
             },
         }
     }
 }
 
 impl RdpServerBuilder<BuilderDone> {
-    pub fn with_cliprdr_factory(mut self, cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>) -> Self {
+    pub fn with_cliprdr_factory(
+        mut self,
+        cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+    ) -> Self {
         self.state.cliprdr_factory = cliprdr_factory;
         self
     }
@@ -159,8 +171,14 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Set quality before codec negotiation. Changing it requires reconnecting.
+    pub fn with_bitmap_quality(mut self, quality: BitmapQuality) -> Self {
+        self.state.bitmap_quality = quality;
+        self
+    }
+
     pub fn build(self) -> RdpServer {
-        RdpServer::new(
+        let mut server = RdpServer::new(
             RdpServerOptions {
                 addr: self.state.addr,
                 security: self.state.security,
@@ -170,7 +188,9 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.display,
             self.state.sound_factory,
             self.state.cliprdr_factory,
-        )
+        );
+        server.set_bitmap_quality(self.state.bitmap_quality);
+        server
     }
 }
 
@@ -196,7 +216,10 @@ struct NoopDisplay;
 #[async_trait::async_trait]
 impl RdpServerDisplay for NoopDisplay {
     async fn size(&mut self) -> DesktopSize {
-        DesktopSize { width: 0, height: 0 }
+        DesktopSize {
+            width: 0,
+            height: 0,
+        }
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {

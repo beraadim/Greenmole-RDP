@@ -206,6 +206,7 @@ impl RdpServerSecurity {
 /// ```
 pub struct RdpServer {
     opts: RdpServerOptions,
+    bitmap_quality: crate::BitmapQuality,
     // FIXME: replace with a channel and poll/process the handler?
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
@@ -286,6 +287,7 @@ impl RdpServer {
         }
         Self {
             opts,
+            bitmap_quality: crate::BitmapQuality::default(),
             handler: Arc::new(Mutex::new(handler)),
             display: Arc::new(Mutex::new(display)),
             static_channels: StaticChannelSet::new(),
@@ -324,6 +326,15 @@ impl RdpServer {
     /// Enable or disable GFX H.264 channel
     pub fn set_gfx_enabled(&mut self, enabled: bool) {
         self.gfx_enabled = enabled;
+    }
+
+    pub(crate) fn set_bitmap_quality(&mut self, quality: crate::BitmapQuality) {
+        quality.restrict_codecs(&mut self.opts.codecs);
+        self.bitmap_quality = quality;
+    }
+
+    fn gfx_channel_enabled(&self) -> bool {
+        self.gfx_enabled && self.bitmap_quality != crate::BitmapQuality::Lossless
     }
 
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
@@ -368,12 +379,14 @@ impl RdpServer {
                 self.additional_input.clone(),
                 self.input_activity.clone(),
             ));
+        }
+        if self.gfx_channel_enabled() {
             let gfx_handler = GfxHandler::new(Arc::clone(&self.gfx_state));
             dvc = dvc.with_dynamic_channel(gfx_handler);
             debug!("GFX channel registered");
         }
         info!(
-            gfx_enabled = self.gfx_enabled,
+            gfx_enabled = self.gfx_channel_enabled(),
             "Registered Display Control channel for client viewport updates"
         );
         DynamicChannels(dvc)
@@ -1279,8 +1292,8 @@ impl RdpServer {
         self.static_channels = result.static_channels;
         {
             let mut gfx_state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx =
-                self.gfx_enabled && self.get_channel_id_by_type::<DynamicChannels>().is_some();
+            let session_uses_gfx = self.gfx_channel_enabled()
+                && self.get_channel_id_by_type::<DynamicChannels>().is_some();
             if !result.reactivation {
                 gfx_state.reset_connection_state(session_uses_gfx);
             } else {
@@ -1353,7 +1366,9 @@ impl RdpServer {
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();
+        update_codecs.set_quality(self.bitmap_quality);
         let mut surface_flags = CmdFlags::empty();
+        let mut client_depth = None;
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
@@ -1366,6 +1381,13 @@ impl RdpServer {
                 }
                 CapabilitySet::SurfaceCommands(c) => {
                     surface_flags = c.flags;
+                }
+                CapabilitySet::Bitmap(c) => {
+                    client_depth = Some(c.pref_bits_per_pix);
+                    update_codecs.set_allow_skip_alpha(
+                        c.drawing_flags
+                            .contains(rdp::capability_sets::BitmapDrawingFlags::ALLOW_SKIP_ALPHA),
+                    );
                 }
                 CapabilitySet::BitmapCodecs(BitmapCodecs(codecs)) => {
                     for codec in codecs {
@@ -1416,6 +1438,19 @@ impl RdpServer {
         let desktop_size = activation_size;
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs)
             .context("failed to initialize update encoder")?;
+        let bitmap_codec = encoder.bitmap_codec();
+        {
+            let mut state = self.gfx_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.bitmap_codec = Some(bitmap_codec);
+            state.negotiated_client_depth = client_depth;
+        }
+        info!(
+            bitmap_codec,
+            quality = ?self.bitmap_quality,
+            client_preferred_depth = ?client_depth,
+            bitmap_wire_depth = 32,
+            "Configured bitmap transport"
+        );
 
         // A resize reactivation retains its own stage timeout, but must not
         // inherit the expired deadline of the initial connection handshake.
