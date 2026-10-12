@@ -60,6 +60,9 @@ pub struct ServerConfig {
     pub password: Option<String>,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    /// Additional DNS names or IP addresses for the managed TLS certificate.
+    /// Localhost and the system hostname are always included. Requires restart.
+    pub tls_server_names: Vec<String>,
     pub idle_timeout_secs: u64,
     /// Log level: trace, debug, info, warn, error
     pub log_level: Option<String>,
@@ -100,6 +103,7 @@ impl Default for ServerConfig {
             password: None,
             cert_path: None,
             key_path: None,
+            tls_server_names: Vec::new(),
             idle_timeout_secs: 1800,
             log_level: None,
             quality: None,
@@ -119,6 +123,11 @@ impl ServerConfig {
     /// Reject unsafe/inconsistent settings before initializing the desktop or listener.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.port > 0, "port must be between 1 and 65535");
+        anyhow::ensure!(
+            self.cert_path.is_some() == self.key_path.is_some(),
+            "cert_path and key_path must both be supplied for a custom TLS identity"
+        );
+        crate::tls::validate_server_names(&self.tls_server_names)?;
         anyhow::ensure!(
             self.username
                 .as_deref()

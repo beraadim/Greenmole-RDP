@@ -4,7 +4,10 @@
 //! Async work lives on the desktop runtime, which survives server stop/restart.
 //! Connection events are ordered and database writes run on a blocking worker.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -19,59 +22,100 @@ const MAX_LOG_ENTRIES: usize = 5000;
 /// Implements ServerEventHandler by forwarding events to Tauri state and emitting frontend events.
 pub struct TauriEventBridge {
     app: AppHandle,
+    generation: u64,
+    status_sequence: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
     connection_tx: tokio::sync::mpsc::Sender<ConnectionEvent>,
 }
 
 impl TauriEventBridge {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(app: AppHandle, generation: u64) -> Self {
         let (connection_tx, mut receiver) = tokio::sync::mpsc::channel(256);
         let worker_app = app.clone();
+        let running = Arc::new(AtomicBool::new(false));
+        let worker_running = running.clone();
         // This worker belongs to the desktop runtime, not the server runtime that is
         // torn down during stop/restart. Events from each server are processed in order.
         tauri::async_runtime::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                process_connection_event(&worker_app, event).await;
+                process_connection_event(&worker_app, event, generation, &worker_running).await;
             }
         });
-        Self { app, connection_tx }
+        Self {
+            app,
+            generation,
+            status_sequence: Arc::new(AtomicU64::new(0)),
+            running,
+            connection_tx,
+        }
     }
 }
 
 impl ServerEventHandler for TauriEventBridge {
     fn on_status_change(&self, status: ServerStatus) {
+        // Stop accepting metrics immediately, before the async UI status task runs.
+        // Polling a handle during thread cleanup must not revive a failed server's tray.
+        self.running.store(status.running, Ordering::Release);
         let app = self.app.clone();
-        let status_clone = status.clone();
+        let generation = self.generation;
+        let sequence = self.status_sequence.clone();
+        let revision = sequence.fetch_add(1, Ordering::AcqRel) + 1;
         tauri::async_runtime::spawn(async move {
             if let Some(state) = app.try_state::<Arc<AppState>>() {
                 let mut guard = state.status.lock().await;
-                *guard = status_clone.clone();
+                if !event_is_current(
+                    generation,
+                    state.server_generation.load(Ordering::Acquire),
+                    revision,
+                    sequence.load(Ordering::Acquire),
+                ) {
+                    return;
+                }
+                *guard = status.clone();
+                if !status.running {
+                    let mut metrics = state.metrics.lock().await;
+                    *metrics = Metrics::default();
+                    crate::tray::update_tray_status(&app, &status.state, &metrics);
+                    let _ = app.emit("metrics", &*metrics);
+                    let mut connections = state.connections.lock().await;
+                    connections.clear();
+                    let _ = app.emit("connections", &*connections);
+                }
+                let _ = app.emit("server-status", &status);
             }
-            let _ = app.emit("server-status", &status_clone);
         });
     }
 
     fn on_metrics(&self, metrics: Metrics) {
-        // Update tray directly (sync-safe)
-        let has_connections = {
-            // We can't hold async lock here, but we can check tray based on metrics
-            // If bitrate > 0, there's likely a connection
-            metrics.bitrate_kbps > 0
-        };
-        let state_str = if has_connections {
-            "connected"
-        } else {
-            "running"
-        };
-        crate::tray::update_tray_status(&self.app, state_str, &metrics);
-
         let app = self.app.clone();
-        let metrics_clone = metrics.clone();
+        let generation = self.generation;
+        let running = self.running.clone();
         tauri::async_runtime::spawn(async move {
             if let Some(state) = app.try_state::<Arc<AppState>>() {
+                // Use the same lock order as status callbacks and hold status through
+                // tray publication, so a terminal update always clears older metrics.
+                let status = state.status.lock().await;
                 let mut guard = state.metrics.lock().await;
-                *guard = metrics_clone.clone();
+                if !metrics_are_current(
+                    generation,
+                    state.server_generation.load(Ordering::Acquire),
+                    status.running,
+                    running.load(Ordering::Acquire),
+                ) {
+                    return;
+                }
+                *guard = metrics.clone();
+                crate::tray::update_tray_status(
+                    &app,
+                    if metrics.bitrate_kbps > 0 {
+                        "connected"
+                    } else {
+                        "running"
+                    },
+                    &metrics,
+                );
+                let _ = app.emit("metrics", &metrics);
             }
-            let _ = app.emit("metrics", &metrics_clone);
         });
     }
 
@@ -124,13 +168,44 @@ fn update_connections(connections: &mut Vec<Connection>, event: &ConnectionEvent
     }
 }
 
-async fn process_connection_event(app: &AppHandle, event: ConnectionEvent) {
+fn event_is_current(
+    generation: u64,
+    current_generation: u64,
+    revision: u64,
+    latest_revision: u64,
+) -> bool {
+    generation == current_generation && revision == latest_revision
+}
+
+fn metrics_are_current(
+    generation: u64,
+    current_generation: u64,
+    ui_running: bool,
+    server_running: bool,
+) -> bool {
+    generation == current_generation && ui_running && server_running
+}
+
+async fn process_connection_event(
+    app: &AppHandle,
+    event: ConnectionEvent,
+    generation: u64,
+    running: &AtomicBool,
+) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
         let mut connections = state.connections.lock().await;
-        update_connections(&mut connections, &event);
-        let _ = app.emit("connections", &*connections);
+        if connection_is_current(
+            generation,
+            state.server_generation.load(Ordering::Acquire),
+            running.load(Ordering::Acquire),
+            &event,
+        ) {
+            update_connections(&mut connections, &event);
+            let _ = app.emit("connections", &*connections);
+            let _ = app.emit("connection-event", &event);
+        }
     }
-    let _ = app.emit("connection-event", &event);
+    // Persist completed older sessions even when their UI events are obsolete.
     if let ConnectionEvent::Disconnected(info) = event {
         let database = app
             .try_state::<Arc<Database>>()
@@ -153,10 +228,38 @@ async fn process_connection_event(app: &AppHandle, event: ConnectionEvent) {
     }
 }
 
+fn connection_is_current(
+    generation: u64,
+    current_generation: u64,
+    running: bool,
+    event: &ConnectionEvent,
+) -> bool {
+    generation == current_generation
+        && (running || matches!(event, ConnectionEvent::Disconnected(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use macrdp_core::{ConnectionInfo, DisconnectionInfo};
+
+    #[test]
+    fn delayed_metrics_cannot_revive_a_terminal_or_replaced_server() {
+        assert!(metrics_are_current(2, 2, true, true));
+        // Fatal callback received, but its async status update has not run yet.
+        assert!(!metrics_are_current(2, 2, true, false));
+        // Terminal UI state already applied, including a manual stop.
+        assert!(!metrics_are_current(2, 2, false, true));
+        // A healthy replacement server must still reject the old ticker.
+        assert!(!metrics_are_current(1, 2, true, true));
+    }
+
+    #[test]
+    fn superseded_startup_events_and_old_servers_cannot_revive_ui_state() {
+        assert!(!event_is_current(1, 2, 4, 4));
+        assert!(!event_is_current(2, 2, 1, 3));
+        assert!(event_is_current(2, 2, 3, 3));
+    }
 
     #[test]
     fn delayed_disconnect_preserves_reconnection_from_same_address() {
@@ -168,6 +271,14 @@ mod tests {
                 connected_at: at.into(),
             })
         };
+        assert!(connection_is_current(2, 2, true, &connected("current")));
+        assert!(!connection_is_current(
+            2,
+            2,
+            false,
+            &connected("late-after-failure")
+        ));
+        assert!(!connection_is_current(1, 2, true, &connected("old-server")));
         update_connections(&mut connections, &connected("2026-01-01T00:00:00Z"));
         update_connections(&mut connections, &connected("2026-01-01T00:01:00Z"));
         update_connections(&mut connections, &connected("2026-01-01T00:01:00Z"));

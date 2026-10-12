@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 
 use serde::Serialize;
 use tauri::AppHandle;
@@ -32,6 +32,10 @@ pub type LogReloadHandle = reload::Handle<EnvFilter, Registry>;
 
 /// Application-wide shared state.
 pub struct AppState {
+    /// Serializes start/stop/settings transitions without blocking read-only polling.
+    pub lifecycle_lock: Mutex<()>,
+    /// Delayed events from an older server must not revive its UI state.
+    pub server_generation: AtomicU64,
     pub status: Mutex<ServerStatus>,
     pub metrics: Mutex<Metrics>,
     pub connections: Mutex<Vec<Connection>>,
@@ -45,6 +49,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(log_reload: LogReloadHandle, ui_config: UiConfig) -> Self {
         Self {
+            lifecycle_lock: Mutex::new(()),
+            server_generation: AtomicU64::new(0),
             status: Mutex::new(ServerStatus::default()),
             metrics: Mutex::new(Metrics::default()),
             connections: Mutex::new(Vec::new()),

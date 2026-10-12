@@ -24,6 +24,9 @@ pub struct UiConfig {
     // ── Auth ────────────────────────────────────────────────
     pub username: String,
     pub password: String,
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    pub tls_server_names: Vec<String>,
 
     // ── Display ─────────────────────────────────────────────
     pub display_backend: DisplayBackend,
@@ -60,6 +63,9 @@ impl Default for UiConfig {
             idle_timeout_secs: 1800,
             username: "macrdp".to_string(),
             password: String::new(),
+            tls_cert_path: String::new(),
+            tls_key_path: String::new(),
+            tls_server_names: Vec::new(),
             display_backend: DisplayBackend::Main,
             resolution: "auto".to_string(),
             show_cursor: false,
@@ -289,6 +295,27 @@ impl UiConfig {
             "theme" => {
                 self.theme = value.as_str().ok_or("theme must be a string")?.to_string();
             }
+            "tls_cert_path" | "tls_key_path" => {
+                let path = value
+                    .as_str()
+                    .ok_or("Certificate paths must be strings")?
+                    .trim();
+                if path.contains('\0') {
+                    return Err("Invalid certificate path".into());
+                }
+                if key == "tls_cert_path" {
+                    self.tls_cert_path = path.to_string();
+                } else {
+                    self.tls_key_path = path.to_string();
+                }
+            }
+            "tls_server_names" => {
+                let names: Vec<String> = serde_json::from_value(value.clone())
+                    .map_err(|_| "Server names must be a list of hostnames or IP addresses")?;
+                macrdp_core::tls::validate_server_names(&names)
+                    .map_err(|error| error.to_string())?;
+                self.tls_server_names = names;
+            }
             "autostart" => {
                 self.autostart = value.as_bool().ok_or("autostart must be a boolean")?;
             }
@@ -298,12 +325,18 @@ impl UiConfig {
         Ok(self.requires_restart(key, None))
     }
 
-    /// A pending switch away from a virtual display must not permit port
-    /// migration to replace its owner before the user restarts the service.
+    /// Listener and identity changes apply together at a serialized service restart.
+    /// Virtual display ownership also cannot change in the middle of a session.
     pub fn requires_restart(&self, key: &str, running_backend: Option<DisplayBackend>) -> bool {
         matches!(
             key,
-            "display_backend" | "bind_address" | "idle_timeout_secs"
+            "display_backend"
+                | "bind_address"
+                | "port"
+                | "idle_timeout_secs"
+                | "tls_cert_path"
+                | "tls_key_path"
+                | "tls_server_names"
         ) || (matches!(key, "resolution" | "hidpi_scale" | "port")
             && (self.display_backend == DisplayBackend::Virtual
                 || running_backend == Some(DisplayBackend::Virtual)))
@@ -324,8 +357,9 @@ impl UiConfig {
             } else {
                 Some(self.password.clone())
             },
-            cert_path: None,
-            key_path: None,
+            cert_path: (!self.tls_cert_path.is_empty()).then(|| PathBuf::from(&self.tls_cert_path)),
+            key_path: (!self.tls_key_path.is_empty()).then(|| PathBuf::from(&self.tls_key_path)),
+            tls_server_names: self.tls_server_names.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
             log_level: Some(self.log_level.clone()),
             quality: None,
@@ -345,6 +379,94 @@ impl UiConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tls_preferences_round_trip_without_persisting_the_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config-ui.toml");
+        let mut config = UiConfig::default();
+        config.password = "tls-settings-test-password".into();
+        assert!(config
+            .set_field("tls_cert_path", &json!(" /tmp/test certificate.pem "))
+            .unwrap());
+        assert!(config
+            .set_field("tls_key_path", &json!(" /tmp/test key.pem "))
+            .unwrap());
+        assert!(config
+            .set_field(
+                "tls_server_names",
+                &json!(["rdp.example.test", "192.0.2.7", "2001:db8::7"])
+            )
+            .unwrap());
+        config
+            .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
+            .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains(&config.password));
+        let restored = UiConfig::load_with_store(
+            &path,
+            || Ok(Some(config.password.clone())),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        let core = restored.to_server_config();
+        assert_eq!(
+            core.cert_path,
+            Some(PathBuf::from("/tmp/test certificate.pem"))
+        );
+        assert_eq!(core.key_path, Some(PathBuf::from("/tmp/test key.pem")));
+        assert_eq!(core.tls_server_names, config.tls_server_names);
+        assert!(core.validate().is_ok());
+        for key in ["tls_cert_path", "tls_key_path", "tls_server_names"] {
+            for backend in [DisplayBackend::Main, DisplayBackend::Virtual] {
+                assert!(restored.requires_restart(key, Some(backend)));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_tls_updates_do_not_mutate_existing_identity_settings() {
+        let mut config = UiConfig::default();
+        config.tls_cert_path = "/tmp/existing.pem".into();
+        config.tls_key_path = "/tmp/existing-key.pem".into();
+        config.tls_server_names = vec!["rdp.example.test".into()];
+        let original = serde_json::to_value(&config).unwrap();
+        for (key, value) in [
+            ("tls_cert_path", json!(true)),
+            ("tls_key_path", json!("/tmp/key\0.pem")),
+            ("tls_server_names", json!("rdp.example.test")),
+            ("tls_server_names", json!([1])),
+            ("tls_server_names", json!(["https://rdp.example.test"])),
+            ("tls_server_names", json!(["*.example.test"])),
+            ("tls_server_names", json!([""])),
+            ("tls_server_names", json!(vec!["rdp.example.test"; 33])),
+        ] {
+            assert!(config.set_field(key, &value).is_err());
+            assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn tls_pair_can_be_edited_individually_but_incomplete_identity_cannot_start() {
+        let mut config: UiConfig = toml::from_str("username = 'test-user'").unwrap();
+        config.password = "test-password".into();
+        let defaults = config.to_server_config();
+        assert!(defaults.cert_path.is_none() && defaults.key_path.is_none());
+        assert!(defaults.tls_server_names.is_empty());
+        config
+            .set_field("tls_cert_path", &json!("/tmp/cert.pem"))
+            .unwrap();
+        assert!(config.to_server_config().validate().is_err());
+        config
+            .set_field("tls_key_path", &json!("/tmp/key.pem"))
+            .unwrap();
+        assert!(config.to_server_config().validate().is_ok());
+        config.set_field("tls_cert_path", &json!(" ")).unwrap();
+        assert!(config.to_server_config().validate().is_err());
+        config.set_field("tls_key_path", &json!("")).unwrap();
+        assert!(config.to_server_config().validate().is_ok());
+    }
 
     #[test]
     fn invalid_numeric_updates_do_not_truncate_or_mutate_settings() {
@@ -545,10 +667,10 @@ mod tests {
         assert!(!config.set_field("frame_rate", &json!(30)).unwrap());
         assert!(!config.set_field("show_cursor", &json!(true)).unwrap());
         config.set_field("display_backend", &json!("main")).unwrap();
-        assert!(!config.set_field("port", &json!(3389)).unwrap());
+        assert!(config.set_field("port", &json!(3389)).unwrap());
         assert!(config.requires_restart("port", Some(DisplayBackend::Virtual)));
         assert!(config.requires_restart("resolution", Some(DisplayBackend::Virtual)));
-        assert!(!config.requires_restart("port", Some(DisplayBackend::Main)));
+        assert!(config.requires_restart("port", Some(DisplayBackend::Main)));
         assert!(!config.requires_restart("frame_rate", Some(DisplayBackend::Virtual)));
     }
 }

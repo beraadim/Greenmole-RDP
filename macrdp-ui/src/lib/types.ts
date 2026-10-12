@@ -119,6 +119,19 @@ export interface UiConfig {
   autostart: boolean;
   tls_cert_path: string;
   tls_key_path: string;
+  tls_server_names: string[];
+}
+
+export interface TlsStatus {
+  source: "running" | "configured";
+  error: string | null;
+  certificate: {
+    fingerprint_sha256: string;
+    expires_at: string;
+    not_before_unix: number;
+    not_after_unix: number;
+    server_names: string[];
+  } | null;
 }
 
 /** @deprecated Use UiConfig instead */

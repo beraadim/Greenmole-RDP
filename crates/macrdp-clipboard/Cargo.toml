@@ -9,7 +9,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSString", "NSArray", "NSURL", "NSData", "NSObject",
 ] }
 objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
-image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "jpeg"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

@@ -12,10 +12,11 @@ port = 13389
 # ─── Authentication ────────────────────────────────────────────────────────────
 
 # RDP login credentials (NLA/Hybrid/CredSSP)
-# Both fields are optional — if omitted, macrdp generates temporary credentials
-# and prints them on startup.
+# Set both fields for unattended startup; use a unique password and protect this file.
+# Omitting both is supported only in an interactive terminal, which displays
+# generated one-time credentials. Empty/partial credentials are rejected.
 username = "admin"
-password = "123456"
+password = "" # Replace before use. No working default password is shipped.
 
 # ─── Display ───────────────────────────────────────────────────────────────────
 
@@ -78,12 +79,19 @@ encoder = "hardware"
 # ─── TLS ───────────────────────────────────────────────────────────────────────
 
 # Path to TLS certificate file (PEM format)
-# Default: auto-generated self-signed certificate
+# Supply both custom paths or neither. Existing custom files are validated and
+# never replaced; otherwise the application manages a self-signed certificate.
 # cert_path = "/path/to/cert.pem"
 
 # Path to TLS private key file (PEM format)
-# Default: auto-generated alongside certificate
+# Custom private keys must match the certificate.
 # key_path = "/path/to/key.pem"
+
+# Additional hostnames/IPs used by clients. Requires a service restart.
+# Managed certificates also include localhost and the Mac hostname; changing names
+# renews the managed identity and may cause a new client trust prompt.
+# With custom paths, each supplied name must be covered by the certificate SANs.
+# tls_server_names = ["mac-mini.local", "192.0.2.10"]
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 

@@ -23,6 +23,9 @@ pub struct Cli {
     /// Collect bounded performance statistics and print a summary on exit.
     #[arg(long)]
     pub perf: bool,
+    /// Record one metrics sample per second to a new private JSONL file (64 MiB limit).
+    #[arg(long)]
+    pub metrics_jsonl: Option<PathBuf>,
 }
 
 impl Cli {

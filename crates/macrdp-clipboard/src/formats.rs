@@ -1,107 +1,16 @@
-// Format conversion implemented in Task 6
+//! Clipboard format identifiers and text conversion.
 
-use image::{ImageFormat, RgbaImage};
-use std::io::Cursor;
-
-pub const BITMAPINFOHEADER_SIZE: usize = 40;
+#[path = "formats/image.rs"]
+mod bounded_image;
+pub use self::bounded_image::{
+    dib_to_png, png_to_dib, BITMAPINFOHEADER_SIZE, MAX_IMAGE_PAYLOAD_BYTES,
+};
 
 /// Registered format ID for Windows "HTML Format"
 pub const FORMAT_ID_HTML: u32 = 0xD010;
 
 /// Registered format ID for FileGroupDescriptorW
 pub const FORMAT_ID_FILE_LIST: u32 = 0xD011;
-
-/// Convert PNG/TIFF image bytes to Windows CF_DIB format.
-/// DIB = BITMAPINFOHEADER (40 bytes) + BGRA pixel data (bottom-up row order).
-pub fn png_to_dib(image_data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let img = image::load_from_memory(image_data)?;
-    let rgba = img.to_rgba8();
-    let (width, height) = rgba.dimensions();
-
-    let row_size = (width * 4) as usize; // BGRA, always 4-byte aligned at 32bpp
-    let pixel_data_size = row_size * height as usize;
-
-    let mut dib = Vec::with_capacity(BITMAPINFOHEADER_SIZE + pixel_data_size);
-
-    // BITMAPINFOHEADER (40 bytes)
-    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    dib.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
-    dib.extend_from_slice(&(height as i32).to_le_bytes()); // biHeight (positive = bottom-up)
-    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount (BGRA)
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB)
-    dib.extend_from_slice(&(pixel_data_size as u32).to_le_bytes()); // biSizeImage
-    dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
-    dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-
-    // Pixel data: RGBA (top-down) → BGRA (bottom-up)
-    for y in (0..height).rev() {
-        for x in 0..width {
-            let pixel = rgba.get_pixel(x, y);
-            dib.push(pixel[2]); // B
-            dib.push(pixel[1]); // G
-            dib.push(pixel[0]); // R
-            dib.push(pixel[3]); // A
-        }
-    }
-
-    Ok(dib)
-}
-
-/// Convert Windows CF_DIB format to PNG bytes.
-pub fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if dib.len() < BITMAPINFOHEADER_SIZE {
-        anyhow::bail!("DIB data too small for BITMAPINFOHEADER");
-    }
-
-    let width = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]) as u32;
-    let height_raw = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
-    let bottom_up = height_raw > 0;
-    let height = height_raw.unsigned_abs();
-    let bits_per_pixel = u16::from_le_bytes([dib[14], dib[15]]);
-
-    let bytes_per_pixel = (bits_per_pixel / 8) as usize;
-    let row_stride = ((width as usize * bytes_per_pixel + 3) / 4) * 4;
-
-    let pixel_offset = BITMAPINFOHEADER_SIZE;
-    let pixel_data = &dib[pixel_offset..];
-
-    let mut img = RgbaImage::new(width, height);
-
-    for y in 0..height {
-        let src_y = if bottom_up { height - 1 - y } else { y };
-        let row_start = src_y as usize * row_stride;
-
-        for x in 0..width {
-            let px_start = row_start + x as usize * bytes_per_pixel;
-            if px_start + bytes_per_pixel > pixel_data.len() {
-                continue;
-            }
-            let (r, g, b, a) = match bits_per_pixel {
-                32 => (
-                    pixel_data[px_start + 2],
-                    pixel_data[px_start + 1],
-                    pixel_data[px_start],
-                    pixel_data[px_start + 3],
-                ),
-                24 => (
-                    pixel_data[px_start + 2],
-                    pixel_data[px_start + 1],
-                    pixel_data[px_start],
-                    255,
-                ),
-                _ => (0, 0, 0, 255),
-            };
-            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
-        }
-    }
-
-    let mut png_bytes = Vec::new();
-    img.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)?;
-    Ok(png_bytes)
-}
 
 /// Convert UTF-8 string to UTF-16LE bytes with null terminator.
 pub fn utf8_to_utf16le(s: &str) -> Vec<u8> {

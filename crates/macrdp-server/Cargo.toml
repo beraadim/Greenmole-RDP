@@ -1,6 +1,6 @@
 [package]
 name = "macrdp-server"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 
 [dependencies]
@@ -10,6 +10,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,8 +14,7 @@ use std::time::Duration;
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::*;
 use ironrdp_core::{impl_as_any, IntoOwned};
-use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
-use tokio::sync::mpsc;
+use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender, ServerEventTx};
 
 use crate::formats::{
     dib_to_png, png_to_dib, uti_to_rdp_format_id, FORMAT_ID_FILE_LIST, FORMAT_ID_HTML,
@@ -30,7 +29,7 @@ use crate::transfer::FileTransferManager;
 /// - Anti-echo mechanism to prevent clipboard feedback loops
 /// - Text clipboard support (CF_UNICODETEXT <-> NSPasteboard text)
 pub struct MacClipboardBackend {
-    event_sender: mpsc::UnboundedSender<ServerEvent>,
+    event_sender: ServerEventTx,
     last_change_count: Arc<AtomicI64>,
     remote_formats: Vec<ClipboardFormat>,
     transfer_manager: FileTransferManager,
@@ -54,7 +53,7 @@ impl_as_any!(MacClipboardBackend);
 
 impl MacClipboardBackend {
     pub fn new(
-        event_sender: mpsc::UnboundedSender<ServerEvent>,
+        event_sender: ServerEventTx,
         temp_dir: PathBuf,
         max_file_size: u64,
         file_transfer: bool,
@@ -130,7 +129,7 @@ impl CliprdrBackend for MacClipboardBackend {
             let bridge = PasteboardBridge::new();
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || sender.is_closed() {
                     break;
                 }
 
@@ -160,9 +159,14 @@ impl CliprdrBackend for MacClipboardBackend {
                         })
                         .collect();
                     if !formats.is_empty() {
-                        let _ = sender.send(ServerEvent::Clipboard(
-                            ClipboardMessage::SendInitiateCopy(formats),
-                        ));
+                        if sender
+                            .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+                                formats,
+                            )))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -260,12 +264,12 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        let format = self.pending_paste_format.take();
         if response.is_error() {
             tracing::warn!("Received error format data response from client");
             return;
         }
 
-        let format = self.pending_paste_format.take();
         match format {
             Some(13) => {
                 if let Ok(text) = response.to_unicode_string() {
@@ -274,16 +278,14 @@ impl CliprdrBackend for MacClipboardBackend {
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
-            Some(8) => {
-                let data = response.data();
-                if data.len() >= formats::BITMAPINFOHEADER_SIZE {
-                    if let Ok(png_data) = dib_to_png(data) {
-                        let pb = PasteboardBridge::new();
-                        let new_count = pb.write_image(&png_data);
-                        self.last_change_count.store(new_count, Ordering::SeqCst);
-                    }
+            Some(8) => match dib_to_png(response.data()) {
+                Ok(png_data) => {
+                    let pb = PasteboardBridge::new();
+                    let new_count = pb.write_image(&png_data);
+                    self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
-            }
+                Err(error) => tracing::warn!(%error, "Rejected clipboard image"),
+            },
             Some(id) if id == FORMAT_ID_HTML => {
                 if let Some(html_content) = crate::html::unwrap_html_format(response.data()) {
                     let pb = PasteboardBridge::new();
@@ -303,26 +305,7 @@ impl CliprdrBackend for MacClipboardBackend {
                     }
                 }
             }
-            _ => {
-                // Fallback: content-based detection for backwards compatibility
-                if let Ok(text) = response.to_unicode_string() {
-                    let pb = PasteboardBridge::new();
-                    let new_count = pb.write_string(&text);
-                    self.last_change_count.store(new_count, Ordering::SeqCst);
-                    return;
-                }
-                let data = response.data();
-                if data.len() >= formats::BITMAPINFOHEADER_SIZE {
-                    let header_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    if header_size == 40 {
-                        if let Ok(png_data) = dib_to_png(data) {
-                            let pb = PasteboardBridge::new();
-                            let new_count = pb.write_image(&png_data);
-                            self.last_change_count.store(new_count, Ordering::SeqCst);
-                        }
-                    }
-                }
-            }
+            _ => tracing::warn!("Ignored unsolicited or unsupported clipboard response"),
         }
     }
 
@@ -387,7 +370,7 @@ impl Drop for MacClipboardBackend {
 /// and `ServerEventSender`. The event sender is injected by the server
 /// before `build_cliprdr_backend` is called.
 pub struct MacClipboardFactory {
-    event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    event_sender: Option<ServerEventTx>,
     temp_dir: PathBuf,
     max_file_size: u64,
     file_transfer: bool,
@@ -418,7 +401,7 @@ impl CliprdrBackendFactory for MacClipboardFactory {
 }
 
 impl ServerEventSender for MacClipboardFactory {
-    fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+    fn set_sender(&mut self, sender: ServerEventTx) {
         self.event_sender = Some(sender);
     }
 }
@@ -430,9 +413,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_images_unsolicited_responses_and_errors_do_not_touch_pasteboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut receiver) = ServerEvent::create_channel();
+        let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, false);
+        let initial = backend.last_change_count.load(Ordering::SeqCst);
+        backend.pending_paste_format = Some(8);
+        backend.on_format_data_response(FormatDataResponse::new_data(vec![0; 40]));
+        assert!(backend.pending_paste_format.is_none());
+        backend.on_format_data_response(FormatDataResponse::new_data(vec![65, 0, 0, 0]));
+        backend.pending_paste_format = Some(8);
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(backend.pending_paste_format.is_none());
+        assert_eq!(backend.last_change_count.load(Ordering::SeqCst), initial);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn short_file_response_schedules_bounded_remainder_on_clipboard_channel() {
         let dir = tempfile::tempdir().unwrap();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = ServerEvent::create_channel();
         let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
         backend
             .transfer_manager
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn disabling_file_transfer_disables_capability_and_ignores_remote_file_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = ServerEvent::create_channel();
         let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, false);
         assert!(!backend
             .client_capabilities()

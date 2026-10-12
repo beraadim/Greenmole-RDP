@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
-use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
+use ironrdp_server::{ServerEvent, ServerEventSender, ServerEventTx, SoundServerFactory};
 use macrdp_capture::AudioFrame;
 use tokio::sync::mpsc;
 
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 /// and sends RdpsndServerMessage::Wave events.
 async fn audio_loop(
     mut audio_rx: mpsc::Receiver<AudioFrame>,
-    event_sender: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
+    event_sender: ServerEventTx,
     frame_size_interleaved: usize,
     channels: u16,
     sample_rate: u32,
@@ -33,7 +33,15 @@ async fn audio_loop(
         channels
     );
 
-    while let Some(frame) = audio_rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = event_sender.closed() => break,
+            frame = audio_rx.recv() => match frame {
+                Some(frame) => frame,
+                None => break,
+            },
+        };
         let started = flow_state.started.load(Ordering::Relaxed);
         if !started {
             if was_started {
@@ -63,9 +71,12 @@ async fn audio_loop(
             let offset_ms = (samples_sent * 1000) / sample_rate as u64;
             let ts = base_timestamp_ms.unwrap_or(0) + offset_ms;
 
-            let _ = event_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
+            if let Err(error) = event_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
                 wave_data, ts as u32,
-            )));
+            ))) {
+                tracing::debug!(%error, "Audio producer stopped with its session");
+                return;
+            }
 
             samples_sent += samples_per_ch as u64;
         }
@@ -164,7 +175,7 @@ pub fn new_shared_audio_tx() -> SharedAudioTx {
 /// Creates a fresh audio channel for each connection so the server survives reconnects.
 pub struct MacAudioFactory {
     shared_tx: SharedAudioTx,
-    event_sender: Option<tokio::sync::mpsc::UnboundedSender<ServerEvent>>,
+    event_sender: Option<ServerEventTx>,
     sample_rate: u32,
     channels: u16,
 }
@@ -209,7 +220,7 @@ impl SoundServerFactory for MacAudioFactory {
 }
 
 impl ServerEventSender for MacAudioFactory {
-    fn set_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<ServerEvent>) {
+    fn set_sender(&mut self, sender: ServerEventTx) {
         self.event_sender = Some(sender);
     }
 }

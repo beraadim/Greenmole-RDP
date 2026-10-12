@@ -1,13 +1,25 @@
 mod config;
+mod metrics_recorder;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use macrdp_core::{ConnectionEvent, ServerEventHandler, ServerStatus};
 use std::io::{IsTerminal, Write};
 
-struct CliEvents;
+struct CliEvents {
+    recorder: std::sync::Mutex<Option<metrics_recorder::MetricsRecorder>>,
+}
 
 impl ServerEventHandler for CliEvents {
+    fn on_metrics(&self, metrics: macrdp_core::Metrics) {
+        let mut recorder = self.recorder.lock().unwrap();
+        if let Some(active) = recorder.as_mut() {
+            if let Err(error) = active.record(&metrics) {
+                tracing::error!(%error, "Benchmark metrics recording stopped");
+                *recorder = None;
+            }
+        }
+    }
     fn on_status_change(&self, status: ServerStatus) {
         tracing::info!(state = %status.state, port = status.port, "Server status changed");
     }
@@ -61,8 +73,15 @@ async fn run() -> Result<()> {
     }
 
     let perf = cli.perf.then(|| macrdp_core::perf_stats::new_shared(true));
-    let server =
-        macrdp_core::server::start_server_with_perf(config, CliEvents, perf.clone()).await?;
+    let events = CliEvents {
+        recorder: std::sync::Mutex::new(
+            cli.metrics_jsonl
+                .as_deref()
+                .map(metrics_recorder::MetricsRecorder::create)
+                .transpose()?,
+        ),
+    };
+    let server = macrdp_core::server::start_server_with_perf(config, events, perf.clone()).await?;
     tracing::info!(port = server.port(), "RDP server ready");
     let result = tokio::select! {
         result = tokio::signal::ctrl_c() => result.context("Failed to wait for Ctrl-C"),

@@ -35,12 +35,14 @@ impl RdpServer {
         let deadline = Instant::now()
             .checked_add(self.handshake_timeout)
             .context("Handshake timeout exceeds the clock's supported range")?;
+        let sender = self.ev_sender.clone();
         tokio::pin!(future);
         loop {
             tokio::select! {
                 biased;
+                reason = sender.failure() => bail!("{stage}: {reason}"),
                 _ = sleep_until(deadline) => bail!("{stage} timed out"),
-                event = receiver.recv() => match event {
+                event = receiver.controls.recv() => match event {
                     Some(ServerEvent::Quit(_)) => {
                         self.quit_requested = true;
                         bail!("server stopped during {stage}");
@@ -54,7 +56,7 @@ impl RdpServer {
                         // rather than allowing revoked credentials to log in.
                         bail!("credentials changed during {stage}");
                     }
-                    Some(_) => tracing::debug!(stage, "Discarding channel event before activation"),
+                    Some(_) => unreachable!("only server controls use this lane"),
                     None => bail!("server control channel closed during {stage}"),
                 },
                 result = &mut future => return result.with_context(|| format!("{stage} failed")),

@@ -66,7 +66,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ironrdp_server::gfx::GfxState;
@@ -79,7 +79,9 @@ use crate::permissions;
 use crate::tls;
 
 mod metrics;
+mod startup;
 use metrics::MetricsSnapshot;
+use startup::{StartupCancellation, StartupSignal};
 
 #[cfg(test)]
 mod tests {
@@ -100,6 +102,7 @@ mod tests {
 
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
+    tls_certificate: tls::TlsCertificateInfo,
     terminal_result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
     display_backend: macrdp_display::DisplayBackend,
     display_controller: macrdp_display::DisplayController,
@@ -111,11 +114,12 @@ pub struct ServerHandle {
     active_connection: Arc<Mutex<Option<ConnectionInfo>>>,
     shutdown_notify: Arc<Notify>,
     stopped: AtomicBool,
+    stop_lock: tokio::sync::Mutex<()>,
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
     metrics_snapshot: Mutex<MetricsSnapshot>,
-    config_tx: tokio::sync::mpsc::UnboundedSender<ConfigUpdate>,
+    config_tx: tokio::sync::mpsc::Sender<ConfigUpdate>,
 }
 
 impl ServerHandle {
@@ -164,12 +168,25 @@ impl ServerHandle {
         self.port
     }
 
+    /// Certificate actually loaded by this server, unaffected by pending settings.
+    pub fn tls_certificate(&self) -> &tls::TlsCertificateInfo {
+        &self.tls_certificate
+    }
+
     /// Current server status.
     pub fn status(&self) -> ServerStatus {
-        if self.stopped.load(Ordering::Relaxed) || self.thread_finished() {
+        if self.stopped.load(Ordering::Acquire)
+            || self.terminal_result.lock().unwrap().is_some()
+            || self.thread_finished()
+        {
             ServerStatus {
                 running: false,
-                state: "stopped".to_string(),
+                state: if !self.stopped.load(Ordering::Acquire) {
+                    "error: RDP server stopped unexpectedly"
+                } else {
+                    "stopped"
+                }
+                .to_string(),
                 uptime_secs: 0,
                 port: Some(self.port),
                 bind_address: Some(self.bind_addr.ip().to_string()),
@@ -210,8 +227,15 @@ impl ServerHandle {
     pub fn update_config(&self, update: ConfigUpdate) -> Result<()> {
         update.validate()?;
         self.config_tx
-            .send(update)
-            .map_err(|_| anyhow::anyhow!("Server configuration worker is no longer running"))
+            .try_send(update)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("Too many pending settings updates; retry shortly")
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("Server configuration worker is no longer running")
+                }
+            })
     }
 
     fn thread_finished(&self) -> bool {
@@ -238,7 +262,8 @@ impl ServerHandle {
 
     /// Gracefully stop the server.
     pub async fn stop(&self) -> Result<()> {
-        if self.stopped.swap(true, Ordering::Relaxed) {
+        let _stop = self.stop_lock.lock().await;
+        if self.stopped.swap(true, Ordering::AcqRel) {
             return Ok(()); // Already stopped
         }
         self.shutdown_notify.notify_one();
@@ -277,12 +302,17 @@ impl Drop for ServerHandle {
         if !self.stopped.load(Ordering::Relaxed) {
             self.shutdown_notify.notify_one();
         }
+        if let Some(task) = self.metrics_task.lock().unwrap().take() {
+            task.abort();
+        }
     }
 }
 
 /// Arguments that are Send-safe, passed to the server thread.
 /// RdpServer itself is !Send, so we pass everything needed to construct it.
 struct ServerThreadArgs {
+    terminal_result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
+    listener: TcpListener,
     perf_stats: Option<crate::perf_stats::SharedPerfStats>,
     display_controller: macrdp_display::DisplayController,
     config: ServerConfig,
@@ -300,42 +330,34 @@ struct ServerThreadArgs {
     active_connection: Arc<Mutex<Option<ConnectionInfo>>>,
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
-    config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
+    config_rx: tokio::sync::mpsc::Receiver<ConfigUpdate>,
 }
 
 /// Try to bind to the given address. If the port is in use, try the next 99 ports.
 /// Returns the successfully bound TcpListener and the actual port.
 fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, u16)> {
-    for offset in 0..100u16 {
-        let port = preferred_port
-            .checked_add(offset)
-            .context("Port number overflow")?;
-        let bind_addr = format!("{addr}:{port}");
-        match TcpListener::bind(&bind_addr) {
+    let last_port = preferred_port.saturating_add(99);
+    for port in preferred_port..=last_port {
+        match TcpListener::bind((addr, port)) {
             Ok(listener) => {
-                if offset > 0 {
+                let actual_port = listener.local_addr()?.port();
+                if actual_port != preferred_port {
                     tracing::warn!(
                         preferred = preferred_port,
-                        actual = port,
+                        actual = actual_port,
                         "Preferred port in use, using alternative"
                     );
                 }
-                return Ok((listener, port));
+                listener.set_nonblocking(true)?;
+                return Ok((listener, actual_port));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                tracing::debug!(port, "Port in use, trying next");
-                continue;
-            }
-            Err(e) => {
-                return Err(e).context(format!("Failed to bind to {bind_addr}"));
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => {
+                return Err(error).context(format!("Failed to bind {addr} on port {port}"))
             }
         }
     }
-    anyhow::bail!(
-        "No available port found in range {}-{}",
-        preferred_port,
-        preferred_port + 99
-    )
+    anyhow::bail!("No available port found in range {preferred_port}-{last_port}")
 }
 
 /// Start the RDP server with the given configuration and event handler.
@@ -353,12 +375,27 @@ pub async fn start_server_with_perf(
     handler: impl ServerEventHandler,
     perf_stats: Option<crate::perf_stats::SharedPerfStats>,
 ) -> Result<Arc<ServerHandle>> {
-    config.validate()?;
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
+    let result = start_server_inner(config, Arc::clone(&handler), perf_stats).await;
+    if let Err(error) = &result {
+        tracing::error!(%error, "RDP server startup failed");
+        handler.on_status_change(ServerStatus {
+            state: "error: RDP server startup failed".into(),
+            ..ServerStatus::default()
+        });
+    }
+    result
+}
 
+async fn start_server_inner(
+    config: ServerConfig,
+    handler: Arc<dyn ServerEventHandler>,
+    perf_stats: Option<crate::perf_stats::SharedPerfStats>,
+) -> Result<Arc<ServerHandle>> {
+    config.validate()?;
     // Notify handler: starting
     handler.on_status_change(ServerStatus {
-        running: true,
+        running: false,
         state: "starting".to_string(),
         uptime_secs: 0,
         port: None,
@@ -370,9 +407,13 @@ pub async fn start_server_with_perf(
     tracing::info!(?perms, "Permission status");
 
     // TLS
-    let (cert_path, key_path) =
-        tls::ensure_tls_files(config.cert_path.as_deref(), config.key_path.as_deref())?;
+    let (cert_path, key_path) = tls::ensure_tls_files(
+        config.cert_path.as_deref(),
+        config.key_path.as_deref(),
+        &config.tls_server_names,
+    )?;
 
+    let tls_certificate = tls::inspect_tls_certificate(&cert_path)?;
     let backend = config.display_backend;
     let display_controller = tokio::task::spawn_blocking(move || {
         macrdp_display::DisplayController::new(backend, 1920, 1080)
@@ -437,15 +478,17 @@ pub async fn start_server_with_perf(
     let bind_host = config.bind_address.as_deref().unwrap_or("0.0.0.0");
     let (listener, port) = find_available_port(bind_host, config.port)?;
     let bind_addr = listener.local_addr()?;
-    // Drop listener so the RDP server can rebind the same port.
-    // IronRDP's RdpServer::with_addr() binds its own socket; we cannot pass
-    // a pre-bound TcpListener. The TOCTOU window is microsecond-level.
-    drop(listener);
+    // Transfer this owned listener to the server thread; never release/rebind the port.
     let shutdown_notify = Arc::new(Notify::new());
-    let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel::<ConfigUpdate>();
+    let mut cancellation = StartupCancellation(Some(Arc::clone(&shutdown_notify)));
+    let (mut ready, ready_rx) = StartupSignal::channel();
+    let (config_tx, config_rx) = tokio::sync::mpsc::channel::<ConfigUpdate>(32);
 
+    let terminal_result = Arc::new(Mutex::new(None));
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
+        terminal_result: Arc::clone(&terminal_result),
+        listener,
         perf_stats,
         display_controller: display_controller.clone(),
         config: config.clone(),
@@ -469,30 +512,20 @@ pub async fn start_server_with_perf(
     // Spawn RDP server on a dedicated OS thread.
     // RdpServer is !Send (contains dyn SoundServerFactory, dyn CliprdrServerFactory),
     // so we construct and run it entirely within this thread.
-    let terminal_result = Arc::new(Mutex::new(None));
     let worker_result = Arc::clone(&terminal_result);
     let server_thread = std::thread::Builder::new()
         .name("rdp-server".into())
         .spawn(move || {
-            *worker_result.lock().unwrap() =
-                Some(run_server_thread(args).map_err(|error| format!("{error:#}")));
+            let result = run_server_thread(args, &mut ready);
+            if let Err(error) = &result {
+                ready.failed(error);
+            }
+            *worker_result.lock().unwrap() = Some(result.map_err(|error| format!("{error:#}")));
         })
         .context("Failed to spawn RDP server thread")?;
 
-    // Spawn metrics ticker (1 second interval) — all types here are Send
-    let metrics_gfx = Arc::clone(&gfx_state);
-    let handler_for_metrics = Arc::clone(&handler);
-    let metrics_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut snapshot = MetricsSnapshot::default();
-        loop {
-            interval.tick().await;
-            let metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
-            handler_for_metrics.on_metrics(metrics);
-        }
-    });
-
     let handle = Arc::new(ServerHandle {
+        tls_certificate,
         terminal_result,
         display_backend: backend,
         display_controller,
@@ -504,20 +537,37 @@ pub async fn start_server_with_perf(
         active_connection,
         shutdown_notify,
         stopped: AtomicBool::new(false),
+        stop_lock: tokio::sync::Mutex::new(()),
         server_thread: Mutex::new(Some(server_thread)),
-        metrics_task: Mutex::new(Some(metrics_task)),
+        metrics_task: Mutex::new(None),
         metrics_snapshot: Mutex::new(MetricsSnapshot::default()),
         config_tx,
     });
 
-    // Notify handler: running
-    handler.on_status_change(ServerStatus {
-        running: true,
-        state: "running".to_string(),
-        uptime_secs: 0,
-        port: Some(port),
-        bind_address: Some(bind_addr.ip().to_string()),
+    if let Err(error) = startup::wait_for_startup(ready_rx, Duration::from_secs(30)).await {
+        // Joining also ensures a failed startup releases its listener before retrying.
+        let _ = handle.stop().await;
+        return Err(error);
+    }
+    cancellation.0 = None;
+    // Spawn metrics ticker (1 second interval) — all types here are Send
+    let metrics_gfx = Arc::clone(&handle.gfx_state);
+    let handler_for_metrics = Arc::clone(&handler);
+    let worker_done = Arc::clone(&handle.terminal_result);
+    let metrics_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut snapshot = MetricsSnapshot::default();
+        loop {
+            interval.tick().await;
+            if worker_done.lock().unwrap().is_some() {
+                break;
+            }
+            let metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
+            handler_for_metrics.on_metrics(metrics);
+        }
     });
+
+    *handle.metrics_task.lock().unwrap() = Some(metrics_task);
 
     Ok(handle)
 }
@@ -525,7 +575,7 @@ pub async fn start_server_with_perf(
 /// Runs the RDP server entirely on the current thread. Called from the dedicated
 /// server thread. Constructs the !Send RdpServer here so it never crosses thread
 /// boundaries.
-fn run_server_thread(args: ServerThreadArgs) -> Result<()> {
+fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Result<()> {
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
     use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
@@ -538,6 +588,8 @@ fn run_server_thread(args: ServerThreadArgs) -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let mut config_rx = args.config_rx;
+        let listener = tokio::net::TcpListener::from_std(args.listener)
+            .context("Failed to register the bound RDP listener")?;
 
         // Load TLS identity (on this thread)
         let tls_identity = match TlsIdentityCtx::init_from_paths(&args.cert_path, &args.key_path) {
@@ -660,7 +712,7 @@ fn run_server_thread(args: ServerThreadArgs) -> Result<()> {
             domain: None,
         }));
 
-        tracing::info!(%args.bind_addr, "RDP server listening");
+        tracing::info!(%args.bind_addr, "RDP listener and TLS identity ready");
 
         // Spawn config hot-update listener
         let gfx_for_config = Arc::clone(&args.gfx_state);
@@ -709,20 +761,39 @@ fn run_server_thread(args: ServerThreadArgs) -> Result<()> {
                     }
                     ConfigUpdate::Credentials { username, password } => {
                         tracing::info!(%username, "Hot-update: credentials");
-                        let _ = ev_sender.send(ironrdp_server::ServerEvent::SetCredentials(
-                            ironrdp_server::Credentials {
-                                username,
-                                password,
-                                domain: None,
-                            },
-                        ));
+                        if let Err(error) =
+                            ev_sender.send(ironrdp_server::ServerEvent::SetCredentials(
+                                ironrdp_server::Credentials {
+                                    username,
+                                    password,
+                                    domain: None,
+                                },
+                            ))
+                        {
+                            tracing::error!(%error, "Credential control channel unavailable");
+                        }
                     }
                 }
             }
         });
 
-        let server_result = tokio::select! {
-            result = server.run() => {
+        let server_result = if let Err(error) = ready.ready() {
+            Err(error)
+        } else {
+            args.handler.on_status_change(ServerStatus {
+                running: true,
+                state: "running".into(),
+                uptime_secs: 0,
+                port: Some(args.bind_addr.port()),
+                bind_address: Some(args.bind_addr.ip().to_string()),
+            });
+            tokio::select! {
+            biased;
+            _ = args.shutdown_notify.notified() => {
+                tracing::info!("Shutdown signal received, stopping server");
+                Ok(())
+            }
+            result = server.run_with_listener(listener) => {
                 if let Err(ref e) = result {
                     tracing::error!("RDP server error: {e}");
                     args.handler.on_status_change(ServerStatus {
@@ -735,11 +806,17 @@ fn run_server_thread(args: ServerThreadArgs) -> Result<()> {
                 }
                 result
             }
-            _ = args.shutdown_notify.notified() => {
-                tracing::info!("Shutdown signal received, stopping server");
-                Ok(())
             }
         };
+
+        // Publish terminal state before native display cleanup so polling/start
+        // cannot mistake a failed worker for a still-running server.
+        *args.terminal_result.lock().unwrap() = Some(
+            server_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}")),
+        );
 
         // Cancelling server.run() during shutdown skips its connection cleanup.
         // Restore the physical display layout explicitly in that path too.

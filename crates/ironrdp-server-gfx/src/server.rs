@@ -53,6 +53,13 @@ mod tests;
 mod connection_control;
 use connection_control::{wait_for_idle_timeout, DEFAULT_HANDSHAKE_TIMEOUT};
 
+#[path = "event_queue.rs"]
+mod event_queue;
+pub use event_queue::{ServerEventRx, ServerEventSendError, ServerEventTx};
+#[path = "output.rs"]
+mod output;
+use output::{SharedWriter, DEFAULT_WRITE_TIMEOUT};
+
 #[derive(Clone)]
 pub struct RdpServerOptions {
     pub addr: SocketAddr,
@@ -256,14 +263,15 @@ pub struct RdpServer {
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
-    ev_sender: mpsc::UnboundedSender<ServerEvent>,
-    ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
+    ev_sender: ServerEventTx,
+    ev_receiver: Arc<Mutex<ServerEventRx>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
+    write_timeout: Duration,
     input_activity: watch::Sender<tokio::time::Instant>,
     quit_requested: bool,
 }
@@ -280,12 +288,12 @@ pub enum ServerEvent {
 }
 
 pub trait ServerEventSender {
-    fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>);
+    fn set_sender(&mut self, sender: ServerEventTx);
 }
 
 impl ServerEvent {
-    pub fn create_channel() -> (mpsc::UnboundedSender<Self>, mpsc::UnboundedReceiver<Self>) {
-        mpsc::unbounded_channel()
+    pub fn create_channel() -> (ServerEventTx, ServerEventRx) {
+        event_queue::channel()
     }
 }
 
@@ -314,6 +322,7 @@ impl RdpServer {
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     ) -> Self {
         let (ev_sender, ev_receiver) = ServerEvent::create_channel();
+        ev_sender.end_session();
         if let Some(cliprdr) = cliprdr_factory.as_mut() {
             cliprdr.set_sender(ev_sender.clone());
         }
@@ -335,6 +344,7 @@ impl RdpServer {
             gfx_enabled: true,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             idle_timeout: None,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             input_activity: watch::channel(tokio::time::Instant::now()).0,
             quit_requested: false,
         }
@@ -359,8 +369,14 @@ impl RdpServer {
         builder::RdpServerBuilder::new()
     }
 
-    pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
+    pub fn event_sender(&self) -> &ServerEventTx {
         &self.ev_sender
+    }
+
+    /// Bound each serialized socket write, including time waiting for another
+    /// channel's write. Values are clamped to 1 ms..5 minutes; default 10 s.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        self.write_timeout = timeout.clamp(Duration::from_millis(1), Duration::from_secs(300));
     }
 
     fn attach_channels(&mut self, acceptor: &mut Acceptor) {
@@ -403,6 +419,14 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        let (_session_guard, sender) = self.ev_sender.start_session();
+        self.ev_receiver.lock().await.data.discard_pending();
+        if let Some(factory) = self.cliprdr_factory.as_mut() {
+            factory.set_sender(sender.clone());
+        }
+        if let Some(factory) = self.sound_factory.as_mut() {
+            factory.set_sender(sender);
+        }
         self.input_activity
             .send_replace(tokio::time::Instant::now());
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
@@ -511,6 +535,12 @@ impl RdpServer {
 
     pub async fn run(&mut self) -> Result<()> {
         let listener = TcpListener::bind(self.opts.addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    /// Serve a listener already bound by the application's startup path.
+    /// Keeping ownership of the socket avoids a release/rebind readiness race.
+    pub async fn run_with_listener(&mut self, listener: TcpListener) -> Result<()> {
         let local_addr = listener.local_addr()?;
 
         debug!("Listening for connections on {local_addr}");
@@ -520,6 +550,7 @@ impl RdpServer {
             let ev_receiver = Arc::clone(&self.ev_receiver);
             let mut ev_receiver = ev_receiver.lock().await;
             tokio::select! {
+                biased;
                 Some(event) = ev_receiver.recv() => {
                     match event {
                         ServerEvent::Quit(reason) => {
@@ -537,7 +568,8 @@ impl RdpServer {
                         }
                     }
                 },
-                Ok((stream, peer)) = listener.accept() => {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted.context("Failed to accept RDP connection")?;
                     debug!(?peer, "Received connection");
                     drop(ev_receiver);
                     if let Err(error) = self.run_connection(stream).await {
@@ -748,12 +780,7 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
     ) -> Result<RunState> {
-        // Avoid wave message queuing up and causing extra delays.
-        // This is a naive solution, better solutions should compute the actual delay, add IO priority, encode audio, use UDP etc.
-        // 4 frames should roughly corresponds to hundreds of ms in regular setups.
-        let mut wave_limit = 4;
         for event in events.drain(..) {
-            trace!(?event, "Dispatching");
             match event {
                 ServerEvent::Quit(reason) => {
                     debug!("Got quit event: {reason}");
@@ -773,11 +800,6 @@ impl RdpServer {
                     };
                     let msgs = match s {
                         RdpsndServerMessage::Wave(data, ts) => {
-                            if wave_limit == 0 {
-                                debug!("Dropping wave");
-                                continue;
-                            }
-                            wave_limit -= 1;
                             match rdpsnd.wave(data, ts) {
                                 Ok(msgs) => msgs,
                                 Err(e) => {
@@ -885,20 +907,15 @@ impl RdpServer {
             display.activate_size(desktop_size);
             display.updates().await?
         };
-        // Capture creation commits the input transform. Replay input received
-        // during activation only after it uses the newly negotiated desktop.
-        if !input_events.is_empty() {
-            debug!("Handling input event backlog from acceptor sequence");
-            self.handle_input_backlog(writer, io_channel_id, user_channel_id, input_events)
-                .await?;
-        }
-        let mut writer = SharedWriter::new(writer);
+        let mut writer = SharedWriter::new(writer, self.write_timeout);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let gfx_state = Arc::clone(&self.gfx_state);
         let idle_timeout = self.idle_timeout;
         let activity = self.input_activity.subscribe();
+        let event_sender = self.ev_sender.clone();
+        let local_addr = self.local_addr;
 
         // Update GFX state with current desktop size
         {
@@ -912,9 +929,18 @@ impl RdpServer {
 
         let s = Rc::new(Mutex::new(self));
         let quit_received = Rc::new(std::cell::Cell::new(false));
+        let changed_credentials = Rc::new(std::cell::RefCell::new(None));
 
         let this = Rc::clone(&s);
         let dispatch_pdu = async move {
+            // Capture creation commits the input transform. Replay activation
+            // input afterward, inside the cancellable session driver.
+            if !input_events.is_empty() {
+                this.lock()
+                    .await
+                    .handle_input_backlog(&mut writer, io_channel_id, user_channel_id, input_events)
+                    .await?;
+            }
             loop {
                 let (action, bytes) = reader.read_pdu().await?;
                 let mut this = this.lock().await;
@@ -967,26 +993,36 @@ impl RdpServer {
 
         let this = Rc::clone(&s);
         let event_quit_received = Rc::clone(&quit_received);
+        let event_credentials = Rc::clone(&changed_credentials);
         let mut ev_receiver = ev_receiver.lock().await;
-        let dispatch_events = async move {
-            let mut events = Vec::with_capacity(100);
+        let ServerEventRx { controls, data } = &mut *ev_receiver;
+        let dispatch_controls = async move {
             loop {
-                let nevents = ev_receiver.recv_many(&mut events, 100).await;
-                if nevents == 0 {
-                    debug!("No sever events.. stopping");
-                    break Ok(RunState::Disconnect);
+                match controls.recv().await {
+                    Some(ServerEvent::Quit(_)) | None => {
+                        event_quit_received.set(true);
+                        break Ok(RunState::Disconnect);
+                    }
+                    Some(ServerEvent::GetLocalAddr(reply)) => {
+                        let _ = reply.send(local_addr);
+                    }
+                    Some(ServerEvent::SetCredentials(credentials)) => {
+                        // Apply after the other futures drop their server lock.
+                        // Revoked credentials must not retain an active session.
+                        *event_credentials.borrow_mut() = Some(credentials);
+                        break Ok(RunState::Disconnect);
+                    }
+                    Some(_) => unreachable!("only server controls use this lane"),
                 }
-                // Bound each batch so continuous audio/clipboard traffic
-                // cannot prevent input and shutdown from being dispatched.
-                if events
-                    .iter()
-                    .any(|event| matches!(event, ServerEvent::Quit(_)))
-                {
-                    // Do not wait for a handler holding the server lock while
-                    // a peer has stopped reading its channel response.
-                    event_quit_received.set(true);
+            }
+        };
+        let dispatch_events = async move {
+            let mut events = Vec::with_capacity(1);
+            loop {
+                let Some(event) = data.recv().await else {
                     break Ok(RunState::Disconnect);
-                }
+                };
+                events.push(event);
                 let mut this = this.lock().await;
                 match this
                     .dispatch_server_events(&mut events, &mut event_writer, user_channel_id)
@@ -999,17 +1035,23 @@ impl RdpServer {
         };
 
         let (source, state) = tokio::select!(
-            state = dispatch_pdu => ("pdu", state),
-            state = dispatch_display => ("display", state),
-            state = dispatch_events => ("events", state),
+            biased;
+            state = dispatch_controls => ("control", state),
+            reason = event_sender.failure() => ("output-queue", Err(anyhow!(reason))),
             _ = wait_for_idle_timeout(activity, idle_timeout) => {
                 info!(?idle_timeout, "Disconnecting inactive session");
                 ("idle-timeout", Ok(RunState::Disconnect))
             },
+            state = dispatch_pdu => ("pdu", state),
+            state = dispatch_display => ("display", state),
+            state = dispatch_events => ("events", state),
         );
 
         if quit_received.get() {
             s.lock().await.quit_requested = true;
+        }
+        if let Some(credentials) = changed_credentials.borrow_mut().take() {
+            s.lock().await.set_credentials(Some(credentials));
         }
 
         match &state {
@@ -1095,6 +1137,7 @@ impl RdpServer {
             );
         }
         if !result.reactivation {
+            let mut responses = Vec::new();
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
@@ -1103,8 +1146,17 @@ impl RdpServer {
                 let svc_responses = channel.start()?;
                 let response =
                     server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
-                writer.write_all(&response).await?;
+                responses.push(response);
             }
+            let write_timeout = self.write_timeout;
+            self.await_connection_stage("channel startup", async {
+                let mut writer = SharedWriter::new(writer, write_timeout);
+                for response in responses {
+                    writer.write_all(&response).await?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         if !result.reactivation {
@@ -1238,7 +1290,7 @@ impl RdpServer {
                 Ok(Action::X224) => {
                     let _ = self
                         .handle_x224(writer, io_channel_id, user_channel_id, &frame)
-                        .await;
+                        .await?;
                 }
 
                 // the frame here is always valid, because otherwise it would
@@ -1513,43 +1565,4 @@ async fn deactivate_all(
 
 fn encode_cliprdr_pdu(pdu: ClipboardPdu<'static>) -> SvcMessage {
     SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL)
-}
-
-struct SharedWriter<'w, W: FramedWrite> {
-    writer: Rc<Mutex<&'w mut W>>,
-}
-
-impl<W: FramedWrite> Clone for SharedWriter<'_, W> {
-    fn clone(&self) -> Self {
-        Self {
-            writer: Rc::clone(&self.writer),
-        }
-    }
-}
-
-impl<W> FramedWrite for SharedWriter<'_, W>
-where
-    W: FramedWrite,
-{
-    type WriteAllFut<'write>
-        = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'write>>
-    where
-        Self: 'write;
-
-    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
-        Box::pin(async {
-            let mut writer = self.writer.lock().await;
-
-            writer.write_all(buf).await?;
-            Ok(())
-        })
-    }
-}
-
-impl<'a, W: FramedWrite> SharedWriter<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
-        Self {
-            writer: Rc::new(Mutex::new(writer)),
-        }
-    }
 }

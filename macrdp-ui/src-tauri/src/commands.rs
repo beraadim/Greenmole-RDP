@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use tauri::Emitter;
 use tauri::Manager;
@@ -14,11 +14,18 @@ pub async fn ensure_server_running(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
 ) -> Result<(), String> {
-    {
-        let guard = state.server_handle.lock().await;
-        if guard.is_some() {
-            tracing::info!("Server already running");
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    let previous = {
+        let mut guard = state.server_handle.lock().await;
+        if guard.as_ref().is_some_and(|handle| handle.status().running) {
             return Ok(());
+        }
+        guard.take()
+    };
+    let generation = state.server_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some(previous) = previous {
+        if let Err(error) = previous.stop().await {
+            tracing::warn!(%error, "Reaped a failed server before restarting");
         }
     }
 
@@ -30,11 +37,23 @@ pub async fn ensure_server_running(
     let _ = app.emit("server-status", &*state.status.lock().await);
 
     let config = state.ui_config.lock().await.to_server_config();
-    let bridge = TauriEventBridge::new(app.clone());
+    let bridge = TauriEventBridge::new(app.clone(), generation);
 
-    let handle = macrdp_core::start_server(config, bridge)
-        .await
-        .map_err(|e| format!("Failed to start server: {}", e))?;
+    let handle = match macrdp_core::start_server(config, bridge).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Invalidate any queued startup events before publishing the failure.
+            state.server_generation.fetch_add(1, Ordering::AcqRel);
+            let mut status = state.status.lock().await;
+            *status = macrdp_core::ServerStatus {
+                state: "error: RDP server startup failed".into(),
+                ..Default::default()
+            };
+            let _ = app.emit("server-status", &*status);
+            crate::tray::update_tray_status(app, "stopped", &macrdp_core::Metrics::default());
+            return Err(format!("Failed to start server: {error}"));
+        }
+    };
 
     let port = handle.port();
     tracing::info!(port, "Server started successfully");
@@ -66,6 +85,13 @@ pub async fn stop_server(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     tracing::info!("stop_server called");
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    stop_running_server(&app, state.inner()).await
+}
+
+/// Caller holds the lifecycle lock, including settings failures that require a safe stop.
+async fn stop_running_server(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    state.server_generation.fetch_add(1, Ordering::AcqRel);
 
     // Take the handle out
     let handle = {
@@ -73,12 +99,14 @@ pub async fn stop_server(
         guard.take()
     };
 
-    if let Some(handle) = handle {
+    let stop_result = if let Some(handle) = handle {
         handle
             .stop()
             .await
-            .map_err(|e| format!("Failed to stop server: {}", e))?;
-    }
+            .map_err(|error| format!("Failed to stop server: {error}"))
+    } else {
+        Ok(())
+    };
 
     // Update status
     {
@@ -101,7 +129,10 @@ pub async fn stop_server(
         connections.clear();
     }
 
-    Ok(())
+    crate::tray::update_tray_status(app, "stopped", &macrdp_core::Metrics::default());
+    let _ = app.emit("metrics", &macrdp_core::Metrics::default());
+    let _ = app.emit("connections", Vec::<crate::state::Connection>::new());
+    stop_result
 }
 
 #[tauri::command]
@@ -191,6 +222,32 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<serde_json::V
 }
 
 #[tauri::command]
+pub async fn get_tls_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    {
+        let handles = state.server_handle.lock().await;
+        if let Some(handle) = handles.as_ref().filter(|handle| handle.status().running) {
+            return Ok(
+                serde_json::json!({"certificate": handle.tls_certificate(), "source": "running", "error": null}),
+            );
+        }
+    }
+    let cert_path = state.ui_config.lock().await.to_server_config().cert_path;
+    let result = tokio::task::spawn_blocking(move || {
+        macrdp_core::tls::inspect_configured_tls_certificate(cert_path.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(match result {
+        Ok(certificate) => {
+            serde_json::json!({"certificate": certificate, "source": "configured", "error": null})
+        }
+        Err(error) => {
+            serde_json::json!({"certificate": null, "source": "configured", "error": error.to_string()})
+        }
+    })
+}
+
+#[tauri::command]
 pub async fn set_config(
     app: tauri::AppHandle,
     key: String,
@@ -198,6 +255,7 @@ pub async fn set_config(
     state: State<'_, Arc<AppState>>,
 ) -> Result<SetConfigResponse, String> {
     tracing::info!(%key, "Updating configuration");
+    let _lifecycle = state.lifecycle_lock.lock().await;
 
     let running_backend = state
         .server_handle
@@ -230,78 +288,59 @@ pub async fn set_config(
 
     // Display ownership changes apply on the next server start. Persist them
     // without changing the current display or moving its windows mid-session.
-    if !restart_required {
-        let guard = state.server_handle.lock().await;
-        if let Some(handle) = guard.as_ref() {
-            let config = state.ui_config.lock().await;
-            match key.as_str() {
-                "frame_rate" => {
-                    handle.update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate))
-                }
-                "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(
-                    config
-                        .bitrate_mbps
-                        .checked_mul(1000)
-                        .ok_or("Bitrate is out of range")?,
-                )),
-                "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(
-                    config.log_level.clone(),
-                )),
-                "show_cursor" => {
-                    handle.update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor))
-                }
-                "resolution" | "hidpi_scale" => handle.update_config(
-                    macrdp_core::ConfigUpdate::Resolution(config.resolution.clone()),
-                ),
-                "encoder" => {
-                    handle.update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone()))
-                }
-                "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(
-                    config.chroma_mode.clone(),
-                )),
-                "gfx_validation_mode" => handle.update_config(
-                    macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode),
-                ),
-                "username" | "password" => {
-                    handle.update_config(macrdp_core::ConfigUpdate::Credentials {
-                        username: config.username.clone(),
-                        password: config.password.clone(),
-                    })
-                }
-                // port: auto-restart needed (can't rebind TCP listener)
-                "port" => Ok(()), // handled below
-                _ => Ok(()),
-            }
-            .map_err(|error| error.to_string())?;
-        }
-    }
-
-    // Seamless port migration: start new port first, then stop old
-    if key == "port" && !restart_required {
-        let old_handle = state.server_handle.lock().await.clone();
-        if old_handle.is_some() {
-            tracing::info!("Port changed, starting new listener before releasing old");
-            let config = state.ui_config.lock().await.to_server_config();
-            let bridge = TauriEventBridge::new(app.clone());
-            match macrdp_core::start_server(config, bridge).await {
-                Ok(new_handle) => {
-                    let new_port = new_handle.port();
-                    // Swap: store new handle, then stop old
-                    let old = {
-                        let mut guard = state.server_handle.lock().await;
-                        guard.replace(new_handle)
-                    };
-                    if let Some(old) = old {
-                        let old_port = old.port();
-                        let _ = old.stop().await;
-                        tracing::info!(old_port, new_port, "Seamless port migration complete");
+    let live_result =
+        if !restart_required {
+            let guard = state.server_handle.lock().await;
+            if let Some(handle) = guard.as_ref() {
+                let config = state.ui_config.lock().await;
+                match key.as_str() {
+                    "frame_rate" => handle
+                        .update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate)),
+                    "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(
+                        config
+                            .bitrate_mbps
+                            .checked_mul(1000)
+                            .ok_or("Bitrate is out of range")?,
+                    )),
+                    "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(
+                        config.log_level.clone(),
+                    )),
+                    "show_cursor" => handle
+                        .update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor)),
+                    "resolution" | "hidpi_scale" => handle.update_config(
+                        macrdp_core::ConfigUpdate::Resolution(config.resolution.clone()),
+                    ),
+                    "encoder" => handle
+                        .update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
+                    "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(
+                        config.chroma_mode.clone(),
+                    )),
+                    "gfx_validation_mode" => handle.update_config(
+                        macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode),
+                    ),
+                    "username" | "password" => {
+                        handle.update_config(macrdp_core::ConfigUpdate::Credentials {
+                            username: config.username.clone(),
+                            password: config.password.clone(),
+                        })
                     }
+                    _ => Ok(()),
                 }
-                Err(e) => {
-                    tracing::error!("Failed to start on new port: {e}, keeping old");
-                }
+                .map_err(|error| error.to_string())
+            } else {
+                Ok(())
             }
+        } else {
+            Ok(())
+        };
+    if let Err(error) = live_result {
+        // Preferences are already durably saved. Stop the old listener rather than
+        // leaving it accepting an obsolete password after a rejected live update.
+        tracing::error!(%key, %error, "Saved setting could not be applied; stopping server");
+        if let Err(stop_error) = stop_running_server(&app, state.inner()).await {
+            tracing::error!(%stop_error, "Cleanup after failed settings update");
         }
+        return Err(format!("Setting saved, but the server was stopped because it could not apply the change: {error}. Start the server to use the saved settings."));
     }
 
     Ok(SetConfigResponse { restart_required })
@@ -368,6 +407,8 @@ pub async fn quit_app(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    state.server_generation.fetch_add(1, Ordering::AcqRel);
     // Stop the server if running
     let handle = {
         let mut guard = state.server_handle.lock().await;

@@ -12,9 +12,7 @@
 
 use std::path::PathBuf;
 
-use objc2_app_kit::{
-    NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
-};
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
 use objc2_foundation::{NSData, NSString};
 use tracing::{debug, warn};
 
@@ -82,29 +80,20 @@ impl PasteboardBridge {
         }
     }
 
-    /// Read image data from the pasteboard as PNG bytes.
-    ///
-    /// Tries PNG first, then falls back to TIFF (converting to PNG via the
-    /// `image` crate).
+    /// Read encoded PNG/TIFF/JPEG bytes. The converter validates dimensions and
+    /// decoding budgets; check NSData length here before creating a Rust copy.
     pub fn read_image(&self) -> Option<Vec<u8>> {
         let pb = NSPasteboard::generalPasteboard();
-
-        // Try PNG first.
-        let png_type: &NSString = unsafe { NSPasteboardTypePNG };
-        if let Some(data) = pb.dataForType(png_type) {
-            return Some(data.to_vec());
-        }
-
-        // Fallback: TIFF -> PNG via image crate.
-        let tiff_type: &NSString = unsafe { NSPasteboardTypeTIFF };
-        if let Some(data) = pb.dataForType(tiff_type) {
-            let bytes = data.to_vec();
-            match tiff_to_png(&bytes) {
-                Ok(png) => return Some(png),
-                Err(e) => warn!("pasteboard: failed to convert TIFF to PNG: {e}"),
+        for uti in ["public.png", "public.tiff", "public.jpeg"] {
+            let image_type = NSString::from_str(uti);
+            if let Some(data) = pb.dataForType(&image_type) {
+                if data.length() > crate::formats::MAX_IMAGE_PAYLOAD_BYTES {
+                    warn!("pasteboard: image payload exceeds clipboard limit");
+                    continue;
+                }
+                return Some(data.to_vec());
             }
         }
-
         None
     }
 
@@ -306,15 +295,4 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-/// Convert raw TIFF bytes to PNG bytes using the `image` crate.
-fn tiff_to_png(tiff: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use image::ImageFormat;
-    use std::io::Cursor;
-
-    let img = image::load_from_memory_with_format(tiff, ImageFormat::Tiff)?;
-    let mut out = Vec::new();
-    img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)?;
-    Ok(out)
 }

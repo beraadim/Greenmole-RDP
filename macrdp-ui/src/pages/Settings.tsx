@@ -1,3 +1,4 @@
+import { CertificateSettings } from "../components/CertificateSettings";
 import { useState, useEffect } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { api } from "../lib/ipc";
@@ -30,6 +31,7 @@ type CategoryId = (typeof categories)[number]["id"];
 function Settings() {
   const [config, setConfig] = useState<UiConfig | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<CategoryId>("rdp");
   const { theme, setTheme } = useTheme();
 
@@ -39,13 +41,17 @@ function Settings() {
 
   const updateConfig = async (key: keyof UiConfig, value: unknown) => {
     try {
+      setSettingsError(null);
       const result = await api.setConfig(key, value);
       if (result.restart_required) {
         setRestartRequired(true);
       }
       setConfig((prev) => (prev ? { ...prev, [key]: value } : prev));
+      return true;
     } catch (err) {
-      console.error("Failed to update config:", err);
+      setSettingsError(String(err));
+      api.getConfig().then(setConfig).catch(console.error);
+      return false;
     }
   };
 
@@ -87,6 +93,7 @@ function Settings() {
 
       {/* Right panel */}
       <div className="flex-1 overflow-y-auto p-4">
+        {settingsError && <p role="alert" className="mb-3 text-xs text-red-600 dark:text-red-400">{settingsError}</p>}
         {/* Restart required banner */}
         {restartRequired && (
           <Alert
@@ -258,6 +265,7 @@ function Settings() {
                 className="h-7 w-[120px] text-xs"
               />
             </SettingRow>
+            <CertificateSettings config={config} save={updateConfig} />
           </CategorySection>
         )}
 

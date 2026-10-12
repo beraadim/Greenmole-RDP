@@ -79,6 +79,37 @@ mod tests {
 }
 
 impl BitmapEncoder {
+    /// Size the initial output from visible pixels, not the source stride. A
+    /// narrow dirty region can still borrow rows with a full-desktop stride.
+    /// RDP6 normally fits within raw pixels plus per-chunk headers; callers may
+    /// grow the output if an incompressible stream exceeds this estimate.
+    pub(crate) fn initial_output_size(bitmap: &BitmapUpdate) -> Result<usize, BitmapEncodeError> {
+        let row_bytes =
+            usize::from(bitmap.width.get()) * usize::from(bitmap.format.bytes_per_pixel());
+        if row_bytes == 0 || row_bytes > usize::from(u16::MAX) {
+            return Err(BitmapEncodeError::Encode(invalid_field_err!(
+                "bitmap",
+                "Row exceeds bitmap header bounds"
+            )));
+        }
+        let rows_per_chunk = usize::from(u16::MAX) / row_bytes;
+        let height = usize::from(bitmap.height.get());
+        // TS_UPDATE_BITMAP_DATA header (4), TS_BITMAP_DATA (18) and optional
+        // TS_CD_HEADER (8). Arithmetic stays checked even on 32-bit targets.
+        row_bytes
+            .checked_mul(height)
+            .and_then(|pixels| {
+                height
+                    .div_ceil(rows_per_chunk)
+                    .checked_mul(26)
+                    .and_then(|headers| pixels.checked_add(headers))
+            })
+            .and_then(|size| size.checked_add(4))
+            .ok_or_else(|| {
+                BitmapEncodeError::Encode(invalid_field_err!("bitmap", "Output size overflow"))
+            })
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             buffer: vec![0; usize::from(u16::MAX)],

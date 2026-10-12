@@ -139,6 +139,7 @@ pub fn run() {
             commands::get_permissions,
             commands::get_input_debug_state,
             commands::get_config,
+            commands::get_tls_status,
             commands::set_config,
             commands::get_logs,
             commands::get_connection_history,

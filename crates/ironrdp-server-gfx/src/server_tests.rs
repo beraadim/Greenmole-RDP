@@ -37,16 +37,42 @@ async fn pending_authentication_services_address_requests_and_quit() {
     let (reply, address) = oneshot::channel();
     let events = server.event_sender().clone();
     events.send(ServerEvent::GetLocalAddr(reply)).unwrap();
-    events
-        .send(ServerEvent::Quit("test shutdown".into()))
-        .unwrap();
-    let error = server
-        .await_connection_stage("test authentication", std::future::pending::<Result<()>>())
-        .await
-        .unwrap_err();
+    let expected_address = server.local_addr;
+    let request_shutdown = async {
+        assert_eq!(address.await.unwrap(), expected_address);
+        events
+            .send(ServerEvent::Quit("test shutdown".into()))
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(
+        server.await_connection_stage("test authentication", std::future::pending::<Result<()>>()),
+        request_shutdown,
+    );
+    let error = result.unwrap_err();
     assert!(error.to_string().contains("server stopped"));
-    assert_eq!(address.await.unwrap(), server.local_addr);
     assert!(server.quit_requested);
+}
+
+#[tokio::test]
+async fn channel_startup_preserves_queued_protocol_messages() {
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+    let (_session, sender) = server.ev_sender.start_session();
+    sender
+        .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Close))
+        .unwrap();
+    server
+        .await_connection_stage("channel startup", async { Ok(()) })
+        .await
+        .unwrap();
+    assert!(matches!(
+        server.ev_receiver.lock().await.try_recv(),
+        Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Close))
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -99,6 +125,145 @@ async fn session_quit_stops_the_listener_after_disconnect() {
         RunState::Disconnect
     );
     assert!(server.quit_requested);
+}
+
+#[tokio::test]
+async fn prebound_listener_is_served_without_rebinding() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut server = RdpServer::builder()
+        .with_addr(address)
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .build();
+    server
+        .event_sender()
+        .send(ServerEvent::Quit("test".into()))
+        .unwrap();
+    server.run_with_listener(listener).await.unwrap();
+    assert_eq!(server.local_addr, Some(address));
+}
+
+struct ResizeOutput;
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for ResizeOutput {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: 800,
+            height: 600,
+        }
+    }
+
+    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        Ok(Box::new(Self))
+    }
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for ResizeOutput {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        Ok(Some(DisplayUpdate::Resize(DesktopSize {
+            width: 1024,
+            height: 768,
+        })))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn query_and_quit_interrupt_a_stalled_display_write() {
+    use tokio::io::AsyncReadExt as _;
+    let mut server = resize_test_server(Box::new(ResizeOutput));
+    let sender = server.event_sender().clone();
+    server.local_addr = Some(([127, 0, 0, 1], 3389).into());
+    let expected_address = server.local_addr;
+    let (stream, mut peer) = tokio::io::duplex(1);
+    let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+    let size = DesktopSize {
+        width: 800,
+        height: 600,
+    };
+    let encoder = UpdateEncoder::new(size, CmdFlags::empty(), UpdateEncoderCodecs::new()).unwrap();
+    let controls = async {
+        // Receiving a prefix proves the resize PDU write started. Leaving the
+        // rest unread keeps that write blocked while the controls arrive.
+        let mut prefix = [0];
+        peer.read_exact(&mut prefix).await.unwrap();
+        let (query, reply) = oneshot::channel();
+        sender.send(ServerEvent::GetLocalAddr(query)).unwrap();
+        assert_eq!(reply.await.unwrap(), expected_address);
+        sender
+            .send(ServerEvent::Quit("test shutdown".into()))
+            .unwrap();
+    };
+    let started = tokio::time::Instant::now();
+    let (state, ()) = tokio::join!(
+        server.client_loop(
+            &mut reader,
+            &mut writer,
+            1003,
+            1002,
+            encoder,
+            size,
+            Vec::new()
+        ),
+        controls,
+    );
+    assert_eq!(state.unwrap(), RunState::Disconnect);
+    assert!(server.quit_requested);
+    assert!(started.elapsed() < DEFAULT_WRITE_TIMEOUT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn output_queue_failure_interrupts_a_stalled_display_write() {
+    use tokio::io::AsyncReadExt as _;
+    let mut server = resize_test_server(Box::new(ResizeOutput));
+    let (_session, sender) = server.ev_sender.start_session();
+    let (stream, mut peer) = tokio::io::duplex(1);
+    let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+    let size = DesktopSize {
+        width: 800,
+        height: 600,
+    };
+    let encoder = UpdateEncoder::new(size, CmdFlags::empty(), UpdateEncoderCodecs::new()).unwrap();
+    let congest = async {
+        let mut prefix = [0];
+        peer.read_exact(&mut prefix).await.unwrap();
+        // A synchronous native callback burst outruns a blocked dispatcher.
+        let mut rejected = false;
+        for _ in 0..300 {
+            if sender
+                .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Close))
+                .is_err()
+            {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+    };
+    let started = tokio::time::Instant::now();
+    let (state, ()) = tokio::join!(
+        server.client_loop(
+            &mut reader,
+            &mut writer,
+            1003,
+            1002,
+            encoder,
+            size,
+            Vec::new()
+        ),
+        congest,
+    );
+    assert!(state
+        .unwrap_err()
+        .to_string()
+        .contains("output event queue"));
+    assert!(started.elapsed() < DEFAULT_WRITE_TIMEOUT);
+    assert!(!server.quit_requested);
 }
 
 #[derive(Default)]
@@ -346,7 +511,7 @@ async fn verify_display_control_resize(gfx_enabled: bool) {
     .unwrap();
     assert!(channels.process(&request).unwrap().is_empty());
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), sizes.recv())
+        tokio::time::timeout(Duration::from_secs(1), sizes.recv())
             .await
             .unwrap(),
         Some(DesktopSize {

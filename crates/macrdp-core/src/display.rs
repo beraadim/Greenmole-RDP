@@ -1,4 +1,5 @@
 mod event_wait;
+mod idle_policy;
 use event_wait::DisplayWake;
 
 use anyhow::{Context, Result};
@@ -318,23 +319,6 @@ fn fingerprint_uncompressed_rects(rects: &[UncompressedRect]) -> u64 {
     hasher.finish()
 }
 
-fn fingerprint_bitmap_update(update: &BitmapUpdate) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    update.x.hash(&mut hasher);
-    update.y.hash(&mut hasher);
-    update.width.get().hash(&mut hasher);
-    update.height.get().hash(&mut hasher);
-    update.stride.get().hash(&mut hasher);
-    for rect in &update.dirty_rects {
-        rect.x.hash(&mut hasher);
-        rect.y.hash(&mut hasher);
-        rect.width.hash(&mut hasher);
-        rect.height.hash(&mut hasher);
-    }
-    update.data.as_ref().hash(&mut hasher);
-    hasher.finish()
-}
-
 fn fingerprint_cursor_shape(shape: &CursorShape) -> u64 {
     let mut hasher = DefaultHasher::new();
     shape.width.hash(&mut hasher);
@@ -385,33 +369,6 @@ fn cursor_shape_to_pointer(shape: CursorShape) -> ironrdp_server::ColorPointer {
         and_mask,
         xor_mask,
     }
-}
-
-fn should_suppress_recent_fingerprint(
-    recent: &mut VecDeque<(u64, Instant)>,
-    fingerprint: u64,
-    now: Instant,
-    window: Duration,
-    capacity: usize,
-) -> bool {
-    while let Some((_, seen_at)) = recent.front() {
-        if now.duration_since(*seen_at) > window {
-            recent.pop_front();
-        } else {
-            break;
-        }
-    }
-
-    if recent.iter().any(|(fp, _)| *fp == fingerprint) {
-        return true;
-    }
-
-    recent.push_back((fingerprint, now));
-    while recent.len() > capacity {
-        recent.pop_front();
-    }
-
-    false
 }
 
 fn should_fallback_from_gfx_avc_no_ack(
@@ -1008,6 +965,8 @@ impl RdpServerDisplay for MacDisplay {
             skip_next_frame: false,
             overload_count: 0,
             idle_frame_count: 0,
+            idle_since: None,
+            last_idle_refresh_attempt: Instant::now(),
             last_idr_time: Instant::now(),
             last_frame_cache: None,
             last_cursor_fingerprint: None,
@@ -1068,8 +1027,6 @@ impl CachedFrame {
     }
 }
 
-/// IDR keepalive interval during idle scenes (seconds).
-const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(75);
 
 struct MacDisplayUpdates {
@@ -1088,6 +1045,9 @@ struct MacDisplayUpdates {
     overload_count: u64,
     /// Consecutive idle events from SCK (desktop unchanged).
     idle_frame_count: u32,
+    idle_since: Option<Instant>,
+    /// Rate-limit retries too: an unavailable encoder must not spin on cursor wakes.
+    last_idle_refresh_attempt: Instant,
     /// When the last IDR keyframe was sent (natural or keepalive).
     last_idr_time: Instant,
     /// Cached last frame for idle IDR re-encoding.
@@ -1240,19 +1200,31 @@ impl MacDisplayUpdates {
 
             // Capture events and timers all return to this outer loop. A cursor
             // timeout must advance its deadline even when the desktop is idle.
-            let idle_deadline = if self.idle_frame_count > 0 && self.last_frame_cache.is_some() {
-                let elapsed = self.last_idr_time.elapsed();
-                if elapsed >= IDLE_IDR_INTERVAL {
-                    if let Some(update) = self.send_idle_idr() {
-                        return Ok(Some(update));
-                    }
-                    None
+            let idle_deadline = self.idle_since.and_then(|idle_since| {
+                self.last_frame_cache.as_ref()?;
+                idle_policy::refresh_delay(
+                    idle_since.elapsed(),
+                    self.last_idr_time
+                        .max(self.last_idle_refresh_attempt)
+                        .elapsed(),
+                    self.needs_conservative_idle_recovery(),
+                    self.client_may_be_stale || self.needs_full_gfx_seed,
+                )
+            });
+            if idle_deadline == Some(Duration::ZERO) {
+                self.last_idle_refresh_attempt = Instant::now();
+                let update = if self.client_may_be_stale {
+                    // This already tries AVC before the uncompressed/bitmap
+                    // recovery paths. Do not retry a failed encode twice.
+                    self.send_cached_full_frame_recovery()
                 } else {
-                    Some(IDLE_IDR_INTERVAL - elapsed)
+                    self.send_idle_idr()
+                };
+                if let Some(update) = update {
+                    return Ok(Some(update));
                 }
-            } else {
-                None
-            };
+                continue;
+            }
             let cursor_deadline = self.cursor_poll_timeout();
             let event = match event_wait::next_event(
                 self.capturer.next_frame(),
@@ -1269,12 +1241,9 @@ impl MacDisplayUpdates {
                     continue 'updates;
                 }
                 DisplayWake::Cursor => continue 'updates,
-                DisplayWake::Idle => {
-                    if let Some(update) = self.send_idle_idr() {
-                        return Ok(Some(update));
-                    }
-                    continue 'updates;
-                }
+                // Re-evaluate current recovery state and rate-limit attempts in
+                // the same outer-loop path used by capture and cursor wakes.
+                DisplayWake::Idle => continue 'updates,
             };
             let frame = {
                 // Handle idle events (desktop unchanged)
@@ -1294,36 +1263,48 @@ impl MacDisplayUpdates {
                                 .unwrap()
                                 .record_capture(delivery.queue_ms, delivery.coalesced_frames);
                         }
-                        // Desktop became active — reset idle counter
-                        if self.idle_frame_count > 0 {
-                            tracing::debug!(
-                                idle_frames = self.idle_frame_count,
-                                "Desktop active again — forcing keyframe for clean recovery"
+                        if let Some(idle_since) = self.idle_since.take() {
+                            let idle_for = idle_since.elapsed();
+                            let action = idle_policy::resume_action(
+                                idle_for,
+                                self.needs_conservative_idle_recovery(),
+                                self.client_may_be_stale || self.needs_full_gfx_seed,
                             );
-                            if let Some(enc) = &mut self.encoder {
-                                enc.force_keyframe();
+                            if action.full_refresh {
+                                if let Some(enc) = &mut self.encoder {
+                                    enc.force_keyframe();
+                                }
+                                self.request_full_bitmap_updates(1);
+                                self.needs_full_gfx_seed = true;
                             }
-                            self.request_full_bitmap_updates(1);
-                            self.needs_full_gfx_seed = true;
-
-                            // Reset BitrateController and restore initial bitrate/fps
-                            self.bitrate_ctrl.on_idle_recovery();
-                            if let Some(enc) = &mut self.encoder {
-                                enc.set_bitrate(self.bitrate_ctrl.current_bitrate());
+                            if action.reset_adaptation {
+                                self.bitrate_ctrl.on_idle_recovery();
+                                if let Some(enc) = &mut self.encoder {
+                                    enc.set_bitrate(self.bitrate_ctrl.current_bitrate());
+                                }
+                                self.apply_capture_fps(
+                                    self.bitrate_ctrl.target_fps(),
+                                    "idle-recovery",
+                                );
                             }
-                            let target_fps = self.bitrate_ctrl.target_fps();
-                            self.apply_capture_fps(target_fps, "idle-recovery");
+                            tracing::debug!(
+                                idle_ms = idle_for.as_millis(),
+                                full_refresh = action.full_refresh,
+                                reset_adaptation = action.reset_adaptation,
+                                "Desktop resumed after idle"
+                            );
                         }
                         self.idle_frame_count = 0;
                         f
                     }
                     macrdp_capture::CaptureEvent::Idle => {
+                        self.idle_since.get_or_insert_with(Instant::now);
                         if self.client_may_be_stale {
                             if let Some(update) = self.send_cached_full_frame_recovery() {
                                 return Ok(Some(update));
                             }
                         }
-                        self.idle_frame_count += 1;
+                        self.idle_frame_count = self.idle_frame_count.saturating_add(1);
                         continue 'updates;
                     }
                     macrdp_capture::CaptureEvent::Unavailable => {
@@ -1360,6 +1341,7 @@ impl MacDisplayUpdates {
 impl MacDisplayUpdates {
     async fn run_coregraphics_fallback_until_recovered(&mut self) -> Result<Option<DisplayUpdate>> {
         self.idle_frame_count = 0;
+        self.idle_since = None;
         self.request_full_bitmap_updates(1);
         tracing::warn!("SCStream unavailable — switching to CoreGraphics fallback");
         let fallback = CgFallbackCapturer::new(&self.capture_config);
@@ -1589,6 +1571,17 @@ impl MacDisplayUpdates {
         self.next_cursor_poll_at
             .checked_duration_since(Instant::now())
             .or(Some(Duration::ZERO))
+    }
+
+    fn needs_conservative_idle_recovery(&self) -> bool {
+        let gfx = self.gfx_state.lock().unwrap();
+        !gfx.is_ready()
+            || !gfx.session_uses_gfx
+            || !gfx.avc420_supported
+            || gfx.last_ack_frame == 0
+            || gfx.frame_acknowledgements_suspended
+            || gfx.avc_fallback_to_uncompressed
+            || gfx.bitmap_fallback_mode
     }
 
     fn mark_client_may_be_stale(&mut self, reason: &'static str) {
@@ -1936,6 +1929,7 @@ impl MacDisplayUpdates {
         self.last_large_uncompressed_sent = None;
         self.last_large_uncompressed_rects = None;
         self.idle_frame_count = 0;
+        self.idle_since = None;
         self.skip_next_frame = false;
         self.request_full_bitmap_updates(1);
         self.needs_full_gfx_seed = true;
@@ -3534,18 +3528,16 @@ impl Drop for MacDisplayUpdates {
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_shape_to_pointer, extract_bgra_rect, fingerprint_bitmap_update,
-        fingerprint_cursor_shape, fingerprint_uncompressed_rects, prepare_uncompressed_dirty_rects,
+        cursor_shape_to_pointer, extract_bgra_rect, fingerprint_cursor_shape,
+        fingerprint_uncompressed_rects, prepare_uncompressed_dirty_rects,
         should_fallback_from_gfx_avc_no_ack, should_force_full_bitmap_update,
-        should_suppress_recent_fingerprint, should_use_nv12_capture_for_gfx,
-        validate_dirty_rects_against_previous_bgra, ClampedRect, DIRTY_RECT_VALIDATION_TILE,
+        should_use_nv12_capture_for_gfx, validate_dirty_rects_against_previous_bgra, ClampedRect,
+        DIRTY_RECT_VALIDATION_TILE,
     };
     use bytes::Bytes;
-    use ironrdp_server::{BitmapUpdate, DiffRect, PixelFormat as RdpPixelFormat, UncompressedRect};
+    use ironrdp_server::UncompressedRect;
     use macrdp_capture::{CursorShape, Rect};
-    use std::collections::VecDeque;
-    use std::num::{NonZeroU16, NonZeroUsize};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn compacts_close_dirty_rects_to_bounding_box() {
@@ -3682,54 +3674,6 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_fingerprint_changes_when_geometry_changes() {
-        let mk = |x, width| BitmapUpdate {
-            x,
-            y: 6,
-            width: NonZeroU16::new(width).unwrap(),
-            height: NonZeroU16::new(2).unwrap(),
-            format: RdpPixelFormat::BgrA32,
-            data: Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8]),
-            stride: NonZeroUsize::new(8).unwrap(),
-            dirty_rects: vec![DiffRect {
-                x: x as usize,
-                y: 6,
-                width: width as usize,
-                height: 2,
-            }],
-        };
-
-        assert_ne!(
-            fingerprint_bitmap_update(&mk(5, 2)),
-            fingerprint_bitmap_update(&mk(6, 2))
-        );
-    }
-
-    #[test]
-    fn bitmap_geometry_fingerprint_ignores_payload_changes() {
-        let mk = |payload: &'static [u8]| BitmapUpdate {
-            x: 12,
-            y: 34,
-            width: NonZeroU16::new(128).unwrap(),
-            height: NonZeroU16::new(64).unwrap(),
-            format: RdpPixelFormat::BgrA32,
-            data: Bytes::from_static(payload),
-            stride: NonZeroUsize::new(512).unwrap(),
-            dirty_rects: vec![DiffRect {
-                x: 12,
-                y: 34,
-                width: 128,
-                height: 64,
-            }],
-        };
-
-        assert_ne!(
-            fingerprint_bitmap_update(&mk(&[1, 2, 3, 4])),
-            fingerprint_bitmap_update(&mk(&[9, 8, 7, 6]))
-        );
-    }
-
-    #[test]
     fn cursor_fingerprint_changes_when_shape_changes() {
         let mk = |hot_x: u16, rgba: Vec<u8>| CursorShape {
             width: 16,
@@ -3775,34 +3719,6 @@ mod tests {
             ]
         );
         assert_eq!(pointer.and_mask, vec![0x00, 0x00, 0xC0, 0x00]);
-    }
-
-    #[test]
-    fn suppresses_recent_duplicate_fingerprints_within_window() {
-        let mut recent = VecDeque::new();
-        let base = Instant::now();
-
-        assert!(!should_suppress_recent_fingerprint(
-            &mut recent,
-            42,
-            base,
-            Duration::from_millis(120),
-            4,
-        ));
-        assert!(should_suppress_recent_fingerprint(
-            &mut recent,
-            42,
-            base + Duration::from_millis(50),
-            Duration::from_millis(120),
-            4,
-        ));
-        assert!(!should_suppress_recent_fingerprint(
-            &mut recent,
-            42,
-            base + Duration::from_millis(200),
-            Duration::from_millis(120),
-            4,
-        ));
     }
 
     #[test]
