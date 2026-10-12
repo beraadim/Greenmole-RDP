@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::*;
@@ -38,7 +38,8 @@ pub struct MacClipboardBackend {
     temp_dir: PathBuf,
     poll_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
-    locked: bool,
+    outgoing_change_count: Option<i64>,
+    pending_descriptor_lock: Option<u32>,
     pending_paste_format: Option<RemoteFormat>,
     // CLIPRDR responses carry no format ID. Serialize requests and coalesce newer
     // offers instead of decoding an older response with the newest format.
@@ -71,7 +72,8 @@ impl MacClipboardBackend {
             temp_dir,
             poll_handle: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
-            locked: false,
+            outgoing_change_count: None,
+            pending_descriptor_lock: None,
             pending_paste_format: None,
             queued_paste_format: None,
             file_transfer,
@@ -91,6 +93,47 @@ impl MacClipboardBackend {
         {
             tracing::debug!(format_id = format.id.value(), kind = ?format.kind, "Requesting remote clipboard format");
             self.pending_paste_format = Some(format);
+        }
+    }
+
+    fn refresh_local_files(&mut self, pasteboard: &PasteboardBridge) {
+        let change_count = pasteboard.change_count();
+        if self.outgoing_change_count != Some(change_count) {
+            let paths = pasteboard.read_file_urls();
+            if self.transfer_manager.set_local_files(paths) {
+                self.outgoing_change_count = Some(change_count);
+            } else {
+                // A later unlock can free snapshot capacity without a new copy.
+                self.outgoing_change_count = None;
+            }
+        }
+    }
+
+    fn dispatch_file_requests(&mut self, requests: Vec<FileContentsRequest>) {
+        for request in requests {
+            if self
+                .event_sender
+                .send(ServerEvent::ClipboardFileContentsRequest(request))
+                .is_err()
+            {
+                self.transfer_manager.set_incoming_descriptors(Vec::new());
+                break;
+            }
+        }
+        let paths = {
+            let transfers = &mut self.transfer_manager;
+            if transfers.all_incoming_complete() {
+                transfers.flush_incoming_files()
+            } else {
+                Vec::new()
+            }
+        };
+        if !paths.is_empty() {
+            let new_count = PasteboardBridge::new().write_file_urls(&paths);
+            if new_count >= 0 {
+                self.last_change_count.store(new_count, Ordering::SeqCst);
+                tracing::info!(count = paths.len(), "Wrote incoming files to pasteboard");
+            }
         }
     }
 
@@ -145,6 +188,7 @@ impl CliprdrBackend for MacClipboardBackend {
         let sender = self.event_sender.clone();
         let stop = self.stop_signal.clone();
         let file_transfer = self.file_transfer;
+        let transfers = self.transfer_manager.monitor();
 
         self.poll_handle = Some(std::thread::spawn(move || {
             let bridge = PasteboardBridge::new();
@@ -154,9 +198,12 @@ impl CliprdrBackend for MacClipboardBackend {
                     break;
                 }
 
+                transfers.expire(Instant::now());
                 let current = bridge.change_count();
                 let prev = last.swap(current, Ordering::SeqCst);
                 if current != prev {
+                    // A new local copy supersedes an unfinished remote paste.
+                    transfers.cancel();
                     // Clipboard changed -- build format list and notify server
                     let formats: Vec<ClipboardFormat> = bridge
                         .available_types()
@@ -251,12 +298,16 @@ impl CliprdrBackend for MacClipboardBackend {
                 None => FormatDataResponse::new_error(),
             },
             id if id == FORMAT_ID_FILE_LIST && self.file_transfer => {
-                let paths = pb.read_file_urls();
-                self.transfer_manager.set_local_files(paths);
-                let file_list = self.transfer_manager.build_file_list();
-                match FormatDataResponse::new_file_list(&file_list) {
-                    Ok(resp) => resp,
-                    Err(e) => {
+                let file_list = if let Some(id) = self.pending_descriptor_lock.take() {
+                    self.transfer_manager.locked_file_list(id)
+                } else {
+                    self.refresh_local_files(&pb);
+                    Some(self.transfer_manager.build_file_list())
+                };
+                match file_list.as_ref().map(FormatDataResponse::new_file_list) {
+                    None => FormatDataResponse::new_error(),
+                    Some(Ok(resp)) => resp,
+                    Some(Err(e)) => {
                         tracing::warn!("Failed to encode file list: {e}");
                         FormatDataResponse::new_error()
                     }
@@ -319,14 +370,12 @@ impl CliprdrBackend for MacClipboardBackend {
                     return;
                 }
                 if let Ok(file_list) = response.to_file_list() {
-                    self.transfer_manager
-                        .set_incoming_descriptors(file_list.files);
-                    let requests = self.transfer_manager.generate_contents_requests();
-                    for req in requests {
-                        let _ = self
-                            .event_sender
-                            .send(ServerEvent::ClipboardFileContentsRequest(req));
-                    }
+                    let requests = {
+                        let transfers = &mut self.transfer_manager;
+                        transfers.set_incoming_descriptors(file_list.files);
+                        transfers.generate_contents_requests()
+                    };
+                    self.dispatch_file_requests(requests);
                 }
             }
             _ => tracing::warn!("Ignored unsolicited or unsupported clipboard response"),
@@ -334,6 +383,11 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        if request.data_id.is_some() && self.pending_descriptor_lock == request.data_id {
+            // A client may lock after receiving descriptors. Its first contents
+            // request consumes the pending descriptor association too.
+            self.pending_descriptor_lock = None;
+        }
         let response = if self.file_transfer {
             self.transfer_manager.handle_contents_request(&request)
         } else {
@@ -349,33 +403,24 @@ impl CliprdrBackend for MacClipboardBackend {
         if !self.file_transfer {
             return;
         }
-        if let Some(request) = self.transfer_manager.handle_contents_response(&response) {
-            let _ = self
-                .event_sender
-                .send(ServerEvent::ClipboardFileContentsRequest(request));
-        }
-
-        if self.transfer_manager.all_incoming_complete() {
-            let paths = self.transfer_manager.flush_incoming_files();
-            if !paths.is_empty() {
-                let pb = PasteboardBridge::new();
-                let new_count = pb.write_file_urls(&paths);
-                if new_count >= 0 {
-                    self.last_change_count.store(new_count, Ordering::SeqCst);
-                    tracing::info!(count = paths.len(), "Wrote incoming files to pasteboard");
-                }
-            }
-        }
+        let requests = self.transfer_manager.handle_contents_response(&response);
+        self.dispatch_file_requests(requests);
     }
 
-    fn on_lock(&mut self, _data_id: LockDataId) {
-        self.locked = true;
-        self.transfer_manager.lock();
+    fn on_lock(&mut self, data_id: LockDataId) {
+        if !self.file_transfer {
+            return;
+        }
+        self.refresh_local_files(&PasteboardBridge::new());
+        self.transfer_manager.lock(data_id.0);
+        self.pending_descriptor_lock = Some(data_id.0);
     }
 
-    fn on_unlock(&mut self, _data_id: LockDataId) {
-        self.locked = false;
-        self.transfer_manager.unlock();
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        self.transfer_manager.unlock(data_id.0);
+        if self.pending_descriptor_lock == Some(data_id.0) {
+            self.pending_descriptor_lock = None;
+        }
     }
 }
 

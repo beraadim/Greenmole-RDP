@@ -49,6 +49,8 @@ use crate::{builder, capabilities, SoundServerFactory};
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "capture_activation.rs"]
+mod capture_activation;
 #[path = "connection_control.rs"]
 mod connection_control;
 use connection_control::{
@@ -989,13 +991,17 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = {
-            let mut display = self.display.lock().await;
+        let display = self.display.clone();
+        let activation = async move {
+            let mut display = display.lock().await;
             display.activate_size(desktop_size);
-            display.updates().await.map_err(|error| {
-                self.record_outcome(ConnectionOutcome::CaptureError);
-                error
-            })?
+            display.updates().await
+        };
+        let Some((mut display_updates, pending_pdus)) = self
+            .await_capture_ready(reader, io_channel_id, activation)
+            .await?
+        else {
+            return Ok(RunState::Disconnect);
         };
         let mut writer = SharedWriter::new(writer, self.write_timeout);
         let mut display_writer = writer.clone();
@@ -1030,6 +1036,18 @@ impl RdpServer {
                     .await
                     .handle_input_backlog(&mut writer, io_channel_id, user_channel_id, input_events)
                     .await?;
+            }
+            // Input received while native capture starts must wait until the
+            // display has committed its coordinate transform, preserving order.
+            for (action, bytes) in pending_pdus {
+                let state = this
+                    .lock()
+                    .await
+                    .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
+                    .await?;
+                if state != RunState::Continue {
+                    return Ok(state);
+                }
             }
             loop {
                 let (action, bytes) = reader.read_pdu().await?;

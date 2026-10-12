@@ -2159,6 +2159,7 @@ dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-core",
  "ironrdp-server",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2169,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2243,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",

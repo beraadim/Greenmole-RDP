@@ -1,4 +1,5 @@
 import { CertificateSettings } from "../components/CertificateSettings";
+import { ClipboardSettings } from "../components/ClipboardSettings";
 import { useState, useEffect } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { api } from "../lib/ipc";
@@ -23,6 +24,7 @@ const categories = [
   { id: "security", label: "Security" },
   { id: "display", label: "Display" },
   { id: "audio", label: "Audio" },
+  { id: "clipboard", label: "Clipboard" },
   { id: "general", label: "General" },
 ] as const;
 
@@ -344,9 +346,19 @@ function Settings() {
 
         {activeCategory === "audio" && (
           <CategorySection title="Audio">
-            <div className="flex items-center justify-center py-10 text-xs text-text-muted">
-              Audio settings are not available yet
-            </div>
+            <SettingRow label="Forward system audio" description="Play this Mac's audio on the remote client. Requires service restart.">
+              <Switch aria-label="Forward system audio" checked={config.audio_enabled}
+                onCheckedChange={(value) => updateConfig("audio_enabled", value)} />
+            </SettingRow>
+            <p className="py-2 text-xs text-text-muted">
+              Audio uses 48 kHz stereo. Enable sound playback in the remote client as well.
+            </p>
+          </CategorySection>
+        )}
+
+        {activeCategory === "clipboard" && (
+          <CategorySection title="Clipboard">
+            <ClipboardSettings config={config} save={updateConfig} />
           </CategorySection>
         )}
 

@@ -33,8 +33,9 @@ fn lifecycle() -> &'static Arc<Lifecycle> {
     LIFECYCLE.get_or_init(|| Arc::new(Lifecycle::default()))
 }
 
-/// The capture must be dropped before this lease. A recovered result owns both
-/// so disconnect cannot release ownership while an unconsumed stream survives.
+/// The native owner drops its stream before this lease. Async handles only
+/// signal that owner, so disconnect cannot release ownership while a pending
+/// start, configuration, late result, or native retirement survives.
 pub(super) struct NativeCaptureLease(Arc<Lifecycle>);
 
 impl Lifecycle {

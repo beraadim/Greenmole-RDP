@@ -1,18 +1,22 @@
 mod bitmap_freshness;
 mod bitmap_pacing;
+mod bitmap_updates;
 pub(crate) mod capture_lifecycle;
 mod capture_recovery;
+mod damage;
+mod native_capture;
+use native_capture::NativeCapture;
 mod event_wait;
 mod idle_policy;
+use damage::FrameDamage;
 use event_wait::DisplayWake;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
-    gfx::GfxState, BitmapUpdate, DesktopSize, DiffRect, DisplayUpdate, GfxFrameUpdate,
-    GfxUncompressedUpdate, PixelFormat as RdpPixelFormat, RdpServerDisplay,
-    RdpServerDisplayUpdates, UncompressedRect,
+    gfx::GfxState, BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
+    PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, UncompressedRect,
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{
@@ -394,99 +398,6 @@ fn rect_area(rect: ClampedRect) -> u32 {
     rect.width.saturating_mul(rect.height)
 }
 
-fn bgra_rect_changed(
-    current: &[u8],
-    current_stride: usize,
-    previous: &[u8],
-    previous_stride: usize,
-    rect: ClampedRect,
-) -> bool {
-    let row_bytes = rect.width as usize * 4;
-
-    for row in 0..rect.height as usize {
-        let y = rect.y as usize + row;
-        let current_offset = y * current_stride + rect.x as usize * 4;
-        let previous_offset = y * previous_stride + rect.x as usize * 4;
-        let current_end = current_offset + row_bytes;
-        let previous_end = previous_offset + row_bytes;
-
-        if current_end > current.len() || previous_end > previous.len() {
-            return true;
-        }
-
-        if current[current_offset..current_end] != previous[previous_offset..previous_end] {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn validate_dirty_rects_against_previous_bgra(
-    frame_width: u32,
-    frame_height: u32,
-    dirty_rects: &[Rect],
-    current: &[u8],
-    current_stride: usize,
-    previous: &[u8],
-    previous_stride: usize,
-) -> Vec<Rect> {
-    let mut refined = Vec::new();
-
-    for rect in dirty_rects.iter().filter(|r| r.width > 0 && r.height > 0) {
-        let x = rect.x.min(frame_width.saturating_sub(1));
-        let y = rect.y.min(frame_height.saturating_sub(1));
-        let width = rect.width.min(frame_width - x);
-        let height = rect.height.min(frame_height - y);
-        if width == 0 || height == 0 {
-            continue;
-        }
-
-        let clamped = ClampedRect {
-            x,
-            y,
-            width,
-            height,
-        };
-
-        if width <= DIRTY_RECT_VALIDATION_TILE && height <= DIRTY_RECT_VALIDATION_TILE {
-            if bgra_rect_changed(current, current_stride, previous, previous_stride, clamped) {
-                refined.push(Rect {
-                    x,
-                    y,
-                    width,
-                    height,
-                });
-            }
-            continue;
-        }
-
-        for tile_y in (y..y + height).step_by(DIRTY_RECT_VALIDATION_TILE as usize) {
-            let tile_height = DIRTY_RECT_VALIDATION_TILE.min(y + height - tile_y);
-            for tile_x in (x..x + width).step_by(DIRTY_RECT_VALIDATION_TILE as usize) {
-                let tile_width = DIRTY_RECT_VALIDATION_TILE.min(x + width - tile_x);
-                let tile = ClampedRect {
-                    x: tile_x,
-                    y: tile_y,
-                    width: tile_width,
-                    height: tile_height,
-                };
-
-                if bgra_rect_changed(current, current_stride, previous, previous_stride, tile) {
-                    refined.push(Rect {
-                        x: tile_x,
-                        y: tile_y,
-                        width: tile_width,
-                        height: tile_height,
-                    });
-                }
-            }
-        }
-    }
-
-    refined
-}
-
 fn try_merge_bitmap_regions(a: ClampedRect, b: ClampedRect) -> Option<ClampedRect> {
     let left = a.x.min(b.x);
     let top = a.y.min(b.y);
@@ -864,9 +775,6 @@ impl RdpServerDisplay for MacDisplay {
         let preparation = self
             .display_controller
             .queue_remote_capture(width, height)?;
-        let geometry = tokio::task::spawn_blocking(move || preparation.wait())
-            .await
-            .context("Display mode worker failed")??;
         let (session_uses_gfx, gfx_avc_ready) = {
             let gfx = self.gfx_state.lock().unwrap();
             (gfx.session_uses_gfx, gfx.is_ready())
@@ -885,7 +793,7 @@ impl RdpServerDisplay for MacDisplay {
         };
 
         let capture_config = CaptureConfig {
-            display_id: geometry.display_id,
+            display_id: 0,
             width: width as u32,
             height: height as u32,
             frame_rate: configured_frame_rate,
@@ -916,7 +824,15 @@ impl RdpServerDisplay for MacDisplay {
             .shared_audio_tx
             .as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
-        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
+        let (capturer, (capture_config, geometry)) =
+            NativeCapture::start(native_lease, move || {
+                let geometry = preparation.wait()?;
+                let mut config = capture_config;
+                config.display_id = geometry.display_id;
+                let capturer = ScreenCapturer::new_blocking(config.clone(), audio_tx)?;
+                Ok((capturer, (config, geometry)))
+            })
+            .await?;
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(
@@ -962,7 +878,6 @@ impl RdpServerDisplay for MacDisplay {
         Ok(Box::new(MacDisplayUpdates {
             capturer: Some(capturer),
             capture_recovery: None,
-            native_lease: Some(native_lease),
             display_controller: self.display_controller.clone(),
             capture_config,
             encoder,
@@ -997,6 +912,8 @@ impl RdpServerDisplay for MacDisplay {
             needs_full_bitmap_seed: true,
             forced_full_bitmap_updates_remaining: 1,
             pending_bitmap_updates: VecDeque::new(),
+            pending_bitmap_frame: None,
+            bitmap_copy_stats: bitmap_updates::CopyStats::default(),
             deferred_bitmap_frame: None,
             bitmap_pacing: bitmap_pacing::BitmapPacing::default(),
             bitmap_perf_dispatches: 0,
@@ -1046,17 +963,14 @@ impl CachedFrame {
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(75);
 
 struct RecoveredCapture {
-    capturer: ScreenCapturer,
+    capturer: NativeCapture,
     config: CaptureConfig,
     frame: Option<CapturedFrame>,
-    // Fields drop in declaration order: native capture cleanup precedes unlock.
-    native_lease: capture_lifecycle::NativeCaptureLease,
 }
 
 struct MacDisplayUpdates {
-    capturer: Option<ScreenCapturer>,
+    capturer: Option<NativeCapture>,
     capture_recovery: Option<capture_recovery::CaptureRecovery<RecoveredCapture>>,
-    native_lease: Option<capture_lifecycle::NativeCaptureLease>,
     display_controller: macrdp_display::DisplayController,
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
@@ -1113,9 +1027,11 @@ struct MacDisplayUpdates {
     /// dirty-region mode may resume. This counter is decremented only after an
     /// actual full-frame bitmap update has been emitted.
     forced_full_bitmap_updates_remaining: u8,
-    /// Additional bitmap updates derived from the last captured frame when
-    /// sparse damage is cheaper to send as multiple smaller regions.
-    pending_bitmap_updates: VecDeque<BitmapUpdate>,
+    /// Pending descriptors retain no copied pixels. One source frame owns the
+    /// batch until its last region is materialized for delivery.
+    pending_bitmap_updates: VecDeque<bitmap_updates::Region>,
+    pending_bitmap_frame: Option<CapturedFrame>,
+    bitmap_copy_stats: bitmap_updates::CopyStats,
     /// New damage waits until the old batch is delivered, while its unsent
     /// regions are refreshed from these newer pixels to avoid visual lag.
     deferred_bitmap_frame: Option<CapturedFrame>,
@@ -1158,7 +1074,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                 recovery.cancel().await?;
                             }
                             if let Some(capturer) = &mut self.capturer {
-                                capturer.stop()?;
+                                capturer.stop().await?;
                             }
                             tracing::info!(width = size.width, height = size.height,
                                 "Requesting RDP reactivation for display resize");
@@ -1176,12 +1092,13 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 impl MacDisplayUpdates {
     async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
         'updates: loop {
+            self.sync_applied_capture_fps();
             self.sync_bitmap_pacing();
             if !self.pending_bitmap_updates.is_empty() || self.deferred_bitmap_frame.is_some() {
                 if let Some(mut latest) = self
                     .capturer
                     .as_mut()
-                    .and_then(ScreenCapturer::try_latest_image)
+                    .and_then(NativeCapture::try_latest_image)
                 {
                     self.record_capture_delivery();
                     if let Some(previous) = self.deferred_bitmap_frame.take() {
@@ -1190,18 +1107,29 @@ impl MacDisplayUpdates {
                     self.deferred_bitmap_frame = Some(latest);
                 }
             }
-            if let Some(mut bitmap) = self.pending_bitmap_updates.pop_front() {
-                if let Some(latest) = &self.deferred_bitmap_frame {
-                    // Finish this batch in order to avoid starving its older
-                    // regions. New damage remains queued in the deferred frame.
-                    if !bitmap_freshness::refresh_region(&mut bitmap, latest) {
-                        self.pending_bitmap_updates.clear();
-                        self.request_full_bitmap_updates(1);
-                        continue;
-                    }
+            if let Some(region) = self.pending_bitmap_updates.pop_front() {
+                // Finish the old geometry in order, but read its pixels only
+                // now. Intervening damage remains in the deferred frame.
+                let refreshed = self.deferred_bitmap_frame.is_some();
+                let source = self
+                    .deferred_bitmap_frame
+                    .as_ref()
+                    .or(self.pending_bitmap_frame.as_ref());
+                let materialized = source
+                    .and_then(|source| bitmap_updates::materialize(region, source, refreshed));
+                if self.pending_bitmap_updates.is_empty() {
+                    self.pending_bitmap_frame = None;
                 }
-                self.record_bitmap_audit(&bitmap, "queued-bitmap-region");
-                return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
+                let Some(materialized) = materialized else {
+                    self.pending_bitmap_updates.clear();
+                    self.pending_bitmap_frame = None;
+                    self.request_full_bitmap_updates(1);
+                    self.mark_client_may_be_stale("bitmap-region-unavailable");
+                    continue;
+                };
+                self.bitmap_copy_stats.record(&materialized);
+                self.record_bitmap_audit(&materialized.update, "queued-bitmap-region");
+                return Ok(Some(DisplayUpdate::Bitmap(materialized.update)));
             }
 
             if let Some(update) = self.poll_cursor_update_if_due() {
@@ -1325,7 +1253,7 @@ impl MacDisplayUpdates {
                     DisplayWake::Idle => continue 'updates,
                 }
             };
-            let frame = {
+            let (frame, damage) = {
                 // Handle idle events (desktop unchanged)
                 let frame = match event {
                     macrdp_capture::CaptureEvent::Frame(f) => {
@@ -1383,15 +1311,15 @@ impl MacDisplayUpdates {
                 // accumulates all overwritten damage relative to our last read.
                 // Draining here would discard that accumulated damage.
                 let mut latest = frame;
-                Self::refine_capture_dirty_rects(
+                let damage = damage::refine_capture_dirty_rects(
                     &mut latest,
                     self.last_frame_cache.as_ref(),
                     preserve_accumulated_damage,
                 );
-                latest
+                (latest, damage)
             };
 
-            match self.encode_and_send(frame)? {
+            match self.encode_and_send_with_damage(frame, damage)? {
                 Some(update) => return Ok(Some(update)),
                 None => {
                     tracing::debug!(
@@ -1413,6 +1341,7 @@ impl MacDisplayUpdates {
         self.idle_since = None;
         self.last_frame_cache = None;
         self.pending_bitmap_updates.clear();
+        self.pending_bitmap_frame = None;
         self.deferred_bitmap_frame = None;
         self.skip_next_frame = false;
         self.request_full_bitmap_updates(1);
@@ -1438,35 +1367,34 @@ impl MacDisplayUpdates {
                 &self.shared_audio_tx,
                 |config, audio| Ok((config, audio)),
             )?;
-            let native_lease = match self.native_lease.take() {
-                Some(lease) => lease,
-                None => capture_lifecycle::acquire(&self.display_controller)?,
-            };
+            let display_controller = self.display_controller.clone();
             recovery.start_probe(
                 move |cancelled| {
-                    // This worker owns its timer and blocking pool, independent of
-                    // service shutdown. Lease ownership survives all native waits.
-                    let native_lease = native_lease;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("Failed to create native recovery runtime")?;
                     if let Some(mut old) = old_capture {
-                        old.stop()
+                        runtime
+                            .block_on(old.stop())
                             .context(capture_recovery::NativeRetirementFailed)?;
                     }
                     if cancelled.load(Ordering::Acquire) {
                         return Ok(None);
                     }
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .context("Failed to create native recovery runtime")?;
-                    let mut capturer =
-                        runtime.block_on(ScreenCapturer::new(config.clone(), audio_tx))?;
+                    let native_lease = capture_lifecycle::acquire(&display_controller)?;
+                    let native_config = config.clone();
+                    let (mut capturer, ()) = runtime
+                        .block_on(NativeCapture::start(native_lease, move || {
+                            Ok((ScreenCapturer::new_blocking(native_config, audio_tx)?, ()))
+                        }))?;
                     let event = runtime.block_on(async {
                         tokio::time::timeout(Duration::from_millis(250), capturer.next_frame())
                             .await
                     });
                     if cancelled.load(Ordering::Acquire) {
-                        capturer
-                            .stop()
+                        runtime
+                            .block_on(capturer.stop())
                             .context(capture_recovery::NativeRetirementFailed)?;
                         return Ok(None);
                     }
@@ -1474,8 +1402,8 @@ impl MacDisplayUpdates {
                         Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => Some(frame),
                         Ok(Some(macrdp_capture::CaptureEvent::Idle)) => None,
                         _ => {
-                            capturer
-                                .stop()
+                            runtime
+                                .block_on(capturer.stop())
                                 .context(capture_recovery::NativeRetirementFailed)?;
                             anyhow::bail!("Recovery probe did not produce usable capture flow");
                         }
@@ -1484,13 +1412,15 @@ impl MacDisplayUpdates {
                         capturer,
                         config,
                         frame,
-                        native_lease,
                     }))
                 },
                 |mut recovered| {
-                    recovered
-                        .capturer
-                        .stop()
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("Failed to create capture cleanup runtime")?;
+                    runtime
+                        .block_on(recovered.capturer.stop())
                         .context(capture_recovery::NativeRetirementFailed)
                 },
             )?;
@@ -1513,9 +1443,9 @@ impl MacDisplayUpdates {
                 let desired_fps = self.capture_config.frame_rate;
                 self.capture_recovery = None;
                 self.last_applied_fps = recovered.config.frame_rate;
+                self.gfx_state.lock().unwrap().applied_frame_rate = Some(self.last_applied_fps);
                 self.capture_config = recovered.config;
                 self.capturer = Some(recovered.capturer);
-                self.native_lease = Some(recovered.native_lease);
                 self.apply_capture_fps(desired_fps, "capture-recovery");
                 self.last_frame_cache = None;
                 self.skip_next_frame = false;
@@ -1558,116 +1488,6 @@ impl MacDisplayUpdates {
             }
             DisplayWake::Cursor | DisplayWake::Idle => Ok(None),
         }
-    }
-
-    fn refine_capture_dirty_rects(
-        frame: &mut CapturedFrame,
-        previous: Option<&CachedFrame>,
-        preserve_accumulated_damage: bool,
-    ) {
-        // Refreshed queued regions may already contain an intermediate image.
-        // Comparing their accumulated damage with the older capture cache can
-        // suppress a pixel that changed and reverted. Only the wire encoder's
-        // framebuffer tracks those partial deliveries accurately.
-        if preserve_accumulated_damage || frame.dirty_rects.is_empty() {
-            return;
-        }
-
-        let previous = match previous {
-            Some(previous) => previous,
-            None => return,
-        };
-
-        let original_count = frame.dirty_rects.len();
-
-        let refined = match (&frame.data, previous) {
-            (
-                FrameData::Raw(current),
-                CachedFrame::Bgra {
-                    data: prev,
-                    stride,
-                    width,
-                    height,
-                },
-            ) if *width == frame.width && *height == frame.height => {
-                validate_dirty_rects_against_previous_bgra(
-                    frame.width,
-                    frame.height,
-                    &frame.dirty_rects,
-                    current,
-                    frame.stride,
-                    prev,
-                    *stride,
-                )
-            }
-            (FrameData::Raw(current), CachedFrame::BgraPixelBuffer(prev, width, height, _))
-                if *width == frame.width && *height == frame.height =>
-            {
-                prev.with_locked_bgra(frame.width, frame.height, |prev_bgra, prev_stride| {
-                    validate_dirty_rects_against_previous_bgra(
-                        frame.width,
-                        frame.height,
-                        &frame.dirty_rects,
-                        current,
-                        frame.stride,
-                        prev_bgra,
-                        prev_stride,
-                    )
-                })
-                .unwrap_or_else(|| frame.dirty_rects.clone())
-            }
-            (
-                FrameData::BgraPixelBuffer(current),
-                CachedFrame::Bgra {
-                    data: prev,
-                    stride,
-                    width,
-                    height,
-                },
-            ) if *width == frame.width && *height == frame.height => current
-                .with_locked_bgra(frame.width, frame.height, |current_bgra, current_stride| {
-                    validate_dirty_rects_against_previous_bgra(
-                        frame.width,
-                        frame.height,
-                        &frame.dirty_rects,
-                        current_bgra,
-                        current_stride,
-                        prev,
-                        *stride,
-                    )
-                })
-                .unwrap_or_else(|| frame.dirty_rects.clone()),
-            (
-                FrameData::BgraPixelBuffer(current),
-                CachedFrame::BgraPixelBuffer(prev, width, height, _),
-            ) if *width == frame.width && *height == frame.height => current
-                .with_locked_bgra(frame.width, frame.height, |current_bgra, current_stride| {
-                    prev.with_locked_bgra(frame.width, frame.height, |prev_bgra, prev_stride| {
-                        validate_dirty_rects_against_previous_bgra(
-                            frame.width,
-                            frame.height,
-                            &frame.dirty_rects,
-                            current_bgra,
-                            current_stride,
-                            prev_bgra,
-                            prev_stride,
-                        )
-                    })
-                    .unwrap_or_else(|| frame.dirty_rects.clone())
-                })
-                .unwrap_or_else(|| frame.dirty_rects.clone()),
-            _ => return,
-        };
-
-        if refined.len() != original_count {
-            tracing::debug!(
-                original_dirty_rects = original_count,
-                refined_dirty_rects = refined.len(),
-                "Refined capture dirty rects against previous frame"
-            );
-        }
-
-        frame.dirty_rects = refined;
     }
 
     fn request_full_bitmap_updates(&mut self, count: u8) {
@@ -1962,23 +1782,12 @@ impl MacDisplayUpdates {
         };
         self.session_audit.record(
             SessionPathKind::Bitmap,
-            bitmap.data.len() as u32,
+            u32::from(bitmap.width.get()) * u32::from(bitmap.height.get()) * 4,
             None,
             bitmap.dirty_rects.len(),
             dirty_pixels,
             detail,
         );
-    }
-
-    fn suppress_duplicate_bitmap_updates(
-        &mut self,
-        updates: Vec<BitmapUpdate>,
-    ) -> Vec<BitmapUpdate> {
-        // Guacamole repaint correctness is more important than shaving off a
-        // few duplicate bitmap bursts. Even exact-payload suppression has
-        // proven unsafe in live tests because repeated damage can still be
-        // semantically necessary to converge the visible screen state.
-        updates
     }
 
     fn desired_capture_pixel_format(&self) -> CapturePixelFormat {
@@ -2017,26 +1826,33 @@ impl MacDisplayUpdates {
 
     fn apply_capture_fps(&mut self, requested_fps: u32, reason: &'static str) {
         let target_fps = requested_fps.max(1);
-        if target_fps == self.last_applied_fps {
+        if target_fps == self.capture_config.frame_rate {
             return;
         }
 
-        if let Some(capturer) = &mut self.capturer {
-            if let Err(e) = capturer.set_frame_rate(target_fps) {
-                tracing::warn!("Failed to update frame rate: {e}");
-                return;
-            }
+        if let Some(capturer) = &self.capturer {
+            capturer.set_frame_rate(target_fps);
         }
 
-        self.last_applied_fps = target_fps;
         self.capture_config.frame_rate = target_fps;
-        self.gfx_state.lock().unwrap().applied_frame_rate = Some(target_fps);
-        tracing::info!(
+        tracing::debug!(
             requested_fps,
-            applied_fps = target_fps,
+            queued_fps = target_fps,
             reason,
-            "Capture frame rate updated"
+            "Capture frame rate update queued"
         );
+    }
+
+    fn sync_applied_capture_fps(&mut self) {
+        let Some(capturer) = &self.capturer else {
+            return;
+        };
+        let applied = capturer.applied_frame_rate();
+        if applied != self.last_applied_fps {
+            self.last_applied_fps = applied;
+            self.gfx_state.lock().unwrap().applied_frame_rate = Some(applied);
+            tracing::info!(applied_fps = applied, "Capture frame rate updated");
+        }
     }
 
     fn sync_runtime_encoder_overrides(&mut self) {
@@ -2124,7 +1940,12 @@ impl MacDisplayUpdates {
 
     async fn refresh_capture_transport_if_needed(&mut self) -> Result<()> {
         let desired_format = self.desired_capture_pixel_format();
-        if self.capture_config.pixel_format == desired_format {
+        let capturer = self
+            .capturer
+            .as_mut()
+            .context("Native capture unavailable")?;
+        if self.capture_config.pixel_format == desired_format && !capturer.has_pending_replacement()
+        {
             return Ok(());
         }
 
@@ -2140,9 +1961,11 @@ impl MacDisplayUpdates {
             .shared_audio_tx
             .as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
-        let new_capturer = ScreenCapturer::new(new_config.clone(), audio_tx).await?;
-
-        self.capturer = Some(new_capturer);
+        let (mut new_config, _) = capturer.replace((new_config, audio_tx)).await?;
+        // A cancelled await can be resumed after a newer rate was requested.
+        // Preserve that coalesced intent when adopting an older format result.
+        new_config.frame_rate = self.capture_config.frame_rate;
+        capturer.set_frame_rate(new_config.frame_rate);
         self.capture_config = new_config;
         self.has_pending_submit = false;
         self.pending_visible_size = None;
@@ -2278,9 +2101,9 @@ impl MacDisplayUpdates {
             self.apply_capture_fps(decision.fps, "adaptive");
             tracing::info!(
                 requested_fps = decision.fps,
-                applied_fps = decision.fps,
+                current_capture_fps = self.last_applied_fps,
                 bitrate_mbps = decision.bitrate_bps as f64 / 1_000_000.0,
-                "Adaptive: fps/bitrate updated"
+                "Adaptive bitrate updated and capture frame rate queued"
             );
         }
     }
@@ -2380,6 +2203,14 @@ impl MacDisplayUpdates {
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+        self.encode_and_send_with_damage(frame, FrameDamage::Unknown)
+    }
+
+    fn encode_and_send_with_damage(
+        &mut self,
+        frame: CapturedFrame,
+        damage: FrameDamage,
+    ) -> Result<Option<DisplayUpdate>> {
         self.coord_mapper.update_frame_content_rect(
             frame.width,
             frame.height,
@@ -2470,6 +2301,21 @@ impl MacDisplayUpdates {
             self.request_full_bitmap_updates(BITMAP_FORCED_FULL_UPDATES_AFTER_GFX_FALLBACK);
         }
         self.sync_runtime_encoder_overrides();
+
+        // A verified no-change capture is safe to omit only when the client
+        // already has its complete baseline. Seeds and stale-client recovery
+        // remain mandatory even when the host pixels have not changed.
+        let refresh_required = self.client_may_be_stale
+            || request_bitmap_fallback_full_frames
+            || if session_uses_gfx {
+                self.needs_full_gfx_seed || force_full_frame_uncompressed_gfx
+            } else {
+                self.needs_full_bitmap_seed || self.forced_full_bitmap_updates_remaining > 0
+            };
+        if damage.can_skip(refresh_required) {
+            tracing::trace!("Skipping capture with verified unchanged pixels");
+            return Ok(None);
+        }
 
         if gfx_channel_ready {
             if self.needs_full_gfx_seed {
@@ -3577,7 +3423,7 @@ impl MacDisplayUpdates {
         } else if self.forced_full_bitmap_updates_remaining > 0 {
             Some("seed")
         } else if frame.dirty_rects.is_empty() {
-            Some("no-dirty-rects")
+            Some("unknown-or-forced-damage")
         } else if should_force_full_bitmap_update(
             frame.width,
             frame.height,
@@ -3590,154 +3436,39 @@ impl MacDisplayUpdates {
         };
         let force_full_bitmap = force_full_bitmap_reason.is_some();
 
-        let build_bitmap = |bgra_bitmap: &[u8],
-                            stride_usize: usize|
-         -> Option<(Vec<BitmapUpdate>, bool)> {
-            if !force_full_bitmap && !frame.dirty_rects.is_empty() {
-                let bpp = 4usize;
-                let regions =
-                    prepare_bitmap_dirty_regions(frame.width, frame.height, &frame.dirty_rects);
-                let mut updates = Vec::with_capacity(regions.len());
-
-                for region in regions {
-                    let width = NonZeroU16::new(region.width as u16)?;
-                    let height = NonZeroU16::new(region.height as u16)?;
-                    let dirty_stride = region.width as usize * bpp;
-                    let mut dirty_data = Vec::with_capacity(dirty_stride * region.height as usize);
-
-                    for row in region.y..region.y + region.height {
-                        let src_offset = row as usize * stride_usize + region.x as usize * bpp;
-                        let src_end = src_offset + dirty_stride;
-                        if src_end > bgra_bitmap.len() {
-                            return None;
-                        }
-                        dirty_data.extend_from_slice(&bgra_bitmap[src_offset..src_end]);
-                    }
-
-                    let stride = NonZeroUsize::new(dirty_stride)?;
-                    let dirty_hints: Vec<DiffRect> = frame
-                        .dirty_rects
-                        .iter()
-                        .filter(|rect| rect.width > 0 && rect.height > 0)
-                        .filter_map(|rect| {
-                            let left = rect.x.max(region.x);
-                            let top = rect.y.max(region.y);
-                            let right = rect
-                                .x
-                                .saturating_add(rect.width)
-                                .min(region.x.saturating_add(region.width));
-                            let bottom = rect
-                                .y
-                                .saturating_add(rect.height)
-                                .min(region.y.saturating_add(region.height));
-                            (right > left && bottom > top).then_some(DiffRect {
-                                x: left as usize,
-                                y: top as usize,
-                                width: (right - left) as usize,
-                                height: (bottom - top) as usize,
-                            })
-                        })
-                        .collect();
-
-                    tracing::debug!(
-                        x = region.x,
-                        y = region.y,
-                        width = region.width,
-                        height = region.height,
-                        dirty_rects = dirty_hints.len(),
-                        bytes = dirty_data.len(),
-                        "Sending bitmap dirty region"
-                    );
-
-                    updates.push(BitmapUpdate {
-                        x: region.x as u16,
-                        y: region.y as u16,
-                        width,
-                        height,
-                        format: RdpPixelFormat::BgrA32,
-                        data: Bytes::from(dirty_data),
-                        stride,
-                        dirty_rects: dirty_hints,
-                    });
-                }
-
-                if !updates.is_empty() {
-                    return Some((updates, false));
-                }
-            }
-
-            let width = NonZeroU16::new(frame.width as u16)?;
-            let height = NonZeroU16::new(frame.height as u16)?;
-            let stride = NonZeroUsize::new(stride_usize)?;
-            tracing::debug!(
-                width = frame.width,
-                height = frame.height,
-                bytes = bgra_bitmap.len(),
-                reason = force_full_bitmap_reason.unwrap_or("fallback"),
-                "Sending full-frame bitmap update"
-            );
-
-            Some((
-                vec![BitmapUpdate {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                    format: RdpPixelFormat::BgrA32,
-                    data: Bytes::copy_from_slice(bgra_bitmap),
-                    stride,
-                    dirty_rects: Vec::new(),
-                }],
-                true,
-            ))
-        };
-
-        let bitmap_updates = match &frame.data {
-            FrameData::Raw(bgra_bitmap) => build_bitmap(bgra_bitmap, frame.stride),
-            FrameData::BgraPixelBuffer(buf) => buf
-                .with_locked_bgra(frame.width, frame.height, |bgra, stride| {
-                    build_bitmap(bgra, stride)
-                })
-                .flatten(),
-            FrameData::PixelBuffer(_) => {
-                tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
-                None
-            }
-        };
-
-        if let Some((mut updates, emitted_full_frame)) = bitmap_updates {
-            updates = self.suppress_duplicate_bitmap_updates(updates);
+        let (mut regions, emitted_full_frame) = bitmap_updates::plan(&frame, force_full_bitmap);
+        let materialized = regions
+            .pop_front()
+            .and_then(|region| bitmap_updates::materialize(region, &frame, false));
+        if let Some(materialized) = materialized {
+            self.bitmap_copy_stats.record(&materialized);
             self.needs_full_bitmap_seed = false;
             if emitted_full_frame {
                 self.last_full_bitmap_sent = Some(Instant::now());
                 self.forced_full_bitmap_updates_remaining =
                     self.forced_full_bitmap_updates_remaining.saturating_sub(1);
+                self.clear_client_stale_flag("bitmap-full-frame");
             }
-            if updates.is_empty() {
+            if !regions.is_empty() {
+                self.pending_bitmap_updates = regions;
+                self.pending_bitmap_frame = Some(frame);
+            }
+            tracing::debug!(
+                reason = force_full_bitmap_reason.unwrap_or("dirty-regions"),
+                queued_regions = self.pending_bitmap_updates.len(),
+                "Dispatching lazily materialized bitmap region"
+            );
+            self.record_bitmap_audit(
+                &materialized.update,
                 if emitted_full_frame {
-                    self.mark_client_may_be_stale("bitmap-full-frame-suppressed");
-                }
-                return Ok(None);
-            }
-            if updates.len() > 1 {
-                self.pending_bitmap_updates.extend(updates.drain(1..));
-            }
-
-            if let Some(bitmap) = updates.into_iter().next() {
-                self.record_bitmap_audit(
-                    &bitmap,
-                    if emitted_full_frame {
-                        "bitmap-full-frame"
-                    } else {
-                        "bitmap-dirty-region"
-                    },
-                );
-                if emitted_full_frame {
-                    self.clear_client_stale_flag("bitmap-full-frame");
-                }
-                return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
-            }
+                    "bitmap-full-frame"
+                } else {
+                    "bitmap-dirty-region"
+                },
+            );
+            return Ok(Some(DisplayUpdate::Bitmap(materialized.update)));
         }
+        self.mark_client_may_be_stale("bitmap-materialization-failed");
 
         Ok(Some(self.fallback_pointer_update()))
     }
@@ -3747,17 +3478,18 @@ impl Drop for MacDisplayUpdates {
     fn drop(&mut self) {
         self.session_audit.bitmap_bytes = self.gfx_state.lock().unwrap().bitmap_wire_bytes;
         self.session_audit.log_summary();
+        self.bitmap_copy_stats.log_summary();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::damage::validate_dirty_rects_against_previous_bgra;
     use super::{
         cursor_shape_to_pointer, extract_bgra_rect, fingerprint_cursor_shape,
         fingerprint_uncompressed_rects, prepare_uncompressed_dirty_rects,
         should_fallback_from_gfx_avc_no_ack, should_force_full_bitmap_update,
-        should_use_nv12_capture_for_gfx, validate_dirty_rects_against_previous_bgra, ClampedRect,
-        DIRTY_RECT_VALIDATION_TILE,
+        should_use_nv12_capture_for_gfx, ClampedRect, DIRTY_RECT_VALIDATION_TILE,
     };
     use bytes::Bytes;
     use ironrdp_server::UncompressedRect;

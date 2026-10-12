@@ -106,6 +106,10 @@ fn safe_configuration(config: &UiConfig) -> Value {
         "display_backend": config.display_backend, "resolution": resolution,
         "automatic_resolution": config.resolution == "auto", "show_cursor": config.show_cursor,
         "idle_timeout_secs": config.idle_timeout_secs,
+        "audio_enabled": config.audio_enabled,
+        "clipboard_enabled": config.clipboard_enabled,
+        "clipboard_file_transfer": config.clipboard_file_transfer,
+        "clipboard_max_file_size_mb": config.clipboard_max_file_size_mb,
         "custom_tls": !config.tls_cert_path.is_empty() || !config.tls_key_path.is_empty(),
     })
 }

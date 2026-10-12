@@ -105,3 +105,15 @@ log_level = "info"
 # Idle timeout in seconds (disconnect after no input)
 # Default: 1800 (30 minutes)
 idle_timeout_secs = 1800
+
+# Audio and clipboard policies take effect after restarting the service.
+[audio]
+enabled = true
+sample_rate = 48000
+channels = 2
+
+[clipboard]
+enabled = true
+file_transfer = true
+# Binary MiB, from 1 to 256. Incoming batches also have a 256 MiB total limit.
+max_file_size_mb = 100

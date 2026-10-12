@@ -36,9 +36,15 @@ fn short_file_response_schedules_bounded_remainder_on_clipboard_channel() {
             attributes: None,
             last_write_time: None,
         }]);
-    let requests = backend.transfer_manager.generate_contents_requests();
+    let size_request = backend
+        .transfer_manager
+        .generate_contents_requests()
+        .remove(0);
+    let requests = backend.transfer_manager.handle_contents_response(
+        &FileContentsResponse::new_size_response(size_request.stream_id, 5),
+    );
     backend.on_file_contents_response(FileContentsResponse::new_data_response(
-        requests[1].stream_id,
+        requests[0].stream_id,
         b"he".to_vec(),
     ));
     let ServerEvent::ClipboardFileContentsRequest(remainder) = receiver.try_recv().unwrap() else {
@@ -108,6 +114,8 @@ fn requests_peer_file_id_and_decodes_its_descriptor_response_as_files() {
         panic!("Expected a file size request");
     };
     assert!(size.flags.contains(FileContentsFlags::SIZE));
+    assert!(receiver.try_recv().is_err());
+    backend.on_file_contents_response(FileContentsResponse::new_size_response(size.stream_id, 5));
     let ServerEvent::ClipboardFileContentsRequest(data) = receiver.try_recv().unwrap() else {
         panic!("Expected a file contents request");
     };
@@ -161,9 +169,8 @@ fn empty_offer_cancels_pending_publication_and_incomplete_file_transfers() {
         }],
     };
     backend.on_format_data_response(FormatDataResponse::new_file_list(&list).unwrap());
-    receiver.try_recv().unwrap();
     let ServerEvent::ClipboardFileContentsRequest(request) = receiver.try_recv().unwrap() else {
-        panic!("Expected a file contents request");
+        panic!("Expected a file size request");
     };
     backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
     receiver.try_recv().unwrap();
@@ -203,4 +210,84 @@ fn hostile_file_list_count_is_rejected_before_decoding_or_requesting_files() {
     assert!(backend.pending_paste_format.is_none());
     assert!(receiver.try_recv().is_err());
     assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn large_file_copy_enqueues_only_the_request_window_without_closing_session_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend =
+        MacClipboardBackend::new(sender, dir.path().to_path_buf(), 32 * 1024 * 1024, true);
+    backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::FILE_LIST)]);
+    receiver.try_recv().unwrap();
+    let list = PackedFileList {
+        files: vec![FileDescriptor {
+            name: "large.bin".to_owned(),
+            file_size: Some(20 * 1024 * 1024),
+            attributes: None,
+            last_write_time: None,
+        }],
+    };
+    backend.on_format_data_response(FormatDataResponse::new_file_list(&list).unwrap());
+    let ServerEvent::ClipboardFileContentsRequest(size) = receiver.try_recv().unwrap() else {
+        panic!("Expected size request")
+    };
+    assert!(receiver.try_recv().is_err());
+    backend.on_file_contents_response(FileContentsResponse::new_size_response(
+        size.stream_id,
+        20 * 1024 * 1024,
+    ));
+    let mut count = 0;
+    while let Ok(event) = receiver.try_recv() {
+        let ServerEvent::ClipboardFileContentsRequest(request) = event else {
+            panic!("Expected data request")
+        };
+        assert_eq!(
+            request.requested_size,
+            crate::file::FILE_TRANSFER_CHUNK_SIZE
+        );
+        count += 1;
+    }
+    assert_eq!(count, 8);
+    assert!(!backend.event_sender.is_closed());
+    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn tagged_contents_consumes_lock_association_and_unlock_keeps_incoming_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source");
+    std::fs::write(&path, b"source").unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    backend.transfer_manager.set_local_files(vec![path]);
+    backend.transfer_manager.build_file_list();
+    backend.transfer_manager.lock(7);
+    backend.pending_descriptor_lock = Some(7);
+    backend
+        .transfer_manager
+        .set_incoming_descriptors(vec![FileDescriptor {
+            name: "incoming".to_owned(),
+            file_size: Some(5),
+            attributes: None,
+            last_write_time: None,
+        }]);
+    backend.on_file_contents_request(FileContentsRequest {
+        stream_id: 42,
+        index: 0,
+        flags: FileContentsFlags::DATA,
+        position: 0,
+        requested_size: 6,
+        data_id: Some(7),
+    });
+    assert!(backend.pending_descriptor_lock.is_none());
+    let ServerEvent::ClipboardFileContents(response) = receiver.try_recv().unwrap() else {
+        panic!("Expected contents response")
+    };
+    assert_eq!(response.data(), b"source");
+    backend.on_unlock(LockDataId(7));
+    assert_eq!(
+        backend.transfer_manager.generate_contents_requests().len(),
+        1
+    );
 }

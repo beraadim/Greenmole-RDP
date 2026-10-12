@@ -14,7 +14,7 @@ pub use geometry::{ContentRect, MouseCoordMapper};
 pub use mailbox::CaptureDeliveryStats;
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -139,11 +139,45 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: SCStream,
     stopped: bool,
+    native_stopped: Arc<AtomicBool>,
     frame_rx: Arc<mailbox::FrameMailbox>,
     config: CaptureConfig,
     actual_width: u32,
     actual_height: u32,
     captures_audio: bool,
+}
+
+struct CaptureStreamDelegate {
+    native_stopped: Arc<AtomicBool>,
+    frames: mailbox::FrameSender,
+}
+
+impl SCStreamDelegateTrait for CaptureStreamDelegate {
+    fn did_stop_with_error(&self, error: screencapturekit::error::SCError) {
+        // This is Apple's didStopWithError notification, not a failed request
+        // to stop. It confirms a system-terminated stream is already retired.
+        self.native_stopped.store(true, Ordering::Release);
+        self.frames.send(CaptureEvent::Unavailable);
+        tracing::warn!(%error, "Screen capture stopped by the system");
+    }
+}
+
+/// Frame delivery is independent of synchronous ScreenCaptureKit controls.
+/// A native worker can retain the stream while the server awaits this mailbox.
+pub struct CaptureReceiver(Arc<mailbox::FrameMailbox>);
+
+impl CaptureReceiver {
+    pub async fn next_frame(&mut self) -> Option<CaptureEvent> {
+        self.0.recv().await
+    }
+
+    pub fn try_latest_image(&mut self) -> Option<CapturedFrame> {
+        self.0.try_recv_frame()
+    }
+
+    pub fn last_delivery_stats(&self) -> CaptureDeliveryStats {
+        self.0.last_delivery_stats()
+    }
 }
 
 struct VideoOutputHandler {
@@ -439,10 +473,10 @@ impl ScreenCapturer {
     ///
     /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
     /// to the provided channel as `AudioFrame` (interleaved Float32 PCM, 48 kHz stereo).
-    pub async fn new(config: CaptureConfig, audio_tx: Option<AudioFrameSender>) -> Result<Self> {
-        // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
-            .await?
+    /// Must run on the capture owner thread: both enumeration and start wait
+    /// synchronously for Apple completion callbacks, without a native timeout.
+    pub fn new_blocking(config: CaptureConfig, audio_tx: Option<AudioFrameSender>) -> Result<Self> {
+        let content = SCShareableContent::get()
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 
         let display = content
@@ -484,7 +518,15 @@ impl ScreenCapturer {
             pixel_format: config.pixel_format,
         };
 
-        let mut stream = SCStream::new(&filter, &stream_config);
+        let native_stopped = Arc::new(AtomicBool::new(false));
+        let mut stream = SCStream::new_with_delegate(
+            &filter,
+            &stream_config,
+            CaptureStreamDelegate {
+                native_stopped: native_stopped.clone(),
+                frames: mailbox::FrameSender(frame_rx.clone()),
+            },
+        );
         stream.add_output_handler(video_handler, SCStreamOutputType::Screen);
 
         // Register audio handler only if a sender was provided
@@ -493,27 +535,48 @@ impl ScreenCapturer {
             stream.add_output_handler(audio_handler, SCStreamOutputType::Audio);
         }
 
-        stream.start_capture().context("Failed to start capture")?;
-
-        tracing::info!(
-            display_id = config.display_id,
-            width = actual_width,
-            height = actual_height,
-            fps = config.frame_rate,
-            pixel_format = ?config.pixel_format,
-            audio = captures_audio,
-            "Screen capture started"
-        );
-
-        Ok(Self {
+        // Establish the retirement guard before start. If Apple reports an
+        // error or Rust unwinds, cleanup still confirms stop on this owner
+        // thread before its process-wide capture lease can be released.
+        let mut capturer = Self {
             stream,
             stopped: false,
+            native_stopped,
             frame_rx,
             config,
             actual_width,
             actual_height,
             captures_audio,
-        })
+        };
+        if let Err(error) = capturer.stream.start_capture() {
+            // A returned completion error confirms that this new stream failed
+            // to start. Calling stop repeatedly would receive "not running"
+            // and incorrectly quarantine the process for a normal permission
+            // or display-availability failure. A pending/panicking start still
+            // retains the guard and must confirm retirement.
+            capturer.stopped = true;
+            return Err(error).context("Failed to start capture");
+        }
+
+        tracing::info!(
+            display_id = capturer.config.display_id,
+            width = actual_width,
+            height = actual_height,
+            fps = capturer.config.frame_rate,
+            pixel_format = ?capturer.config.pixel_format,
+            audio = captures_audio,
+            "Screen capture started"
+        );
+
+        Ok(capturer)
+    }
+
+    pub fn receiver(&self) -> CaptureReceiver {
+        CaptureReceiver(self.frame_rx.clone())
+    }
+
+    pub fn frame_rate(&self) -> u32 {
+        self.config.frame_rate
     }
 
     /// Receive the next capture event (async, cancellation safe)
@@ -539,15 +602,21 @@ impl ScreenCapturer {
     ///
     /// The upstream API waits for Apple's completion callback and has no timeout.
     /// A failure is returned without marking the stream stopped, so a caller can
-    /// abort reconfiguration and cleanup can retry. Recovery isolates this wait
-    /// on its single native worker while retaining exclusive capture ownership.
+    /// abort reconfiguration and cleanup can retry. The dedicated capture owner
+    /// isolates this wait while retaining exclusive process-wide ownership.
     pub fn stop(&mut self) -> Result<()> {
-        if self.stopped {
+        if self.stopped || self.native_stopped.load(Ordering::Acquire) {
+            self.stopped = true;
             return Ok(());
         }
-        self.stream
-            .stop_capture()
-            .context("Failed to stop screen capture")?;
+        if let Err(error) = self.stream.stop_capture() {
+            // A system stop can race the explicit stop completion. Only the
+            // delegate's native acknowledgement permits treating it as done;
+            // never infer native state from a localized error string.
+            if !self.native_stopped.load(Ordering::Acquire) {
+                return Err(error).context("Failed to stop screen capture");
+            }
+        }
         self.stopped = true;
         tracing::debug!(
             display_id = self.config.display_id,
@@ -559,16 +628,18 @@ impl ScreenCapturer {
     /// Update capture frame rate at runtime.
     /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
     pub fn set_frame_rate(&mut self, fps: u32) -> anyhow::Result<()> {
-        self.config.frame_rate = fps;
+        let mut next_config = self.config.clone();
+        next_config.frame_rate = fps;
         let config = build_stream_config(
             self.actual_width,
             self.actual_height,
-            &self.config,
+            &next_config,
             self.captures_audio,
         );
         self.stream
             .update_configuration(&config)
             .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
+        self.config = next_config;
         tracing::info!(
             fps,
             width = self.actual_width,
@@ -586,11 +657,21 @@ impl Drop for ScreenCapturer {
         // SCStream's own Drop only releases its reference; it does not wait for
         // capture to stop. Keep callbacks and their Rust context alive until the
         // stop completion arrives, including disconnect and recovery teardown.
-        if let Err(error) = self.stop() {
-            // Destructors cannot report failure to the session. Log it and let
-            // SCStream release its resources; explicit stop() is used when a
-            // successful stop is required before a display-mode transition.
-            tracing::warn!(display_id = self.config.display_id, %error, "Capture cleanup could not confirm stop");
+        let mut retry_delay = std::time::Duration::from_millis(250);
+        let mut warned = false;
+        loop {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.stop()))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Native capture stop panicked")));
+            let Err(error) = result else { break };
+            // All ScreenCapturer instances belong to a dedicated native owner.
+            // Even startup failure/unwinding must not release callbacks or the
+            // owner's display lease while a native stream could remain alive.
+            if !warned {
+                tracing::warn!(display_id = self.config.display_id, %error, "Capture cleanup could not confirm stop; retaining native ownership");
+                warned = true;
+            }
+            std::thread::sleep(retry_delay);
+            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(2));
         }
     }
 }
@@ -902,5 +983,31 @@ impl std::fmt::Debug for SafePixelBuffer {
         f.debug_struct("SafePixelBuffer")
             .field("ptr", &self.ptr)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_stop_notification_acknowledges_retirement_and_wakes_frame_delivery() {
+        let native_stopped = Arc::new(AtomicBool::new(false));
+        let mailbox = Arc::new(mailbox::FrameMailbox::default());
+        let mut receiver = CaptureReceiver(mailbox.clone());
+        let delegate = CaptureStreamDelegate {
+            native_stopped: native_stopped.clone(),
+            frames: mailbox::FrameSender(mailbox),
+        };
+        delegate.did_stop_with_error(screencapturekit::error::SCError::InternalError(
+            "simulated system stop".into(),
+        ));
+        assert!(native_stopped.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.next_frame().await,
+            Some(CaptureEvent::Unavailable)
+        ));
+        drop(delegate);
+        assert!(receiver.next_frame().await.is_none());
     }
 }

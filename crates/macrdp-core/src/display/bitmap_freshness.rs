@@ -1,8 +1,6 @@
 //! Refresh pending regions without discarding the newer frame's damage.
 
-use bytes::Bytes;
-use ironrdp_server::BitmapUpdate;
-use macrdp_capture::{CapturedFrame, FrameData};
+use macrdp_capture::CapturedFrame;
 
 const MAX_DEFERRED_DAMAGE_RECTS: usize = 128;
 
@@ -21,42 +19,30 @@ pub(super) fn accumulate_frame(latest: &mut CapturedFrame, previous: &CapturedFr
     }
 }
 
-pub(super) fn refresh_region(bitmap: &mut BitmapUpdate, frame: &CapturedFrame) -> bool {
-    let x = usize::from(bitmap.x);
-    let y = usize::from(bitmap.y);
-    let width = usize::from(bitmap.width.get());
-    let height = usize::from(bitmap.height.get());
-    if x + width > frame.width as usize || y + height > frame.height as usize {
-        return false;
-    }
-    let copy = |data: &[u8], stride: usize| -> Option<Bytes> {
-        let row_bytes = width.checked_mul(4)?;
-        let mut pixels = Vec::with_capacity(row_bytes.checked_mul(height)?);
-        for row in y..y + height {
-            let start = row.checked_mul(stride)?.checked_add(x.checked_mul(4)?)?;
-            pixels.extend_from_slice(data.get(start..start.checked_add(row_bytes)?)?);
-        }
-        Some(Bytes::from(pixels))
-    };
-    let pixels = match &frame.data {
-        FrameData::Raw(data) => copy(data, frame.stride),
-        FrameData::BgraPixelBuffer(buffer) => buffer
-            .with_locked_bgra(frame.width, frame.height, copy)
-            .flatten(),
-        FrameData::PixelBuffer(_) => None,
-    };
-    let Some(pixels) = pixels else { return false };
-    bitmap.data = pixels;
-    bitmap.stride = std::num::NonZeroUsize::new(width * 4).unwrap();
-    // Newer pixels may have changed anywhere inside this region. Its original
-    // damage hints are no longer sufficient for the downstream framebuffer diff.
-    bitmap.dirty_rects.clear();
-    true
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::{bitmap_updates, damage, ClampedRect};
     use super::*;
+    use bytes::Bytes;
+    use ironrdp_server::BitmapUpdate;
+    use macrdp_capture::FrameData;
+
+    fn refresh_region(bitmap: &mut BitmapUpdate, frame: &CapturedFrame) -> bool {
+        let region = bitmap_updates::Region {
+            bounds: ClampedRect {
+                x: u32::from(bitmap.x),
+                y: u32::from(bitmap.y),
+                width: u32::from(bitmap.width.get()),
+                height: u32::from(bitmap.height.get()),
+            },
+            dirty_rects: bitmap.dirty_rects.clone(),
+        };
+        let Some(materialized) = bitmap_updates::materialize(region, frame, true) else {
+            return false;
+        };
+        *bitmap = materialized.update;
+        true
+    }
     use ironrdp_server::{DiffRect, PixelFormat};
     use macrdp_capture::Rect;
     use std::num::{NonZeroU16, NonZeroUsize};
@@ -99,7 +85,9 @@ mod tests {
             }],
         };
         assert!(refresh_region(&mut queued, &latest));
-        assert_eq!(queued.data.as_ref(), &[2; 16]);
+        assert_eq!(&queued.data[..8], &[2; 8]);
+        assert_eq!(&queued.data[20..28], &[2; 8]);
+        assert_eq!(queued.stride.get(), 20);
         assert!(queued.dirty_rects.is_empty());
         assert_eq!(
             latest.dirty_rects.iter().map(|r| r.x).collect::<Vec<_>>(),
@@ -175,7 +163,7 @@ mod tests {
 
     #[test]
     fn intermediate_pixels_that_revert_are_not_removed_by_capture_refinement() {
-        use super::super::{CachedFrame, MacDisplayUpdates};
+        use super::super::CachedFrame;
         let make_frame = |pixels: &[u8; 6], changed: &[u32]| CapturedFrame {
             width: 6,
             height: 1,
@@ -220,7 +208,7 @@ mod tests {
         // must not erase X from the accumulated damage still owed to the client.
         let mut latest = make_frame(&[1, 1, 1, 1, 5, 1], &[2, 4]);
         accumulate_frame(&mut latest, &intermediate);
-        MacDisplayUpdates::refine_capture_dirty_rects(&mut latest, Some(&baseline), true);
+        damage::refine_capture_dirty_rects(&mut latest, Some(&baseline), true);
         assert!(latest.dirty_rects.iter().any(|rect| rect.x == 2));
         let FrameData::Raw(expected) = &latest.data else {
             unreachable!()

@@ -34,6 +34,12 @@ pub struct UiConfig {
     pub resolution: String,
     pub show_cursor: bool,
 
+    // Audio and clipboard channels are configured at service startup.
+    pub audio_enabled: bool,
+    pub clipboard_enabled: bool,
+    pub clipboard_file_transfer: bool,
+    pub clipboard_max_file_size_mb: u32,
+
     // ── Application ─────────────────────────────────────────
     pub log_level: String,
     pub theme: String,
@@ -69,6 +75,10 @@ impl Default for UiConfig {
             display_backend: DisplayBackend::Main,
             resolution: "auto".to_string(),
             show_cursor: false,
+            audio_enabled: true,
+            clipboard_enabled: true,
+            clipboard_file_transfer: true,
+            clipboard_max_file_size_mb: 100,
             log_level: "warn".to_string(),
             theme: "system".to_string(),
             autostart: false,
@@ -203,7 +213,7 @@ impl UiConfig {
     }
 
     /// Update a single field by key name from a JSON value.
-    /// Listener address, idle timeout, and display backend changes require a restart. Changing the initial
+    /// Listener, channel policy, idle timeout, and display backend changes require a restart. Changing the initial
     /// virtual display resolution also requires a restart so `auto` can resume
     /// following client requests. Virtual display port changes require a restart
     /// to avoid creating overlapping display owners. Other settings use their live update
@@ -286,6 +296,24 @@ impl UiConfig {
             "show_cursor" => {
                 self.show_cursor = value.as_bool().ok_or("show_cursor must be a boolean")?;
             }
+            "audio_enabled" | "clipboard_enabled" | "clipboard_file_transfer" => {
+                let enabled = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{key} must be a boolean"))?;
+                match key {
+                    "audio_enabled" => self.audio_enabled = enabled,
+                    "clipboard_enabled" => self.clipboard_enabled = enabled,
+                    _ => self.clipboard_file_transfer = enabled,
+                }
+            }
+            "clipboard_max_file_size_mb" => {
+                self.clipboard_max_file_size_mb = integer_in_range(
+                    value,
+                    key,
+                    1,
+                    macrdp_core::config::MAX_CLIPBOARD_FILE_SIZE_MB as u64,
+                )? as u32;
+            }
             "log_level" => {
                 self.log_level = value
                     .as_str()
@@ -337,6 +365,10 @@ impl UiConfig {
                 | "tls_cert_path"
                 | "tls_key_path"
                 | "tls_server_names"
+                | "audio_enabled"
+                | "clipboard_enabled"
+                | "clipboard_file_transfer"
+                | "clipboard_max_file_size_mb"
         ) || (matches!(key, "resolution" | "hidpi_scale" | "port")
             && (self.display_backend == DisplayBackend::Virtual
                 || running_backend == Some(DisplayBackend::Virtual)))
@@ -369,8 +401,15 @@ impl UiConfig {
             resolution: Some(self.resolution.clone()),
             show_cursor: Some(self.show_cursor),
             bitrate_mbps: Some(self.bitrate_mbps),
-            audio: macrdp_core::AudioConfig::default(),
-            clipboard: macrdp_core::ClipboardConfig::default(),
+            audio: macrdp_core::AudioConfig {
+                enabled: self.audio_enabled,
+                ..macrdp_core::AudioConfig::default()
+            },
+            clipboard: macrdp_core::ClipboardConfig {
+                enabled: self.clipboard_enabled,
+                file_transfer: self.clipboard_file_transfer,
+                max_file_size_mb: self.clipboard_max_file_size_mb,
+            },
         }
     }
 }
@@ -379,6 +418,72 @@ impl UiConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sharing_settings_migrate_persist_and_reach_server_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config-ui.toml");
+        std::fs::write(&path, "username = 'fixture-user'\n").unwrap();
+        let mut config = UiConfig::load_with_store(
+            &path,
+            || Ok(Some("fixture-secret".into())),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(config.audio_enabled && config.clipboard_enabled && config.clipboard_file_transfer);
+        assert_eq!(config.clipboard_max_file_size_mb, 100);
+        for (key, value) in [
+            ("audio_enabled", json!(false)),
+            ("clipboard_enabled", json!(false)),
+            ("clipboard_file_transfer", json!(false)),
+            ("clipboard_max_file_size_mb", json!(256)),
+        ] {
+            assert!(config.set_field(key, &value).unwrap());
+            for backend in [DisplayBackend::Main, DisplayBackend::Virtual] {
+                assert!(config.requires_restart(key, Some(backend)));
+            }
+        }
+        config
+            .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
+            .unwrap();
+        let restored: UiConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let core = restored.to_server_config();
+        assert!(!core.audio.enabled && !core.clipboard.enabled && !core.clipboard.file_transfer);
+        assert_eq!(core.clipboard.max_file_size_mb, 256);
+        assert_eq!((core.audio.sample_rate, core.audio.channels), (48000, 2));
+        assert!(restored.password.is_empty());
+    }
+
+    #[test]
+    fn invalid_sharing_settings_leave_preferences_unchanged() {
+        let mut config = UiConfig::default();
+        let original = serde_json::to_value(&config).unwrap();
+        for key in [
+            "audio_enabled",
+            "clipboard_enabled",
+            "clipboard_file_transfer",
+        ] {
+            for value in [json!(1), json!("false"), json!(null)] {
+                assert!(config.set_field(key, &value).is_err());
+                assert_eq!(serde_json::to_value(&config).unwrap(), original);
+            }
+        }
+        for value in [
+            json!(0),
+            json!(257),
+            json!(u64::MAX),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!("100"),
+        ] {
+            assert!(config
+                .set_field("clipboard_max_file_size_mb", &value)
+                .is_err());
+            assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        }
+    }
 
     #[test]
     fn tls_preferences_round_trip_without_persisting_the_password() {

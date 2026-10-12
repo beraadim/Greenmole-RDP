@@ -23,7 +23,10 @@ impl Default for AudioConfig {
     }
 }
 
-/// Clipboard synchronization configuration
+/// Largest configurable per-file limit, matching the aggregate incoming budget.
+pub const MAX_CLIPBOARD_FILE_SIZE_MB: u32 = 256;
+
+/// Clipboard synchronization configuration. Size limits use binary MiB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipboardConfig {
@@ -153,6 +156,10 @@ impl ServerConfig {
             anyhow::ensure!(self.audio.sample_rate == 48000 && self.audio.channels == 2,
                 "Audio capture supports 48000 Hz stereo only; set audio.sample_rate=48000 and audio.channels=2, or disable audio");
         }
+        anyhow::ensure!(
+            (1..=MAX_CLIPBOARD_FILE_SIZE_MB).contains(&self.clipboard.max_file_size_mb),
+            "clipboard.max_file_size_mb must be between 1 and 256 MiB"
+        );
         Ok(())
     }
 
@@ -216,6 +223,24 @@ fn config_dir_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_file_size_limits_are_validated_even_when_disabled() {
+        let mut config = ServerConfig::default();
+        config.username = Some("fixture-user".into());
+        config.password = Some("fixture-secret".into());
+        for enabled in [true, false] {
+            config.clipboard.enabled = enabled;
+            for limit in [0, 257, u32::MAX] {
+                config.clipboard.max_file_size_mb = limit;
+                assert!(config.validate().is_err());
+            }
+            for limit in [1, 100, MAX_CLIPBOARD_FILE_SIZE_MB] {
+                config.clipboard.max_file_size_mb = limit;
+                assert!(config.validate().is_ok());
+            }
+        }
+    }
 
     #[test]
     fn enabled_audio_requires_the_native_capture_format() {
