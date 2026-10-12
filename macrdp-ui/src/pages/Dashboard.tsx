@@ -188,6 +188,10 @@ function Dashboard() {
             <div>Capture queue: {metrics.capture_queue_ms.toFixed(1)} ms</div>
             <div>Encode delivery: {metrics.completion_queue_ms.toFixed(1)} ms</div>
             <div>Socket write: {metrics.write_ms.toFixed(1)} ms</div>
+            <div>Capture requested: {metrics.requested_capture_frame_rate ?? "--"} fps</div>
+            <div>Capture applied: {metrics.applied_frame_rate ?? "--"} fps</div>
+            <div>Capture update failures: {metrics.capture_frame_rate_update_failures}</div>
+            {metrics.capture_frame_rate_retry_exhausted && <div role="status" className="text-amber-600">Capture rate change failed; reconnect to retry.</div>}
             <div>Frames combined: {metrics.capture_frames_coalesced}</div>
             <div>Audio queue: {metrics.audio_queued_ms.toFixed(0)} ms</div>
             <div>Last audio wait: {metrics.audio_queue_age_ms.toFixed(0)} ms</div>

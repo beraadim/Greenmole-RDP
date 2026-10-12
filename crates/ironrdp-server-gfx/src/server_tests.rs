@@ -222,14 +222,11 @@ async fn session_quit_stops_the_listener_after_disconnect() {
         .with_no_input()
         .with_no_display()
         .build();
-    let (stream, _peer) = tokio::io::duplex(1024);
-    let (_, mut writer) = split_tokio_framed(TokioFramed::new(stream));
-    let mut events = vec![ServerEvent::Quit("test shutdown".into())];
     assert_eq!(
         server
-            .dispatch_server_events(&mut events, &mut writer, 1002)
-            .await
-            .unwrap(),
+            .dispatch_server_event(ServerEvent::Quit("test shutdown".into()), 1002)
+            .unwrap()
+            .0,
         RunState::Disconnect
     );
     assert!(server.quit_requested);

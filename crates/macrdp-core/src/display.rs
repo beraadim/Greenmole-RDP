@@ -859,7 +859,13 @@ impl RdpServerDisplay for MacDisplay {
             .map(|ip| NetworkQuality::from_ip(is_private_ip(ip)))
             .unwrap_or(NetworkQuality::from_ip(false));
         let initial_fps = capture_config.frame_rate;
-        self.gfx_state.lock().unwrap().applied_frame_rate = Some(initial_fps.max(1));
+        {
+            let mut gfx = self.gfx_state.lock().unwrap();
+            gfx.requested_capture_frame_rate = Some(initial_fps.max(1));
+            gfx.applied_frame_rate = Some(initial_fps.max(1));
+            gfx.capture_frame_rate_update_failures = 0;
+            gfx.capture_frame_rate_retry_exhausted = false;
+        }
         let bitrate_ctrl = BitrateController::new(configured_bitrate, initial_fps, network);
 
         self.coord_mapper.update_display_bounds(
@@ -1013,7 +1019,8 @@ struct MacDisplayUpdates {
     last_large_uncompressed_rects: Option<Vec<ClampedRect>>,
     /// Adaptive bitrate/fps controller.
     bitrate_ctrl: BitrateController,
-    /// Last fps value applied to the capturer (to avoid redundant updates).
+    /// Last FPS acknowledged by the native capturer; desired rate is kept in
+    /// capture_config while the owner retries transient configuration failures.
     last_applied_fps: u32,
     /// Whether a pipelined encode has been submitted and not yet collected.
     has_pending_submit: bool,
@@ -1443,10 +1450,10 @@ impl MacDisplayUpdates {
                 let desired_fps = self.capture_config.frame_rate;
                 self.capture_recovery = None;
                 self.last_applied_fps = recovered.config.frame_rate;
-                self.gfx_state.lock().unwrap().applied_frame_rate = Some(self.last_applied_fps);
                 self.capture_config = recovered.config;
                 self.capturer = Some(recovered.capturer);
                 self.apply_capture_fps(desired_fps, "capture-recovery");
+                self.sync_applied_capture_fps();
                 self.last_frame_cache = None;
                 self.skip_next_frame = false;
                 self.last_uncompressed_rects = None;
@@ -1835,6 +1842,11 @@ impl MacDisplayUpdates {
         }
 
         self.capture_config.frame_rate = target_fps;
+        {
+            let mut gfx = self.gfx_state.lock().unwrap();
+            gfx.requested_capture_frame_rate = Some(target_fps);
+            gfx.capture_frame_rate_retry_exhausted = false;
+        }
         tracing::debug!(
             requested_fps,
             queued_fps = target_fps,
@@ -1847,11 +1859,22 @@ impl MacDisplayUpdates {
         let Some(capturer) = &self.capturer else {
             return;
         };
-        let applied = capturer.applied_frame_rate();
+        let status = capturer.frame_rate_status();
+        let applied = status.applied;
+        {
+            let mut gfx = self.gfx_state.lock().unwrap();
+            gfx.requested_capture_frame_rate = Some(status.requested);
+            gfx.applied_frame_rate = Some(applied);
+            gfx.capture_frame_rate_update_failures = status.failures;
+            gfx.capture_frame_rate_retry_exhausted = status.retry_exhausted;
+        }
         if applied != self.last_applied_fps {
             self.last_applied_fps = applied;
-            self.gfx_state.lock().unwrap().applied_frame_rate = Some(applied);
-            tracing::info!(applied_fps = applied, "Capture frame rate updated");
+            tracing::info!(
+                applied_fps = applied,
+                requested_fps = status.requested,
+                "Capture frame rate updated"
+            );
         }
     }
 

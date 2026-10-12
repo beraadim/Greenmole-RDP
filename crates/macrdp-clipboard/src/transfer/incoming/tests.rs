@@ -13,6 +13,28 @@ fn manager(directory: &tempfile::TempDir) -> IncomingTransfers {
     IncomingTransfers::new(Some(directory.path().to_owned()), MAX_INCOMING_BYTES)
 }
 
+#[test]
+fn discarded_prepared_batch_removes_files_without_consuming_session_quota() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = manager(&directory);
+    let now = Instant::now();
+    let request = start_file(&mut manager, "obsolete", 3, now).remove(0);
+    manager.respond(
+        &FileContentsResponse::new_data_response(request.stream_id, b"old".to_vec()),
+        now,
+    );
+    let prepared = manager.prepare().unwrap();
+    let path = prepared.paths[0].clone();
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    assert_eq!(manager.stored_files, 0);
+    assert_eq!(manager.stored_bytes, 0);
+    drop(prepared);
+    assert!(!path.exists());
+    assert!(!path.parent().unwrap().exists());
+    assert_eq!(manager.stored_files, 0);
+    assert_eq!(manager.stored_bytes, 0);
+}
+
 fn start_file(
     manager: &mut IncomingTransfers,
     name: &str,

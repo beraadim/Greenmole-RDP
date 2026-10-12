@@ -173,6 +173,7 @@ pub(super) struct ControlReceiver {
 
 pub(super) struct DataReceiver {
     data: mpsc::Receiver<QueuedEvent>,
+    deferred: Option<QueuedEvent>,
 }
 
 /// Dropping this guard invalidates callbacks even when a connection future is
@@ -212,7 +213,10 @@ fn channel_with_limits(capacity: usize, bytes: usize) -> (ServerEventTx, ServerE
                 credentials: credentials_rx,
                 quit: quit_rx,
             },
-            data: DataReceiver { data: data_rx },
+            data: DataReceiver {
+                data: data_rx,
+                deferred: None,
+            },
         },
     )
 }
@@ -461,18 +465,34 @@ impl ControlReceiver {
 }
 
 impl DataReceiver {
+    /// A resize may close admission immediately after recv completes. Retain
+    /// that one event, including its byte/audio permits, for the next activation.
+    pub(super) fn defer(&mut self, queued: QueuedEvent) {
+        assert!(
+            self.deferred.is_none(),
+            "only one event can await resize admission"
+        );
+        self.deferred = Some(queued);
+    }
+
     pub(super) async fn recv(&mut self) -> Option<QueuedEvent> {
-        while let Some(queued) = self.data.recv().await {
+        loop {
+            let queued = match self.deferred.take() {
+                Some(queued) => queued,
+                None => self.data.recv().await?,
+            };
             if queued.admission.is_deliverable_at(Instant::now()) {
                 return Some(queued);
             }
         }
-        None
     }
 
     fn try_recv(&mut self) -> Result<ServerEvent, mpsc::error::TryRecvError> {
         loop {
-            let queued = self.data.try_recv()?;
+            let queued = match self.deferred.take() {
+                Some(queued) => queued,
+                None => self.data.try_recv()?,
+            };
             if queued.admission.is_deliverable_at(Instant::now()) {
                 return Ok(queued.event);
             }
@@ -480,6 +500,7 @@ impl DataReceiver {
     }
 
     pub(super) fn discard_pending(&mut self) {
+        self.deferred = None;
         while self.data.try_recv().is_ok() {}
     }
 }
@@ -528,6 +549,28 @@ mod tests {
         assert_eq!(sender.audio_stats().snapshot().stale_frames, 1);
         drop(admission);
         assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn resize_deferred_event_keeps_budget_and_is_cleared_before_a_new_session() {
+        let (sender, mut receiver) = channel();
+        let (session, scoped) = sender.start_session();
+        scoped
+            .send_audio_wave(vec![0; 3840], 0, Duration::from_millis(20), Instant::now())
+            .unwrap();
+        let queued = receiver.data.recv().await.unwrap();
+        receiver.data.defer(queued);
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 20.0);
+        drop(session);
+        let (_session, fresh) = sender.start_session();
+        receiver.data.discard_pending();
+        assert_eq!(sender.audio_stats().snapshot().queued_ms, 0.0);
+        fresh.send(wave(10)).unwrap();
+        let (event, _admission) = receiver.data.recv().await.unwrap().into_parts();
+        let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _)) = event else {
+            panic!("missing new session output");
+        };
+        assert_eq!(data.len(), 10);
     }
 
     #[test]

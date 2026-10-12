@@ -9,6 +9,7 @@ import type {
   ConnectionHistory,
   TrafficStats,
   UiConfig,
+  ConfigurationStatus,
   TlsStatus,
   WindowMoveStatus,
   WindowMoveResult,
@@ -25,9 +26,10 @@ export const api = {
   getWindowMoveStatus: () => invoke<WindowMoveStatus>("get_window_move_status"),
   moveWindowsToRemote: () => invoke<WindowMoveResult>("move_windows_to_remote"),
   getConfig: () => invoke<UiConfig>("get_config"),
+  getConfigurationStatus: () => invoke<ConfigurationStatus>("get_configuration_status"),
   getTlsStatus: () => invoke<TlsStatus>("get_tls_status"),
   setConfig: (key: string, value: unknown) =>
-    invoke<{ restart_required: boolean }>("set_config", { key, value }),
+    invoke<ConfigurationStatus>("set_config", { key, value }),
   exportDiagnostics: () => invoke<{ path: string }>("export_diagnostics"),
   getLogs: (limit?: number) =>
     invoke<LogEntry[]>("get_logs", { limit: limit ?? 500 }),

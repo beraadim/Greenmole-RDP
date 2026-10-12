@@ -34,6 +34,7 @@ struct Observed {
     stop_gate: Mutex<Option<Gate>>,
     fail_stop_once: std::sync::atomic::AtomicBool,
     panic_configure: std::sync::atomic::AtomicBool,
+    fail_configure_remaining: AtomicU32,
 }
 
 impl Observed {
@@ -72,6 +73,16 @@ impl NativeStream for Stream {
         );
         if let Some(gate) = self.observed.configure_gate.lock().unwrap().take() {
             gate.wait();
+        }
+        if self
+            .observed
+            .fail_configure_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            anyhow::bail!("simulated native configuration failure");
         }
         self.fps = fps;
         Ok(())
@@ -360,5 +371,136 @@ async fn configuration_panic_still_retires_native_stream_before_releasing_owner(
     assert_eq!(
         observed.events(),
         ["configure-10", "stop", "stream-dropped", "owner-released"]
+    );
+}
+
+async fn wait_for_status(
+    capture: &CaptureWorker<Stream>,
+    predicate: impl Fn(FrameRateStatus) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !predicate(capture.frame_rate_status()) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn failed_frame_rate_update_retries_and_reports_only_confirmed_application() {
+    let (owner, stream, observed, retired) = owned_stream();
+    observed
+        .fail_configure_remaining
+        .store(1, Ordering::Release);
+    let (mut capture, ()) = CaptureWorker::start(owner, move || Ok((stream, ())))
+        .await
+        .unwrap();
+    capture.set_frame_rate(15);
+    wait_for_status(&capture, |status| status.failures == 1).await;
+    let status = capture.frame_rate_status();
+    assert_eq!(status.requested, 15);
+    assert_eq!(status.applied, 30);
+    assert!(!status.retry_exhausted);
+    wait_for_status(&capture, |status| status.applied == 15).await;
+    assert_eq!(capture.frame_rate_status().failures, 1);
+    assert!(!capture.frame_rate_status().retry_exhausted);
+    capture.stop().await.unwrap();
+    complete(retired).await;
+    assert_eq!(
+        observed.events(),
+        [
+            "configure-15",
+            "configure-15",
+            "stop",
+            "stream-dropped",
+            "owner-released"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn exhausted_frame_rate_retries_stay_bounded_and_a_new_request_can_recover() {
+    let (owner, stream, observed, retired) = owned_stream();
+    observed
+        .fail_configure_remaining
+        .store(100, Ordering::Release);
+    let (mut capture, ()) = CaptureWorker::start(owner, move || Ok((stream, ())))
+        .await
+        .unwrap();
+    capture.set_frame_rate(15);
+    wait_for_status(&capture, |status| status.retry_exhausted).await;
+    let status = capture.frame_rate_status();
+    assert_eq!(status.failures, 4);
+    assert_eq!(status.requested, 15);
+    assert_eq!(status.applied, 30);
+    // Longer than the final backoff: an exhausted target must remain idle.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(observed.events(), ["configure-15"; 4]);
+    observed
+        .fail_configure_remaining
+        .store(0, Ordering::Release);
+    capture.set_frame_rate(20);
+    wait_for_status(&capture, |status| status.applied == 20).await;
+    let status = capture.frame_rate_status();
+    assert_eq!(status.requested, 20);
+    assert_eq!(status.failures, 4);
+    assert!(!status.retry_exhausted);
+    capture.stop().await.unwrap();
+    complete(retired).await;
+}
+
+#[tokio::test]
+async fn newer_frame_rate_target_supersedes_a_failed_in_flight_request() {
+    let (owner, stream, observed, retired) = owned_stream();
+    let (configure, entered, release) = gate();
+    *observed.configure_gate.lock().unwrap() = Some(configure);
+    observed
+        .fail_configure_remaining
+        .store(1, Ordering::Release);
+    let (mut capture, ()) = CaptureWorker::start(owner, move || Ok((stream, ())))
+        .await
+        .unwrap();
+    capture.set_frame_rate(15);
+    complete(entered).await;
+    capture.set_frame_rate(20);
+    release.send(()).unwrap();
+    wait_for_status(&capture, |status| status.applied == 20).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(observed.events(), ["configure-15", "configure-20"]);
+    assert_eq!(capture.frame_rate_status().requested, 20);
+    assert!(!capture.frame_rate_status().retry_exhausted);
+    capture.stop().await.unwrap();
+    complete(retired).await;
+}
+
+#[tokio::test]
+async fn stop_interrupts_frame_rate_retry_backoff() {
+    let (owner, stream, observed, retired) = owned_stream();
+    observed
+        .fail_configure_remaining
+        .store(100, Ordering::Release);
+    let (mut capture, ()) = CaptureWorker::start(owner, move || Ok((stream, ())))
+        .await
+        .unwrap();
+    capture.set_frame_rate(15);
+    wait_for_status(&capture, |status| status.failures == 3).await;
+    // The next retry is 400 ms away. Retirement should wake the condition
+    // variable immediately instead of sleeping through that backoff.
+    tokio::time::timeout(Duration::from_millis(200), capture.stop())
+        .await
+        .unwrap()
+        .unwrap();
+    complete(retired).await;
+    assert_eq!(
+        observed.events(),
+        [
+            "configure-15",
+            "configure-15",
+            "configure-15",
+            "stop",
+            "stream-dropped",
+            "owner-released"
+        ]
     );
 }

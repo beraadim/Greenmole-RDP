@@ -49,6 +49,10 @@ use crate::{builder, capabilities, SoundServerFactory};
 #[path = "server_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod transport_tests;
+
 #[path = "capture_activation.rs"]
 mod capture_activation;
 #[path = "connection_control.rs"]
@@ -69,7 +73,10 @@ pub use event_queue::{
 };
 #[path = "output.rs"]
 mod output;
-use output::{SharedWriter, DEFAULT_WRITE_TIMEOUT};
+use output::{ChannelOutput, MessagePermit, SharedWriter, DEFAULT_WRITE_TIMEOUT};
+#[path = "pending_input.rs"]
+mod pending_input;
+use pending_input::PendingInput;
 
 #[derive(Clone)]
 pub struct RdpServerOptions {
@@ -289,6 +296,7 @@ pub struct RdpServer {
     write_timeout: Duration,
     input_activity: watch::Sender<tokio::time::Instant>,
     quit_requested: bool,
+    deferred_input: PendingInput,
 }
 
 #[derive(Debug)]
@@ -366,6 +374,7 @@ impl RdpServer {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             input_activity: watch::channel(tokio::time::Instant::now()).0,
             quit_requested: false,
+            deferred_input: PendingInput::default(),
         }
     }
 
@@ -457,6 +466,8 @@ impl RdpServer {
         self.handshake_deadline = Some(tokio::time::Instant::now() + self.total_handshake_timeout);
         self.gfx_state.lock().unwrap().connection_outcome = None;
         let result = self.run_connection_inner(stream).await;
+        self.deferred_input = PendingInput::default();
+        self.ev_receiver.lock().await.data.discard_pending();
         self.handshake_deadline = None;
         if self.connection_authenticated {
             self.admission.succeeded(peer);
@@ -490,6 +501,7 @@ impl RdpServer {
     }
 
     async fn run_connection_inner(&mut self, stream: TcpStream) -> Result<()> {
+        self.deferred_input = PendingInput::default();
         transport::configure_stream(&stream)?;
         let (_session_guard, sender) = self.ev_sender.start_session();
         self.ev_receiver.lock().await.data.discard_pending();
@@ -682,10 +694,9 @@ impl RdpServer {
         &mut self,
         action: Action,
         bytes: bytes::BytesMut,
-        writer: &mut impl FramedWrite,
         io_channel_id: u16,
         user_channel_id: u16,
-    ) -> Result<RunState> {
+    ) -> Result<(RunState, Option<ChannelOutput>)> {
         match action {
             Action::FastPath => {
                 let input = decode(&bytes)?;
@@ -693,23 +704,75 @@ impl RdpServer {
             }
 
             Action::X224 => {
-                if self
-                    .handle_x224(writer, io_channel_id, user_channel_id, &bytes)
+                let (disconnect, output) = self
+                    .handle_x224(io_channel_id, user_channel_id, &bytes)
                     .await
-                    .context("X224 input error")?
-                {
+                    .context("X224 input error")?;
+                if disconnect {
                     debug!("Got disconnect request");
-                    return Ok(RunState::Disconnect);
+                    return Ok((RunState::Disconnect, output));
                 }
+                return Ok((RunState::Continue, output));
             }
         }
 
-        Ok(RunState::Continue)
+        Ok((RunState::Continue, None))
+    }
+
+    async fn dispatch_input_pdu(
+        server: &Mutex<&mut Self>,
+        action: Action,
+        bytes: bytes::BytesMut,
+        writer: &mut SharedWriter<'_, impl FramedWrite>,
+        permit: MessagePermit,
+        io_channel_id: u16,
+        user_channel_id: u16,
+    ) -> Result<RunState> {
+        let (state, output) = server
+            .lock()
+            .await
+            .dispatch_pdu(action, bytes, io_channel_id, user_channel_id)
+            .await?;
+        // Channel state is committed before output, but must not stay locked
+        // while another channel or a slow peer holds up socket progress.
+        if let Some(output) = output {
+            writer
+                .write_admitted_channel(&output, permit, || true)
+                .await?;
+        }
+        Ok(state)
+    }
+
+    async fn dispatch_event_output(
+        server: &Mutex<&mut Self>,
+        event: ServerEvent,
+        admission: event_queue::EventAdmission,
+        writer: &mut SharedWriter<'_, impl FramedWrite>,
+        permit: MessagePermit,
+        user_channel_id: u16,
+    ) -> Result<RunState> {
+        let (state, output) = {
+            let mut server = server.lock().await;
+            if !admission.is_deliverable_at(std::time::Instant::now()) {
+                return Ok(RunState::Continue);
+            }
+            server.dispatch_server_event(event, user_channel_id)?
+        };
+        if let Some(output) = output {
+            // Keep the event budget until the complete message is written.
+            // Recheck PCM freshness after both channel and socket admission.
+            writer
+                .write_admitted_channel(&output, permit, || {
+                    admission.is_deliverable_at(std::time::Instant::now())
+                })
+                .await?;
+        }
+        Ok(state)
     }
 
     async fn dispatch_display_update(
         update: DisplayUpdate,
-        writer: &mut impl FramedWrite,
+        writer: &mut SharedWriter<'_, impl FramedWrite>,
         user_channel_id: u16,
         io_channel_id: u16,
         buffer: &mut Vec<u8>,
@@ -753,14 +816,18 @@ impl RdpServer {
                         user_channel_id,
                     )?;
                     let write_started = std::time::Instant::now();
+                    let output = ChannelOutput {
+                        channel_id: drdynvc_id,
+                        data,
+                    };
                     writer
-                        .write_all(&data)
+                        .write_channel(&output)
                         .await
                         .context("failed to write GFX frame")?;
                     let mut state = gfx_state.lock().unwrap();
                     state.frame_written(frame_id);
                     state.record_display_write(
-                        data.len(),
+                        output.data.len(),
                         write_started.elapsed().as_secs_f64() * 1000.0,
                     );
 
@@ -798,14 +865,18 @@ impl RdpServer {
                         user_channel_id,
                     )?;
                     let write_started = std::time::Instant::now();
+                    let output = ChannelOutput {
+                        channel_id: drdynvc_id,
+                        data,
+                    };
                     writer
-                        .write_all(&data)
+                        .write_channel(&output)
                         .await
                         .context("failed to write GFX uncompressed frame")?;
                     let mut state = gfx_state.lock().unwrap();
                     state.frame_written(frame_id);
                     state.record_display_write(
-                        data.len(),
+                        output.data.len(),
                         write_started.elapsed().as_secs_f64() * 1000.0,
                     );
 
@@ -860,120 +931,110 @@ impl RdpServer {
         Ok((RunState::Continue, encoder))
     }
 
-    async fn dispatch_server_events(
+    fn dispatch_server_event(
         &mut self,
-        events: &mut Vec<ServerEvent>,
-        writer: &mut impl FramedWrite,
+        event: ServerEvent,
         user_channel_id: u16,
-    ) -> Result<RunState> {
-        for event in events.drain(..) {
-            match event {
-                ServerEvent::Quit(reason) => {
-                    debug!("Got quit event: {reason}");
-                    self.quit_requested = true;
-                    return Ok(RunState::Disconnect);
-                }
-                ServerEvent::GetLocalAddr(tx) => {
-                    let _ = tx.send(self.local_addr);
-                }
-                ServerEvent::SetCredentials(creds) => {
-                    self.set_credentials(Some(creds));
-                }
-                ServerEvent::Rdpsnd(s) => {
-                    let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
-                        warn!("No rdpsnd channel, dropping event");
-                        continue;
-                    };
-                    let msgs = match s {
-                        RdpsndServerMessage::Wave(data, ts) => {
-                            match rdpsnd.wave(data, ts) {
-                                Ok(msgs) => msgs,
-                                Err(e) => {
-                                    // Wave before handshake complete — drop silently
-                                    debug!("Dropping wave: {e}");
-                                    continue;
-                                }
+    ) -> Result<(RunState, Option<ChannelOutput>)> {
+        let output = match event {
+            ServerEvent::Quit(reason) => {
+                debug!("Got quit event: {reason}");
+                self.quit_requested = true;
+                return Ok((RunState::Disconnect, None));
+            }
+            ServerEvent::GetLocalAddr(tx) => {
+                let _ = tx.send(self.local_addr);
+                None
+            }
+            ServerEvent::SetCredentials(creds) => {
+                self.set_credentials(Some(creds));
+                None
+            }
+            ServerEvent::Rdpsnd(s) => {
+                let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
+                    warn!("No rdpsnd channel, dropping event");
+                    return Ok((RunState::Continue, None));
+                };
+                let msgs = match s {
+                    RdpsndServerMessage::Wave(data, ts) => {
+                        match rdpsnd.wave(data, ts) {
+                            Ok(msgs) => msgs,
+                            Err(e) => {
+                                // Wave before handshake complete — drop silently
+                                debug!("Dropping wave: {e}");
+                                return Ok((RunState::Continue, None));
                             }
                         }
-                        RdpsndServerMessage::SetVolume { left, right } => rdpsnd
-                            .set_volume(left, right)
-                            .context("failed to send rdpsnd event")?,
-                        RdpsndServerMessage::Close => {
-                            rdpsnd.close().context("failed to send rdpsnd event")?
-                        }
-                        RdpsndServerMessage::Error(error) => {
-                            error!(?error, "Handling rdpsnd event");
-                            continue;
-                        }
-                    };
-                    let channel_id = self
-                        .get_channel_id_by_type::<RdpsndServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    // Encode the complete logical audio event into one write,
-                    // including both legacy WaveInfo/WaveData and SVC fragments.
-                    // Freshness admission must never drop only half of a wave.
-                    let data =
-                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
-                    writer.write_all(&data).await?;
-                }
-                ServerEvent::Clipboard(c) => {
-                    let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
-                        warn!("No clipboard channel, dropping event");
-                        continue;
-                    };
-                    let msgs = match c {
-                        ClipboardMessage::SendInitiateCopy(formats) => {
-                            cliprdr.initiate_copy(&formats)
-                        }
-                        ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
-                        ClipboardMessage::SendInitiatePaste(format) => {
-                            cliprdr.initiate_paste(format)
-                        }
-                        ClipboardMessage::Error(error) => {
-                            error!(?error, "Handling clipboard event");
-                            continue;
-                        }
                     }
-                    .context("failed to send clipboard event")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data =
-                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
-                    writer.write_all(&data).await?;
-                }
-                ServerEvent::ClipboardFileContents(response) => {
-                    let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
-                        warn!("No clipboard channel, dropping file contents response");
-                        continue;
-                    };
-                    let msgs = cliprdr
-                        .submit_file_contents(response)
-                        .context("failed to submit file contents")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data =
-                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
-                    writer.write_all(&data).await?;
-                }
-                ServerEvent::ClipboardFileContentsRequest(request) => {
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let pdu = ClipboardPdu::FileContentsRequest(request);
-                    let svc_msg = encode_cliprdr_pdu(pdu);
-                    let data = server_encode_svc_messages(
-                        vec![svc_msg].into(),
-                        channel_id,
-                        user_channel_id,
-                    )?;
-                    writer.write_all(&data).await?;
-                }
+                    RdpsndServerMessage::SetVolume { left, right } => rdpsnd
+                        .set_volume(left, right)
+                        .context("failed to send rdpsnd event")?,
+                    RdpsndServerMessage::Close => {
+                        rdpsnd.close().context("failed to send rdpsnd event")?
+                    }
+                    RdpsndServerMessage::Error(error) => {
+                        error!(?error, "Handling rdpsnd event");
+                        return Ok((RunState::Continue, None));
+                    }
+                };
+                let channel_id = self
+                    .get_channel_id_by_type::<RdpsndServer>()
+                    .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                // Encode the complete logical audio event into one batch,
+                // including both legacy WaveInfo/WaveData and SVC fragments.
+                // Freshness admission must never drop only half of a wave.
+                let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                Some(ChannelOutput { channel_id, data })
             }
-        }
+            ServerEvent::Clipboard(c) => {
+                let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                    warn!("No clipboard channel, dropping event");
+                    return Ok((RunState::Continue, None));
+                };
+                let msgs = match c {
+                    ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
+                    ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
+                    ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
+                    ClipboardMessage::Error(error) => {
+                        // Untagged format responses cannot safely recover
+                        // by guessing which request a late reply belongs to.
+                        bail!("clipboard backend failed: {error}");
+                    }
+                }
+                .context("failed to send clipboard event")?;
+                let channel_id = self
+                    .get_channel_id_by_type::<CliprdrServer>()
+                    .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                Some(ChannelOutput { channel_id, data })
+            }
+            ServerEvent::ClipboardFileContents(response) => {
+                let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                    warn!("No clipboard channel, dropping file contents response");
+                    return Ok((RunState::Continue, None));
+                };
+                let msgs = cliprdr
+                    .submit_file_contents(response)
+                    .context("failed to submit file contents")?;
+                let channel_id = self
+                    .get_channel_id_by_type::<CliprdrServer>()
+                    .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                Some(ChannelOutput { channel_id, data })
+            }
+            ServerEvent::ClipboardFileContentsRequest(request) => {
+                let channel_id = self
+                    .get_channel_id_by_type::<CliprdrServer>()
+                    .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                let pdu = ClipboardPdu::FileContentsRequest(request);
+                let svc_msg = encode_cliprdr_pdu(pdu);
+                let data =
+                    server_encode_svc_messages(vec![svc_msg].into(), channel_id, user_channel_id)?;
+                Some(ChannelOutput { channel_id, data })
+            }
+        };
 
-        Ok(RunState::Continue)
+        Ok((RunState::Continue, output))
     }
 
     async fn client_loop<R, W>(
@@ -1023,38 +1084,55 @@ impl RdpServer {
         // Get DRDYNVC channel ID for sending GFX frames
         let drdynvc_channel_id = self.get_channel_id_by_type::<DynamicChannels>();
 
+        // Replay pre-resize input first, then activation input in wire order.
+        // Nothing is removed until a message permit protects state processing
+        // and any response from cancellation by successful reactivation.
+        let mut pending = core::mem::take(&mut self.deferred_input);
+        for frame in input_events {
+            let header = frame
+                .first()
+                .ok_or_else(|| anyhow!("empty deferred input PDU"))?;
+            let action = Action::from_fp_output_header(*header)
+                .map_err(|code| anyhow!("invalid deferred input PDU action: {code}"))?;
+            pending.push(action, frame.as_slice().into())?;
+        }
+        for (action, bytes) in pending_pdus {
+            pending.push(action, bytes)?;
+        }
+        let pending = Rc::new(std::cell::RefCell::new(pending));
+
         let s = Rc::new(Mutex::new(self));
         let quit_received = Rc::new(std::cell::Cell::new(false));
         let changed_credentials = Rc::new(std::cell::RefCell::new(None));
 
         let this = Rc::clone(&s);
+        let pending_input = Rc::clone(&pending);
         let dispatch_pdu = async move {
-            // Capture creation commits the input transform. Replay activation
-            // input afterward, inside the cancellable session driver.
-            if !input_events.is_empty() {
-                this.lock()
-                    .await
-                    .handle_input_backlog(&mut writer, io_channel_id, user_channel_id, input_events)
-                    .await?;
-            }
-            // Input received while native capture starts must wait until the
-            // display has committed its coordinate transform, preserving order.
-            for (action, bytes) in pending_pdus {
-                let state = this
-                    .lock()
-                    .await
-                    .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
-                    .await?;
-                if state != RunState::Continue {
-                    return Ok(state);
-                }
-            }
             loop {
-                let (action, bytes) = reader.read_pdu().await?;
-                let mut this = this.lock().await;
-                match this
-                    .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
-                    .await?
+                if pending_input.borrow().is_empty() {
+                    let (action, bytes) = reader.read_pdu().await?;
+                    pending_input.borrow_mut().push(action, bytes)?;
+                }
+                let Some(permit) = writer.try_begin_message() else {
+                    // A resize is already draining output. Keep the consumed
+                    // PDU for the next activation, without holding an idle
+                    // reader permit that would prevent deactivation forever.
+                    return std::future::pending::<Result<RunState>>().await;
+                };
+                let (action, bytes) = pending_input
+                    .borrow_mut()
+                    .pop()
+                    .expect("pending input exists");
+                match Self::dispatch_input_pdu(
+                    &this,
+                    action,
+                    bytes,
+                    &mut writer,
+                    permit,
+                    io_channel_id,
+                    user_channel_id,
+                )
+                .await?
                 {
                     RunState::Continue => continue,
                     state => break Ok(state),
@@ -1128,25 +1206,24 @@ impl RdpServer {
             }
         };
         let dispatch_events = async move {
-            let mut events = Vec::with_capacity(1);
             loop {
                 let Some(queued) = data.recv().await else {
                     break Ok(RunState::Disconnect);
                 };
+                let Some(permit) = event_writer.try_begin_message() else {
+                    data.defer(queued);
+                    return std::future::pending::<Result<RunState>>().await;
+                };
                 let (event, admission) = queued.into_parts();
-                let mut this = this.lock().await;
-                if !admission.is_deliverable_at(std::time::Instant::now()) {
-                    continue;
-                }
-                events.push(event);
-                // Display output can hold the socket lock after we acquire the
-                // server lock. Keep capture metadata and budgets until the
-                // writer rechecks admission immediately before any bytes.
-                let mut admitted_writer = event_writer
-                    .with_admission(|| admission.is_deliverable_at(std::time::Instant::now()));
-                match this
-                    .dispatch_server_events(&mut events, &mut admitted_writer, user_channel_id)
-                    .await?
+                match Self::dispatch_event_output(
+                    &this,
+                    event,
+                    admission,
+                    &mut event_writer,
+                    permit,
+                    user_channel_id,
+                )
+                .await?
                 {
                     RunState::Continue => continue,
                     state => break Ok(state),
@@ -1166,6 +1243,12 @@ impl RdpServer {
             state = dispatch_display => ("display", state),
             state = dispatch_events => ("events", state),
         );
+
+        if matches!(state, Ok(RunState::DeactivationReactivation { .. })) {
+            s.lock().await.deferred_input = core::mem::take(&mut *pending.borrow_mut());
+        } else {
+            ev_receiver.data.discard_pending();
+        }
 
         if quit_received.get() {
             s.lock().await.quit_requested = true;
@@ -1419,35 +1502,6 @@ impl RdpServer {
         Ok(state)
     }
 
-    async fn handle_input_backlog(
-        &mut self,
-        writer: &mut impl FramedWrite,
-        io_channel_id: u16,
-        user_channel_id: u16,
-        frames: Vec<Vec<u8>>,
-    ) -> Result<()> {
-        for frame in frames {
-            match Action::from_fp_output_header(frame[0]) {
-                Ok(Action::FastPath) => {
-                    let input = decode(&frame)?;
-                    self.handle_fastpath(input).await;
-                }
-
-                Ok(Action::X224) => {
-                    let _ = self
-                        .handle_x224(writer, io_channel_id, user_channel_id, &frame)
-                        .await?;
-                }
-
-                // the frame here is always valid, because otherwise it would
-                // have failed during the acceptor loop
-                Err(_) => unreachable!(),
-            }
-        }
-
-        Ok(())
-    }
-
     async fn handle_fastpath(&mut self, input: FastPathInput) {
         if input
             .input_events()
@@ -1519,17 +1573,16 @@ impl RdpServer {
 
     async fn handle_x224(
         &mut self,
-        writer: &mut impl FramedWrite,
         io_channel_id: u16,
         user_channel_id: u16,
         frame: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<ChannelOutput>)> {
         let message = decode::<X224<mcs::McsMessage<'_>>>(frame)?;
         match message.0 {
             mcs::McsMessage::SendDataRequest(data) => {
                 debug!(?data, "McsMessage::SendDataRequest");
                 if data.channel_id == io_channel_id {
-                    return self.handle_io_channel_data(data).await;
+                    return Ok((self.handle_io_channel_data(data).await?, None));
                 }
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
@@ -1539,7 +1592,13 @@ impl RdpServer {
                         data.channel_id,
                         user_channel_id,
                     )?;
-                    writer.write_all(&response).await?;
+                    return Ok((
+                        false,
+                        Some(ChannelOutput {
+                            channel_id: data.channel_id,
+                            data: response,
+                        }),
+                    ));
                 } else {
                     warn!(
                         channel_id = data.channel_id,
@@ -1550,7 +1609,7 @@ impl RdpServer {
 
             mcs::McsMessage::DisconnectProviderUltimatum(disconnect) => {
                 if disconnect.reason == mcs::DisconnectReason::UserRequested {
-                    return Ok(true);
+                    return Ok((true, None));
                 }
             }
 
@@ -1562,7 +1621,7 @@ impl RdpServer {
             }
         }
 
-        Ok(false)
+        Ok((false, None))
     }
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
@@ -1695,7 +1754,7 @@ impl RdpServer {
 async fn deactivate_all(
     io_channel_id: u16,
     user_channel_id: u16,
-    writer: &mut impl FramedWrite,
+    writer: &mut SharedWriter<'_, impl FramedWrite>,
 ) -> Result<(), anyhow::Error> {
     let pdu = ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll);
     let pdu = rdp::headers::ShareControlHeader {
@@ -1710,7 +1769,7 @@ async fn deactivate_all(
         user_data,
     };
     let msg = encode_vec(&X224(pdu))?;
-    writer.write_all(&msg).await?;
+    writer.write_barrier(&msg).await?;
     Ok(())
 }
 

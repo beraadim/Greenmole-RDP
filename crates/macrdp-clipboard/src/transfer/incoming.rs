@@ -51,6 +51,14 @@ struct Batch {
     directory: tempfile::TempDir,
 }
 
+/// Completed files retain their private directory until pasteboard publication
+/// succeeds. Dropping a stale batch removes it without consuming session quota.
+pub(crate) struct PreparedIncoming {
+    pub paths: Vec<PathBuf>,
+    bytes: u64,
+    directory: tempfile::TempDir,
+}
+
 pub(super) struct IncomingTransfers {
     directory: Option<PathBuf>,
     max_file_size: u64,
@@ -339,14 +347,13 @@ impl IncomingTransfers {
         })
     }
 
-    pub(super) fn finish(&mut self) -> Vec<PathBuf> {
+    pub(super) fn prepare(&mut self) -> Option<PreparedIncoming> {
         if !self.complete() {
-            return Vec::new();
+            return None;
         }
-        let Some(batch) = self.batch.take() else {
-            return Vec::new();
-        };
+        let batch = self.batch.take()?;
         let mut paths = Vec::new();
+        let mut bytes = 0;
         for file in batch.files {
             if file.state != State::Complete {
                 continue;
@@ -357,21 +364,39 @@ impl IncomingTransfers {
             let path = batch.directory.path().join(file.descriptor.name);
             match staging.persist_noclobber(&path) {
                 Ok(_) => {
-                    self.stored_bytes += file.size;
-                    self.stored_files += 1;
+                    bytes += file.size;
                     paths.push(path);
                 }
-                Err(_) => tracing::warn!("Cannot publish staged clipboard file"),
+                Err(_) => tracing::warn!("Cannot prepare staged clipboard file"),
             }
         }
-        if !paths.is_empty() {
-            let _ = batch.directory.keep();
-            tracing::info!(
-                count = paths.len(),
-                "Completed incoming clipboard file batch"
-            );
+        if paths.is_empty() {
+            return None;
         }
-        paths
+        Some(PreparedIncoming {
+            paths,
+            bytes,
+            directory: batch.directory,
+        })
+    }
+
+    pub(super) fn retain(&mut self, prepared: PreparedIncoming) -> Vec<PathBuf> {
+        self.stored_bytes += prepared.bytes;
+        self.stored_files += prepared.paths.len();
+        let _ = prepared.directory.keep();
+        tracing::info!(
+            count = prepared.paths.len(),
+            "Published incoming clipboard file batch"
+        );
+        prepared.paths
+    }
+
+    #[cfg(test)]
+    fn finish(&mut self) -> Vec<PathBuf> {
+        match self.prepare() {
+            Some(prepared) => self.retain(prepared),
+            None => Vec::new(),
+        }
     }
 }
 

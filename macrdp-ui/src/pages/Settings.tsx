@@ -1,9 +1,9 @@
 import { CertificateSettings } from "../components/CertificateSettings";
 import { ClipboardSettings } from "../components/ClipboardSettings";
 import { useState, useEffect } from "react";
-import { AlertTriangle, X } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { api } from "../lib/ipc";
-import type { UiConfig } from "../lib/types";
+import type { ConfigurationStatus, UiConfig } from "../lib/types";
 import { Input } from "../components/ui/input";
 import {
   Select,
@@ -14,7 +14,6 @@ import {
 } from "../components/ui/select";
 import { Switch } from "../components/ui/switch";
 import { Alert, AlertDescription } from "../components/ui/alert";
-import { Button } from "../components/ui/button";
 import { SettingRow } from "../components/SettingRow";
 import { useTheme } from "../contexts/ThemeContext";
 
@@ -30,24 +29,43 @@ const categories = [
 
 type CategoryId = (typeof categories)[number]["id"];
 
+const restartLabels: Record<string, string> = {
+  display_backend: "display", bind_address: "bind address", port: "port",
+  idle_timeout_secs: "idle timeout", tls_cert_path: "certificate", tls_key_path: "certificate key",
+  tls_server_names: "certificate names", audio_enabled: "system audio",
+  clipboard_enabled: "clipboard synchronization", clipboard_file_transfer: "file transfers",
+  clipboard_max_file_size_mb: "file size limit", resolution: "resolution",
+};
+const settingLabel = (key: string) => restartLabels[key] ?? "service setting";
+
 function Settings() {
   const [config, setConfig] = useState<UiConfig | null>(null);
-  const [restartRequired, setRestartRequired] = useState(false);
+  const [configurationState, setConfigurationState] = useState<ConfigurationStatus | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<CategoryId>("rdp");
   const { theme, setTheme } = useTheme();
 
   useEffect(() => {
-    api.getConfig().then(setConfig).catch(console.error);
+    let cancelled = false;
+    api.getConfig().then((value) => { if (!cancelled) setConfig(value); }).catch(console.error);
+    const refreshStatus = async () => {
+      try {
+        const value = await api.getConfigurationStatus();
+        if (!cancelled) setConfigurationState(value);
+      } catch (error) {
+        if (!cancelled) setSettingsError(String(error));
+      }
+    };
+    void refreshStatus();
+    const timer = setInterval(refreshStatus, 2000);
+    return () => { cancelled = true; clearInterval(timer); };
   }, []);
 
   const updateConfig = async (key: keyof UiConfig, value: unknown) => {
     try {
       setSettingsError(null);
       const result = await api.setConfig(key, value);
-      if (result.restart_required) {
-        setRestartRequired(true);
-      }
+      setConfigurationState(result);
       setConfig((prev) => (prev ? { ...prev, [key]: value } : prev));
       return true;
     } catch (err) {
@@ -97,7 +115,7 @@ function Settings() {
       <div className="flex-1 overflow-y-auto p-4">
         {settingsError && <p role="alert" className="mb-3 text-xs text-red-600 dark:text-red-400">{settingsError}</p>}
         {/* Restart required banner */}
-        {restartRequired && (
+        {configurationState?.restart_required && (
           <Alert
             variant="default"
             className="mb-4 border-yellow-400/60 bg-yellow-50 dark:bg-yellow-950/30"
@@ -105,16 +123,9 @@ function Settings() {
             <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
             <AlertDescription className="flex items-center justify-between">
               <span className="text-yellow-800 dark:text-yellow-300 text-xs">
-                Some settings take effect after restarting the service
+                Saved settings are pending a service restart: {configurationState.pending_restart.map(settingLabel).join(", ")}.
               </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-6 w-6 p-0 text-yellow-700 hover:text-yellow-900 dark:text-yellow-400"
-                onClick={() => setRestartRequired(false)}
-              >
-                <X className="h-3.5 w-3.5" />
-              </Button>
+
             </AlertDescription>
           </Alert>
         )}
@@ -214,15 +225,8 @@ function Settings() {
               />
             </SettingRow>
 
-            <SettingRow label="Max connections" description="Requires service restart">
-              <Input
-                type="number"
-                value={config.max_connections}
-                onChange={(e) =>
-                  updateConfig("max_connections", parseInt(e.target.value, 10))
-                }
-                className="h-7 w-[120px] text-xs"
-              />
+            <SettingRow label="Connections" description="One remote session at a time">
+              <span className="text-xs text-text-muted">1 active session</span>
             </SettingRow>
 
             <SettingRow label="Idle timeout (seconds)" description="Requires service restart">

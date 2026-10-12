@@ -27,6 +27,7 @@ pub struct ExportResult {
 
 #[tauri::command]
 pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<ExportResult, String> {
+    let lifecycle = state.lifecycle_lock.lock().await;
     let config = state.ui_config.lock().await.clone();
     let history = state.diagnostic_history.lock().await.snapshot();
     let (status, metrics, connection_count) = {
@@ -44,6 +45,15 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
             ),
         }
     };
+    let running_config = state
+        .running_config
+        .lock()
+        .await
+        .clone()
+        .filter(|_| status.running);
+    let configuration_state =
+        crate::configuration::configuration_status(&config, running_config.as_ref());
+    drop(lifecycle);
     tokio::task::spawn_blocking(move || {
         let directory = dirs::desktop_dir().ok_or("Desktop folder is unavailable")?;
         let permissions = macrdp_core::permissions::check_permissions();
@@ -55,7 +65,7 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
             },
         );
         let report = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -64,7 +74,12 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
             "service": {"running": status.running,
                 "state": service_state(&status.state), "uptime_secs": status.uptime_secs,
                 "port": status.port, "connections": connection_count},
-            "configuration": safe_configuration(&config),
+            "configuration": {
+                "saved": safe_configuration(&config),
+                "running": running_config.as_ref().map(safe_configuration),
+                "state": configuration_state,
+                "live_updates": "Running preferences include accepted live updates; observed capture rates are in metrics."
+            },
             "permissions": permissions,
             "metrics": safe_metrics(&metrics),
             "history": history,
@@ -129,6 +144,10 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
         "completion_queue_ms",
         "write_ms",
         "capture_frames_coalesced",
+        "requested_capture_frame_rate",
+        "applied_frame_rate",
+        "capture_frame_rate_update_failures",
+        "capture_frame_rate_retry_exhausted",
         "client_queue_depth_bytes",
         "ack_suspended",
         "last_frame_bytes",
@@ -243,6 +262,15 @@ fn event_category(message: &str) -> &'static str {
         ),
         ("Desktop resumed after idle", "desktop_resumed"),
         ("Capture frame rate updated", "capture_pacing"),
+        (
+            "Native capture frame rate update failed",
+            "capture_rate_failed",
+        ),
+        (
+            "Native capture frame rate update recovered",
+            "capture_rate_recovered",
+        ),
+        ("Clipboard connection failed", "clipboard_failed"),
         ("Audio recovery counters", "audio_recovery"),
         ("Connection outcome", "connection_outcome"),
         ("Connection admission throttled", "admission_throttled"),
@@ -293,6 +321,9 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
         let mut fields = serde_json::Map::new();
         for key in [
             "fps",
+            "requested_fps",
+            "applied_fps",
+            "attempt",
             "width",
             "height",
             "bitrate_kbps",
@@ -323,6 +354,26 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             if let Some(authenticated) = event["fields"]["authenticated"].as_bool() {
                 fields.insert("authenticated".into(), json!(authenticated));
             }
+        }
+        if category == "capture_rate_failed" {
+            if let Some(retrying) = event["fields"]["retrying"].as_bool() {
+                fields.insert("retrying".into(), json!(retrying));
+            }
+        }
+        if category == "clipboard_failed" {
+            fields.insert(
+                "reason".into(),
+                json!(selection(
+                    event["fields"]["reason"].as_str().unwrap_or(""),
+                    &[
+                        "clipboard worker panicked",
+                        "clipboard worker unavailable (previous storage operation still blocked)",
+                        "clipboard worker queue capacity exceeded",
+                        "clipboard request or storage operation timed out",
+                        "cannot start clipboard timeout monitor",
+                    ],
+                )),
+            );
         }
         if events.len() == MAX_EVENTS {
             events.pop_front();

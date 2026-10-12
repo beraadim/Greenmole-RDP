@@ -68,6 +68,13 @@ pub struct Metrics {
     pub completion_queue_ms: f64,
     pub write_ms: f64,
     pub capture_frames_coalesced: u64,
+    /// Adaptive native capture target, distinct from delivered update rate.
+    pub requested_capture_frame_rate: Option<u32>,
+    /// Last rate confirmed by the native capture API.
+    pub applied_frame_rate: Option<u32>,
+    /// Failed frame-rate configuration attempts for the current capture owner.
+    pub capture_frame_rate_update_failures: u64,
+    pub capture_frame_rate_retry_exhausted: bool,
     pub client_queue_depth_bytes: Option<u32>,
     pub ack_suspended: bool,
     /// Legacy alias of ACK latency. Network-only latency is not measured by GFX ACKs.

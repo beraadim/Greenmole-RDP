@@ -1,25 +1,45 @@
 use super::*;
 
+fn test_backend(
+    sender: ServerEventTx,
+    directory: PathBuf,
+    max_file_size: u64,
+    file_transfer: bool,
+) -> ClipboardWorker {
+    let pb = PasteboardBridge::isolated();
+    let shared = Arc::new(PublicationState::new(pb.change_count()));
+    ClipboardWorker::new(sender, directory, max_file_size, file_transfer, shared, pb)
+}
+
+fn pending(backend: &ClipboardWorker, id: ClipboardFormatId, kind: FormatKind) -> RemoteOffer {
+    RemoteOffer {
+        format: Some(crate::remote_formats::RemoteFormat { id, kind }),
+        token: backend.shared.remote_copy(&backend.pasteboard),
+    }
+}
+
 #[test]
 fn malformed_images_unsolicited_responses_and_errors_do_not_touch_pasteboard() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, false);
-    let initial = backend.last_change_count.load(Ordering::SeqCst);
-    backend.pending_paste_format = Some(RemoteFormat {
-        id: ClipboardFormatId::CF_DIB,
-        kind: FormatKind::Dib,
-    });
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, false);
+    let initial = backend.pasteboard.change_count();
+    backend.pending_paste_format = Some(pending(
+        &backend,
+        ClipboardFormatId::CF_DIB,
+        FormatKind::Dib,
+    ));
     backend.on_format_data_response(FormatDataResponse::new_data(vec![0; 40]));
     assert!(backend.pending_paste_format.is_none());
     backend.on_format_data_response(FormatDataResponse::new_data(vec![65, 0, 0, 0]));
-    backend.pending_paste_format = Some(RemoteFormat {
-        id: ClipboardFormatId::CF_DIB,
-        kind: FormatKind::Dib,
-    });
+    backend.pending_paste_format = Some(pending(
+        &backend,
+        ClipboardFormatId::CF_DIB,
+        FormatKind::Dib,
+    ));
     backend.on_format_data_response(FormatDataResponse::new_error());
     assert!(backend.pending_paste_format.is_none());
-    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), initial);
+    assert_eq!(backend.pasteboard.change_count(), initial);
     assert!(receiver.try_recv().is_err());
 }
 
@@ -27,7 +47,7 @@ fn malformed_images_unsolicited_responses_and_errors_do_not_touch_pasteboard() {
 fn short_file_response_schedules_bounded_remainder_on_clipboard_channel() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     backend
         .transfer_manager
         .set_incoming_descriptors(vec![FileDescriptor {
@@ -59,7 +79,7 @@ fn short_file_response_schedules_bounded_remainder_on_clipboard_channel() {
 fn disabling_file_transfer_disables_capability_and_ignores_remote_file_copy() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, false);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, false);
     assert!(!backend
         .client_capabilities()
         .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED));
@@ -71,8 +91,8 @@ fn disabling_file_transfer_disables_capability_and_ignores_remote_file_copy() {
     assert!(backend.pending_paste_format.is_none());
     backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::new(13))]);
     assert_eq!(
-        backend.pending_paste_format,
-        Some(RemoteFormat {
+        backend.pending_paste_format.and_then(|offer| offer.format),
+        Some(crate::remote_formats::RemoteFormat {
             id: ClipboardFormatId::CF_UNICODETEXT,
             kind: FormatKind::Text
         })
@@ -88,7 +108,7 @@ fn offered_format(id: u32, name: ClipboardFormatName) -> ClipboardFormat {
 fn requests_peer_file_id_and_decodes_its_descriptor_response_as_files() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     // Deliberately collide with our HTML ID: the peer's name determines the kind.
     backend.on_remote_copy(&[offered_format(
         FORMAT_ID_HTML,
@@ -122,14 +142,14 @@ fn requests_peer_file_id_and_decodes_its_descriptor_response_as_files() {
     assert!(data.flags.contains(FileContentsFlags::DATA));
     assert_eq!(data.requested_size, 5);
     assert!(receiver.try_recv().is_err());
-    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+    assert!(backend.pasteboard.available_types().is_empty());
 }
 
 #[test]
 fn coalesces_new_offers_without_misinterpreting_or_publishing_old_responses() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
     receiver.try_recv().unwrap();
     backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::FILE_LIST)]);
@@ -146,18 +166,21 @@ fn coalesces_new_offers_without_misinterpreting_or_publishing_old_responses() {
         panic!("Expected the newest offer to be requested");
     };
     assert_eq!(id.value(), 0xc002);
-    assert_eq!(backend.pending_paste_format.unwrap().kind, FormatKind::Html);
+    assert_eq!(
+        backend.pending_paste_format.unwrap().format.unwrap().kind,
+        FormatKind::Html
+    );
     backend.on_format_data_response(FormatDataResponse::new_error());
     assert!(backend.pending_paste_format.is_none());
     assert!(backend.queued_paste_format.is_none());
-    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+    assert!(backend.pasteboard.available_types().is_empty());
 }
 
 #[test]
 fn empty_offer_cancels_pending_publication_and_incomplete_file_transfers() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::FILE_LIST)]);
     receiver.try_recv().unwrap();
     let list = PackedFileList {
@@ -184,7 +207,7 @@ fn empty_offer_cancels_pending_publication_and_incomplete_file_transfers() {
     assert!(backend.queued_paste_format.is_none());
     assert!(!backend.transfer_manager.all_incoming_complete());
     assert!(receiver.try_recv().is_err());
-    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+    assert!(backend.pasteboard.available_types().is_empty());
 }
 
 #[test]
@@ -192,7 +215,7 @@ fn failed_send_does_not_leave_an_unanswerable_pending_request() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, receiver) = ServerEvent::create_channel();
     drop(receiver);
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::HTML)]);
     assert!(backend.pending_paste_format.is_none());
 }
@@ -201,7 +224,7 @@ fn failed_send_does_not_leave_an_unanswerable_pending_request() {
 fn hostile_file_list_count_is_rejected_before_decoding_or_requesting_files() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::FILE_LIST)]);
     receiver.try_recv().unwrap();
     backend.on_format_data_response(FormatDataResponse::new_data(
@@ -209,15 +232,14 @@ fn hostile_file_list_count_is_rejected_before_decoding_or_requesting_files() {
     ));
     assert!(backend.pending_paste_format.is_none());
     assert!(receiver.try_recv().is_err());
-    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+    assert!(backend.pasteboard.available_types().is_empty());
 }
 
 #[test]
 fn large_file_copy_enqueues_only_the_request_window_without_closing_session_queue() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend =
-        MacClipboardBackend::new(sender, dir.path().to_path_buf(), 32 * 1024 * 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 32 * 1024 * 1024, true);
     backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::FILE_LIST)]);
     receiver.try_recv().unwrap();
     let list = PackedFileList {
@@ -250,7 +272,7 @@ fn large_file_copy_enqueues_only_the_request_window_without_closing_session_queu
     }
     assert_eq!(count, 8);
     assert!(!backend.event_sender.is_closed());
-    assert_eq!(backend.last_change_count.load(Ordering::SeqCst), 0);
+    assert!(backend.pasteboard.available_types().is_empty());
 }
 
 #[test]
@@ -259,7 +281,7 @@ fn tagged_contents_consumes_lock_association_and_unlock_keeps_incoming_transfer(
     let path = dir.path().join("source");
     std::fs::write(&path, b"source").unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();
-    let mut backend = MacClipboardBackend::new(sender, dir.path().to_path_buf(), 1024, true);
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
     backend.transfer_manager.set_local_files(vec![path]);
     backend.transfer_manager.build_file_list();
     backend.transfer_manager.lock(7);
@@ -290,4 +312,90 @@ fn tagged_contents_consumes_lock_association_and_unlock_keeps_incoming_transfer(
         backend.transfer_manager.generate_contents_requests().len(),
         1
     );
+}
+
+#[test]
+fn local_copy_before_text_response_is_preserved_and_next_remote_copy_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, false);
+    backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    receiver.try_recv().unwrap();
+    backend.pasteboard.write_string("new local copy");
+    backend.on_format_data_response(FormatDataResponse::new_unicode_string("stale remote"));
+    assert_eq!(
+        backend.pasteboard.read_string().as_deref(),
+        Some("new local copy")
+    );
+    assert!(backend.pending_paste_format.is_none());
+
+    backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    receiver.try_recv().unwrap();
+    backend.on_format_data_response(FormatDataResponse::new_unicode_string("new remote copy"));
+    assert_eq!(
+        backend.pasteboard.read_string().as_deref(),
+        Some("new remote copy")
+    );
+    assert!(!backend.shared.local_copy_changed(&backend.pasteboard));
+}
+
+#[test]
+fn local_copy_supersedes_queued_remote_offer_without_issuing_another_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
+    backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    receiver.try_recv().unwrap();
+    backend.on_remote_copy(&[offered_format(0xc002, ClipboardFormatName::HTML)]);
+    backend.pasteboard.write_string("latest local");
+    backend.on_format_data_response(FormatDataResponse::new_unicode_string("older remote"));
+    assert!(receiver.try_recv().is_err());
+    assert!(backend.pending_paste_format.is_none());
+    assert_eq!(
+        backend.pasteboard.read_string().as_deref(),
+        Some("latest local")
+    );
+}
+
+#[test]
+fn local_copy_before_descriptor_response_does_not_start_obsolete_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
+    backend.on_remote_copy(&[offered_format(0xc001, ClipboardFormatName::FILE_LIST)]);
+    receiver.try_recv().unwrap();
+    backend.pasteboard.write_string("keep this");
+    let list = PackedFileList {
+        files: vec![FileDescriptor {
+            name: "stale.txt".into(),
+            file_size: Some(1),
+            attributes: None,
+            last_write_time: None,
+        }],
+    };
+    backend.on_format_data_response(FormatDataResponse::new_file_list(&list).unwrap());
+    assert!(receiver.try_recv().is_err());
+    assert!(backend.incoming_token.is_none());
+    assert_eq!(
+        backend.pasteboard.read_string().as_deref(),
+        Some("keep this")
+    );
+}
+
+#[test]
+fn timed_out_untagged_response_never_retries_or_decodes_using_a_newer_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend = test_backend(sender, dir.path().to_path_buf(), 1024, true);
+    backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    receiver.try_recv().unwrap();
+    backend.on_remote_copy(&[offered_format(0xc002, ClipboardFormatName::HTML)]);
+    assert!(backend
+        .shared
+        .expire(Instant::now() + crate::publication::FORMAT_REQUEST_TIMEOUT));
+    backend.on_format_data_response(FormatDataResponse::new_unicode_string("late old text"));
+    backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+    assert!(receiver.try_recv().is_err());
+    assert!(backend.pending_paste_format.is_none());
+    assert!(backend.pasteboard.available_types().is_empty());
 }

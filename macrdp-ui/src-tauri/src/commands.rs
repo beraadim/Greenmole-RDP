@@ -4,8 +4,6 @@ use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 
-use serde::Serialize;
-
 use crate::database::Database;
 use crate::event_bridge::TauriEventBridge;
 use crate::state::AppState;
@@ -22,6 +20,7 @@ pub async fn ensure_server_running(
         }
         guard.take()
     };
+    *state.running_config.lock().await = None;
     let generation = state.server_generation.fetch_add(1, Ordering::AcqRel) + 1;
     if let Some(previous) = previous {
         if let Err(error) = previous.stop().await {
@@ -37,7 +36,8 @@ pub async fn ensure_server_running(
     }
     let _ = app.emit("server-status", &*state.status.lock().await);
 
-    let config = state.ui_config.lock().await.to_server_config();
+    let started_config = state.ui_config.lock().await.clone();
+    let config = started_config.to_server_config();
     let bridge = TauriEventBridge::new(app.clone(), generation);
 
     let handle = match macrdp_core::start_server(config, bridge).await {
@@ -62,14 +62,9 @@ pub async fn ensure_server_running(
 
     let mut guard = state.server_handle.lock().await;
     *guard = Some(handle);
+    *state.running_config.lock().await = Some(started_config);
 
     Ok(())
-}
-
-/// Response from `set_config` indicating whether the server must be restarted.
-#[derive(Debug, Clone, Serialize)]
-pub struct SetConfigResponse {
-    pub restart_required: bool,
 }
 
 #[tauri::command]
@@ -92,7 +87,10 @@ pub async fn stop_server(
 }
 
 /// Caller holds the lifecycle lock, including settings failures that require a safe stop.
-async fn stop_running_server(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+pub(crate) async fn stop_running_server(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+) -> Result<(), String> {
     state.server_generation.fetch_add(1, Ordering::AcqRel);
 
     // Take the handle out
@@ -109,6 +107,8 @@ async fn stop_running_server(app: &tauri::AppHandle, state: &Arc<AppState>) -> R
     } else {
         Ok(())
     };
+
+    *state.running_config.lock().await = None;
 
     // Update status
     {
@@ -220,12 +220,6 @@ pub async fn get_input_debug_state(
 }
 
 #[tauri::command]
-pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let config = state.ui_config.lock().await.clone();
-    serde_json::to_value(&config).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub async fn get_tls_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     {
         let handles = state.server_handle.lock().await;
@@ -249,105 +243,6 @@ pub async fn get_tls_status(state: State<'_, Arc<AppState>>) -> Result<serde_jso
             serde_json::json!({"certificate": null, "source": "configured", "error": error.to_string()})
         }
     })
-}
-
-#[tauri::command]
-pub async fn set_config(
-    app: tauri::AppHandle,
-    key: String,
-    value: serde_json::Value,
-    state: State<'_, Arc<AppState>>,
-) -> Result<SetConfigResponse, String> {
-    tracing::info!(%key, "Updating configuration");
-    let _lifecycle = state.lifecycle_lock.lock().await;
-
-    let running_backend = state
-        .server_handle
-        .lock()
-        .await
-        .as_ref()
-        .map(|handle| handle.display_backend());
-    let restart_required = {
-        let mut config = state.ui_config.lock().await;
-        let mut candidate = config.clone();
-        candidate.set_field(&key, &value)?;
-        candidate.save()?;
-        let restart = candidate.requires_restart(&key, running_backend);
-        *config = candidate;
-        restart
-    };
-
-    if key == "log_level" {
-        let level = {
-            let config = state.ui_config.lock().await;
-            config.log_level.clone()
-        };
-        let filter = format!("macrdp_ui={level},macrdp_core={level},{level}");
-        state
-            .log_reload
-            .reload(tracing_subscriber::EnvFilter::new(&filter))
-            .map_err(|e| format!("failed to reload log level: {e}"))?;
-        tracing::info!(%level, "Reloaded tracing filter");
-    }
-
-    // Display ownership changes apply on the next server start. Persist them
-    // without changing the current display or moving its windows mid-session.
-    let live_result =
-        if !restart_required {
-            let guard = state.server_handle.lock().await;
-            if let Some(handle) = guard.as_ref() {
-                let config = state.ui_config.lock().await;
-                match key.as_str() {
-                    "frame_rate" => handle
-                        .update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate)),
-                    "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(
-                        config
-                            .bitrate_mbps
-                            .checked_mul(1000)
-                            .ok_or("Bitrate is out of range")?,
-                    )),
-                    "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(
-                        config.log_level.clone(),
-                    )),
-                    "show_cursor" => handle
-                        .update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor)),
-                    "resolution" | "hidpi_scale" => handle.update_config(
-                        macrdp_core::ConfigUpdate::Resolution(config.resolution.clone()),
-                    ),
-                    "encoder" => handle
-                        .update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
-                    "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(
-                        config.chroma_mode.clone(),
-                    )),
-                    "gfx_validation_mode" => handle.update_config(
-                        macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode),
-                    ),
-                    "username" | "password" => {
-                        handle.update_config(macrdp_core::ConfigUpdate::Credentials {
-                            username: config.username.clone(),
-                            password: config.password.clone(),
-                        })
-                    }
-                    _ => Ok(()),
-                }
-                .map_err(|error| error.to_string())
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        };
-    if let Err(error) = live_result {
-        // Preferences are already durably saved. Stop the old listener rather than
-        // leaving it accepting an obsolete password after a rejected live update.
-        tracing::error!(%key, %error, "Saved setting could not be applied; stopping server");
-        if let Err(stop_error) = stop_running_server(&app, state.inner()).await {
-            tracing::error!(%stop_error, "Cleanup after failed settings update");
-        }
-        return Err(format!("Setting saved, but the server was stopped because it could not apply the change: {error}. Start the server to use the saved settings."));
-    }
-
-    Ok(SetConfigResponse { restart_required })
 }
 
 #[tauri::command]

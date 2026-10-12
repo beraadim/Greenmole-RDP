@@ -43,6 +43,9 @@ pub struct AppState {
     pub logs: Mutex<VecDeque<LogEntry>>,
     pub server_handle: SharedServerHandle,
     pub ui_config: Mutex<UiConfig>,
+    /// Settings used to start this service, plus accepted live updates. Kept in
+    /// the backend so pending restart changes survive window/navigation changes.
+    pub running_config: Mutex<Option<UiConfig>>,
     pub log_reload: LogReloadHandle,
     pub window_move_lock: Mutex<()>,
 }
@@ -59,6 +62,7 @@ impl AppState {
             logs: Mutex::new(VecDeque::new()),
             server_handle: Arc::new(Mutex::new(None)),
             ui_config: Mutex::new(ui_config),
+            running_config: Mutex::new(None),
             log_reload,
             window_move_lock: Mutex::new(()),
         }

@@ -1,4 +1,5 @@
 mod commands;
+mod configuration;
 mod database;
 mod diagnostics;
 mod event_bridge;
@@ -139,9 +140,10 @@ pub fn run() {
             commands::get_connections,
             commands::get_permissions,
             commands::get_input_debug_state,
-            commands::get_config,
+            configuration::get_config,
+            configuration::get_configuration_status,
             commands::get_tls_status,
-            commands::set_config,
+            configuration::set_config,
             commands::get_logs,
             diagnostics::export_diagnostics,
             commands::get_connection_history,

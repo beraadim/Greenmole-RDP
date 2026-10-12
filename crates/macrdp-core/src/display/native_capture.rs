@@ -4,7 +4,7 @@
 //! frame mailbox and signals this dedicated thread. The process-wide lease
 //! stays on that thread until stream cleanup and display restoration complete.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,17 @@ use macrdp_capture::{
 use tokio::sync::oneshot;
 
 use super::capture_recovery::NativeRetirementFailed;
+
+mod frame_rate;
+use frame_rate::FrameRateUpdate;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FrameRateStatus {
+    pub requested: u32,
+    pub applied: u32,
+    pub failures: u64,
+    pub retry_exhausted: bool,
+}
 
 pub(super) trait NativeStream: Send + 'static {
     type Receiver: Send + 'static;
@@ -87,12 +98,103 @@ struct Commands<S: NativeStream> {
     pending: Mutex<Requested<S>>,
     changed: Condvar,
     applied_fps: AtomicU32,
+    requested_fps: AtomicU32,
+    fps_failures: AtomicU64,
+    fps_retry_exhausted: AtomicBool,
 }
 
 impl<S: NativeStream> Commands<S> {
     fn request_stop(&self) {
         self.pending.lock().unwrap().stop = true;
         self.changed.notify_one();
+    }
+
+    fn control_stream(&self, stream: &mut S) {
+        let mut retry: Option<FrameRateUpdate> = None;
+        loop {
+            let mut pending = self.pending.lock().unwrap();
+            while !pending.stop && pending.replacement.is_none() && pending.fps.is_none() {
+                pending = if let Some(update) = &retry {
+                    let delay = update.remaining_delay();
+                    if delay.is_zero() {
+                        break;
+                    }
+                    // Unlike sleeping, this releases the mailbox and wakes for
+                    // shutdown, replacement, or a newer adaptive FPS target.
+                    self.changed.wait_timeout(pending, delay).unwrap().0
+                } else {
+                    self.changed.wait(pending).unwrap()
+                };
+            }
+            if pending.stop {
+                return;
+            }
+            if let Some(replacement) = pending.replacement.take() {
+                drop(pending);
+                let configuration = replacement.configuration;
+                let result = stream
+                    .replace(configuration.clone())
+                    .map(|receiver| (receiver, configuration));
+                self.applied_fps
+                    .store(stream.frame_rate(), Ordering::Release);
+                if result.is_ok() {
+                    // A format replacement may have started with an older
+                    // configuration. Preserve the latest target on the new stream.
+                    let _pending = self.pending.lock().unwrap();
+                    self.fps_retry_exhausted.store(false, Ordering::Release);
+                    retry = Some(FrameRateUpdate::new(
+                        self.requested_fps.load(Ordering::Acquire),
+                    ));
+                }
+                let _ = replacement.ready.send(result);
+                continue;
+            }
+            if let Some(fps) = pending.fps.take() {
+                retry = Some(FrameRateUpdate::new(fps));
+            }
+            drop(pending);
+            let Some(mut update) = retry.take() else {
+                continue;
+            };
+            if update.fps == stream.frame_rate() {
+                continue;
+            }
+            match stream.set_frame_rate(update.fps) {
+                Ok(()) => {
+                    self.applied_fps
+                        .store(stream.frame_rate(), Ordering::Release);
+                    if update.attempt() > 1 {
+                        tracing::info!(
+                            fps = update.fps,
+                            attempt = update.attempt(),
+                            "Native capture frame rate update recovered"
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.fps_failures.fetch_add(1, Ordering::Relaxed);
+                    let attempt = update.attempt();
+                    let retrying = update.failed();
+                    // A failed old request must not label a newer target as
+                    // exhausted. The producer clears this under the same lock.
+                    let pending = self.pending.lock().unwrap();
+                    if pending.fps.is_none() {
+                        self.fps_retry_exhausted.store(!retrying, Ordering::Release);
+                    }
+                    drop(pending);
+                    tracing::warn!(
+                        %error,
+                        fps = update.fps,
+                        attempt,
+                        retrying,
+                        "Native capture frame rate update failed"
+                    );
+                    if retrying {
+                        retry = Some(update);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -126,6 +228,9 @@ impl<S: NativeStream> CaptureWorker<S> {
             pending: Mutex::new(Requested::default()),
             changed: Condvar::new(),
             applied_fps: AtomicU32::new(0),
+            requested_fps: AtomicU32::new(0),
+            fps_failures: AtomicU64::new(0),
+            fps_retry_exhausted: AtomicBool::new(false),
         });
         let stop_on_drop = StopOnDrop(commands.clone());
         let (ready_tx, ready) = oneshot::channel();
@@ -141,6 +246,9 @@ impl<S: NativeStream> CaptureWorker<S> {
                         commands
                             .applied_fps
                             .store(stream.frame_rate(), Ordering::Release);
+                        commands
+                            .requested_fps
+                            .store(stream.frame_rate(), Ordering::Release);
                         if ready_tx.send(Ok((stream.receiver(), metadata))).is_err() {
                             commands.request_stop();
                         }
@@ -154,33 +262,8 @@ impl<S: NativeStream> CaptureWorker<S> {
                     }
                 };
 
-                let controls = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
-                    let mut pending = commands.pending.lock().unwrap();
-                    while !pending.stop && pending.replacement.is_none() && pending.fps.is_none() {
-                        pending = commands.changed.wait(pending).unwrap();
-                    }
-                    if pending.stop {
-                        break;
-                    }
-                    if let Some(replacement) = pending.replacement.take() {
-                        drop(pending);
-                        let configuration = replacement.configuration;
-                        let result = stream
-                            .replace(configuration.clone())
-                            .map(|receiver| (receiver, configuration));
-                        commands
-                            .applied_fps
-                            .store(stream.frame_rate(), Ordering::Release);
-                        let _ = replacement.ready.send(result);
-                    } else if let Some(fps) = pending.fps.take() {
-                        drop(pending);
-                        if fps != stream.frame_rate() {
-                            match stream.set_frame_rate(fps) {
-                                Ok(()) => commands.applied_fps.store(fps, Ordering::Release),
-                                Err(error) => tracing::warn!(%error, fps, "Native capture frame rate update failed"),
-                            }
-                        }
-                    }
+                let controls = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    commands.control_stream(&mut stream);
                 }));
                 if controls.is_err() {
                     tracing::error!("Native capture control panicked; retiring stream before releasing ownership");
@@ -236,11 +319,33 @@ impl<S: NativeStream> CaptureWorker<S> {
         self.stop_on_drop.0.applied_fps.load(Ordering::Acquire)
     }
 
+    pub fn frame_rate_status(&self) -> FrameRateStatus {
+        let commands = &self.stop_on_drop.0;
+        // Keep requested target and its exhausted flag in one generation.
+        // Native calls never hold this lock.
+        let _pending = commands.pending.lock().unwrap();
+        FrameRateStatus {
+            requested: commands.requested_fps.load(Ordering::Acquire),
+            applied: self.applied_frame_rate(),
+            failures: commands.fps_failures.load(Ordering::Relaxed),
+            retry_exhausted: commands.fps_retry_exhausted.load(Ordering::Acquire),
+        }
+    }
+
     pub fn set_frame_rate(&self, fps: u32) {
+        let fps = fps.max(1);
         let mut pending = self.stop_on_drop.0.pending.lock().unwrap();
         if !pending.stop {
             // Only the latest desired rate survives a slow configuration call.
             pending.fps = Some(fps);
+            self.stop_on_drop
+                .0
+                .requested_fps
+                .store(fps, Ordering::Release);
+            self.stop_on_drop
+                .0
+                .fps_retry_exhausted
+                .store(false, Ordering::Release);
             self.stop_on_drop.0.changed.notify_one();
         }
     }

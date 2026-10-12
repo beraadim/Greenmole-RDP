@@ -1,6 +1,8 @@
 use core::{cmp, fmt};
 
-use ironrdp_pdu::fast_path::{EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
+use ironrdp_pdu::fast_path::{
+    EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode,
+};
 use ironrdp_pdu::{Encode as _, WriteCursor};
 
 // this is the maximum amount of data (not including headers) we can send in a single TS_FP_UPDATE_PDU
@@ -57,6 +59,11 @@ impl UpdateFragmenter {
 
     fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
         match self.data.len() - self.position {
+            // System pointer updates deliberately have no payload. Their
+            // Fast-Path update header is still a complete, required PDU.
+            0 if self.index == 0 => self
+                .encode_fastpath(Fragmentation::Single, &[], dst)
+                .map(|written| (0, written)),
             0 => None,
 
             1..=MAX_FASTPATH_UPDATE_SIZE => {
@@ -112,6 +119,24 @@ mod tests {
     use ironrdp_core::{decode_cursor, ReadCursor};
 
     use super::*;
+
+    #[test]
+    fn empty_system_pointer_updates_emit_exactly_one_wire_pdu() {
+        for code in [UpdateCode::HiddenPointer, UpdateCode::DefaultPointer] {
+            let mut fragmenter = UpdateFragmenter::new(code, Vec::new());
+            let mut buffer = vec![0; fragmenter.size_hint()];
+            let written = fragmenter.next(&mut buffer).unwrap();
+            let mut cursor = ReadCursor::new(&buffer[..written]);
+            let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+            assert_eq!(header.data_length, 3);
+            assert_eq!(update.update_code, code);
+            assert_eq!(update.fragmentation, Fragmentation::Single);
+            assert!(update.data.is_empty());
+            assert!(cursor.is_empty());
+            assert!(fragmenter.next(&mut buffer).is_none());
+        }
+    }
 
     #[test]
     fn test_single_fragment() {

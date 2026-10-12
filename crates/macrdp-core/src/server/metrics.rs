@@ -120,6 +120,10 @@ impl MetricsSnapshot {
             completion_queue_ms: sanitize_f64(gfx.completion_queue_ms),
             write_ms: sanitize_f64(gfx.last_write_ms),
             capture_frames_coalesced: gfx.capture_frames_coalesced,
+            requested_capture_frame_rate: gfx.requested_capture_frame_rate,
+            applied_frame_rate: gfx.applied_frame_rate,
+            capture_frame_rate_update_failures: gfx.capture_frame_rate_update_failures,
+            capture_frame_rate_retry_exhausted: gfx.capture_frame_rate_retry_exhausted,
             client_queue_depth_bytes: gfx.client_queue_depth_bytes,
             ack_suspended: gfx.frame_acknowledgements_suspended,
             last_frame_bytes: gfx.last_frame_bytes,
@@ -143,6 +147,28 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_rate_metrics_distinguish_requested_applied_and_exhausted_updates() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.target_frame_rate = Some(60);
+        gfx.requested_capture_frame_rate = Some(20);
+        gfx.applied_frame_rate = Some(30);
+        gfx.capture_frame_rate_update_failures = 4;
+        gfx.capture_frame_rate_retry_exhausted = true;
+        let mut snapshot = MetricsSnapshot::default();
+        let metrics = snapshot.sample(&gfx);
+        assert_eq!(metrics.requested_capture_frame_rate, Some(20));
+        assert_eq!(metrics.applied_frame_rate, Some(30));
+        assert_eq!(metrics.capture_frame_rate_update_failures, 4);
+        assert!(metrics.capture_frame_rate_retry_exhausted);
+        gfx.reset_connection_state(false);
+        let metrics = snapshot.sample(&gfx);
+        assert_eq!(metrics.requested_capture_frame_rate, None);
+        assert_eq!(metrics.applied_frame_rate, None);
+        assert_eq!(metrics.capture_frame_rate_update_failures, 0);
+        assert!(!metrics.capture_frame_rate_retry_exhausted);
+    }
 
     #[test]
     fn timing_summaries_include_stage_events_without_polling_duplication() {

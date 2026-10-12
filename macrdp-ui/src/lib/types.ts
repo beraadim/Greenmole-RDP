@@ -27,6 +27,10 @@ export interface Metrics {
   completion_queue_ms: number;
   write_ms: number;
   capture_frames_coalesced: number;
+  requested_capture_frame_rate: number | null;
+  applied_frame_rate: number | null;
+  capture_frame_rate_update_failures: number;
+  capture_frame_rate_retry_exhausted: boolean;
   client_queue_depth_bytes: number | null;
   ack_suspended: boolean;
   net_ms: number;
@@ -127,7 +131,6 @@ export interface UiConfig {
   encoder: string;
   chroma_mode: string;
   bind_address: string;
-  max_connections: number;
   idle_timeout_secs: number;
   username: string;
   password: string;
@@ -160,3 +163,9 @@ export interface TlsStatus {
 
 /** @deprecated Use UiConfig instead */
 export type ServerConfig = UiConfig;
+
+export interface ConfigurationStatus {
+  running: boolean;
+  restart_required: boolean;
+  pending_restart: string[];
+}

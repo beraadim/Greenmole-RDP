@@ -5,31 +5,17 @@ mod incoming;
 mod outgoing;
 
 use incoming::IncomingTransfers;
+pub(crate) use incoming::PreparedIncoming;
 use ironrdp_cliprdr::pdu::*;
 use outgoing::OutgoingSnapshots;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct FileTransferManager {
-    incoming: TransferMonitor,
+    incoming: IncomingTransfers,
     outgoing: OutgoingSnapshots,
     // Drop staging files and handles before removing the session directory.
     _directory: Option<tempfile::TempDir>,
-}
-
-/// Only incoming state crosses threads. Outgoing source opens and metadata reads
-/// cannot delay the independent timeout monitor.
-#[derive(Clone)]
-pub struct TransferMonitor(Arc<Mutex<IncomingTransfers>>);
-
-impl TransferMonitor {
-    pub fn expire(&self, now: Instant) {
-        self.0.lock().unwrap().expire(now);
-    }
-    pub fn cancel(&self) {
-        self.0.lock().unwrap().start(Vec::new(), Instant::now());
-    }
 }
 
 impl FileTransferManager {
@@ -44,10 +30,10 @@ impl FileTransferManager {
             tracing::warn!("Cannot create private clipboard directory; incoming files disabled");
         }
         Self {
-            incoming: TransferMonitor(Arc::new(Mutex::new(IncomingTransfers::new(
+            incoming: IncomingTransfers::new(
                 directory.as_ref().map(|dir| dir.path().to_owned()),
                 max_file_size,
-            )))),
+            ),
             outgoing: OutgoingSnapshots::new(max_file_size),
             _directory: directory,
         }
@@ -75,34 +61,27 @@ impl FileTransferManager {
         self.outgoing.unlock(data_id);
     }
     pub fn set_incoming_descriptors(&mut self, descriptors: Vec<FileDescriptor>) {
-        self.incoming
-            .0
-            .lock()
-            .unwrap()
-            .start(descriptors, Instant::now());
+        self.incoming.start(descriptors, Instant::now());
     }
     pub fn generate_contents_requests(&mut self) -> Vec<FileContentsRequest> {
-        self.incoming.0.lock().unwrap().requests(Instant::now())
+        self.incoming.requests(Instant::now())
     }
     pub fn handle_contents_response(
         &mut self,
         response: &FileContentsResponse<'_>,
     ) -> Vec<FileContentsRequest> {
-        self.incoming
-            .0
-            .lock()
-            .unwrap()
-            .respond(response, Instant::now())
+        self.incoming.respond(response, Instant::now())
     }
     pub fn all_incoming_complete(&self) -> bool {
-        self.incoming.0.lock().unwrap().complete()
+        self.incoming.complete()
     }
-    pub fn flush_incoming_files(&mut self) -> Vec<PathBuf> {
-        self.incoming.0.lock().unwrap().finish()
+    pub(crate) fn prepare_incoming_files(&mut self) -> Option<PreparedIncoming> {
+        self.incoming.prepare()
     }
-
-    /// Serviced by the clipboard polling thread even when the peer sends nothing.
-    pub fn monitor(&self) -> TransferMonitor {
-        self.incoming.clone()
+    pub(crate) fn retain_incoming_files(&mut self, prepared: PreparedIncoming) {
+        self.incoming.retain(prepared);
+    }
+    pub fn expire(&mut self, now: Instant) {
+        self.incoming.expire(now);
     }
 }

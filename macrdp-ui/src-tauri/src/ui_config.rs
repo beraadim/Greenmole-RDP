@@ -18,7 +18,6 @@ pub struct UiConfig {
     pub chroma_mode: String,
     pub gfx_validation_mode: bool,
     pub bind_address: String,
-    pub max_connections: u32,
     pub idle_timeout_secs: u64,
 
     // ── Auth ────────────────────────────────────────────────
@@ -65,7 +64,6 @@ impl Default for UiConfig {
             chroma_mode: "avc420".to_string(),
             gfx_validation_mode: false,
             bind_address: "0.0.0.0".to_string(),
-            max_connections: 3,
             idle_timeout_secs: 1800,
             username: "macrdp".to_string(),
             password: String::new(),
@@ -251,9 +249,6 @@ impl UiConfig {
                     .as_str()
                     .ok_or("bind_address must be a string")?
                     .to_string();
-            }
-            "max_connections" => {
-                self.max_connections = integer_in_range(value, key, 1, u32::MAX as u64)? as u32;
             }
             "idle_timeout_secs" => {
                 self.idle_timeout_secs =

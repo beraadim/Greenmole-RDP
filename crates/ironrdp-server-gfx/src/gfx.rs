@@ -359,8 +359,14 @@ pub struct GfxState {
     pub target_bitrate: Option<u32>,
     /// Hot-updatable: frame rate override (set via ConfigUpdate).
     pub target_frame_rate: Option<u32>,
+    /// Most recent native capture target after adaptive pacing.
+    pub requested_capture_frame_rate: Option<u32>,
     /// Currently applied capture frame rate after hot updates/adaptation.
     pub applied_frame_rate: Option<u32>,
+    /// Failed native configuration attempts for the current capture owner.
+    pub capture_frame_rate_update_failures: u64,
+    /// The current target exhausted its bounded native retry budget.
+    pub capture_frame_rate_retry_exhausted: bool,
     /// Hot-updatable: show cursor flag (set via ConfigUpdate)
     pub show_cursor: Option<bool>,
     /// Hot-updatable: resolution (set via ConfigUpdate)
@@ -427,7 +433,10 @@ impl GfxState {
             last_frame_time: None,
             target_bitrate: None,
             target_frame_rate: None,
+            requested_capture_frame_rate: None,
             applied_frame_rate: None,
+            capture_frame_rate_update_failures: 0,
+            capture_frame_rate_retry_exhausted: false,
             show_cursor: None,
             resolution: None,
             encoder_pref: None,
@@ -595,6 +604,10 @@ impl GfxState {
         self.total_frames_sent = 0;
         self.capture_queue_ms = 0.0;
         self.capture_frames_coalesced = 0;
+        self.requested_capture_frame_rate = None;
+        self.applied_frame_rate = None;
+        self.capture_frame_rate_update_failures = 0;
+        self.capture_frame_rate_retry_exhausted = false;
         self.completion_queue_ms = 0.0;
         self.last_frame_bytes = 0;
         self.total_bytes_sent = 0;

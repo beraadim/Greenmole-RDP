@@ -44,6 +44,31 @@ fn outcome_logs_export_only_known_reasons_and_typed_authentication_state() {
 }
 
 #[test]
+fn clipboard_and_capture_failures_keep_only_selected_diagnostic_fields() {
+    let clipboard = json!({"level": "warn", "message": "Clipboard connection failed; reconnect to reset clipboard state",
+        "fields": {"reason": "clipboard request or storage operation timed out", "path": "private-file"}});
+    let capture = json!({"level": "warn", "message": "Native capture frame rate update failed",
+        "fields": {"fps": 30, "attempt": 4, "retrying": false, "error": "private-error"}});
+    let summary = summarize_bytes(format!("{clipboard}\n{capture}\n").as_bytes(), false);
+    assert_eq!(summary["events"][0]["category"], "clipboard_failed");
+    assert_eq!(
+        summary["events"][0]["fields"]["reason"],
+        "clipboard request or storage operation timed out"
+    );
+    assert_eq!(summary["events"][1]["fields"]["retrying"], false);
+    assert_eq!(summary["events"][1]["fields"]["attempt"], 4);
+    assert!(!summary.to_string().contains("private"));
+    let mut metrics = macrdp_core::Metrics::default();
+    metrics.requested_capture_frame_rate = Some(60);
+    metrics.applied_frame_rate = Some(30);
+    metrics.capture_frame_rate_retry_exhausted = true;
+    let exported = safe_metrics(&metrics);
+    assert_eq!(exported["requested_capture_frame_rate"], 60);
+    assert_eq!(exported["applied_frame_rate"], 30);
+    assert_eq!(exported["capture_frame_rate_retry_exhausted"], true);
+}
+
+#[test]
 fn log_summary_bounds_events_and_discards_partial_records() {
     let event = b"{\"level\":\"error\",\"message\":\"unknown user data\"}\n";
     let mut bytes = b"partial record\n".to_vec();
