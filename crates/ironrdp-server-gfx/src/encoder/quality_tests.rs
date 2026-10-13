@@ -8,7 +8,7 @@ use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_pdu::bitmap::BitmapUpdateData;
 use ironrdp_pdu::codecs::rfx::{Block, CodecChannel, EntropyAlgorithm, Quant};
 
-fn fixture(width: u16, height: u16, noise: bool) -> BitmapUpdate {
+pub(super) fn fixture(width: u16, height: u16, noise: bool) -> BitmapUpdate {
     let stride = usize::from(width) * 4 + 12;
     let mut data = vec![0; stride * usize::from(height - 1) + usize::from(width) * 4];
     let mut seed = 0x1234_5678u32;
@@ -63,6 +63,7 @@ fn remotefx_error(bitmap: &BitmapUpdate, quality: BitmapQuality, entropy: Entrop
             height: 64,
         },
         quality,
+        OperatingMode::IMAGE_MODE,
     );
     let output = handler.handle(bitmap).unwrap();
     let surface: SurfaceCommand<'_> = ironrdp_core::decode(&output.data).unwrap();
@@ -175,6 +176,7 @@ fn tiny_remotefx_frame_keeps_initialization_headers_across_output_growth() {
             height: 64,
         },
         BitmapQuality::HighQuality,
+        OperatingMode::IMAGE_MODE,
     );
     for new_size in [
         None,
@@ -194,7 +196,7 @@ fn tiny_remotefx_frame_keeps_initialization_headers_across_output_growth() {
         let mut cursor = ReadCursor::new(surface.extended_bitmap_data.data);
         let first: Block<'_> = decode_cursor(&mut cursor).unwrap();
         assert!(matches!(first, Block::Sync(_)));
-        assert!(handler.desktop_size.is_none());
+        assert!(handler.desktop_size.is_some());
     }
 }
 
@@ -205,7 +207,7 @@ fn lossless_overrides_surface_codecs_and_roundtrips_rgb_across_bitmap_chunks() {
         let mut codecs = UpdateEncoderCodecs::new();
         codecs.set_quality(BitmapQuality::Lossless);
         codecs.set_allow_skip_alpha(skip_alpha);
-        codecs.set_remotefx(Some((EntropyBits::Rlgr3, 3)));
+        codecs.set_remotefx(Some((EntropyBits::Rlgr3, 3, OperatingMode::IMAGE_MODE)));
         #[cfg(feature = "qoi")]
         codecs.set_qoi(Some(4));
         #[cfg(feature = "qoiz")]

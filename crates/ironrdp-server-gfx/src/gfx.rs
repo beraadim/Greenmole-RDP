@@ -293,6 +293,8 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 pub struct GfxState {
     /// Stable terminal reason, published before disconnect callbacks run.
     pub connection_outcome: Option<ConnectionOutcome>,
+    /// Clipboard was quarantined for this connection; a reconnect resets it.
+    pub clipboard_disabled: bool,
     /// Whether this connection negotiated the GFX/DVC path at all.
     pub session_uses_gfx: bool,
     pub channel_id: Option<u32>,
@@ -400,6 +402,7 @@ impl GfxState {
     pub fn new(width: u16, height: u16, avc444_enabled: bool, gfx_validation_mode: bool) -> Self {
         Self {
             connection_outcome: None,
+            clipboard_disabled: false,
             session_uses_gfx: false,
             channel_id: None,
             surface_created: false,

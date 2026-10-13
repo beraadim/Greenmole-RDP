@@ -19,6 +19,12 @@ use ownership::{NativeSession, OwnedCf, OwnedPixelBuffer};
 static RETIREMENTS: std::sync::OnceLock<crate::retirement::RetirementPool> =
     std::sync::OnceLock::new();
 
+pub(crate) fn native_cleanup_pending() -> bool {
+    RETIREMENTS
+        .get()
+        .is_some_and(crate::retirement::RetirementPool::pending)
+}
+
 // --- FFI declarations ---
 
 type CVPixelBufferRef = *mut c_void;

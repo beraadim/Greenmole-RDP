@@ -1,71 +1,12 @@
 use std::sync::{atomic::Ordering, Arc};
 
-use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 
 use crate::database::Database;
-use crate::event_bridge::TauriEventBridge;
 use crate::state::AppState;
 
-pub async fn ensure_server_running(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-) -> Result<(), String> {
-    let _lifecycle = state.lifecycle_lock.lock().await;
-    let previous = {
-        let mut guard = state.server_handle.lock().await;
-        if guard.as_ref().is_some_and(|handle| handle.status().running) {
-            return Ok(());
-        }
-        guard.take()
-    };
-    *state.running_config.lock().await = None;
-    let generation = state.server_generation.fetch_add(1, Ordering::AcqRel) + 1;
-    if let Some(previous) = previous {
-        if let Err(error) = previous.stop().await {
-            tracing::warn!(%error, "Reaped a failed server before restarting");
-        }
-    }
-
-    {
-        let mut status = state.status.lock().await;
-        status.running = false;
-        status.state = "starting".to_string();
-        status.error_details = None;
-    }
-    let _ = app.emit("server-status", &*state.status.lock().await);
-
-    let started_config = state.ui_config.lock().await.clone();
-    let config = started_config.to_server_config();
-    let bridge = TauriEventBridge::new(app.clone(), generation);
-
-    let handle = match macrdp_core::start_server(config, bridge).await {
-        Ok(handle) => handle,
-        Err(error) => {
-            // Invalidate any queued startup events before publishing the failure.
-            state.server_generation.fetch_add(1, Ordering::AcqRel);
-            let mut status = state.status.lock().await;
-            *status = macrdp_core::ServerStatus {
-                state: "error: RDP server startup failed".into(),
-                error_details: Some(format!("{error:#}")),
-                ..Default::default()
-            };
-            let _ = app.emit("server-status", &*status);
-            crate::tray::update_tray_status(app, "stopped", &macrdp_core::Metrics::default());
-            return Err(format!("Failed to start server: {error:#}"));
-        }
-    };
-
-    let port = handle.port();
-    tracing::info!(port, "Server started successfully");
-
-    let mut guard = state.server_handle.lock().await;
-    *guard = Some(handle);
-    *state.running_config.lock().await = Some(started_config);
-
-    Ok(())
-}
+pub(crate) use crate::server_lifecycle::{ensure_server_running, stop_running_server};
 
 #[tauri::command]
 pub async fn start_server(
@@ -82,73 +23,38 @@ pub async fn stop_server(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     tracing::info!("stop_server called");
-    let _lifecycle = state.lifecycle_lock.lock().await;
+    state
+        .stop_requests
+        .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    let _lifecycle = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.lifecycle_lock.lock(),
+    )
+    .await
+    .map_err(|_| "A service transition is still pending; Stop will remain available.")?;
     stop_running_server(&app, state.inner()).await
-}
-
-/// Caller holds the lifecycle lock, including settings failures that require a safe stop.
-pub(crate) async fn stop_running_server(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-) -> Result<(), String> {
-    state.server_generation.fetch_add(1, Ordering::AcqRel);
-
-    // Take the handle out
-    let handle = {
-        let mut guard = state.server_handle.lock().await;
-        guard.take()
-    };
-
-    let stop_result = if let Some(handle) = handle {
-        handle
-            .stop()
-            .await
-            .map_err(|error| format!("Failed to stop server: {error}"))
-    } else {
-        Ok(())
-    };
-
-    *state.running_config.lock().await = None;
-
-    // Update status
-    {
-        let mut status = state.status.lock().await;
-        status.running = false;
-        status.state = "stopped".to_string();
-        status.error_details = stop_result.as_ref().err().cloned();
-        status.uptime_secs = 0;
-        status.port = None;
-        status.bind_address = None;
-    }
-    let _ = app.emit("server-status", &*state.status.lock().await);
-
-    // Clear metrics and connections
-    {
-        let mut metrics = state.metrics.lock().await;
-        *metrics = macrdp_core::Metrics::default();
-    }
-    {
-        let mut connections = state.connections.lock().await;
-        connections.clear();
-    }
-
-    crate::tray::update_tray_status(app, "stopped", &macrdp_core::Metrics::default());
-    let _ = app.emit("metrics", &macrdp_core::Metrics::default());
-    let _ = app.emit("connections", Vec::<crate::state::Connection>::new());
-    stop_result
 }
 
 #[tauri::command]
 pub async fn get_server_status(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    // If we have a live handle, refresh from it
-    {
-        let guard = state.server_handle.lock().await;
-        if let Some(ref handle) = *guard {
-            let live_status = handle.status();
+    if let Ok(_lifecycle) = state.lifecycle_lock.try_lock() {
+        let handle = state.server_handle.lock().await.as_ref().cloned();
+        if let Some(handle) = handle {
+            *state.status.lock().await = handle.status();
+            if handle.cleanup_complete() {
+                state.server_handle.lock().await.take();
+                *state.running_config.lock().await = None;
+            }
+        } else {
             let mut status = state.status.lock().await;
-            *status = live_status;
+            if macrdp_core::server_resources_pending() {
+                status.state = "cleanup_pending".into();
+                status.running = false;
+            } else if status.state == "cleanup_pending" {
+                *status = Default::default();
+            }
         }
     }
     let status = state.status.lock().await.clone();
@@ -202,6 +108,29 @@ pub fn get_permissions() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+pub async fn request_permissions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    if macrdp_core::server_resources_pending()
+        || state
+            .server_handle
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|handle| !handle.cleanup_complete())
+    {
+        return Err(
+            "Stop the server and wait for display cleanup before requesting permissions.".into(),
+        );
+    }
+    let perms = tokio::task::spawn_blocking(macrdp_core::permissions::request_permissions)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(perms).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn get_input_debug_state(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
@@ -225,9 +154,11 @@ pub async fn get_tls_status(state: State<'_, Arc<AppState>>) -> Result<serde_jso
             );
         }
     }
-    let cert_path = state.ui_config.lock().await.to_server_config().cert_path;
+    let configured = state.ui_config.lock().await.to_server_config();
+    let cert_path = configured.cert_path;
+    let directory = configured.managed_tls_directory.expect("GUI TLS directory");
     let result = tokio::task::spawn_blocking(move || {
-        macrdp_core::tls::inspect_configured_tls_certificate(cert_path.as_deref())
+        macrdp_core::tls::inspect_configured_tls_certificate_at(&directory, cert_path.as_deref())
     })
     .await
     .map_err(|error| error.to_string())?;
@@ -302,17 +233,26 @@ pub async fn quit_app(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let _lifecycle = state.lifecycle_lock.lock().await;
+    state
+        .stop_requests
+        .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    let _lifecycle = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.lifecycle_lock.lock(),
+    )
+    .await
+    .ok();
     state.server_generation.fetch_add(1, Ordering::AcqRel);
-    // Stop the server if running
-    let handle = {
-        let mut guard = state.server_handle.lock().await;
-        guard.take()
-    };
-
+    // Process exit is the final recovery boundary: its display helper observes
+    // closed stdin and restores/removes the owned virtual display.
+    let handle = state.server_handle.lock().await.as_ref().cloned();
     if let Some(handle) = handle {
-        if let Err(e) = handle.stop().await {
-            tracing::warn!("Error stopping server during quit: {}", e);
+        match handle.stop().await {
+            Ok(macrdp_core::StopOutcome::Pending { reason }) => {
+                tracing::warn!(reason, "Exiting with native cleanup still pending")
+            }
+            Err(error) => tracing::warn!(%error, "Error stopping server during quit"),
+            Ok(macrdp_core::StopOutcome::Complete) => {}
         }
     }
 

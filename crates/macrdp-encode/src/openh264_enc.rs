@@ -266,6 +266,39 @@ fn bgra_to_yuv420_padded(
 }
 
 impl VideoEncoder for OpenH264Encoder {
+    fn prepare(&mut self) -> Result<()> {
+        let y_size = (self.width * self.height) as usize;
+        let uv_size = y_size / 4;
+        self.yuv_buf[..y_size].fill(16);
+        self.yuv_buf[y_size..].fill(128);
+        let (y, uv) = self.yuv_buf.split_at(y_size);
+        let (u, v) = uv.split_at(uv_size);
+        let yuv = YUVSlices::new(
+            (y, u, v),
+            (self.width as usize, self.height as usize),
+            (
+                self.width as usize,
+                self.width as usize / 2,
+                self.width as usize / 2,
+            ),
+        );
+        // The wrapper initializes the native codec only on encode. Discard this
+        // neutral frame and force an IDR so no client references that hidden frame.
+        self.encoder
+            .encode(&yuv)
+            .context("OpenH264 native startup failed")?;
+        self.main_initialized = true;
+        if let Some(aux) = &mut self.encoder_aux {
+            aux.encode(&yuv)
+                .context("OpenH264 auxiliary native startup failed")?;
+            self.aux_initialized = true;
+        }
+        self.bitrate_applied = true;
+        self.force_keyframe = true;
+        tracing::info!(quality = ?self.quality, "OpenH264 native quality and bitrate configuration accepted");
+        Ok(())
+    }
+
     fn backend_name(&self) -> &'static str {
         "openh264"
     }
@@ -385,6 +418,11 @@ impl VideoEncoder for OpenH264Encoder {
             .encoder_aux
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no auxiliary encoder"))?;
+        if self.force_keyframe {
+            self.encoder.force_intra_frame();
+            encoder_aux.force_intra_frame();
+            self.force_keyframe = false;
+        }
         let bufs = self
             .yuv444_bufs
             .as_mut()
@@ -632,6 +670,28 @@ mod tests {
             crate::screen_bitrate(1920, 1080, 60.0, Quality::Lossless),
             0
         );
+    }
+
+    #[test]
+    fn prepared_encoders_deliver_independent_first_frames_for_both_views() {
+        for mode_444 in [false, true] {
+            let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 2_000_000, mode_444).unwrap();
+            encoder.prepare().unwrap();
+            assert!(encoder.main_initialized);
+            assert_eq!(encoder.aux_initialized, mode_444);
+            assert_eq!(encoder.applied_bitrate(), Some(2_000_000));
+            // A hot bitrate update is now native, not a deferred configuration.
+            encoder.set_bitrate(1_000_000).unwrap();
+            let bgra = vec![128; 64 * 64 * 4];
+            if mode_444 {
+                let frame = encoder.encode_bgra_444(&bgra, 64, 64, 256).unwrap();
+                assert!(frame.main_view.is_keyframe && frame.aux_view.is_keyframe);
+                assert!(!frame.main_view.data.is_empty() && !frame.aux_view.data.is_empty());
+            } else {
+                let frame = encoder.encode_bgra(&bgra, 64, 64, 256).unwrap();
+                assert!(frame.is_keyframe && !frame.data.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -63,6 +63,9 @@ pub struct ServerConfig {
     pub password: Option<String>,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    /// Embedder-selected private storage; CLI TOML keeps its existing discovery policy.
+    #[serde(skip)]
+    pub managed_tls_directory: Option<PathBuf>,
     /// Additional DNS names or IP addresses for the managed TLS certificate.
     /// Localhost and the system hostname are always included. Requires restart.
     pub tls_server_names: Vec<String>,
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
             password: None,
             cert_path: None,
             key_path: None,
+            managed_tls_directory: None,
             tls_server_names: Vec::new(),
             idle_timeout_secs: 1800,
             log_level: None,

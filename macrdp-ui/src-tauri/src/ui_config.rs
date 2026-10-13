@@ -399,6 +399,7 @@ impl UiConfig {
             },
             cert_path: (!self.tls_cert_path.is_empty()).then(|| PathBuf::from(&self.tls_cert_path)),
             key_path: (!self.tls_key_path.is_empty()).then(|| PathBuf::from(&self.tls_key_path)),
+            managed_tls_directory: Some(macrdp_core::tls::desktop_managed_tls_directory()),
             tls_server_names: self.tls_server_names.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
             log_level: Some(self.log_level.clone()),

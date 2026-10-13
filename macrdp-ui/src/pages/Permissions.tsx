@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Monitor, MousePointer2, Mic, Check } from "lucide-react";
+import { Monitor, MousePointer2, Check } from "lucide-react";
 import { api } from "../lib/ipc";
 import type { PermissionStatus } from "../lib/types";
+import { useServerStatus } from "../hooks/useServerStatus";
 
 const permissionDefs = [
   {
@@ -17,17 +18,22 @@ const permissionDefs = [
     pane: "accessibility",
     icon: MousePointer2,
   },
-  {
-    key: "microphone" as keyof PermissionStatus,
-    name: "Microphone",
-    pane: "microphone",
-    icon: Mic,
-    optional: true,
-  },
 ];
 
 function Permissions() {
   const [perms, setPerms] = useState<PermissionStatus | null>(null);
+  const status = useServerStatus();
+  const [requesting, setRequesting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const serviceOwnsResources = status.running || status.state === "stopping" || status.state === "cleanup_pending";
+  const request = async () => {
+    if (requesting || serviceOwnsResources) return;
+    setRequesting(true);
+    setError(null);
+    try { setPerms(await api.requestPermissions()); }
+    catch (reason) { setError(String(reason)); }
+    finally { setRequesting(false); }
+  };
 
   useEffect(() => {
     api.getPermissions().then(setPerms).catch(console.error);
@@ -66,6 +72,13 @@ function Permissions() {
         <div className="rounded-[8px] border border-orange/20 bg-orange/10 p-3 text-[11px] text-text-secondary">
           Screen Recording can require reopening the app before macOS reports it
           as granted.
+          <p className="mt-2">Complete setup on the physical display before starting a remote connection.</p>
+          <button onClick={() => void request()} disabled={requesting || serviceOwnsResources}
+            className="mt-2 rounded-md bg-orange/15 px-2.5 py-1 font-medium text-orange disabled:opacity-50">
+            {requesting ? "Requesting permissions..." : "Request required permissions"}
+          </button>
+          {serviceOwnsResources && <p className="mt-2">Stop the server and wait for cleanup before requesting permissions.</p>}
+          {error && <p role="alert" className="mt-2 text-red">{error}</p>}
         </div>
       )}
 

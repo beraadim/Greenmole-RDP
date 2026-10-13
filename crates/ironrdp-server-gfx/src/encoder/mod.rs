@@ -1,16 +1,18 @@
 use core::fmt;
+#[cfg(test)]
 use core::num::NonZeroU16;
 
 use anyhow::{anyhow, Context as _, Result};
 use ironrdp_acceptor::DesktopSize;
 use ironrdp_graphics::diff::{find_different_rects_sub, Rect};
+use ironrdp_pdu::codecs::rfx::OperatingMode;
 use ironrdp_pdu::encode_vec;
 use ironrdp_pdu::fast_path::UpdateCode;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::pointer::{
     ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute,
 };
-use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
+use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, RfxICap, RfxICapFlags};
 use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
 use tracing::{debug, warn};
 
@@ -24,6 +26,12 @@ use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
 mod allocation_tests;
 mod bitmap;
 mod fast_path;
+mod iter;
+mod limits;
+pub(crate) use iter::EncoderIter;
+use iter::State;
+#[cfg(test)]
+mod limits_tests;
 #[cfg(test)]
 mod quality_tests;
 pub(crate) mod rfx;
@@ -31,6 +39,7 @@ mod rfx_rlgr;
 
 pub(crate) use fast_path::*;
 use ironrdp_graphics::rdp6::BitmapEncodeError;
+use limits::UpdateLimits;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -51,7 +60,8 @@ impl CodecId {
 #[cfg_attr(feature = "__bench", visibility::make(pub))]
 #[derive(Debug)]
 pub(crate) struct UpdateEncoderCodecs {
-    remotefx: Option<(EntropyBits, u8)>,
+    remotefx: Option<(EntropyBits, u8, OperatingMode)>,
+    limits: UpdateLimits,
     quality: crate::BitmapQuality,
     allow_skip_alpha: bool,
     #[cfg(feature = "qoi")]
@@ -65,6 +75,7 @@ impl UpdateEncoderCodecs {
     pub(crate) fn new() -> Self {
         Self {
             remotefx: None,
+            limits: UpdateLimits::default(),
             quality: crate::BitmapQuality::default(),
             allow_skip_alpha: false,
             #[cfg(feature = "qoi")]
@@ -75,8 +86,27 @@ impl UpdateEncoderCodecs {
     }
 
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
-    pub(crate) fn set_remotefx(&mut self, remotefx: Option<(EntropyBits, u8)>) {
+    pub(crate) fn set_remotefx(&mut self, remotefx: Option<(EntropyBits, u8, OperatingMode)>) {
         self.remotefx = remotefx
+    }
+
+    pub(crate) fn set_remotefx_capability(&mut self, codec_id: u8, capability: RfxICap) {
+        // MS-RDPRFX 3.1.5.1: select mode and entropy from the same ICAP.
+        // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/b253aeab-5120-4b05-8061-7c51e8e9750f
+        let mode = if capability.flags.contains(RfxICapFlags::CODEC_MODE) {
+            OperatingMode::IMAGE_MODE
+        } else {
+            OperatingMode::empty()
+        };
+        self.set_remotefx(Some((capability.entropy_bits, codec_id, mode)));
+    }
+
+    pub(crate) fn set_max_request_size(&mut self, bytes: u32) {
+        self.limits = UpdateLimits::from_client(bytes);
+    }
+
+    pub(crate) fn max_update_size(&self) -> usize {
+        self.limits.max_payload()
     }
 
     pub(crate) fn set_quality(&mut self, quality: crate::BitmapQuality) {
@@ -111,6 +141,7 @@ pub(crate) struct UpdateEncoder {
     desktop_size: DesktopSize,
     framebuffer: Option<Framebuffer>,
     bitmap_updater: Option<BitmapUpdater>,
+    limits: UpdateLimits,
 }
 
 impl fmt::Debug for UpdateEncoder {
@@ -133,12 +164,13 @@ impl UpdateEncoder {
         {
             let mut bitmap = BitmapUpdater::None(NoneHandler);
 
-            if let Some((algo, id)) = codecs.remotefx {
+            if let Some((algo, id, mode)) = codecs.remotefx {
                 bitmap = BitmapUpdater::RemoteFx(RemoteFxHandler::new(
                     algo,
                     id,
                     desktop_size,
                     codecs.quality,
+                    mode,
                 ));
             }
 
@@ -164,6 +196,7 @@ impl UpdateEncoder {
             desktop_size,
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
+            limits: codecs.limits,
         })
     }
 
@@ -347,7 +380,7 @@ impl UpdateEncoder {
         }
     }
 
-    async fn bitmap(&mut self, bitmap: BitmapUpdate) -> Result<UpdateFragmenter> {
+    async fn bitmap(&mut self, bitmap: BitmapUpdate) -> Result<Option<UpdateFragmenter>> {
         // Move the bitmap updater to satisfy spawn_blocking 'static requirement.
         // It is restored after the blocking operation completes.
         let mut updater = self
@@ -355,8 +388,13 @@ impl UpdateEncoder {
             .take()
             .expect("bitmap updater always Some");
 
+        let limit = self.limits.max_payload();
         let (result, updater) = tokio::task::spawn_blocking(move || {
-            let result = time_warn!("Encoding bitmap", 10, updater.handle(&bitmap));
+            let result = time_warn!(
+                "Encoding bitmap",
+                10,
+                updater.handle_with_limit(&bitmap, limit)
+            );
             (result, updater)
         })
         .await?;
@@ -446,124 +484,6 @@ fn merge_rects(a: Rect, b: Rect, gap: usize) -> Option<Rect> {
     })
 }
 
-#[derive(Debug, Default)]
-enum State {
-    Start(DisplayUpdate),
-    BitmapDiffs {
-        diffs: Vec<Rect>,
-        bitmap: BitmapUpdate,
-        pos: usize,
-    },
-    #[default]
-    Ended,
-}
-
-#[cfg_attr(feature = "__bench", visibility::make(pub))]
-pub(crate) struct EncoderIter<'a> {
-    encoder: &'a mut UpdateEncoder,
-    state: State,
-}
-
-impl EncoderIter<'_> {
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
-    pub(crate) async fn next(&mut self) -> Option<Result<UpdateFragmenter>> {
-        loop {
-            let state = core::mem::take(&mut self.state);
-            let encoder = &mut self.encoder;
-
-            let res = match state {
-                State::Start(update) => match update {
-                    DisplayUpdate::Bitmap(bitmap) => {
-                        let diffs = encoder.bitmap_diffs(&bitmap);
-                        self.state = State::BitmapDiffs {
-                            diffs,
-                            bitmap,
-                            pos: 0,
-                        };
-                        continue;
-                    }
-                    DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
-                    DisplayUpdate::RGBAPointer(ptr) => UpdateEncoder::rgba_pointer(ptr),
-                    DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
-                    DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
-                    DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
-                    DisplayUpdate::Resize(_) => return None,
-                    DisplayUpdate::GfxFrame(_) | DisplayUpdate::GfxUncompressed(_) => {
-                        // GFX frames are handled separately in the server loop, not through the encoder
-                        return None;
-                    }
-                },
-                State::BitmapDiffs { diffs, bitmap, pos } => {
-                    let Some(rect) = diffs.get(pos) else {
-                        encoder.bitmap_update_framebuffer(bitmap, &diffs);
-                        self.state = State::Ended;
-                        return None;
-                    };
-                    let Rect {
-                        x,
-                        y,
-                        width,
-                        height,
-                    } = *rect;
-
-                    let x = match u16::try_from(x) {
-                        Ok(x) => x,
-                        Err(_) => {
-                            return Some(Err(anyhow!(
-                                "invalid `x`: out of range integral conversion"
-                            )))
-                        }
-                    };
-                    let y = match u16::try_from(y) {
-                        Ok(y) => y,
-                        Err(_) => {
-                            return Some(Err(anyhow!(
-                                "invalid `y`: out of range integral conversion"
-                            )))
-                        }
-                    };
-                    let width = match u16::try_from(width) {
-                        Ok(width) => match NonZeroU16::new(width) {
-                            Some(width) => width,
-                            None => return Some(Err(anyhow!("rectangle width cannot be zero"))),
-                        },
-                        Err(_) => {
-                            return Some(Err(anyhow!(
-                                "invalid `width`: out of range integral conversion"
-                            )))
-                        }
-                    };
-                    let height = match u16::try_from(height) {
-                        Ok(height) => match NonZeroU16::new(height) {
-                            Some(height) => height,
-                            None => return Some(Err(anyhow!("rectangle height cannot be zero"))),
-                        },
-                        Err(_) => {
-                            return Some(Err(anyhow!(
-                                "invalid `height`: out of range integral conversion"
-                            )))
-                        }
-                    };
-
-                    let Some(sub) = bitmap.sub(x, y, width, height) else {
-                        warn!("Failed to extract bitmap subregion");
-                        return None;
-                    };
-                    self.state = State::BitmapDiffs {
-                        diffs,
-                        bitmap,
-                        pos: pos + 1,
-                    };
-                    encoder.bitmap(sub).await
-                }
-                State::Ended => return None,
-            };
-
-            return Some(res);
-        }
-    }
-}
-
 #[derive(Debug)]
 enum BitmapUpdater {
     None(NoneHandler),
@@ -576,6 +496,27 @@ enum BitmapUpdater {
 }
 
 impl BitmapUpdater {
+    fn handle_with_limit(
+        &mut self,
+        bitmap: &BitmapUpdate,
+        limit: usize,
+    ) -> Result<Option<UpdateFragmenter>> {
+        // Oversized candidates are discarded and subdivided. Do not consume a
+        // video stream's initial headers or frame index until an update fits.
+        let checkpoint = match self {
+            Self::RemoteFx(handler) => Some(handler.clone()),
+            _ => None,
+        };
+        let output = self.handle(bitmap)?;
+        if output.data.len() <= limit {
+            return Ok(Some(output));
+        }
+        if let Some(handler) = checkpoint {
+            *self = Self::RemoteFx(handler);
+        }
+        Ok(None)
+    }
+
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
         match self {
             Self::None(up) => up.handle(bitmap),
@@ -676,15 +617,17 @@ impl RemoteFxHandler {
         codec_id: u8,
         desktop_size: DesktopSize,
         quality: crate::BitmapQuality,
+        mode: OperatingMode,
     ) -> Self {
         tracing::info!(
             entropy_algorithm = ?algo,
             quality = ?quality,
             codec_id,
+            ?mode,
             "Configured RemoteFX bitmap encoder"
         );
         Self {
-            remotefx: RfxEncoder::new(algo, quality),
+            remotefx: RfxEncoder::new(algo, quality, mode),
             desktop_size: Some(desktop_size),
             codec_id,
         }
@@ -692,12 +635,14 @@ impl RemoteFxHandler {
 
     fn set_desktop_size(&mut self, size: DesktopSize) {
         self.desktop_size = Some(size);
+        self.remotefx.reset();
     }
 }
 
 impl BitmapUpdateHandler for RemoteFxHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        let mut buffer = vec![0; bitmap.data.len()];
+        let mut buffer =
+            vec![0; usize::from(bitmap.width.get()) * usize::from(bitmap.height.get()) * 4 + 256];
         let len = loop {
             match self
                 .remotefx
@@ -705,7 +650,11 @@ impl BitmapUpdateHandler for RemoteFxHandler {
             {
                 Err(e) => match e.kind() {
                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                        buffer.resize(buffer.len() * 2, 0);
+                        let size = buffer
+                            .len()
+                            .checked_mul(2)
+                            .ok_or_else(|| anyhow!("RemoteFX output size overflow"))?;
+                        buffer.resize(size, 0);
                         debug!("encoder buffer resized to: {}", buffer.len());
                     }
                     _ => Err(e).context("RemoteFX encode error")?,
@@ -714,9 +663,9 @@ impl BitmapUpdateHandler for RemoteFxHandler {
             }
         };
 
-        // A failed size estimate must not consume the first frame's codec
-        // headers. The client needs them on the successful retry as well.
-        self.desktop_size = None;
+        // MS-RDPRFX 3.1.5 requires headers before every image; 3.1.8.3.1
+        // permits repeating them in video mode too. Keep each partition
+        // independently decodable, including after output-size retries.
 
         set_surface(bitmap, self.codec_id, &buffer[..len])
     }

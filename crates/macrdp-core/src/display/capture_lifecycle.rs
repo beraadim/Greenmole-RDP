@@ -9,6 +9,8 @@ type Restore = Box<dyn FnOnce() -> Result<()> + Send>;
 
 struct Owner {
     restore: Option<Restore>,
+    shutdown: Option<Restore>,
+    shutdown_started: bool,
     restore_requested: bool,
     finishing: bool,
 }
@@ -16,6 +18,7 @@ struct Owner {
 #[derive(Default)]
 struct Lifecycle {
     owner: Mutex<Option<Owner>>,
+    cleanup_error: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -33,6 +36,20 @@ fn lifecycle() -> &'static Arc<Lifecycle> {
     LIFECYCLE.get_or_init(|| Arc::new(Lifecycle::default()))
 }
 
+/// Includes streams in startup, late recovery, retirement, and restoration.
+pub(crate) fn pending() -> bool {
+    lifecycle().owner.lock().unwrap().is_some()
+}
+
+pub(crate) fn cleanup_error() -> Option<String> {
+    lifecycle().cleanup_error.lock().unwrap().clone()
+}
+
+/// A new server may clear a completed previous error, never a pending owner.
+pub(crate) fn clear_cleanup_error() {
+    *lifecycle().cleanup_error.lock().unwrap() = None;
+}
+
 /// The native owner drops its stream before this lease. Async handles only
 /// signal that owner, so disconnect cannot release ownership while a pending
 /// start, configuration, late result, or native retirement survives.
@@ -44,6 +61,8 @@ impl Lifecycle {
         anyhow::ensure!(owner.is_none(), NativeCaptureBusy);
         *owner = Some(Owner {
             restore: Some(restore),
+            shutdown: None,
+            shutdown_started: false,
             restore_requested: false,
             finishing: false,
         });
@@ -66,7 +85,7 @@ impl Lifecycle {
 
 pub(super) fn acquire(display: &DisplayController) -> Result<NativeCaptureLease> {
     let display = display.clone();
-    lifecycle().acquire(Box::new(move || display.end_remote_session()))
+    lifecycle().acquire(Box::new(move || display.end_remote_session_owned()))
 }
 
 impl Drop for NativeCaptureLease {
@@ -89,6 +108,8 @@ impl Drop for NativeCaptureLease {
         if let Some(restore) = restore {
             if requested {
                 if let Err(error) = restore() {
+                    *self.0.cleanup_error.lock().unwrap() =
+                        Some(format!("Physical display restoration failed: {error:#}"));
                     tracing::warn!(%error, "Deferred physical display restoration failed");
                 }
             } else {
@@ -98,7 +119,27 @@ impl Drop for NativeCaptureLease {
             }
         }
         if requested {
-            *self.0.owner.lock().unwrap() = None;
+            let shutdown = {
+                let mut owner = self.0.owner.lock().unwrap();
+                let current = owner.as_mut().expect("finishing native owner");
+                let shutdown = current.shutdown.take();
+                if shutdown.is_some() {
+                    current.shutdown_started = true;
+                } else {
+                    // Atomic with shutdown registration: a later server Stop
+                    // must acquire its own barrier rather than lose its request.
+                    *owner = None;
+                }
+                shutdown
+            };
+            if let Some(shutdown) = shutdown {
+                if let Err(error) = shutdown() {
+                    *self.0.cleanup_error.lock().unwrap() =
+                        Some(format!("Display worker shutdown failed: {error:#}"));
+                    tracing::warn!(%error, "Deferred display worker shutdown failed");
+                }
+                *self.0.owner.lock().unwrap() = None;
+            }
         }
     }
 }
@@ -116,20 +157,39 @@ pub(crate) fn queue_restoration(display: &DisplayController) -> Result<()> {
 /// Called from the server's existing blocking shutdown cleanup. Recovery owns
 /// its own native thread, so pending retirement never blocks server shutdown.
 pub(crate) fn restore_after_capture(display: DisplayController) -> Result<()> {
+    if display.shutdown_complete() {
+        return Ok(());
+    }
     let lease = {
         let mut owner = lifecycle().owner.lock().unwrap();
+        if display.shutdown_complete() {
+            return Ok(());
+        }
         if Lifecycle::request_restore(&mut owner) {
+            let current = owner.as_mut().expect("restoration owner exists");
+            if current.shutdown.is_none() && !current.shutdown_started {
+                current.shutdown = Some(Box::new(move || display.shutdown_owned()));
+            }
             return Ok(());
         }
         let retained = display.clone();
         *owner = Some(Owner {
-            restore: Some(Box::new(move || retained.end_remote_session())),
+            restore: Some(Box::new(move || retained.end_remote_session_owned())),
+            shutdown: None,
+            shutdown_started: false,
             restore_requested: false,
             finishing: false,
         });
         NativeCaptureLease(lifecycle().clone())
     };
-    let result = display.end_remote_session();
+    let restore_result = display.end_remote_session_owned();
+    // Attempt shutdown even after a completed restoration error. The worker's
+    // native owner gets its final cleanup attempt before acknowledging exit.
+    let result = restore_result.and(display.shutdown_owned());
+    if let Err(error) = &result {
+        *lifecycle().cleanup_error.lock().unwrap() =
+            Some(format!("Physical display restoration failed: {error:#}"));
+    }
     drop(display);
     drop(lease);
     result
@@ -164,6 +224,53 @@ mod tests {
     struct NativeResult {
         _capture: NativeStub,
         _lease: NativeCaptureLease,
+    }
+
+    #[test]
+    fn restoration_and_controller_shutdown_share_the_same_retained_owner() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let restored = Arc::new(AtomicUsize::new(0));
+        let count = restored.clone();
+        let lease = lifecycle
+            .acquire(Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("simulated restoration failure"))
+            }))
+            .unwrap();
+        let (entered, blocked) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        {
+            let mut owner = lifecycle.owner.lock().unwrap();
+            Lifecycle::request_restore(&mut owner);
+            owner.as_mut().unwrap().shutdown = Some(Box::new(move || {
+                assert_eq!(restored.load(Ordering::SeqCst), 1);
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok(())
+            }));
+        }
+        let cleanup = std::thread::spawn(move || drop(lease));
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(lifecycle.acquire(Box::new(|| Ok(()))).is_err());
+        assert!(
+            lifecycle
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .shutdown_started
+        );
+        assert!(lifecycle
+            .cleanup_error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("simulated restoration failure"));
+        release.send(()).unwrap();
+        cleanup.join().unwrap();
+        assert!(lifecycle.acquire(Box::new(|| Ok(()))).is_ok());
     }
 
     #[test]

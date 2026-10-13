@@ -34,6 +34,7 @@ pub type LogReloadHandle = reload::Handle<EnvFilter, Registry>;
 pub struct AppState {
     /// Serializes start/stop/settings transitions without blocking read-only polling.
     pub lifecycle_lock: Mutex<()>,
+    pub stop_requests: tokio::sync::watch::Sender<u64>,
     /// Delayed events from an older server must not revive its UI state.
     pub server_generation: AtomicU64,
     pub status: Mutex<ServerStatus>,
@@ -48,12 +49,14 @@ pub struct AppState {
     pub running_config: Mutex<Option<UiConfig>>,
     pub log_reload: LogReloadHandle,
     pub window_move_lock: Mutex<()>,
+    pub diagnostic_export_lock: Mutex<()>,
 }
 
 impl AppState {
     pub fn new(log_reload: LogReloadHandle, ui_config: UiConfig) -> Self {
         Self {
             lifecycle_lock: Mutex::new(()),
+            stop_requests: tokio::sync::watch::channel(0).0,
             server_generation: AtomicU64::new(0),
             status: Mutex::new(ServerStatus::default()),
             metrics: Mutex::new(Metrics::default()),
@@ -65,6 +68,7 @@ impl AppState {
             running_config: Mutex::new(None),
             log_reload,
             window_move_lock: Mutex::new(()),
+            diagnostic_export_lock: Mutex::new(()),
         }
     }
 }

@@ -6,6 +6,7 @@ mod event_bridge;
 #[cfg(target_os = "macos")]
 mod own_windows;
 mod permissions;
+mod server_lifecycle;
 mod state;
 mod tray;
 mod ui_config;
@@ -84,11 +85,10 @@ pub fn run() {
             // Initialize application state
             state::init_app_state(&handle, log_reload.clone(), ui_config.clone())?;
 
-            // Request permissions proactively on startup (non-blocking)
-            std::thread::spawn(|| {
-                let perms = macrdp_core::permissions::request_permissions();
-                tracing::info!(?perms, "Startup permission request completed");
-            });
+            // Setup is explicit and only allowed while no remote owner exists.
+            // Automatic launch never races a system dialog against virtual-display creation.
+            let perms = macrdp_core::permissions::check_permissions();
+            tracing::info!(?perms, "Startup permission check completed");
 
             // Database for logs and history
             let db_path = dirs::data_dir()
@@ -139,6 +139,7 @@ pub fn run() {
             commands::get_metrics,
             commands::get_connections,
             commands::get_permissions,
+            commands::request_permissions,
             commands::get_input_debug_state,
             configuration::get_config,
             configuration::get_configuration_status,

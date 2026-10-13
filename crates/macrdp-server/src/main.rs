@@ -87,9 +87,21 @@ async fn run() -> Result<()> {
         result = tokio::signal::ctrl_c() => result.context("Failed to wait for Ctrl-C"),
         result = server.wait_until_stopped() => result,
     };
-    let stopped = server.stop().await;
+    // Keep the owner alive until native restoration completes. Exiting merely
+    // because the bounded UI-facing Stop timed out could strand the desktop.
+    let stopped = loop {
+        match server.stop().await {
+            Ok(macrdp_core::StopOutcome::Complete) => break Ok(()),
+            Ok(macrdp_core::StopOutcome::Pending { reason }) => {
+                tracing::warn!(reason, "Shutdown pending; waiting for native cleanup");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(error) => break Err(error),
+        }
+    };
     if let Some(perf) = perf {
         perf.lock().unwrap().print_summary();
     }
+    let _ = tokio::task::spawn_blocking(macrdp_core::flush_logs).await;
     result.and(stopped)
 }

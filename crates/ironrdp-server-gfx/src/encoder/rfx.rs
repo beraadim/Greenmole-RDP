@@ -17,10 +17,16 @@ use crate::BitmapUpdate;
 pub(crate) struct RfxEncoder {
     entropy_algorithm: rfx::EntropyAlgorithm,
     quant: Quant,
+    mode: OperatingMode,
+    frame_index: u32,
 }
 
 impl RfxEncoder {
-    pub(crate) fn new(entropy_bits: EntropyBits, quality: crate::BitmapQuality) -> Self {
+    pub(crate) fn new(
+        entropy_bits: EntropyBits,
+        quality: crate::BitmapQuality,
+        mode: OperatingMode,
+    ) -> Self {
         let entropy_algorithm = match entropy_bits {
             EntropyBits::Rlgr1 => rfx::EntropyAlgorithm::Rlgr1,
             EntropyBits::Rlgr3 => rfx::EntropyAlgorithm::Rlgr3,
@@ -28,7 +34,17 @@ impl RfxEncoder {
         Self {
             entropy_algorithm,
             quant: quality.remotefx_quant(),
+            mode,
+            frame_index: 0,
         }
+    }
+
+    pub(crate) fn is_image_mode(&self) -> bool {
+        self.mode.contains(OperatingMode::IMAGE_MODE)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.frame_index = 0;
     }
 
     pub(crate) fn encode(
@@ -46,7 +62,7 @@ impl RfxEncoder {
             let height = desktop_size.height;
             Block::Sync(SyncPdu).encode(&mut cursor)?;
             let context = rfx::ContextPdu {
-                flags: OperatingMode::IMAGE_MODE,
+                flags: self.mode,
                 entropy_algorithm,
             };
             Block::CodecChannel(CodecChannel::Context(context)).encode(&mut cursor)?;
@@ -62,7 +78,7 @@ impl RfxEncoder {
 
         // data messages
         let frame_begin = FrameBeginPdu {
-            index: 0,
+            index: self.frame_index,
             number_of_regions: 1,
         };
         Block::CodecChannel(CodecChannel::FrameBegin(frame_begin)).encode(&mut cursor)?;
@@ -94,7 +110,11 @@ impl RfxEncoder {
         let frame_end = FrameEndPdu;
         Block::CodecChannel(CodecChannel::FrameEnd(frame_end)).encode(&mut cursor)?;
 
-        Ok(cursor.pos())
+        let len = cursor.pos();
+        if !self.is_image_mode() {
+            self.frame_index = self.frame_index.wrapping_add(1);
+        }
+        Ok(len)
     }
 }
 

@@ -52,6 +52,13 @@ mod tests;
 #[path = "transport_tests.rs"]
 mod transport_tests;
 
+#[cfg(test)]
+#[path = "clipboard_channel_tests.rs"]
+mod clipboard_channel_tests;
+
+#[path = "clipboard_status.rs"]
+mod clipboard_status;
+
 #[path = "capture_activation.rs"]
 mod capture_activation;
 #[path = "connection_control.rs"]
@@ -260,13 +267,11 @@ enum RunState {
     DeactivationReactivation { desktop_size: DesktopSize },
 }
 
-fn is_benign_disconnect_error_text(err: &str) -> bool {
-    err.contains("reset by peer")
-        || err.contains("Broken pipe")
-        // Guacamole teardown can leave the TCP stream ending mid-PDU read,
-        // which currently bubbles up as a decode "not enough bytes" error
-        // even though the client intentionally closed the session.
-        || err.contains("not enough bytes")
+fn is_benign_disconnect_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error_outcome(error, ConnectionOutcome::ProtocolError),
+        ConnectionOutcome::PeerClosed | ConnectionOutcome::PeerReset | ConnectionOutcome::PeerEof
+    )
 }
 
 impl RdpServer {
@@ -612,7 +617,7 @@ impl RdpServer {
                     drop(ev_receiver);
                     if let Err(error) = self.run_connection(stream).await {
                         let err_str = format!("{error:#}");
-                        if is_benign_disconnect_error_text(&err_str) {
+                        if is_benign_disconnect_error(&error) {
                             warn!("Client disconnected: {err_str}");
                         } else {
                             error!(?error, "Connection error");
@@ -676,16 +681,26 @@ impl RdpServer {
         io_channel_id: u16,
         user_channel_id: u16,
     ) -> Result<RunState> {
-        let (state, output) = server
-            .lock()
-            .await
-            .dispatch_pdu(action, bytes, io_channel_id, user_channel_id)
-            .await?;
+        let (state, output, clipboard_sender) = {
+            let mut server = server.lock().await;
+            let (state, output) = server
+                .dispatch_pdu(action, bytes, io_channel_id, user_channel_id)
+                .await?;
+            let clipboard_sender = output.as_ref().and_then(|output| {
+                (server.get_channel_id_by_type::<CliprdrServer>() == Some(output.channel_id))
+                    .then(|| server.ev_sender.clone())
+            });
+            (state, output, clipboard_sender)
+        };
         // Channel state is committed before output, but must not stay locked
         // while another channel or a slow peer holds up socket progress.
         if let Some(output) = output {
             writer
-                .write_admitted_channel(&output, permit, || true)
+                .write_admitted_channel(&output, permit, || {
+                    clipboard_sender
+                        .as_ref()
+                        .map_or(true, |sender| !sender.is_clipboard_closed())
+                })
                 .await?;
         }
         Ok(state)
@@ -884,6 +899,28 @@ impl RdpServer {
         event: ServerEvent,
         user_channel_id: u16,
     ) -> Result<(RunState, Option<ChannelOutput>)> {
+        if matches!(
+            &event,
+            ServerEvent::Clipboard(_)
+                | ServerEvent::ClipboardFileContents(_)
+                | ServerEvent::ClipboardFileContentsRequest(_)
+        ) {
+            if self.ev_sender.is_clipboard_closed() {
+                return Ok((RunState::Continue, None));
+            }
+            // Only clipboard's protocol state becomes unusable. Never restart
+            // its untagged exchange on this connection or disconnect the desktop.
+            let output = match self.dispatch_clipboard_event(event, user_channel_id) {
+                Ok(output) => output,
+                Err(error) => {
+                    warn!(%error, "Clipboard output failed");
+                    self.ev_sender
+                        .quarantine_clipboard("clipboard protocol output failed");
+                    None
+                }
+            };
+            return Ok((RunState::Continue, output));
+        }
         let output = match event {
             ServerEvent::Quit(reason) => {
                 debug!("Got quit event: {reason}");
@@ -934,20 +971,35 @@ impl RdpServer {
                 let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                 Some(ChannelOutput { channel_id, data })
             }
+            ServerEvent::Clipboard(_)
+            | ServerEvent::ClipboardFileContents(_)
+            | ServerEvent::ClipboardFileContentsRequest(_) => unreachable!("handled above"),
+        };
+
+        Ok((RunState::Continue, output))
+    }
+
+    fn dispatch_clipboard_event(
+        &mut self,
+        event: ServerEvent,
+        user_channel_id: u16,
+    ) -> Result<Option<ChannelOutput>> {
+        let output = match event {
+            ServerEvent::Clipboard(ClipboardMessage::Error(_)) => {
+                self.ev_sender
+                    .quarantine_clipboard("clipboard producer reported an error");
+                None
+            }
             ServerEvent::Clipboard(c) => {
                 let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
                     warn!("No clipboard channel, dropping event");
-                    return Ok((RunState::Continue, None));
+                    return Ok(None);
                 };
                 let msgs = match c {
                     ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
                     ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
                     ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
-                    ClipboardMessage::Error(error) => {
-                        // Untagged format responses cannot safely recover
-                        // by guessing which request a late reply belongs to.
-                        bail!("clipboard backend failed: {error}");
-                    }
+                    ClipboardMessage::Error(_) => unreachable!("handled above"),
                 }
                 .context("failed to send clipboard event")?;
                 let channel_id = self
@@ -959,7 +1011,7 @@ impl RdpServer {
             ServerEvent::ClipboardFileContents(response) => {
                 let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
                     warn!("No clipboard channel, dropping file contents response");
-                    return Ok((RunState::Continue, None));
+                    return Ok(None);
                 };
                 let msgs = cliprdr
                     .submit_file_contents(response)
@@ -980,9 +1032,10 @@ impl RdpServer {
                     server_encode_svc_messages(vec![svc_msg].into(), channel_id, user_channel_id)?;
                 Some(ChannelOutput { channel_id, data })
             }
+            _ => unreachable!("not a clipboard event"),
         };
 
-        Ok((RunState::Continue, output))
+        Ok(output)
     }
 
     async fn client_loop<R, W>(
@@ -1020,6 +1073,8 @@ impl RdpServer {
         let idle_timeout = self.idle_timeout;
         let activity = self.input_activity.subscribe();
         let event_sender = self.ev_sender.clone();
+        let clipboard_status =
+            clipboard_status::mirror(event_sender.clone(), self.gfx_state.clone());
         let local_addr = self.local_addr;
 
         // Update GFX state with current desktop size
@@ -1183,6 +1238,7 @@ impl RdpServer {
             biased;
             state = dispatch_controls => ("control", state),
             reason = event_sender.failure() => ("output-queue", Err(anyhow!(reason))),
+            _ = clipboard_status => unreachable!("clipboard status never terminates a connection"),
             _ = wait_for_idle_timeout(activity, idle_timeout) => {
                 info!(?idle_timeout, "Disconnecting inactive session");
                 ("idle-timeout", Ok(RunState::Disconnect))
@@ -1223,6 +1279,24 @@ impl RdpServer {
                 Ok(_) => fallback,
             };
             s.lock().await.record_outcome(reason);
+            let io = state.as_ref().err().and_then(|error| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            });
+            let gfx = s.lock().await.gfx_state.clone();
+            let stats = gfx.lock().unwrap_or_else(|error| error.into_inner());
+            info!(source, reason = reason.as_str(),
+                socket_error_kind = ?io.map(std::io::Error::kind),
+                socket_error_code = io.and_then(std::io::Error::raw_os_error),
+                delivered_updates = stats.total_frames_sent,
+                delivered_bytes = stats.total_bytes_sent,
+                last_update_bytes = stats.last_frame_bytes,
+                last_write_ms = stats.last_write_ms,
+                bitmap_codec = stats.bitmap_codec,
+                pending_acks = stats.pending_acks,
+                ack_suspended = stats.frame_acknowledgements_suspended,
+                "Connection transport ended");
         }
 
         match &state {
@@ -1231,7 +1305,7 @@ impl RdpServer {
             }
             Err(error) => {
                 let err_str = format!("{error:#}");
-                if is_benign_disconnect_error_text(&err_str) {
+                if is_benign_disconnect_error(error) {
                     info!(
                         source,
                         error = err_str,
@@ -1382,6 +1456,9 @@ impl RdpServer {
                 CapabilitySet::SurfaceCommands(c) => {
                     surface_flags = c.flags;
                 }
+                CapabilitySet::MultiFragmentUpdate(c) => {
+                    update_codecs.set_max_request_size(c.max_request_size);
+                }
                 CapabilitySet::Bitmap(c) => {
                     client_depth = Some(c.pref_bits_per_pix);
                     update_codecs.set_allow_skip_alpha(
@@ -1392,27 +1469,21 @@ impl RdpServer {
                 CapabilitySet::BitmapCodecs(BitmapCodecs(codecs)) => {
                     for codec in codecs {
                         match codec.property {
-                            // FIXME: The encoder operates in image mode only.
-                            //
-                            // See [MS-RDPRFX] 3.1.1.1 "State Machine" for
-                            // implementation of the video mode. which allows to
-                            // skip sending Header for each image.
-                            //
-                            // We should distinguish parameters for both modes,
-                            // and somehow choose the "best", instead of picking
-                            // the last parsed here.
+                            // Preserve the complete selected ICAP. Its mode and
+                            // entropy must match the encoded stream (MS-RDPRFX
+                            // 3.1.5.1), including Image RemoteFX clients.
                             CodecProperty::RemoteFx(
                                 rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
                             ) if self.opts.has_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
-                                    update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
+                                    update_codecs.set_remotefx_capability(codec.id, caps);
                                 }
                             }
                             CodecProperty::ImageRemoteFx(
                                 rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
                             ) if self.opts.has_image_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
-                                    update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
+                                    update_codecs.set_remotefx_capability(codec.id, caps);
                                 }
                             }
                             CodecProperty::NsCodec(_) => (),
@@ -1436,6 +1507,7 @@ impl RdpServer {
         // can request another size or echo the previous one; keep the advertised
         // size through capture creation and negotiate pending changes separately.
         let desktop_size = activation_size;
+        let max_bitmap_update_bytes = update_codecs.max_update_size();
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs)
             .context("failed to initialize update encoder")?;
         let bitmap_codec = encoder.bitmap_codec();
@@ -1449,6 +1521,7 @@ impl RdpServer {
             quality = ?self.bitmap_quality,
             client_preferred_depth = ?client_depth,
             bitmap_wire_depth = 32,
+            max_bitmap_update_bytes,
             "Configured bitmap transport"
         );
 
@@ -1569,13 +1642,32 @@ impl RdpServer {
                     return Ok((self.handle_io_channel_data(data).await?, None));
                 }
 
+                let clipboard =
+                    self.get_channel_id_by_type::<CliprdrServer>() == Some(data.channel_id);
+                if clipboard && self.ev_sender.is_clipboard_closed() {
+                    // Discard even late fragments before touching reassembly or
+                    // a backend that retired an ambiguous format request.
+                    return Ok((false, None));
+                }
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
-                    let response_pdus = svc.process(&data.user_data)?;
-                    let response = server_encode_svc_messages(
-                        response_pdus,
-                        data.channel_id,
-                        user_channel_id,
-                    )?;
+                    let response = (|| -> Result<Vec<u8>> {
+                        let response_pdus = svc.process(&data.user_data)?;
+                        Ok(server_encode_svc_messages(
+                            response_pdus,
+                            data.channel_id,
+                            user_channel_id,
+                        )?)
+                    })();
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(error) if clipboard => {
+                            warn!(%error, "Clipboard input failed");
+                            self.ev_sender
+                                .quarantine_clipboard("clipboard protocol input failed");
+                            return Ok((false, None));
+                        }
+                        Err(error) => return Err(error),
+                    };
                     // DVC callbacks cannot await the input handler. Drain their
                     // staged events before processing another PDU or releasing
                     // this message's resize barrier permit.

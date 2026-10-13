@@ -20,7 +20,7 @@ function formatUptime(seconds: number): string {
 }
 
 const statusConfig: Record<
-  "running" | "starting" | "stopped" | "error",
+  "running" | "starting" | "stopping" | "cleanup_pending" | "stopped" | "error",
   { dotClass: string; glowColor: string; label: string }
 > = {
   running: {
@@ -38,6 +38,8 @@ const statusConfig: Record<
     glowColor: "none",
     label: "Stopped",
   },
+  stopping: { dotClass: "bg-yellow", glowColor: "none", label: "Stopping..." },
+  cleanup_pending: { dotClass: "bg-yellow", glowColor: "none", label: "Waiting for cleanup" },
   error: {
     dotClass: "bg-red",
     glowColor: "0 0 6px var(--color-red)",
@@ -58,15 +60,17 @@ function StatusBar({
 }: StatusBarProps) {
   const normalizedState = state.startsWith("error")
     ? "error"
-    : (state as "running" | "starting" | "stopped" | "error");
+    : (state as keyof typeof statusConfig);
   const config = statusConfig[normalizedState] ?? statusConfig.stopped;
   const isError = normalizedState === "error";
   const isLoading = loading || normalizedState === "starting";
+  const isStopping = normalizedState === "stopping" || normalizedState === "cleanup_pending";
   const showStop =
     normalizedState === "running" ||
     normalizedState === "starting" ||
+    isStopping ||
     (loading && normalizedState !== "stopped");
-  const buttonsDisabled = isLoading;
+  const buttonsDisabled = loading && normalizedState !== "starting";
   const lastClickRef = useRef(0);
 
   const debounced = useCallback(
@@ -119,7 +123,7 @@ function StatusBar({
             ) : (
               <Square className="h-3 w-3" />
             )}
-            {isLoading ? "Working..." : "Stop"}
+            {normalizedState === "starting" ? "Cancel start" : isLoading ? "Working..." : isStopping ? "Check cleanup" : "Stop"}
           </button>
         ) : (
           <button

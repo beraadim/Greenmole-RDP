@@ -67,7 +67,7 @@ async fn peer_close_cancels_pending_start() {
         .is_err());
     assert_eq!(
         server.gfx_state.lock().unwrap().connection_outcome,
-        Some(ConnectionOutcome::PeerClosed)
+        Some(ConnectionOutcome::PeerEof)
     );
 }
 

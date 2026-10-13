@@ -8,6 +8,7 @@ FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
 TARGET_LIB="libswift_Concurrency.dylib"
 RPATH="@executable_path/../Frameworks"
 BUNDLE_ID="${BUNDLE_ID:-com.macrdp.app}"
+SIGNING_IDENTITY="${MACRDP_SIGNING_IDENTITY:--}"
 SWIFT_RUNTIME_MODE="${MACRDP_SWIFT_RUNTIME_MODE:-auto}"
 
 if [ ! -f "$APP_BIN" ]; then
@@ -177,9 +178,17 @@ if [ -f "$FRAMEWORKS_DIR/$TARGET_LIB" ]; then
 fi
 
 if [ -f "$FRAMEWORKS_DIR/$TARGET_LIB" ]; then
-  codesign --force --sign - "$FRAMEWORKS_DIR/$TARGET_LIB"
+  if [ "$SIGNING_IDENTITY" = - ]; then
+    codesign --force --sign - "$FRAMEWORKS_DIR/$TARGET_LIB"
+  else
+    codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp "$FRAMEWORKS_DIR/$TARGET_LIB"
+  fi
 fi
-codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_BUNDLE"
+if [ "$SIGNING_IDENTITY" = - ]; then
+  codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_BUNDLE"
+else
+  codesign --force --sign "$SIGNING_IDENTITY" --identifier "$BUNDLE_ID" --options runtime --timestamp "$APP_BUNDLE"
+fi
 
 if [ "$SWIFT_RUNTIME_MODE" = "system" ]; then
   echo "Swift concurrency linked against system runtime: $SYSTEM_SWIFT_LIB"

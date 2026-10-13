@@ -1,9 +1,10 @@
 //! Bounded producer queues scoped to one connection. Overflow fails the
-//! connection instead of silently losing a reliable protocol message. PCM audio
+//! connection instead of silently losing a reliable protocol message. Clipboard
+//! failures instead quarantine that optional channel until reconnect. PCM audio
 //! has a separate duration budget and deadline, so stalls do not replay old sound.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
@@ -17,6 +18,13 @@ const DATA_BYTES: usize = 32 * 1024 * 1024;
 const CONTROL_CAPACITY: usize = 32;
 const AUDIO_BUDGET_US: u32 = 200_000;
 const MAX_AUDIO_AGE: Duration = Duration::from_millis(200);
+const CLIPBOARD_OPEN: u8 = 0;
+const CLIPBOARD_PUBLISHING: u8 = 1;
+const CLIPBOARD_CLOSED: u8 = 2;
+
+#[cfg(test)]
+#[path = "clipboard_queue_tests.rs"]
+mod clipboard_tests;
 
 #[derive(Default)]
 pub struct AudioQueueStats {
@@ -70,6 +78,9 @@ enum SessionStatus {
 struct Session {
     active: AtomicBool,
     status: watch::Sender<SessionStatus>,
+    clipboard: AtomicU8,
+    clipboard_failure: OnceLock<&'static str>,
+    clipboard_status: watch::Sender<bool>,
 }
 
 impl Session {
@@ -77,18 +88,54 @@ impl Session {
         Arc::new(Self {
             active: AtomicBool::new(true),
             status: watch::channel(SessionStatus::Open).0,
+            clipboard: AtomicU8::new(CLIPBOARD_OPEN),
+            clipboard_failure: OnceLock::new(),
+            clipboard_status: watch::channel(false).0,
         })
     }
 
     fn close(&self) {
+        self.clipboard.store(CLIPBOARD_CLOSED, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.status.send_replace(SessionStatus::Closed);
     }
 
     fn fail(&self, reason: &'static str) {
+        self.clipboard.store(CLIPBOARD_CLOSED, Ordering::Release);
         if self.active.swap(false, Ordering::AcqRel) {
             self.status.send_replace(SessionStatus::Failed(reason));
             tracing::warn!(reason, "Disconnecting client after output queue exhaustion");
+        }
+    }
+
+    fn quarantine_clipboard(&self, reason: &'static str) {
+        let reason = self.clipboard_failure.get_or_init(|| reason);
+        if self.clipboard.swap(CLIPBOARD_CLOSED, Ordering::AcqRel) != CLIPBOARD_CLOSED {
+            self.clipboard_status.send_replace(true);
+            tracing::warn!(
+                reason,
+                "Clipboard disabled for this connection; reconnect to restore clipboard"
+            );
+        }
+    }
+}
+
+struct ClipboardPublication<'a>(&'a Session);
+
+impl Drop for ClipboardPublication<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0
+                .quarantine_clipboard("clipboard publication panicked");
+        } else {
+            // Quarantine may have happened while AppKit was busy. Completing
+            // an already admitted native call must never reopen that channel.
+            let _ = self.0.clipboard.compare_exchange(
+                CLIPBOARD_PUBLISHING,
+                CLIPBOARD_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 }
@@ -102,6 +149,7 @@ pub(super) struct QueuedEvent {
 /// server lock and serialized socket-write admission.
 pub(super) struct EventAdmission {
     session: Arc<Session>,
+    clipboard: bool,
     _bytes: OwnedSemaphorePermit,
     audio: Option<QueuedAudio>,
 }
@@ -115,6 +163,9 @@ impl QueuedEvent {
 impl EventAdmission {
     pub(super) fn is_deliverable_at(&self, now: Instant) -> bool {
         if !self.session.active.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.clipboard && self.session.clipboard.load(Ordering::Acquire) == CLIPBOARD_CLOSED {
             return false;
         }
         if let Some(audio) = &self.audio {
@@ -273,6 +324,7 @@ impl ServerEventTx {
             event,
             admission: EventAdmission {
                 session,
+                clipboard: false,
                 _bytes: bytes,
                 audio: Some(QueuedAudio {
                     captured_at,
@@ -316,6 +368,54 @@ impl ServerEventTx {
 
     pub fn is_closed(&self) -> bool {
         self.data.is_closed() || !self.session().active.load(Ordering::Acquire)
+    }
+
+    /// A clipboard failure is permanent for this connection. Reconnection gives
+    /// producers a fresh gate; stale callbacks keep their old, closed gate.
+    pub fn quarantine_clipboard(&self, reason: &'static str) {
+        self.session().quarantine_clipboard(reason);
+    }
+
+    pub fn clipboard_failure(&self) -> Option<&'static str> {
+        self.session().clipboard_failure.get().copied()
+    }
+
+    pub(super) async fn clipboard_quarantined(&self) {
+        let session = self.session();
+        let mut status = session.clipboard_status.subscribe();
+        loop {
+            if *status.borrow_and_update() {
+                return;
+            }
+            if status.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn is_clipboard_closed(&self) -> bool {
+        self.is_closed() || self.clipboard_failure().is_some()
+    }
+
+    /// Admit one final native publication without holding a lock across AppKit.
+    /// Quarantine never waits for native code. An already admitted publication
+    /// may finish, but all later publications are permanently rejected.
+    pub fn with_clipboard_active<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        let session = self.session();
+        if self.data.is_closed() || !session.active.load(Ordering::Acquire) {
+            return None;
+        }
+        session
+            .clipboard
+            .compare_exchange(
+                CLIPBOARD_OPEN,
+                CLIPBOARD_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        let _publication = ClipboardPublication(&session);
+        Some(publish())
     }
 
     /// Completes on disconnect or overflow, including when no producer sends.
@@ -373,8 +473,13 @@ impl ServerEventTx {
                 .addresses
                 .try_send(event)
                 .map_err(|_| ServerEventSendError("server query queue is full or closed")),
-            ServerEvent::Clipboard(ClipboardMessage::Error(_))
-            | ServerEvent::Rdpsnd(RdpsndServerMessage::Error(_)) => {
+            ServerEvent::Clipboard(ClipboardMessage::Error(_)) => {
+                self.quarantine_clipboard("clipboard producer reported an error");
+                Err(ServerEventSendError(
+                    "clipboard is disabled for this connection",
+                ))
+            }
+            ServerEvent::Rdpsnd(RdpsndServerMessage::Error(_)) => {
                 self.session().fail("channel producer reported an error");
                 Err(ServerEventSendError("channel producer reported an error"))
             }
@@ -387,11 +492,21 @@ impl ServerEventTx {
                 if !session.active.load(Ordering::Acquire) {
                     return Err(ServerEventSendError("session is closed"));
                 }
+                let clipboard = is_clipboard_event(&event);
+                if clipboard && session.clipboard.load(Ordering::Acquire) == CLIPBOARD_CLOSED {
+                    return Err(ServerEventSendError(
+                        "clipboard is disabled for this connection",
+                    ));
+                }
                 let charge = event_bytes(&event).and_then(|n| u32::try_from(n).ok());
                 let permit =
                     charge.and_then(|n| self.budget.clone().try_acquire_many_owned(n).ok());
                 let Some(permit) = permit else {
-                    session.fail("output byte budget exceeded");
+                    if clipboard {
+                        session.quarantine_clipboard("clipboard output byte budget exceeded");
+                    } else {
+                        session.fail("output byte budget exceeded");
+                    }
                     return Err(ServerEventSendError("output byte budget exceeded"));
                 };
                 self.data
@@ -399,17 +514,33 @@ impl ServerEventTx {
                         event,
                         admission: EventAdmission {
                             session: session.clone(),
+                            clipboard,
                             _bytes: permit,
                             audio: None,
                         },
                     })
                     .map_err(|_| {
-                        session.fail("output event queue full or closed");
+                        if clipboard {
+                            session.quarantine_clipboard(
+                                "clipboard output event queue full or closed",
+                            );
+                        } else {
+                            session.fail("output event queue full or closed");
+                        }
                         ServerEventSendError("output event queue full or closed")
                     })
             }
         }
     }
+}
+
+fn is_clipboard_event(event: &ServerEvent) -> bool {
+    matches!(
+        event,
+        ServerEvent::Clipboard(_)
+            | ServerEvent::ClipboardFileContents(_)
+            | ServerEvent::ClipboardFileContentsRequest(_)
+    )
 }
 
 fn event_bytes(event: &ServerEvent) -> Option<usize> {

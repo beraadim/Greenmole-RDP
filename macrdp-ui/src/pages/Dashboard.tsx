@@ -85,20 +85,18 @@ function Dashboard() {
       await api.startServer();
     } catch (err: unknown) {
       setActionError(String(err));
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   };
 
   const handleStop = async () => {
-    if (loading) return;
+    if (loading && status.state !== "starting") return;
     setLoading(true);
     setActionError(null);
     try {
       await api.stopServer();
     } catch (err: unknown) {
       setActionError(String(err));
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   };
 
   const chartsEmpty = !metricsAvailable || bitrateHistory.length === 0;
@@ -127,6 +125,11 @@ function Dashboard() {
       />
 
       <ServerError message={actionError ?? status.error_details} />
+      {metricsAvailable && connections.length > 0 && metrics.clipboard_disabled && (
+        <p role="status" className="rounded-md bg-orange/10 p-3 text-xs text-orange">
+          Clipboard is unavailable for this connection. Reconnect to restore clipboard sharing; the desktop remains connected.
+        </p>
+      )}
 
       <MoveWindowsControl />
 

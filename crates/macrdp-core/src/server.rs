@@ -79,10 +79,33 @@ use crate::permissions;
 use crate::tls;
 
 mod audio_metrics;
+mod lifecycle;
 mod metrics;
 mod startup;
 use metrics::MetricsSnapshot;
 use startup::{StartupCancellation, StartupSignal};
+
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A bounded Stop reports ownership still held by native work instead of
+/// presenting an incomplete teardown as safe to restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    Complete,
+    Pending { reason: &'static str },
+}
+
+fn native_cleanup_pending() -> bool {
+    crate::display::capture_lifecycle::pending()
+        || crate::display::encoder_startup::pending()
+        || macrdp_encode::native_cleanup_pending()
+}
+
+/// Also usable after a cancelled startup that never returned a ServerHandle.
+/// True while any server, display, capture, or encoder owner is still alive.
+pub fn server_resources_pending() -> bool {
+    lifecycle::pending() || native_cleanup_pending()
+}
 
 #[cfg(test)]
 mod tests {
@@ -190,7 +213,11 @@ impl ServerHandle {
         {
             ServerStatus {
                 running: false,
-                state: if !self.stopped.load(Ordering::Acquire) {
+                state: if !self.thread_finished() {
+                    "stopping"
+                } else if !self.cleanup_complete() {
+                    "cleanup_pending"
+                } else if !self.stopped.load(Ordering::Acquire) {
                     "error: RDP server stopped unexpectedly"
                 } else {
                     "stopped"
@@ -201,7 +228,8 @@ impl ServerHandle {
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .and_then(|result| result.as_ref().err().cloned()),
+                    .and_then(|result| result.as_ref().err().cloned())
+                    .or_else(crate::display::capture_lifecycle::cleanup_error),
                 uptime_secs: 0,
                 port: Some(self.port),
                 bind_address: Some(self.bind_addr.ip().to_string()),
@@ -263,9 +291,20 @@ impl ServerHandle {
             .map_or(true, |thread| thread.is_finished())
     }
 
+    /// True only after the server thread and every deferred native owner have
+    /// finished. A terminal error or Stop request alone does not imply cleanup.
+    pub fn cleanup_complete(&self) -> bool {
+        self.thread_finished()
+            && self.display_controller.shutdown_complete()
+            && !server_resources_pending()
+    }
+
     /// Wait for a fatal server error or an orderly stop without losing a notification.
     pub async fn wait_until_stopped(&self) -> Result<()> {
-        while !self.stopped.load(Ordering::Acquire) && !self.thread_finished() {
+        while !self.stopped.load(Ordering::Acquire)
+            && !self.thread_finished()
+            && self.terminal_result.lock().unwrap().is_none()
+        {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         match self.terminal_result.lock().unwrap().as_ref() {
@@ -277,40 +316,48 @@ impl ServerHandle {
         }
     }
 
-    /// Gracefully stop the server.
-    pub async fn stop(&self) -> Result<()> {
-        let _stop = self.stop_lock.lock().await;
-        if self.stopped.swap(true, Ordering::AcqRel) {
-            return Ok(()); // Already stopped
-        }
+    /// Request shutdown, waiting at most five seconds. Pending native owners
+    /// remain retained and observable; repeated calls continue the same cleanup.
+    pub async fn stop(&self) -> Result<StopOutcome> {
+        let started = Instant::now();
+        self.stopped.store(true, Ordering::Release);
         self.shutdown_notify.notify_one();
-
-        // Extract thread handle from mutex *before* the await point so that
-        // the MutexGuard is dropped and the future remains Send.
-        let thread = self.server_thread.lock().unwrap().take();
-        let join_result = if let Some(thread) = thread {
-            tokio::task::spawn_blocking(move || {
-                thread
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("RDP server thread panicked"))
-            })
-            .await
-            .context("RDP server join task failed")
-            .and_then(|result| result)
-        } else {
-            Ok(())
-        };
-        // Cancel metrics task
-        let task = self.metrics_task.lock().unwrap().take();
-        if let Some(task) = task {
+        if let Some(task) = self.metrics_task.lock().unwrap().take() {
             task.abort();
         }
-        let _ = tokio::task::spawn_blocking(crate::log_bridge::flush_logs).await;
-        join_result?;
+        let Ok(_stop) = tokio::time::timeout(STOP_TIMEOUT, self.stop_lock.lock()).await else {
+            return Ok(StopOutcome::Pending {
+                reason: "Another Stop request is awaiting cleanup",
+            });
+        };
+        if !lifecycle::wait_for_cleanup(STOP_TIMEOUT.saturating_sub(started.elapsed()), || {
+            self.cleanup_complete()
+        })
+        .await
+        {
+            let reason = if self.thread_finished() {
+                "Native capture, display restoration, or encoder cleanup is still pending"
+            } else {
+                "The server is still stopping; its resources remain owned"
+            };
+            tracing::warn!(reason, "Server Stop is pending; restart remains blocked");
+            return Ok(StopOutcome::Pending { reason });
+        }
+        // Only join an already-finished thread. Retain its handle across every
+        // timeout/cancelled Stop so no waiting task can lose server ownership.
+        if let Some(thread) = self.server_thread.lock().unwrap().take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("RDP server thread panicked"))?;
+        }
         if let Some(Err(error)) = self.terminal_result.lock().unwrap().as_ref() {
             anyhow::bail!("{error}");
         }
-        Ok(())
+        if let Some(error) = crate::display::capture_lifecycle::cleanup_error() {
+            anyhow::bail!("{error}");
+        }
+        tracing::info!("Server and native resource cleanup completed");
+        Ok(StopOutcome::Complete)
     }
 }
 
@@ -412,6 +459,14 @@ async fn start_server_inner(
     perf_stats: Option<crate::perf_stats::SharedPerfStats>,
 ) -> Result<Arc<ServerHandle>> {
     config.validate()?;
+    // Hold this process-wide lease through startup cancellation, the server
+    // runtime's destruction, and any blocking initialization still in flight.
+    let owner = lifecycle::ServerOwner::acquire()?;
+    anyhow::ensure!(
+        !native_cleanup_pending(),
+        "Previous native capture or encoder cleanup is still pending; wait before restarting"
+    );
+    crate::display::capture_lifecycle::clear_cleanup_error();
     // Notify handler: starting
     handler.on_status_change(ServerStatus {
         running: false,
@@ -422,31 +477,49 @@ async fn start_server_inner(
         bind_address: None,
     });
 
-    // Check and request permissions
-    let perms = permissions::request_permissions();
+    // Check without prompting before binding or preparing any remote display.
+    let perms = permissions::ensure_required_permissions()?;
     tracing::info!(?perms, "Permission status");
 
     // TLS
-    let (cert_path, key_path) = tls::ensure_tls_files(
-        config.cert_path.as_deref(),
-        config.key_path.as_deref(),
-        &config.tls_server_names,
-    )?;
+    let (cert_path, key_path) = if let Some(directory) = &config.managed_tls_directory {
+        tls::ensure_tls_files_at(
+            directory,
+            config.cert_path.as_deref(),
+            config.key_path.as_deref(),
+            &config.tls_server_names,
+        )?
+    } else {
+        tls::ensure_tls_files(
+            config.cert_path.as_deref(),
+            config.key_path.as_deref(),
+            &config.tls_server_names,
+        )?
+    };
 
     let tls_certificate = tls::inspect_tls_certificate(&cert_path)?;
     let backend = config.display_backend;
-    let display_controller = tokio::task::spawn_blocking(move || {
-        macrdp_display::DisplayController::new(backend, 1920, 1080)
+    let preparation_owner = owner.clone();
+    let (display_controller, geometry) = tokio::task::spawn_blocking(move || {
+        let display = macrdp_display::DisplayController::new_with_owner(
+            backend,
+            1920,
+            1080,
+            preparation_owner,
+        )?;
+        // Physical geometry queries can also wait on the native display worker.
+        // Keep them off the async caller so startup cancellation remains usable.
+        let geometry = if backend == macrdp_display::DisplayBackend::Main {
+            Some(display.geometry()?)
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((display, geometry))
     })
     .await
     .context("Display initialization worker failed")??;
     // An idle virtual backend owns no native display. Only physical capture
     // needs live geometry before a client negotiates its initial desktop size.
-    let geometry = if backend == macrdp_display::DisplayBackend::Main {
-        Some(display_controller.geometry()?)
-    } else {
-        None
-    };
 
     // Quality / encoder / chroma
     let quality = match config.quality.as_deref() {
@@ -536,16 +609,39 @@ async fn start_server_inner(
     // RdpServer is !Send (contains dyn SoundServerFactory, dyn CliprdrServerFactory),
     // so we construct and run it entirely within this thread.
     let worker_result = Arc::clone(&terminal_result);
+    let worker_owner = owner.clone();
     let server_thread = std::thread::Builder::new()
         .name("rdp-server".into())
         .spawn(move || {
-            let result = run_server_thread(args, &mut ready);
+            let _owner = worker_owner;
+            let display = args.display_controller.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_server_thread(args, &mut ready)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("RDP server thread panicked")));
+            if let Err(error) = &result {
+                ready.failed(error);
+            }
+            *worker_result.lock().unwrap() = Some(
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}")),
+            );
+            // Startup failures before the RDP loop also own a display worker.
+            // Normal shutdown already queued this barrier; repeating it only
+            // registers with the same pending native owner when needed.
+            let cleanup = crate::display::capture_lifecycle::restore_after_capture(display);
+            let result = result.and(cleanup);
             if let Err(error) = &result {
                 ready.failed(error);
             }
             *worker_result.lock().unwrap() = Some(result.map_err(|error| format!("{error:#}")));
         })
         .context("Failed to spawn RDP server thread")?;
+    // From here, the server and display workers own the gate. Keeping a local
+    // clone while awaiting startup/Stop would itself prevent cleanup completion.
+    drop(owner);
 
     let handle = Arc::new(ServerHandle {
         audio_stats,
@@ -569,8 +665,11 @@ async fn start_server_inner(
     });
 
     if let Err(error) = startup::wait_for_startup(ready_rx, Duration::from_secs(30)).await {
-        // Joining also ensures a failed startup releases its listener before retrying.
-        let _ = handle.stop().await;
+        // A stalled startup still owns the global gate after this request
+        // returns. Never announce that a timeout released its native resources.
+        if let Ok(StopOutcome::Pending { reason }) = handle.stop().await {
+            tracing::warn!(reason, "Failed startup still has pending cleanup");
+        }
         return Err(error);
     }
     cancellation.0 = None;

@@ -14,12 +14,14 @@ export function useServerStatus() {
     bind_address: null,
   });
   const mountedRef = useRef(true);
+  const revisionRef = useRef(0);
 
   const fetch = useCallback(() => {
+    const revision = ++revisionRef.current;
     api
       .getServerStatus()
       .then((s) => {
-        if (mountedRef.current) setStatus(s);
+        if (mountedRef.current && revision === revisionRef.current) setStatus(s);
       })
       .catch(console.error);
   }, []);
@@ -32,6 +34,7 @@ export function useServerStatus() {
 
     // Event-driven updates (primary)
     const unlisten = listen<ServerStatus>("server-status", (event) => {
+      revisionRef.current += 1;
       if (mountedRef.current) setStatus(event.payload);
     });
 
@@ -40,6 +43,7 @@ export function useServerStatus() {
 
     return () => {
       mountedRef.current = false;
+      revisionRef.current += 1;
       unlisten.then((fn) => fn());
       clearInterval(timer);
     };

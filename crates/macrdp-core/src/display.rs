@@ -4,6 +4,8 @@ mod bitmap_updates;
 pub(crate) mod capture_lifecycle;
 mod capture_recovery;
 mod damage;
+mod encoder_lifecycle;
+pub(crate) mod encoder_startup;
 mod native_capture;
 use native_capture::NativeCapture;
 mod event_wait;
@@ -798,18 +800,9 @@ impl RdpServerDisplay for MacDisplay {
             width: width as u32,
             height: height as u32,
             frame_rate: configured_frame_rate,
-            // Start GFX sessions in BGRA so we can guarantee one visible full-frame
-            // seed before switching into the NV12/pipelined hardware path.
-            pixel_format: if session_uses_gfx {
-                CapturePixelFormat::Bgra
-            } else if gfx_avc_ready
-                && self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
-                && !self.mode_444
-            {
-                CapturePixelFormat::Nv12
-            } else {
-                CapturePixelFormat::Bgra
-            },
+            // Capture can deliver the initial desktop before AVC negotiation or
+            // encoder startup. Switch to NV12 only after a usable AVC baseline.
+            pixel_format: CapturePixelFormat::Bgra,
             show_cursor: self.show_cursor,
         };
         tracing::info!(
@@ -835,30 +828,11 @@ impl RdpServerDisplay for MacDisplay {
             })
             .await?;
 
-        // Create H.264 encoder with configured quality and encoder preference
-        let encoder = if self.quality == Quality::Lossless {
-            None
-        } else {
-            macrdp_encode::create_encoder(
-                width as u32,
-                height as u32,
-                configured_frame_rate as f32,
-                self.quality,
-                self.encoder_pref,
-                self.mode_444,
-                configured_bitrate,
-            )
-            .ok()
-        };
-
         {
             let mut state = self.gfx_state.lock().unwrap();
-            state.active_encoder = encoder.as_ref().map(|e| e.backend_name());
-            state.applied_encoder_bitrate = encoder.as_ref().and_then(|e| e.applied_bitrate());
-            state.requested_encoder_bitrate = encoder.as_ref().map(|_| configured_bitrate);
-        }
-        if encoder.is_some() {
-            tracing::info!("H.264 encoder available — will use GFX path when client supports it");
+            state.active_encoder = None;
+            state.applied_encoder_bitrate = None;
+            state.requested_encoder_bitrate = None;
         }
 
         let peer_addr = {
@@ -896,7 +870,10 @@ impl RdpServerDisplay for MacDisplay {
             capture_recovery: None,
             display_controller: self.display_controller.clone(),
             capture_config,
-            encoder,
+            encoder: None,
+            encoder_startup: None,
+            encoder_startup_attempted: false,
+            quality: self.quality,
             gfx_state: Arc::clone(&self.gfx_state),
             coord_mapper: self.coord_mapper.clone(),
             resize_rx: self.resize_tx.subscribe(),
@@ -990,6 +967,9 @@ struct MacDisplayUpdates {
     display_controller: macrdp_display::DisplayController,
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
+    encoder_startup: Option<encoder_startup::Initializer<Box<dyn VideoEncoder>>>,
+    encoder_startup_attempted: bool,
+    quality: Quality,
     gfx_state: Arc<Mutex<GfxState>>,
     coord_mapper: MouseCoordMapper,
     resize_rx: tokio::sync::watch::Receiver<DesktopSize>,
@@ -1109,6 +1089,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 impl MacDisplayUpdates {
     async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
         'updates: loop {
+            self.sync_encoder_startup();
             self.sync_applied_capture_fps();
             self.sync_bitmap_pacing();
             if !self.pending_bitmap_updates.is_empty() || self.deferred_bitmap_frame.is_some() {
@@ -1577,13 +1558,15 @@ impl MacDisplayUpdates {
     }
 
     fn cursor_poll_timeout(&self) -> Option<Duration> {
+        let encoder_wait = self.encoder_control_timeout();
         if self.capture_config.show_cursor {
-            return None;
+            return encoder_wait;
         }
-
-        self.next_cursor_poll_at
+        let cursor_wait = self
+            .next_cursor_poll_at
             .checked_duration_since(Instant::now())
-            .or(Some(Duration::ZERO))
+            .unwrap_or(Duration::ZERO);
+        Some(encoder_wait.map_or(cursor_wait, |wait| wait.min(cursor_wait)))
     }
 
     fn needs_conservative_idle_recovery(&self) -> bool {
@@ -2373,6 +2356,7 @@ impl MacDisplayUpdates {
             }
             let force_full_frame_uncompressed_gfx = state.gfx_validation_mode
                 || state.avc_fallback_to_uncompressed
+                || self.encoder.is_none()
                 || DEFAULT_FORCE_FULL_FRAME_UNCOMPRESSED_GFX;
             (
                 session_uses_gfx,
@@ -3473,8 +3457,8 @@ impl MacDisplayUpdates {
                     }
                 }
             }
-        } else if self.encoder.is_some() && session_uses_gfx {
-            // H.264 encoder exists and this session negotiated GFX — do not mix
+        } else if session_uses_gfx {
+            // This session is negotiating GFX — do not mix
             // bitmap updates into a live GFX session, or reconnects can fail with
             // DECOMPRESSION_FAILED.
             return Ok(Some(self.fallback_pointer_update()));

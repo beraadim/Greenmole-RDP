@@ -40,6 +40,7 @@ export interface Metrics {
   negotiated_client_depth: number | null;
   client_queue_depth_bytes: number | null;
   ack_suspended: boolean;
+  clipboard_disabled?: boolean;
   net_ms: number;
   last_frame_bytes: number;
   network_quality: number;

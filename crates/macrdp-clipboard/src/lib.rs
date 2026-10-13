@@ -25,11 +25,10 @@ use std::{fmt, path::PathBuf, sync::Arc};
 
 /// Nonblocking CLIPRDR adapter. All file access and image conversion is ordered
 /// on one bounded worker; callbacks only capture requests and copy admitted PDUs.
-/// NSPasteboard change-count reads are used to stamp copy generations.
+/// Native pasteboard access is confined to that worker too.
 pub struct MacClipboardBackend {
     runtime: ClipboardRuntime,
     shared: Arc<PublicationState>,
-    pasteboard: PasteboardBridge,
     temp_dir: PathBuf,
     file_transfer: bool,
 }
@@ -51,7 +50,9 @@ impl MacClipboardBackend {
         file_transfer: bool,
     ) -> Self {
         let pasteboard = PasteboardBridge::new();
-        let shared = Arc::new(PublicationState::new(pasteboard.change_count()));
+        // The worker observes the initial native count. Construction and RDP
+        // callbacks must never wait for the system pasteboard service.
+        let shared = Arc::new(PublicationState::new(-1));
         let runtime = ClipboardRuntime::new(
             event_sender,
             temp_dir.clone(),
@@ -63,7 +64,6 @@ impl MacClipboardBackend {
         Self {
             runtime,
             shared,
-            pasteboard,
             temp_dir,
             file_transfer,
         }
@@ -93,9 +93,12 @@ impl CliprdrBackend for MacClipboardBackend {
         self.runtime.enqueue(0, || Command::RequestFormatList);
     }
     fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+        if !self.runtime.is_active() {
+            return;
+        }
         let format = preferred_format(formats, self.file_transfer);
         let offer = RemoteOffer {
-            token: self.shared.remote_copy(&self.pasteboard),
+            token: self.shared.remote_copy_cached(),
             format,
             text_fallback: text_fallback(formats, format),
         };

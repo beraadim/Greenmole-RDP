@@ -87,6 +87,8 @@ pub struct Metrics {
     pub negotiated_client_depth: Option<u16>,
     pub client_queue_depth_bytes: Option<u32>,
     pub ack_suspended: bool,
+    /// Clipboard was quarantined for this connection; display/input remain active.
+    pub clipboard_disabled: bool,
     /// Legacy alias of ACK latency. Network-only latency is not measured by GFX ACKs.
     pub net_ms: f64,
     /// Byte size of the last encoded frame

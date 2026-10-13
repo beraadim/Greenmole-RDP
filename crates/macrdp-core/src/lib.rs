@@ -18,4 +18,6 @@ pub use log_bridge::{flush_logs, init_log_file, log_file_path, LogBridgeLayer};
 pub use macrdp_display::{
     run_display_helper_if_requested, DisplayBackend, DisplayGeometry, WindowMoveReport,
 };
-pub use server::{resolve_resolution, start_server, ServerHandle};
+pub use server::{
+    resolve_resolution, server_resources_pending, start_server, ServerHandle, StopOutcome,
+};

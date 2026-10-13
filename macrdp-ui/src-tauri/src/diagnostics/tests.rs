@@ -44,6 +44,23 @@ fn outcome_logs_export_only_known_reasons_and_typed_authentication_state() {
 }
 
 #[test]
+fn transport_and_quarantined_clipboard_events_keep_static_reasons_and_numeric_evidence() {
+    let transport = json!({"level": "info", "message": "Connection transport ended",
+        "fields": {"reason": "peer_reset", "socket_error_code": 54, "delivered_updates": 123,
+            "last_update_bytes": 456, "last_write_ms": 1.2, "error": "private-client-data"}});
+    let clipboard = json!({"level": "warn", "message": "Clipboard disabled for this connection; reconnect to restore clipboard",
+        "fields": {"reason": "clipboard protocol input failed", "path": "private-file"}});
+    let summary = summarize_bytes(format!("{transport}\n{clipboard}\n").as_bytes(), false);
+    assert_eq!(summary["events"][0]["fields"]["reason"], "peer_reset");
+    assert_eq!(summary["events"][0]["fields"]["socket_error_code"], 54);
+    assert_eq!(
+        summary["events"][1]["fields"]["reason"],
+        "clipboard protocol input failed"
+    );
+    assert!(!summary.to_string().contains("private"));
+}
+
+#[test]
 fn clipboard_and_capture_failures_keep_only_selected_diagnostic_fields() {
     let clipboard = json!({"level": "warn", "message": "Clipboard connection failed; reconnect to reset clipboard state",
         "fields": {"reason": "clipboard request or storage operation timed out", "path": "private-file"}});
@@ -83,19 +100,27 @@ fn log_summary_bounds_events_and_discards_partial_records() {
 }
 
 #[test]
-fn export_files_are_private_unique_and_size_bounded() {
+fn selected_export_is_atomic_private_and_does_not_follow_an_existing_symlink() {
     let directory = tempfile::tempdir().unwrap();
-    let first = write_report(directory.path(), b"first").unwrap();
-    let second = write_report(directory.path(), b"second").unwrap();
-    assert_ne!(first, second);
-    assert_eq!(std::fs::read(&first).unwrap(), b"first");
-    assert!(write_report(directory.path(), &vec![0; EXPORT_BYTES + 1]).is_err());
+    let target = directory.path().join("selected.json");
+    std::fs::write(&target, b"old report").unwrap();
+    write_selected_report(&target, b"new report").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"new report");
+    assert!(write_selected_report(&target, &vec![0; EXPORT_BYTES + 1]).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"new report");
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
         assert_eq!(
-            std::fs::metadata(first).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let outside = directory.path().join("other.json");
+        std::fs::write(&outside, b"unrelated file").unwrap();
+        std::fs::remove_file(&target).unwrap();
+        symlink(&outside, &target).unwrap();
+        write_selected_report(&target, b"chosen report").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"unrelated file");
+        assert_eq!(std::fs::read(&target).unwrap(), b"chosen report");
     }
 }

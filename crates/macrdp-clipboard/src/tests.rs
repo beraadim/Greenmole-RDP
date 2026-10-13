@@ -20,6 +20,37 @@ fn pending(backend: &ClipboardWorker, id: ClipboardFormatId, kind: FormatKind) -
 }
 
 #[test]
+fn server_quarantine_blocks_late_native_publication_and_outgoing_format_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, mut receiver) = ServerEvent::create_channel();
+    let mut backend = test_backend(sender.clone(), dir.path().to_path_buf(), 1024, false);
+    backend.pasteboard.write_string("preserve local clipboard");
+    backend.pending_paste_format = Some(pending(
+        &backend,
+        ClipboardFormatId::CF_UNICODETEXT,
+        FormatKind::Text,
+    ));
+    sender.quarantine_clipboard("synthetic output failure during worker conversion");
+    // This models a worker already inside a job before the server disabled its
+    // channel. The worker's generation is still current, so the shared server
+    // publication gate, not merely a generation check, must reject its result.
+    assert!(backend.shared.is_active());
+    backend.on_format_data_response(FormatDataResponse::new_unicode_string("late remote copy"));
+    assert_eq!(
+        backend.pasteboard.read_string().as_deref(),
+        Some("preserve local clipboard")
+    );
+    backend.on_format_data_request(FormatDataRequest {
+        format: ClipboardFormatId::CF_UNICODETEXT,
+    });
+    assert!(
+        receiver.try_recv().is_err(),
+        "late format data escaped quarantine"
+    );
+    assert!(!sender.is_closed());
+}
+
+#[test]
 fn malformed_images_unsolicited_responses_and_errors_do_not_touch_pasteboard() {
     let dir = tempfile::tempdir().unwrap();
     let (sender, mut receiver) = ServerEvent::create_channel();

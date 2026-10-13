@@ -3,6 +3,8 @@
 pub enum ConnectionOutcome {
     ClientDisconnect,
     PeerClosed,
+    PeerReset,
+    PeerEof,
     ProtocolError,
     TransportError,
     WriteTimeout,
@@ -24,6 +26,8 @@ impl ConnectionOutcome {
         match self {
             Self::ClientDisconnect => "client_disconnect",
             Self::PeerClosed => "peer_closed",
+            Self::PeerReset => "peer_reset",
+            Self::PeerEof => "peer_eof",
             Self::ProtocolError => "protocol_error",
             Self::TransportError => "transport_error",
             Self::WriteTimeout => "write_timeout",

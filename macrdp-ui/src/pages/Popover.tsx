@@ -19,6 +19,8 @@ import { Separator } from "@/components/ui/separator";
 const statusDotColor: Record<string, string> = {
   running: "bg-green",
   starting: "bg-accent",
+  stopping: "bg-accent",
+  cleanup_pending: "bg-accent",
   stopped: "bg-muted-foreground",
   error: "bg-destructive",
 };
@@ -31,12 +33,13 @@ function Popover() {
   const [actionError, setActionError] = useState<string | null>(null);
 
   const metricsAvailable = status.running && metrics && !stale;
+  const cleanupPending = status.state === "stopping" || status.state === "cleanup_pending";
 
   const handleToggle = async () => {
     setToggling(true);
     setActionError(null);
     try {
-      if (status.running) {
+      if (status.running || cleanupPending || status.state === "starting") {
         await api.stopServer();
       } else {
         await api.startServer();
@@ -69,6 +72,7 @@ function Popover() {
     <div className="min-h-screen bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
       <div className="flex flex-col p-3.5 gap-3">
         <ServerError message={!status.running ? actionError ?? status.error_details : null} />
+        {metricsAvailable && connections.length > 0 && metrics.clipboard_disabled && <p role="status" className="text-xs text-orange">Clipboard unavailable. Reconnect to restore sharing.</p>}
         {/* Header row */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -208,12 +212,12 @@ function Popover() {
           <Button
             variant={status.running ? "destructive" : "default"}
             size="sm"
-            disabled={toggling || status.state === "starting"}
+            disabled={toggling && status.state !== "starting"}
             onClick={handleToggle}
             className="w-full"
           >
-            {status.running ? (
-              <><Square className="h-3 w-3" /> Stop</>
+            {status.running || cleanupPending || status.state === "starting" ? (
+              <><Square className="h-3 w-3" /> {cleanupPending ? "Check cleanup" : "Stop"}</>
             ) : (
               <><Play className="h-3 w-3" /> Start</>
             )}

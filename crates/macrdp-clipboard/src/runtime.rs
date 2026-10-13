@@ -1,4 +1,4 @@
-//! Dedicated clipboard owner plus independent timeout/change-count monitor.
+//! Dedicated native clipboard owner plus independent, native-free watchdog.
 //! Native file I/O cannot be cancelled safely; teardown never joins a blocked
 //! worker. A process-wide admission limit bounds retired, stuck workers.
 
@@ -8,11 +8,10 @@ use crate::{
     work_queue::WorkQueue,
     worker::ClipboardWorker,
 };
-use ironrdp_cliprdr::{
-    backend::{ClipboardMessage, CliprdrBackend},
-    pdu::*,
-};
-use ironrdp_server::{ServerEvent, ServerEventTx};
+use ironrdp_cliprdr::{backend::CliprdrBackend, pdu::*};
+#[cfg(test)]
+use ironrdp_server::ServerEvent;
+use ironrdp_server::ServerEventTx;
 use objc2::rc::autoreleasepool;
 use std::{
     path::PathBuf,
@@ -41,7 +40,12 @@ pub(crate) enum Command {
     Lock(LockDataId),
     Unlock(LockDataId),
     #[cfg(test)]
-    HoldForTest(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
+    ReadFileAfterHoldForTest {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        path: PathBuf,
+        completed: std::sync::mpsc::Sender<bool>,
+    },
 }
 
 struct WorkerSlot;
@@ -63,23 +67,15 @@ impl Drop for WorkerSlot {
 
 fn fail(sender: &ServerEventTx, shared: &PublicationState, reason: &'static str) {
     shared.stop();
-    tracing::warn!(
-        reason,
-        "Clipboard connection failed; reconnect to reset clipboard state"
-    );
-    // A producer error invalidates this session's event sender and wakes its
-    // failure watcher. It does not stop the listening server.
-    let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::Error(Box::new(
-        std::io::Error::other(reason),
-    ))));
+    // Untagged responses cannot be matched safely after a timeout. Retire only
+    // clipboard; display, input and audio keep their healthy connection.
+    sender.quarantine_clipboard(reason);
 }
 
 pub(crate) struct ClipboardRuntime {
     queue: WorkQueue<Command>,
     shared: Arc<PublicationState>,
     sender: ServerEventTx,
-    pasteboard: PasteboardBridge,
-    file_transfer: bool,
     worker: Option<JoinHandle<()>>,
     monitor: Option<JoinHandle<()>>,
 }
@@ -105,6 +101,7 @@ impl ClipboardRuntime {
                     let _slot = slot;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         worker_shared.begin_work(Instant::now());
+                        autoreleasepool(|_| worker_shared.local_copy_changed(&worker_pb));
                         let mut worker = ClipboardWorker::new(
                             worker_sender.clone(),
                             temp_dir,
@@ -114,10 +111,12 @@ impl ClipboardRuntime {
                             worker_pb,
                         );
                         worker_shared.finish_work();
-                        while worker_shared.is_active() && !worker_sender.is_closed() {
+                        while worker_shared.is_active() && !worker_sender.is_clipboard_closed() {
                             match receiver.recv_timeout(POLL_INTERVAL) {
                                 Ok(item) => {
-                                    if !worker_shared.is_active() || worker_sender.is_closed() {
+                                    if !worker_shared.is_active()
+                                        || worker_sender.is_clipboard_closed()
+                                    {
                                         break;
                                     }
                                     worker_shared.begin_work(Instant::now());
@@ -146,9 +145,25 @@ impl ClipboardRuntime {
                                             Command::Lock(id) => worker.on_lock(id),
                                             Command::Unlock(id) => worker.on_unlock(id),
                                             #[cfg(test)]
-                                            Command::HoldForTest(started, release) => {
+                                            Command::ReadFileAfterHoldForTest {
+                                                started,
+                                                release,
+                                                path,
+                                                completed,
+                                            } => {
+                                                // A deterministic stand-in for a file read
+                                                // waiting on TCC or unavailable storage.
                                                 let _ = started.send(());
                                                 let _ = release.recv();
+                                                let bytes = std::fs::read(path).unwrap();
+                                                let rejected = worker_sender
+                                                    .send(ServerEvent::ClipboardFileContents(
+                                                        FileContentsResponse::new_data_response(
+                                                            1, bytes,
+                                                        ),
+                                                    ))
+                                                    .is_err();
+                                                let _ = completed.send(rejected);
                                             }
                                         }
                                         worker.tick();
@@ -156,6 +171,9 @@ impl ClipboardRuntime {
                                     worker_shared.finish_work();
                                 }
                                 Err(RecvTimeoutError::Timeout) => {
+                                    if worker_sender.is_clipboard_closed() {
+                                        break;
+                                    }
                                     worker_shared.begin_work(Instant::now());
                                     autoreleasepool(|_| worker.tick());
                                     worker_shared.finish_work();
@@ -163,10 +181,10 @@ impl ClipboardRuntime {
                                 Err(RecvTimeoutError::Disconnected) => break,
                             }
                         }
-                        // Includes destructor file cleanup in the watchdog budget.
-                        worker_shared.begin_work(Instant::now());
+                        // Retired workers may finish cleanup but never accept
+                        // more work or restore their publication generation.
+                        worker_shared.stop();
                         autoreleasepool(|_| drop(worker));
-                        worker_shared.finish_work();
                     }));
                     if result.is_err() {
                         fail(&worker_sender, &worker_shared, "clipboard worker panicked");
@@ -187,15 +205,14 @@ impl ClipboardRuntime {
             queue,
             shared,
             sender,
-            pasteboard,
-            file_transfer,
             worker,
             monitor: None,
         }
     }
 
     pub fn enqueue(&self, bytes: usize, make: impl FnOnce() -> Command) {
-        if !self.shared.is_active() || self.sender.is_closed() {
+        if !self.is_active() {
+            self.shared.stop();
             return;
         }
         if !self.queue.try_push(bytes.saturating_add(256), make) {
@@ -209,20 +226,22 @@ impl ClipboardRuntime {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        self.shared.is_active() && !self.sender.is_clipboard_closed()
+    }
+
     pub fn start_monitor(&mut self) {
-        if self.monitor.is_some() || !self.shared.is_active() {
+        if self.monitor.is_some() || !self.is_active() {
             return;
         }
         let shared = self.shared.clone();
         let sender = self.sender.clone();
-        let pb = self.pasteboard.clone();
-        let file_transfer = self.file_transfer;
         self.monitor = thread::Builder::new()
             .name("rdp-clipboard-monitor".into())
             .spawn(move || {
-                while shared.is_active() && !sender.is_closed() {
+                while shared.is_active() && !sender.is_clipboard_closed() {
                     thread::park_timeout(POLL_INTERVAL);
-                    if !shared.is_active() || sender.is_closed() {
+                    if !shared.is_active() || sender.is_clipboard_closed() {
                         break;
                     }
                     let keep_running = autoreleasepool(|_| {
@@ -234,24 +253,13 @@ impl ClipboardRuntime {
                             );
                             return false;
                         }
-                        if shared.local_copy_changed(&pb) {
-                            let formats = ClipboardWorker::build_format_list(&pb, file_transfer);
-                            // Empty copies also revoke the previous offer.
-                            if sender
-                                .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
-                                    formats,
-                                )))
-                                .is_err()
-                            {
-                                return false;
-                            }
-                        }
                         true
                     });
                     if !keep_running {
                         break;
                     }
                 }
+                shared.stop();
             })
             .ok();
         if self.monitor.is_none() {
@@ -290,9 +298,10 @@ impl Drop for ClipboardRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_cliprdr::backend::ClipboardMessage;
 
     #[test]
-    fn publication_panic_still_fails_session_and_allows_runtime_drop() {
+    fn publication_panic_quarantines_clipboard_and_allows_runtime_drop() {
         let pb = PasteboardBridge::isolated();
         let shared = Arc::new(PublicationState::new(pb.change_count()));
         let token = shared.remote_copy(&pb);
@@ -302,8 +311,6 @@ mod tests {
             queue,
             shared: shared.clone(),
             sender: sender.clone(),
-            pasteboard: pb.clone(),
-            file_transfer: false,
             worker: None,
             monitor: None,
         };
@@ -312,9 +319,10 @@ mod tests {
         }));
         assert!(result.is_err());
         // This is the same recovery path used by the worker's catch_unwind.
-        // Poison recovery must not panic before notifying the session watcher.
+        // Poison recovery must not panic before retiring the optional channel.
         fail(&sender, &shared, "clipboard worker panicked");
-        assert!(sender.is_closed());
+        assert!(!sender.is_closed());
+        assert!(sender.is_clipboard_closed());
         assert!(!shared.is_active());
         assert!(
             receiver.try_recv().is_err(),
@@ -324,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_completes_requests_in_order_and_failed_admission_closes_only_session() {
+    fn worker_completes_requests_in_order_and_failed_admission_quarantines_clipboard() {
         let directory = tempfile::tempdir().unwrap();
         let pb = PasteboardBridge::isolated();
         pb.write_string("worker text");
@@ -363,7 +371,8 @@ mod tests {
         assert_eq!(responses[0].to_unicode_string().unwrap(), "worker text");
         assert!(responses[1].is_error());
         runtime.enqueue(JOB_BYTES, || panic!("rejected job must not allocate"));
-        assert!(sender.is_closed());
+        assert!(!sender.is_closed());
+        assert!(sender.is_clipboard_closed());
         assert!(!shared.is_active());
         assert!(
             receiver.try_recv().is_err(),
@@ -372,11 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn blocked_storage_does_not_block_watchdog_or_runtime_drop() {
+    fn blocked_file_read_is_quarantined_without_disconnect_or_late_output() {
         let directory = tempfile::tempdir().unwrap();
         let pb = PasteboardBridge::isolated();
         let shared = Arc::new(PublicationState::new(pb.change_count()));
-        let (sender, _receiver) = ServerEvent::create_channel();
+        let (sender, mut receiver) = ServerEvent::create_channel();
         let mut runtime = ClipboardRuntime::new(
             sender.clone(),
             directory.path().to_owned(),
@@ -388,21 +397,43 @@ mod tests {
         runtime.start_monitor();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        runtime.enqueue(0, || Command::HoldForTest(started_tx, release_rx));
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let path = directory.path().join("fixture.txt");
+        std::fs::write(&path, "late file content").unwrap();
+        runtime.enqueue(0, || Command::ReadFileAfterHoldForTest {
+            started: started_tx,
+            release: release_rx,
+            path,
+            completed: completed_tx,
+        });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // Advance the injected start timestamp while the worker remains blocked;
-        // the independent monitor must fail this session without an I/O result.
+        // the independent monitor must retire clipboard without an I/O result.
         shared.begin_work(Instant::now() - crate::publication::FORMAT_REQUEST_TIMEOUT);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !sender.is_closed() && Instant::now() < deadline {
+        while !sender.is_clipboard_closed() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        let disconnected = sender.is_closed();
+        let quarantined = sender.is_clipboard_closed();
+        assert!(
+            !sender.is_closed(),
+            "file access must not disconnect the desktop"
+        );
+        runtime.enqueue(0, || panic!("late clipboard response must not be copied"));
+        assert!(sender
+            .send_audio_wave(vec![0; 1920], 1, Duration::from_millis(10), Instant::now())
+            .unwrap());
+        assert!(matches!(receiver.try_recv(), Ok(ServerEvent::Rdpsnd(_))));
         let start = Instant::now();
         drop(runtime);
         let elapsed = start.elapsed();
         let _ = release_tx.send(());
-        assert!(disconnected, "watchdog cannot depend on worker progress");
+        assert!(quarantined, "watchdog cannot depend on worker progress");
+        assert!(
+            completed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "file result after quarantine escaped to the client"
+        );
+        assert!(receiver.try_recv().is_err());
         assert!(
             elapsed < Duration::from_secs(1),
             "drop joined a blocked worker"

@@ -54,8 +54,7 @@ impl ClipboardWorker {
                         token: offer.token,
                     });
                 } else if let Some(html) = html {
-                    self.shared
-                        .publish(offer.token, &self.pasteboard, |pb| pb.write_html(&html));
+                    self.publish(offer.token, |pb| pb.write_html(&html));
                 }
             }
             Some(FormatKind::Text) => {
@@ -74,13 +73,12 @@ impl ClipboardWorker {
                     .filter(|html| html.token == offer.token);
                 match (html, text) {
                     (Some(html), text) => {
-                        self.shared.publish(offer.token, &self.pasteboard, |pb| {
+                        self.publish(offer.token, |pb| {
                             pb.write_rich_text(&html.content, text.as_deref())
                         });
                     }
                     (None, Some(text)) => {
-                        self.shared
-                            .publish(offer.token, &self.pasteboard, |pb| pb.write_string(&text));
+                        self.publish(offer.token, |pb| pb.write_string(&text));
                     }
                     (None, None) => {}
                 }

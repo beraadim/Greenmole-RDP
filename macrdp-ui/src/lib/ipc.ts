@@ -22,6 +22,7 @@ export const api = {
   getMetrics: () => invoke<Metrics>("get_metrics"),
   getConnections: () => invoke<Connection[]>("get_connections"),
   getPermissions: () => invoke<PermissionStatus>("get_permissions"),
+  requestPermissions: () => invoke<PermissionStatus>("request_permissions"),
   getInputDebugState: () => invoke<InputDebugState>("get_input_debug_state"),
   getWindowMoveStatus: () => invoke<WindowMoveStatus>("get_window_move_status"),
   moveWindowsToRemote: () => invoke<WindowMoveResult>("move_windows_to_remote"),
@@ -30,7 +31,7 @@ export const api = {
   getTlsStatus: () => invoke<TlsStatus>("get_tls_status"),
   setConfig: (key: string, value: unknown) =>
     invoke<ConfigurationStatus>("set_config", { key, value }),
-  exportDiagnostics: () => invoke<{ path: string }>("export_diagnostics"),
+  exportDiagnostics: () => invoke<{ path: string | null }>("export_diagnostics"),
   getLogs: (limit?: number) =>
     invoke<LogEntry[]>("get_logs", { limit: limit ?? 500 }),
   getConnectionHistory: (limit: number, offset: number) =>

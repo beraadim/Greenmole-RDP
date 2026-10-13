@@ -19,6 +19,19 @@ pub use openh264_enc::OpenH264Encoder;
 #[cfg(target_os = "macos")]
 pub use videotoolbox::VtEncoder;
 
+/// Native sessions retain ownership through asynchronous retirement. Server
+/// restart must wait for this to clear after its display handles are dropped.
+pub fn native_cleanup_pending() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        videotoolbox::native_cleanup_pending()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Keep the native encoders' signed integer bitrate properties in range.
 pub const MAX_BITRATE_BPS: u32 = 1_000_000_000;
 
@@ -67,6 +80,12 @@ impl Quality {
 
 /// Video encoder trait
 pub trait VideoEncoder: Send {
+    /// Run any lazy native initialization on the bounded startup worker before
+    /// exposing the encoder to the display loop. No generated frame is sent.
+    fn prepare(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Backend actually instantiated, including any initialization fallback.
     fn backend_name(&self) -> &'static str;
 

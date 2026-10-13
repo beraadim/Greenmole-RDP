@@ -3,6 +3,30 @@ use super::*;
 const NOW: i64 = 1_767_225_600; // 2026-01-01 UTC, independent of the test machine clock.
 const YEAR: i64 = 365 * 24 * 60 * 60;
 
+#[test]
+fn desktop_storage_preserves_existing_identity_without_working_directory_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    let preferred = root.path().join("application/tls");
+    let legacy = root.path().join("legacy/tls");
+    assert_eq!(
+        select_desktop_directory(preferred.clone(), Some(legacy.clone())),
+        preferred
+    );
+    fs::create_dir_all(&legacy).unwrap();
+    // A partial identity also stays put, so validation reports it instead of silently replacing it.
+    fs::write(legacy.join("key.pem"), b"fixture").unwrap();
+    assert_eq!(
+        select_desktop_directory(preferred.clone(), Some(legacy.clone())),
+        legacy
+    );
+    fs::create_dir_all(&preferred).unwrap();
+    fs::write(preferred.join(MANIFEST), b"fixture").unwrap();
+    assert_eq!(
+        select_desktop_directory(preferred.clone(), Some(legacy)),
+        preferred
+    );
+}
+
 fn names() -> Vec<String> {
     names::names_with_hostname(&["rdp.example.test".into(), "192.0.2.7".into()], "test-mac")
         .unwrap()

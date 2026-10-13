@@ -259,7 +259,7 @@ function Settings() {
               <span className="text-xs text-text-muted">1 active session</span>
             </SettingRow>
 
-            <SettingRow label="Idle timeout (seconds)" description="Requires service restart">
+            <SettingRow label="Idle timeout (seconds)" description="Keyboard/mouse inactivity; 0 disables. Requires service restart">
               <NumericSettingInput
                 label="Idle timeout" min={0} max={Number.MAX_SAFE_INTEGER}
                 value={config.idle_timeout_secs}

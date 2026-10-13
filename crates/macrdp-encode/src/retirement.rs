@@ -13,6 +13,10 @@ pub(crate) struct RetirementPool {
 }
 
 impl RetirementPool {
+    pub fn pending(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
+    }
+
     pub fn new(limit: usize) -> Self {
         Self {
             active: Arc::default(),

@@ -21,15 +21,54 @@ pub(super) fn error_outcome(
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             return match io.kind() {
                 std::io::ErrorKind::TimedOut => ConnectionOutcome::WriteTimeout,
-                std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::BrokenPipe => ConnectionOutcome::PeerClosed,
+                std::io::ErrorKind::UnexpectedEof => ConnectionOutcome::PeerEof,
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                    ConnectionOutcome::PeerReset
+                }
+                std::io::ErrorKind::BrokenPipe => ConnectionOutcome::PeerClosed,
                 _ => ConnectionOutcome::TransportError,
             };
         }
     }
     fallback
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn typed_transport_errors_preserve_reset_eof_timeout_and_protocol_distinctions() {
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::ConnectionReset,
+                ConnectionOutcome::PeerReset,
+            ),
+            (
+                std::io::ErrorKind::UnexpectedEof,
+                ConnectionOutcome::PeerEof,
+            ),
+            (
+                std::io::ErrorKind::TimedOut,
+                ConnectionOutcome::WriteTimeout,
+            ),
+            (
+                std::io::ErrorKind::BrokenPipe,
+                ConnectionOutcome::PeerClosed,
+            ),
+        ] {
+            let error =
+                anyhow::Error::new(std::io::Error::new(kind, "fixture")).context("PDU read");
+            assert_eq!(
+                error_outcome(&error, ConnectionOutcome::ProtocolError),
+                expected
+            );
+        }
+        let malformed = anyhow::anyhow!("not enough bytes");
+        assert_eq!(
+            error_outcome(&malformed, ConnectionOutcome::ProtocolError),
+            ConnectionOutcome::ProtocolError
+        );
+    }
 }
 
 impl RdpServer {

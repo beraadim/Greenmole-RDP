@@ -124,12 +124,80 @@ fn newer_local_copy_between_flavors_is_preserved() {
     worker.pasteboard.write_string("newer local copy");
     worker.tick();
     assert!(worker.pending_html.is_none());
+    // Polling moved from the monitor to the native I/O worker. The new local
+    // copy must be advertised, while the old untagged text response stays owed.
+    let ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) =
+        receiver.try_recv().unwrap()
+    else {
+        panic!("Expected the newer local copy announcement, not another remote request");
+    };
+    assert!(formats
+        .iter()
+        .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT));
+    assert!(worker.pending_paste_format.is_some());
+    assert!(receiver.try_recv().is_err());
     worker.on_format_data_response(FormatDataResponse::new_unicode_string("stale text"));
     assert_eq!(
         worker.pasteboard.read_string().as_deref(),
         Some("newer local copy")
     );
     assert!(worker.pasteboard.read_html().is_none());
+    assert!(worker.pending_paste_format.is_none());
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn unpolled_local_copy_before_html_response_blocks_fallback_and_preserves_request_order() {
+    let (mut worker, mut receiver, _directory) = backend();
+    let formats = rich_formats();
+    let format = crate::remote_formats::preferred_format(&formats, false);
+    // Match the production RDP callback: it stamps the last observed count
+    // without performing pasteboard IPC on the session thread.
+    let token = worker.shared.remote_copy_cached();
+    worker.remote_copy(RemoteOffer {
+        format,
+        text_fallback: crate::remote_formats::text_fallback(&formats, format),
+        token,
+    });
+    assert_eq!(requested(&mut receiver).value(), 0xc137);
+    worker
+        .pasteboard
+        .write_string("local copy after remote request");
+    // No tick has observed the native count, so generation alone is insufficient.
+    worker.on_format_data_response(html_response("<b>superseded</b>"));
+    assert!(worker.pending_paste_format.is_none());
+    assert!(worker.pending_html.is_none());
+    assert!(
+        receiver.try_recv().is_err(),
+        "stale HTML triggered a text fallback request"
+    );
+    assert_eq!(
+        worker.pasteboard.read_string().as_deref(),
+        Some("local copy after remote request")
+    );
+    assert!(worker.pasteboard.read_html().is_none());
+    // The consumed HTML response freed the untagged slot; a later remote copy
+    // gets its own HTML and text sequence and cannot inherit the older payload.
+    worker.tick();
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(_))
+    ));
+    let token = worker.shared.remote_copy_cached();
+    worker.remote_copy(RemoteOffer {
+        format,
+        text_fallback: crate::remote_formats::text_fallback(&formats, format),
+        token,
+    });
+    assert_eq!(requested(&mut receiver).value(), 0xc137);
+    worker.on_format_data_response(html_response("<b>current</b>"));
+    assert_eq!(requested(&mut receiver), ClipboardFormatId::CF_UNICODETEXT);
+    worker.on_format_data_response(FormatDataResponse::new_unicode_string("current"));
+    assert_eq!(
+        worker.pasteboard.read_html().as_deref(),
+        Some("<b>current</b>")
+    );
+    assert_eq!(worker.pasteboard.read_string().as_deref(), Some("current"));
     assert!(receiver.try_recv().is_err());
 }
 

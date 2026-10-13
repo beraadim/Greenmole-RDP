@@ -24,7 +24,7 @@ export default function DiagnosticsExport() {
   return (
     <div className="rounded-md border border-border bg-card p-3 space-y-2 text-xs">
       <div className="flex items-center justify-between gap-3">
-        <p className="text-text-muted">Save recent timings and session outcomes to Desktop, including after stopping the service. Credentials and personal content are excluded.</p>
+        <p className="text-text-muted">Choose where to save recent timings and session outcomes, including after stopping the service. Credentials and personal content are excluded.</p>
         <Button size="sm" variant="outline" className="shrink-0" disabled={busy} onClick={() => void save()}>
           {busy ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <Download className="mr-1 h-3 w-3" />}
           {busy ? "Saving..." : "Export diagnostics"}

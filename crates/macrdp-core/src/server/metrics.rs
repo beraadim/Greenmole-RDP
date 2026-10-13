@@ -142,6 +142,7 @@ impl MetricsSnapshot {
             negotiated_client_depth: gfx.negotiated_client_depth,
             client_queue_depth_bytes: gfx.client_queue_depth_bytes,
             ack_suspended: gfx.frame_acknowledgements_suspended,
+            clipboard_disabled: gfx.clipboard_disabled,
             last_frame_bytes: gfx.last_frame_bytes,
             network_quality: sanitize_f32(gfx.network_quality),
             pending_acks: gfx.pending_acks,

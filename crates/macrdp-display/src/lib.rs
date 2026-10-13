@@ -120,11 +120,15 @@ struct ControllerInner {
     backend: DisplayBackend,
     commands: mpsc::SyncSender<Command>,
     stopping: Arc<AtomicBool>,
+    shutdown_complete: AtomicBool,
     stopped: Mutex<mpsc::Receiver<()>>,
 }
 
 impl Drop for ControllerInner {
     fn drop(&mut self) {
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return;
+        }
         self.stopping.store(true, Ordering::Release);
         // A full queue already wakes the worker, which checks stopping before
         // processing another request. This never blocks waiting for capacity.
@@ -161,13 +165,24 @@ impl DisplayPreparation {
 
 impl DisplayController {
     pub fn new(backend: DisplayBackend, width: u16, height: u16) -> Result<Self> {
+        Self::new_with_owner(backend, width, height, ())
+    }
+
+    /// Keep the caller's native ownership token on the display worker, including
+    /// initialization after a requester times out and final native destruction.
+    pub fn new_with_owner(
+        backend: DisplayBackend,
+        width: u16,
+        height: u16,
+        owner: impl Send + 'static,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !std::env::args_os().any(|arg| arg == HELPER_ARGUMENT),
             "Display helper entry hook was not called; call run_display_helper_if_requested before application initialization"
         );
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (backend, width, height);
+            let _ = (backend, width, height, owner);
             anyhow::bail!("Display control requires macOS");
         }
         #[cfg(target_os = "macos")]
@@ -181,6 +196,7 @@ impl DisplayController {
             std::thread::Builder::new()
                 .name("macrdp-display".to_owned())
                 .spawn(move || {
+                    let _owner = owner;
                     macos::run_worker(
                         backend,
                         width,
@@ -201,6 +217,7 @@ impl DisplayController {
                 backend,
                 commands,
                 stopping,
+                shutdown_complete: AtomicBool::new(false),
                 stopped: Mutex::new(stopped_rx),
             })))
         }
@@ -208,6 +225,29 @@ impl DisplayController {
 
     pub fn backend(&self) -> DisplayBackend {
         self.0.backend
+    }
+
+    pub fn shutdown_complete(&self) -> bool {
+        self.0.shutdown_complete.load(Ordering::Acquire)
+    }
+
+    /// Retire the controller after capture and restoration. Only a dedicated
+    /// cleanup owner may block here; its lease survives any native shutdown stall.
+    /// Successful acknowledgment also makes the last handle's Drop nonblocking.
+    pub fn shutdown_owned(&self) -> Result<()> {
+        let stopped = self.0.stopped.lock().unwrap();
+        if self.shutdown_complete() {
+            return Ok(());
+        }
+        self.0.stopping.store(true, Ordering::Release);
+        let _ = self.0.commands.try_send(Command::Shutdown);
+        let result = stopped
+            .recv()
+            .context("Display worker exited without shutdown acknowledgment");
+        // Even a disconnected reply means the worker has exited; retain the
+        // error for diagnostics, but do not block Drop on an exhausted receiver.
+        self.0.shutdown_complete.store(true, Ordering::Release);
+        result
     }
 
     /// Queue a single, user-requested relocation of external application windows.
@@ -289,6 +329,22 @@ impl DisplayController {
         receiver
             .recv_timeout(REQUEST_TIMEOUT)
             .context("Timed out restoring the physical display layout")?
+    }
+
+    /// Shutdown barrier for a dedicated native cleanup owner. Unlike the
+    /// ordinary request timeout, this returns only when the display worker has
+    /// actually completed restoration and virtual-display removal. Never call
+    /// from a UI or async executor thread; the owner must retain its lease while
+    /// waiting, including when the command queue is full or native work stalls.
+    pub fn end_remote_session_owned(&self) -> Result<()> {
+        let (reply, receiver) = mpsc::channel();
+        self.0
+            .commands
+            .send(Command::EndRemoteSession(reply))
+            .map_err(|_| anyhow::anyhow!("Display controller worker unavailable during cleanup"))?;
+        receiver
+            .recv()
+            .context("Display restoration worker exited without acknowledgment")?
     }
 
     /// Queue disconnect restoration without blocking the input callback. The
@@ -412,6 +468,7 @@ mod tests {
             backend: DisplayBackend::Virtual,
             commands,
             stopping: Arc::new(AtomicBool::new(false)),
+            shutdown_complete: AtomicBool::new(false),
             stopped: Mutex::new(stopped_rx),
         }));
         let preparation = controller.queue_remote_capture(1921, 1081).unwrap();
@@ -445,6 +502,83 @@ mod tests {
     }
 
     #[test]
+    fn owned_restoration_waits_for_queue_and_actual_worker_acknowledgment() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let controller = DisplayController(Arc::new(ControllerInner {
+            backend: DisplayBackend::Virtual,
+            commands,
+            stopping: Arc::new(AtomicBool::new(false)),
+            shutdown_complete: AtomicBool::new(false),
+            stopped: Mutex::new(stopped_rx),
+        }));
+        // A queued operation already fills the bounded command channel.
+        drop(controller.queue_remote_capture(1280, 720).unwrap());
+        let cleanup_owner = controller.clone();
+        let (done, result) = mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            done.send(cleanup_owner.end_remote_session_owned()).unwrap();
+        });
+        assert!(result.recv_timeout(Duration::from_millis(10)).is_err());
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Command::PrepareRemoteCapture { .. }
+        ));
+        let Command::EndRemoteSession(reply) = receiver.recv().unwrap() else {
+            panic!("cleanup must follow queued activation")
+        };
+        assert!(result.recv_timeout(Duration::from_millis(10)).is_err());
+        reply
+            .send(Err(anyhow::anyhow!("simulated restoration failure")))
+            .unwrap();
+        assert!(result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("simulated restoration failure"));
+        cleanup.join().unwrap();
+        stopped_tx.send(()).unwrap();
+        drop(controller);
+    }
+
+    #[test]
+    fn owned_shutdown_is_pending_until_native_worker_acknowledges_and_drop_does_not_wait_again() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let controller = DisplayController(Arc::new(ControllerInner {
+            backend: DisplayBackend::Virtual,
+            commands,
+            stopping: Arc::new(AtomicBool::new(false)),
+            shutdown_complete: AtomicBool::new(false),
+            stopped: Mutex::new(stopped_rx),
+        }));
+        let retained = controller.clone();
+        let (done, completed) = mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            retained.shutdown_owned().unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(matches!(receiver.recv().unwrap(), Command::Shutdown));
+        assert!(!controller.shutdown_complete());
+        assert!(completed.recv_timeout(Duration::from_millis(10)).is_err());
+        stopped_tx.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        cleanup.join().unwrap();
+        assert!(controller.shutdown_complete());
+        // Keep the sender alive: rereading the consumed acknowledgment would
+        // block for ten seconds, rather than immediately see a disconnected pipe.
+        let (dropped, drop_done) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(controller);
+            dropped.send(()).unwrap();
+        });
+        drop_done.recv_timeout(Duration::from_secs(2)).unwrap();
+        dropper.join().unwrap();
+        drop(stopped_tx);
+    }
+
+    #[test]
     fn only_the_last_handle_requests_and_waits_for_worker_release() {
         let (commands, receiver) = mpsc::sync_channel(1);
         let stopping = Arc::new(AtomicBool::new(false));
@@ -453,6 +587,7 @@ mod tests {
             backend: DisplayBackend::Virtual,
             commands,
             stopping: Arc::clone(&stopping),
+            shutdown_complete: AtomicBool::new(false),
             stopped: Mutex::new(stopped_rx),
         }));
         let clone = controller.clone();
@@ -480,6 +615,7 @@ mod tests {
             backend: DisplayBackend::Virtual,
             commands,
             stopping: Arc::new(AtomicBool::new(false)),
+            shutdown_complete: AtomicBool::new(false),
             stopped: Mutex::new(stopped_rx),
         }));
         let action = controller.queue_move_windows_to_remote().unwrap();

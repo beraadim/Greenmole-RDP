@@ -2,7 +2,7 @@
 //! Free-form messages can contain input text, paths, hostnames or credentials.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -18,15 +18,23 @@ const MAX_EVENTS: usize = 200;
 const EXPORT_BYTES: usize = 2 * 1024 * 1024;
 
 mod history;
+mod save_dialog;
 pub(crate) use history::DiagnosticHistory;
 
 #[derive(Serialize)]
 pub struct ExportResult {
-    path: String,
+    path: Option<String>,
 }
 
 #[tauri::command]
-pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<ExportResult, String> {
+pub async fn export_diagnostics(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ExportResult, String> {
+    let _export = state
+        .diagnostic_export_lock
+        .try_lock()
+        .map_err(|_| "A diagnostics export is already open")?;
     let lifecycle = state.lifecycle_lock.lock().await;
     let config = state.ui_config.lock().await.clone();
     let history = state.diagnostic_history.lock().await.snapshot();
@@ -54,8 +62,10 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
     let configuration_state =
         crate::configuration::configuration_status(&config, running_config.as_ref());
     drop(lifecycle);
+    let Some(path) = save_dialog::destination(&app).await? else {
+        return Ok(ExportResult { path: None });
+    };
     tokio::task::spawn_blocking(move || {
-        let directory = dirs::desktop_dir().ok_or("Desktop folder is unavailable")?;
         let permissions = macrdp_core::permissions::check_permissions();
         let logs = macrdp_core::log_file_path().map_or_else(
             || json!({"available": false}),
@@ -87,15 +97,38 @@ pub async fn export_diagnostics(state: State<'_, Arc<AppState>>) -> Result<Expor
             "privacy": "Only selected operational fields are included. Credentials, input text, clipboard contents, addresses, client names, paths, raw log messages and free-form error details are excluded."
         });
         let bytes = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
-        let path = write_report(&directory, &bytes).map_err(|e| format!("Could not save diagnostics: {e}"))?;
-        Ok(ExportResult { path: path.to_string_lossy().into_owned() })
+        write_selected_report(&path, &bytes).map_err(|e| format!("Could not save diagnostics: {e}"))?;
+        Ok(ExportResult { path: Some(path.to_string_lossy().into_owned()) })
     }).await.map_err(|e| format!("Diagnostics worker failed: {e}"))?
+}
+
+fn write_selected_report(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.len() > EXPORT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Diagnostics report exceeds its size limit",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Save destination has no parent"))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".macrdp-diagnostics-")
+        .tempfile_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    // Save-panel overwrite consent applies to this exact path. Atomic replacement
+    // avoids following a destination symlink or leaving a partial report on failure.
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn service_state(value: &str) -> &'static str {
     match value {
         "running" => "running",
         "starting" => "starting",
+        "stopping" => "stopping",
+        "cleanup_pending" => "cleanup_pending",
         "stopped" => "stopped",
         _ => "error",
     }
@@ -157,6 +190,7 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
         "negotiated_client_depth",
         "client_queue_depth_bytes",
         "ack_suspended",
+        "clipboard_disabled",
         "last_frame_bytes",
         "network_quality",
         "pending_acks",
@@ -249,6 +283,8 @@ fn safe_outcome(value: &str) -> &str {
             "protocol_error",
             "transport_error",
             "write_timeout",
+            "peer_reset",
+            "peer_eof",
             "idle_timeout",
             "server_shutdown",
             "credentials_changed",
@@ -266,6 +302,11 @@ fn safe_outcome(value: &str) -> &str {
 
 fn event_category(message: &str) -> &'static str {
     for (prefix, category) in [
+        ("Connection transport ended", "connection_transport_ended"),
+        (
+            "Clipboard disabled for this connection",
+            "clipboard_disabled",
+        ),
         ("RDP server startup failed", "startup_failed"),
         ("RDP listener and TLS identity ready", "listener_ready"),
         ("Client loop failed", "client_failed"),
@@ -359,12 +400,17 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             "invalid_frames",
             "discontinuities",
             "duration_ms",
+            "socket_error_code",
+            "delivered_updates",
+            "delivered_bytes",
+            "last_update_bytes",
+            "last_write_ms",
         ] {
             if let Some(value) = event["fields"].get(key).filter(|v| v.is_number()) {
                 fields.insert(key.into(), value.clone());
             }
         }
-        if category == "connection_outcome" {
+        if category == "connection_outcome" || category == "connection_transport_ended" {
             fields.insert(
                 "reason".into(),
                 json!(safe_outcome(
@@ -380,7 +426,7 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
                 fields.insert("retrying".into(), json!(retrying));
             }
         }
-        if category == "clipboard_failed" {
+        if category == "clipboard_failed" || category == "clipboard_disabled" {
             fields.insert(
                 "reason".into(),
                 json!(selection(
@@ -391,6 +437,12 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
                         "clipboard worker queue capacity exceeded",
                         "clipboard request or storage operation timed out",
                         "cannot start clipboard timeout monitor",
+                        "clipboard protocol input failed",
+                        "clipboard protocol output failed",
+                        "clipboard producer reported an error",
+                        "clipboard output byte budget exceeded",
+                        "clipboard output event queue full or closed",
+                        "clipboard publication panicked",
                     ],
                 )),
             );
@@ -403,41 +455,6 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
         );
     }
     json!({"available": true, "tail_truncated": truncated, "bytes_examined": bytes.len(), "counts": counts, "events": events})
-}
-
-fn write_report(directory: &Path, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
-    if bytes.len() > EXPORT_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Diagnostics exceed size limit",
-        ));
-    }
-    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
-    for suffix in 0..100 {
-        let path = directory.join(format!("macrdp-diagnostics-{timestamp}-{suffix}.json"));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-        return Ok(path);
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "Could not create a unique diagnostics file",
-    ))
 }
 
 #[cfg(test)]

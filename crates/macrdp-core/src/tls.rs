@@ -31,6 +31,21 @@ pub fn ensure_tls_files(
     key_path: Option<&Path>,
     server_names: &[String],
 ) -> Result<(PathBuf, PathBuf)> {
+    ensure_tls_files_at(
+        &crate::config::config_dir().join("tls"),
+        cert_path,
+        key_path,
+        server_names,
+    )
+}
+
+/// GUI callers select private app storage directly, without probing their working directory.
+pub fn ensure_tls_files_at(
+    directory: &Path,
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    server_names: &[String],
+) -> Result<(PathBuf, PathBuf)> {
     validate_server_names(server_names)?;
     let names = if cert_path.is_none() && key_path.is_none() {
         names::managed_server_names(server_names)?
@@ -38,7 +53,7 @@ pub fn ensure_tls_files(
         names::normalize_names(server_names)?
     };
     ensure_tls_files_in(
-        &crate::config::config_dir().join("tls"),
+        directory,
         cert_path,
         key_path,
         &names,
@@ -50,10 +65,42 @@ pub fn ensure_tls_files(
 pub fn inspect_configured_tls_certificate(
     cert_path: Option<&Path>,
 ) -> Result<Option<TlsCertificateInfo>> {
+    inspect_configured_tls_certificate_at(&crate::config::config_dir().join("tls"), cert_path)
+}
+
+pub fn inspect_configured_tls_certificate_at(
+    directory: &Path,
+    cert_path: Option<&Path>,
+) -> Result<Option<TlsCertificateInfo>> {
     if let Some(cert) = cert_path {
         return inspect_tls_certificate(cert).map(Some);
     }
-    inspect_managed_certificate(&crate::config::config_dir().join("tls"))
+    inspect_managed_certificate(directory)
+}
+
+/// Keep the installed identity where it already exists, without scanning Desktop/cwd.
+pub fn desktop_managed_tls_directory() -> PathBuf {
+    let preferred = dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("macrdp")
+        .join("tls");
+    let legacy = dirs::home_dir().map(|home| home.join(".config/macrdp/tls"));
+    select_desktop_directory(preferred, legacy)
+}
+
+fn select_desktop_directory(preferred: PathBuf, legacy: Option<PathBuf>) -> PathBuf {
+    let has_identity = |directory: &Path| {
+        directory.join(MANIFEST).exists()
+            || directory.join("cert.pem").exists()
+            || directory.join("key.pem").exists()
+    };
+    if has_identity(&preferred) {
+        return preferred;
+    }
+    if let Some(legacy) = legacy.filter(|legacy| has_identity(legacy)) {
+        return legacy;
+    }
+    preferred
 }
 
 fn inspect_managed_certificate(directory: &Path) -> Result<Option<TlsCertificateInfo>> {

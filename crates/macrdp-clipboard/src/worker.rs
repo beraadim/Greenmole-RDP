@@ -47,6 +47,17 @@ impl fmt::Debug for ClipboardWorker {
 impl_as_any!(ClipboardWorker);
 
 impl ClipboardWorker {
+    /// Final publication shares the server's quarantine gate. A format/output
+    /// failure can disable clipboard while this worker is converting or blocked
+    /// on storage; its eventual result must never replace the native pasteboard.
+    fn publish(&self, token: CopyToken, write: impl FnOnce(&PasteboardBridge) -> i64) -> bool {
+        self.shared.publish(token, &self.pasteboard, |pb| {
+            self.event_sender
+                .with_clipboard_active(|| write(pb))
+                .unwrap_or(-1)
+        })
+    }
+
     pub fn new(
         event_sender: ServerEventTx,
         temp_dir: PathBuf,
@@ -110,6 +121,14 @@ impl ClipboardWorker {
     }
 
     pub(crate) fn tick(&mut self) {
+        if !self.shared.is_active() || self.event_sender.is_clipboard_closed() {
+            return;
+        }
+        if self.shared.local_copy_changed(&self.pasteboard) {
+            // Native metadata and format enumeration can also stall. Keep
+            // these calls on the bounded worker, covered by its work deadline.
+            self.on_request_format_list();
+        }
         self.expire_pending_html();
         if self
             .incoming_token
@@ -146,11 +165,10 @@ impl ClipboardWorker {
             }
         }
         if let Some(prepared) = self.transfer_manager.prepare_incoming_files() {
-            let published = self.incoming_token.take().is_some_and(|token| {
-                self.shared.publish(token, &self.pasteboard, |pb| {
-                    pb.write_file_urls(&prepared.paths)
-                })
-            });
+            let published = self
+                .incoming_token
+                .take()
+                .is_some_and(|token| self.publish(token, |pb| pb.write_file_urls(&prepared.paths)));
             if published {
                 self.transfer_manager.retain_incoming_files(prepared);
             }
@@ -319,9 +337,7 @@ impl CliprdrBackend for ClipboardWorker {
         match offer.format.map(|format| format.kind) {
             Some(FormatKind::Dib) => match dib_to_png(response.data()) {
                 Ok(png_data) => {
-                    self.shared.publish(offer.token, &self.pasteboard, |pb| {
-                        pb.write_image(&png_data)
-                    });
+                    self.publish(offer.token, |pb| pb.write_image(&png_data));
                 }
                 Err(error) => tracing::warn!(%error, "Rejected clipboard image"),
             },
