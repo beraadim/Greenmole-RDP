@@ -563,6 +563,37 @@ mod tests {
     }
 
     #[test]
+    fn guacamole_double_click_keeps_both_complete_clicks_at_packet_position() {
+        let mut handler = RecordingHandler::default();
+        // Guacamole sends two ordinary down/up pairs, without a MOVE flag or
+        // a double-click marker. Native injection must infer the click count;
+        // neither repeated position nor repeated button may discard a pair.
+        for flags in [
+            PointerFlags::LEFT_BUTTON | PointerFlags::DOWN,
+            PointerFlags::LEFT_BUTTON,
+            PointerFlags::LEFT_BUTTON | PointerFlags::DOWN,
+            PointerFlags::LEFT_BUTTON,
+        ] {
+            let wire = ironrdp_core::encode_vec(&pointer(flags, 400, 250)).unwrap();
+            let packet: MousePdu = ironrdp_core::decode(&wire).unwrap();
+            handler.mouse_pdu(packet);
+        }
+        assert_eq!(
+            handler.events,
+            [
+                MouseEvent::Move { x: 400, y: 250 },
+                MouseEvent::LeftPressed,
+                MouseEvent::Move { x: 400, y: 250 },
+                MouseEvent::LeftReleased,
+                MouseEvent::Move { x: 400, y: 250 },
+                MouseEvent::LeftPressed,
+                MouseEvent::Move { x: 400, y: 250 },
+                MouseEvent::LeftReleased,
+            ]
+        );
+    }
+
+    #[test]
     fn button_packets_update_position_before_press_and_release_without_move_flag() {
         for (flag, pressed, released) in [
             (

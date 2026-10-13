@@ -1,8 +1,9 @@
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType};
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
+use std::time::{Duration, Instant};
 
 extern "C" {
     fn CGEventCreateMouseEvent(
@@ -23,7 +24,9 @@ extern "C" {
 
 /// ScrollEventUnit::Line
 const SCROLL_UNIT_LINE: u32 = 1;
+mod click;
 mod scroll;
+use click::ClickState;
 use scroll::ScrollState;
 
 pub struct MouseInjector {
@@ -31,10 +34,22 @@ pub struct MouseInjector {
     scroll: ScrollState,
 }
 
-#[derive(Default)]
 struct MouseState {
     pressed: [bool; 5],
     position: (f64, f64),
+    clicks: ClickState,
+    double_click_interval: Duration,
+}
+
+impl Default for MouseState {
+    fn default() -> Self {
+        Self {
+            pressed: [false; 5],
+            position: (0.0, 0.0),
+            clicks: ClickState::default(),
+            double_click_interval: Duration::from_millis(500),
+        }
+    }
 }
 
 impl MouseInjector {
@@ -65,6 +80,11 @@ impl MouseInjector {
         x: f64,
         y: f64,
     ) -> Result<()> {
+        if pressed {
+            // Read on each new press so changes to the host's Accessibility
+            // double-click speed take effect without restarting the server.
+            self.state.double_click_interval = system_double_click_interval();
+        }
         self.state
             .button_event(button, pressed, x, y, Self::post_mouse_event)
     }
@@ -75,7 +95,24 @@ impl MouseInjector {
         self.state.release_all(Self::post_mouse_event)
     }
 
-    fn post_mouse_event(event_type: CGEventType, button: u32, point: CGPoint) -> Result<()> {
+    fn post_mouse_event(
+        event_type: CGEventType,
+        button: u32,
+        point: CGPoint,
+        click_count: i64,
+    ) -> Result<()> {
+        let event = Self::create_mouse_event(event_type, button, point, click_count)?;
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Separated from posting so native event fields can be tested without desktop input.
+    fn create_mouse_event(
+        event_type: CGEventType,
+        button: u32,
+        point: CGPoint,
+        click_count: i64,
+    ) -> Result<CGEvent> {
         let source = Self::source()?;
         // The Rust CGMouseButton enum only exposes 0..=2. CoreGraphics accepts
         // other button numbers through its C API; never manufacture invalid enums.
@@ -86,8 +123,8 @@ impl MouseInjector {
             "Failed to create mouse event: {event_type:?}"
         );
         let event = unsafe { CGEvent::from_ptr(event_ref) };
-        event.post(CGEventTapLocation::HID);
-        Ok(())
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
+        Ok(event)
     }
 
     /// Read the host cursor once when establishing a relative-input session.
@@ -137,7 +174,7 @@ impl MouseState {
         &mut self,
         x: f64,
         y: f64,
-        mut post: impl FnMut(CGEventType, u32, CGPoint) -> Result<()>,
+        mut post: impl FnMut(CGEventType, u32, CGPoint, i64) -> Result<()>,
     ) -> Result<()> {
         anyhow::ensure!(
             x.is_finite() && y.is_finite(),
@@ -168,7 +205,13 @@ impl MouseState {
         } else {
             (CGEventType::MouseMoved, MouseButton::Left as u32)
         };
-        post(event_type, button, point)?;
+        post(
+            event_type,
+            button,
+            point,
+            self.clicks.count_for_drag(button as usize),
+        )?;
+        self.clicks.move_to((x, y));
         self.position = (x, y);
         tracing::trace!(x, y, ?event_type, "Mouse moved");
         Ok(())
@@ -180,13 +223,25 @@ impl MouseState {
         pressed: bool,
         x: f64,
         y: f64,
-        mut post: impl FnMut(CGEventType, u32, CGPoint) -> Result<()>,
+        post: impl FnMut(CGEventType, u32, CGPoint, i64) -> Result<()>,
+    ) -> Result<()> {
+        self.button_event_at(button, pressed, x, y, Instant::now(), post)
+    }
+
+    fn button_event_at(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        x: f64,
+        y: f64,
+        now: Instant,
+        mut post: impl FnMut(CGEventType, u32, CGPoint, i64) -> Result<()>,
     ) -> Result<()> {
         anyhow::ensure!(
             x.is_finite() && y.is_finite(),
             "Mouse position must be finite"
         );
-        if !pressed && !self.pressed[button as usize] {
+        if pressed == self.pressed[button as usize] {
             return Ok(());
         }
         let point = CGPoint::new(x, y);
@@ -199,24 +254,41 @@ impl MouseState {
             (other, false) => (CGEventType::OtherMouseUp, other as u32),
         };
 
-        post(event_type, cg_button, point)?;
+        let mut clicks = self.clicks;
+        let click_count = clicks.transition(
+            button as usize,
+            pressed,
+            (x, y),
+            now,
+            self.double_click_interval,
+        );
+        post(event_type, cg_button, point, click_count)?;
         // Failed creation must not lose a held button or start a phantom drag.
         self.pressed[button as usize] = pressed;
         self.position = (x, y);
-        tracing::trace!(?button, pressed, x, y, "Mouse button event");
+        self.clicks = clicks;
+        tracing::trace!(?button, pressed, x, y, click_count, "Mouse button event");
         Ok(())
     }
 
     fn release_all(
         &mut self,
-        mut post: impl FnMut(CGEventType, u32, CGPoint) -> Result<()>,
+        post: impl FnMut(CGEventType, u32, CGPoint, i64) -> Result<()>,
+    ) -> Result<()> {
+        self.release_all_at(Instant::now(), post)
+    }
+
+    fn release_all_at(
+        &mut self,
+        now: Instant,
+        mut post: impl FnMut(CGEventType, u32, CGPoint, i64) -> Result<()>,
     ) -> Result<()> {
         let mut first_error = None;
         let mut released = 0;
         for button in MouseButton::ALL {
             if self.pressed[button as usize] {
                 let (x, y) = self.position;
-                match self.button_event(button, false, x, y, &mut post) {
+                match self.button_event_at(button, false, x, y, now, &mut post) {
                     Ok(()) => released += 1,
                     Err(error) => {
                         // Keep failed buttons held for a later cleanup attempt,
@@ -229,8 +301,17 @@ impl MouseState {
         if released > 0 {
             tracing::debug!(released, "Released held remote mouse buttons");
         }
+        self.clicks.cancel_sequence();
         first_error.map_or(Ok(()), Err)
     }
+}
+
+fn system_double_click_interval() -> Duration {
+    let seconds = objc2_app_kit::NSEvent::doubleClickInterval();
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or_else(|| Duration::from_millis(500))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,5 +334,7 @@ impl MouseButton {
     ];
 }
 
+#[cfg(test)]
+mod click_tests;
 #[cfg(test)]
 mod tests;

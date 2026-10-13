@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2239,12 +2239,13 @@ dependencies = [
  "core-graphics",
  "core-graphics-types",
  "foreign-types",
+ "objc2-app-kit",
  "tracing",
 ]
 
 [[package]]
 name = "macrdp-server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",

@@ -18,8 +18,8 @@ impl PartialEq for RecordedEvent {
 
 fn record(
     events: &mut Vec<RecordedEvent>,
-) -> impl FnMut(CGEventType, u32, CGPoint) -> Result<()> + '_ {
-    move |event_type, button, point| {
+) -> impl FnMut(CGEventType, u32, CGPoint, i64) -> Result<()> + '_ {
+    move |event_type, button, point, _click_count| {
         events.push(RecordedEvent(event_type, button, point.x, point.y));
         Ok(())
     }
@@ -144,7 +144,7 @@ fn stationary_clicks_do_not_emit_drag_events() {
 fn releasing_one_button_preserves_other_buttons_and_duplicate_events_are_idempotent() {
     let mut mouse = MouseState::default();
     let mut moves = Vec::new();
-    let mut discard = |_, _, _| Ok(());
+    let mut discard = |_, _, _, _| Ok(());
     for button in [MouseButton::Middle, MouseButton::Right, MouseButton::Left] {
         mouse
             .button_event(button, true, 10.0, 20.0, &mut discard)
@@ -209,9 +209,9 @@ fn releasing_one_button_preserves_other_buttons_and_duplicate_events_are_idempot
 fn rejects_nonfinite_positions_before_posting_or_changing_state() {
     let mut mouse = MouseState::default();
     mouse
-        .button_event(MouseButton::Left, true, -42.5, 80.25, |_, _, _| Ok(()))
+        .button_event(MouseButton::Left, true, -42.5, 80.25, |_, _, _, _| Ok(()))
         .unwrap();
-    let mut must_not_post = |_, _, _| -> Result<()> { panic!("invalid position was posted") };
+    let mut must_not_post = |_, _, _, _| -> Result<()> { panic!("invalid position was posted") };
     for (x, y) in [
         (f64::NAN, 0.0),
         (0.0, f64::NAN),
@@ -246,7 +246,7 @@ fn rejects_nonfinite_positions_before_posting_or_changing_state() {
 fn failed_posts_do_not_start_or_end_drags_or_change_cleanup_position() {
     let mut mouse = MouseState::default();
     let mut events = Vec::new();
-    let mut fail = |_, _, _| anyhow::bail!("simulated event creation failure");
+    let mut fail = |_, _, _, _| anyhow::bail!("simulated event creation failure");
     assert!(mouse
         .button_event(MouseButton::Left, true, 100.0, 200.0, &mut fail)
         .is_err());
@@ -282,12 +282,12 @@ fn cleanup_releases_every_held_button_at_last_successful_move_and_is_repeatable(
     let mut mouse = MouseState::default();
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
         mouse
-            .button_event(button, true, 10.0, 20.0, |_, _, _| Ok(()))
+            .button_event(button, true, 10.0, 20.0, |_, _, _, _| Ok(()))
             .unwrap();
     }
-    mouse.move_to(-100.5, 300.25, |_, _, _| Ok(())).unwrap();
+    mouse.move_to(-100.5, 300.25, |_, _, _, _| Ok(())).unwrap();
     assert!(mouse
-        .move_to(900.0, 999.0, |_, _, _| anyhow::bail!("failed move"))
+        .move_to(900.0, 999.0, |_, _, _, _| anyhow::bail!("failed move"))
         .is_err());
     let mut events = Vec::new();
     mouse.release_all(record(&mut events)).unwrap();
@@ -324,11 +324,11 @@ fn cleanup_continues_after_failures_and_retries_only_failed_buttons() {
     let mut mouse = MouseState::default();
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
         mouse
-            .button_event(button, true, 15.0, 25.0, |_, _, _| Ok(()))
+            .button_event(button, true, 15.0, 25.0, |_, _, _, _| Ok(()))
             .unwrap();
     }
     let mut attempts = Vec::new();
-    let result = mouse.release_all(|event_type, button, point| {
+    let result = mouse.release_all(|event_type, button, point, _click_count| {
         attempts.push(RecordedEvent(event_type, button, point.x, point.y));
         if button == MouseButton::Left as u32 || button == MouseButton::Middle as u32 {
             anyhow::bail!("failed release for {button:?}");
@@ -386,7 +386,7 @@ fn cleanup_continues_after_failures_and_retries_only_failed_buttons() {
 #[test]
 fn cleanup_without_held_buttons_does_not_post() {
     MouseState::default()
-        .release_all(|_, _, _| panic!("cleanup posted with no held buttons"))
+        .release_all(|_, _, _, _| panic!("cleanup posted with no held buttons"))
         .unwrap();
 }
 
@@ -401,7 +401,7 @@ fn side_buttons_use_native_numbers_and_cleanup_ends_their_drags() {
         state.move_to(11.0, 21.0, record(&mut events)).unwrap();
         state.release_all(record(&mut events)).unwrap();
         state
-            .release_all(|_, _, _| panic!("repeat cleanup posted"))
+            .release_all(|_, _, _, _| panic!("repeat cleanup posted"))
             .unwrap();
         assert_eq!(
             events,
@@ -419,7 +419,9 @@ fn release_for_unowned_button_does_not_affect_local_mouse() {
     let mut state = MouseState::default();
     for button in MouseButton::ALL {
         state
-            .button_event(button, false, 0.0, 0.0, |_, _, _| panic!("unowned release"))
+            .button_event(button, false, 0.0, 0.0, |_, _, _, _| {
+                panic!("unowned release")
+            })
             .unwrap();
     }
 }
