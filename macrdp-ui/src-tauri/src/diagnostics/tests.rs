@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn native_timeouts_and_keepalive_policy_preserve_only_operational_evidence() {
+    let transport = json!({"level": "warn", "message": "Connection transport ended",
+        "fields": {"reason": "transport_timeout", "socket_error_code": 60,
+            "error": "private-route-data"}});
+    let policy = json!({"level": "info", "message": "TCP keepalive configured",
+        "fields": {"keepalive_idle_seconds": 60, "keepalive_interval_seconds": 15,
+            "keepalive_retries": 4, "peer": "private-peer"}});
+    let summary = summarize_bytes(format!("{transport}\n{policy}\n").as_bytes(), false);
+    assert_eq!(
+        summary["events"][0]["fields"]["reason"],
+        "transport_timeout"
+    );
+    assert_eq!(summary["events"][1]["category"], "transport_policy");
+    assert_eq!(summary["events"][1]["fields"]["keepalive_retries"], 4);
+    assert!(!summary.to_string().contains("private"));
+    let mut metrics = macrdp_core::Metrics::default();
+    metrics.bitmap_update_budget_bytes = Some(32_768);
+    metrics.connection_outcome = Some("transport_timeout".into());
+    let exported = safe_metrics(&metrics);
+    assert_eq!(exported["bitmap_update_budget_bytes"], 32_768);
+    assert_eq!(exported["connection_outcome"], "transport_timeout");
+}
+
+#[test]
 fn exports_selected_operational_fields_without_credentials_or_input_text() {
     let secret = "private-canary-value";
     let mut config = UiConfig::default();

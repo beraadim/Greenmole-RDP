@@ -49,6 +49,9 @@ use crate::{builder, capabilities, SoundServerFactory};
 mod tests;
 
 #[cfg(test)]
+#[path = "display_partition_tests.rs"]
+mod display_partition_tests;
+#[cfg(test)]
 #[path = "transport_tests.rs"]
 mod transport_tests;
 
@@ -69,6 +72,8 @@ use connection_control::{
 };
 #[path = "admission.rs"]
 mod admission;
+#[path = "bitmap_budget.rs"]
+pub(crate) mod bitmap_budget;
 #[path = "transport.rs"]
 mod transport;
 
@@ -742,6 +747,7 @@ impl RdpServer {
         mut encoder: UpdateEncoder,
         gfx_state: &Arc<std::sync::Mutex<GfxState>>,
         drdynvc_channel_id: Option<StaticChannelId>,
+        display_updates: &mut dyn crate::RdpServerDisplayUpdates,
     ) -> Result<(RunState, UpdateEncoder)> {
         let is_bitmap_update = matches!(&update, DisplayUpdate::Bitmap(_));
 
@@ -805,6 +811,7 @@ impl RdpServer {
 
         // Handle GFX uncompressed dirty rect updates through the DVC channel
         if let DisplayUpdate::GfxUncompressed(ref uncompressed) = update {
+            let prepare_started = std::time::Instant::now();
             let mut state = gfx_state.lock().unwrap();
             if state.is_ready() {
                 if let Some(drdynvc_id) = drdynvc_channel_id {
@@ -827,6 +834,7 @@ impl RdpServer {
                         drdynvc_id,
                         user_channel_id,
                     )?;
+                    let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
                     let write_started = std::time::Instant::now();
                     let output = ChannelOutput {
                         channel_id: drdynvc_id,
@@ -838,10 +846,14 @@ impl RdpServer {
                         .context("failed to write GFX uncompressed frame")?;
                     let mut state = gfx_state.lock().unwrap();
                     state.frame_written(frame_id);
-                    state.record_display_write(
-                        output.data.len(),
-                        write_started.elapsed().as_secs_f64() * 1000.0,
-                    );
+                    let write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
+                    state.uncompressed_dispatches = state.uncompressed_dispatches.saturating_add(1);
+                    state.uncompressed_prepare_ms_total += prepare_ms;
+                    state.uncompressed_write_ms_total += write_ms;
+                    state.uncompressed_wire_bytes = state
+                        .uncompressed_wire_bytes
+                        .saturating_add(output.data.len() as u64);
+                    state.record_display_write(output.data.len(), write_ms);
 
                     return Ok((RunState::Continue, encoder));
                 }
@@ -851,6 +863,11 @@ impl RdpServer {
             }
         }
 
+        if is_bitmap_update {
+            let mut state = gfx_state.lock().unwrap();
+            let budget = encoder.set_bitmap_working_budget(state.bitmap_budget.bytes());
+            state.bitmap_update_budget_bytes = Some(budget as u32);
+        }
         let mut encoder_iter = encoder.update(update);
         let mut bytes_written = 0usize;
         let mut write_ms = 0.0;
@@ -877,6 +894,24 @@ impl RdpServer {
                 bytes_written = bytes_written.saturating_add(len);
                 write_ms += write_started.elapsed().as_secs_f64() * 1000.0;
             }
+            if is_bitmap_update {
+                // Fast-Path fragments form one reassembled update. Poll only
+                // after the complete partition, and emit at most one pointer
+                // before the next bitmap partition makes progress.
+                if let Some(pointer) = display_updates.poll_pointer_update() {
+                    if let Some(mut pointer) = encoder_iter.encode_pointer(pointer)? {
+                        if pointer.size_hint() > buffer.len() {
+                            buffer.resize(pointer.size_hint(), 0);
+                        }
+                        while let Some(len) = pointer.next(buffer) {
+                            writer
+                                .write_all(&buffer[..len])
+                                .await
+                                .context("failed to write interleaved pointer update")?;
+                        }
+                    }
+                }
+            }
         }
 
         if is_bitmap_update {
@@ -886,6 +921,18 @@ impl RdpServer {
             state.bitmap_encode_ms_total += encode_ms;
             state.bitmap_write_ms_total += write_ms;
             state.bitmap_wire_bytes = state.bitmap_wire_bytes.saturating_add(bytes_written as u64);
+            let previous_budget = state.bitmap_budget.bytes();
+            state
+                .bitmap_budget
+                .observe(bytes_written, write_ms, std::time::Instant::now());
+            if state.bitmap_budget.bytes() != previous_budget {
+                debug!(
+                    previous_budget_bytes = previous_budget,
+                    bitmap_update_budget_bytes = state.bitmap_budget.bytes(),
+                    write_ms,
+                    "Bitmap transmission budget adjusted"
+                );
+            }
             if bytes_written > 0 {
                 state.record_display_write(bytes_written, write_ms);
             }
@@ -1158,6 +1205,7 @@ impl RdpServer {
                             encoder,
                             &gfx_state,
                             drdynvc_channel_id,
+                            display_updates.as_mut(),
                         )
                         .await?
                         {

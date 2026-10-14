@@ -2893,6 +2893,7 @@ dependencies = [
  "qoicoubeh",
  "rayon",
  "rustls-pemfile",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3343,7 +3344,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3417,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-ui"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "chrono",

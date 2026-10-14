@@ -352,6 +352,14 @@ pub struct GfxState {
     pub bitmap_dispatches: u64,
     pub bitmap_encode_ms_total: f64,
     pub bitmap_write_ms_total: f64,
+    pub(crate) bitmap_budget: crate::server::bitmap_budget::BitmapBudget,
+    /// Actual working partition budget, capped by the client's reassembly limit.
+    pub bitmap_update_budget_bytes: Option<u32>,
+    /// Completed uncompressed GFX service costs, independent of AVC/bitmap pacing.
+    pub uncompressed_dispatches: u64,
+    pub uncompressed_prepare_ms_total: f64,
+    pub uncompressed_write_ms_total: f64,
+    pub uncompressed_wire_bytes: u64,
     /// Time of first frame sent
     pub start_time: Option<std::time::Instant>,
     /// Client peer IP address (set after TCP connection is established)
@@ -438,6 +446,12 @@ impl GfxState {
             bitmap_dispatches: 0,
             bitmap_encode_ms_total: 0.0,
             bitmap_write_ms_total: 0.0,
+            bitmap_budget: Default::default(),
+            bitmap_update_budget_bytes: None,
+            uncompressed_dispatches: 0,
+            uncompressed_prepare_ms_total: 0.0,
+            uncompressed_write_ms_total: 0.0,
+            uncompressed_wire_bytes: 0,
             start_time: None,
             peer_addr: None,
             bitrate_samples: Vec::new(),
@@ -636,6 +650,12 @@ impl GfxState {
         self.bitmap_dispatches = 0;
         self.bitmap_encode_ms_total = 0.0;
         self.bitmap_write_ms_total = 0.0;
+        self.bitmap_budget = Default::default();
+        self.bitmap_update_budget_bytes = None;
+        self.uncompressed_dispatches = 0;
+        self.uncompressed_prepare_ms_total = 0.0;
+        self.uncompressed_write_ms_total = 0.0;
+        self.uncompressed_wire_bytes = 0;
         self.active_encoder = None;
         self.start_time = None;
         self.bitrate_samples.clear();
@@ -1401,6 +1421,14 @@ mod tests {
         state.last_frame_bytes = 123_456;
         state.total_bytes_sent = 987_654;
         state.bitmap_wire_bytes = 456_789;
+        state.bitmap_update_budget_bytes = Some(16_384);
+        state
+            .bitmap_budget
+            .observe(32_768, 1000.0, std::time::Instant::now());
+        state.uncompressed_dispatches = 4;
+        state.uncompressed_prepare_ms_total = 7.0;
+        state.uncompressed_write_ms_total = 8.0;
+        state.uncompressed_wire_bytes = 500_000;
         state.bitmap_codec = Some("remotefx");
         state.negotiated_client_depth = Some(24);
         state.start_time = Some(std::time::Instant::now());
@@ -1427,6 +1455,12 @@ mod tests {
         assert_eq!(state.last_frame_bytes, 0);
         assert_eq!(state.total_bytes_sent, 0);
         assert_eq!(state.bitmap_wire_bytes, 0);
+        assert_eq!(state.bitmap_update_budget_bytes, None);
+        assert_eq!(state.bitmap_budget.bytes(), 128 * 1024);
+        assert_eq!(state.uncompressed_dispatches, 0);
+        assert_eq!(state.uncompressed_prepare_ms_total, 0.0);
+        assert_eq!(state.uncompressed_write_ms_total, 0.0);
+        assert_eq!(state.uncompressed_wire_bytes, 0);
         assert_eq!(state.bitmap_codec, None);
         assert_eq!(state.negotiated_client_depth, None);
         assert_eq!(state.start_time, None);

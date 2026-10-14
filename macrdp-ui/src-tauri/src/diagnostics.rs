@@ -237,6 +237,10 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
             })
             .unwrap_or(Value::Null),
     );
+    selected.insert(
+        "bitmap_update_budget_bytes".into(),
+        json!(metrics.bitmap_update_budget_bytes),
+    );
     // Encoder mode has a human-readable suffix; never export unvalidated free text.
     selected.insert(
         "encoder_mode".into(),
@@ -283,6 +287,7 @@ fn safe_outcome(value: &str) -> &str {
             "protocol_error",
             "transport_error",
             "write_timeout",
+            "transport_timeout",
             "peer_reset",
             "peer_eof",
             "idle_timeout",
@@ -303,6 +308,12 @@ fn safe_outcome(value: &str) -> &str {
 fn event_category(message: &str) -> &'static str {
     for (prefix, category) in [
         ("Connection transport ended", "connection_transport_ended"),
+        ("TCP keepalive configured", "transport_policy"),
+        (
+            "TCP keepalive options could not be fully applied",
+            "transport_policy_failed",
+        ),
+        ("Bitmap transmission budget adjusted", "bitmap_budget"),
         (
             "Clipboard disabled for this connection",
             "clipboard_disabled",
@@ -405,6 +416,11 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             "delivered_bytes",
             "last_update_bytes",
             "last_write_ms",
+            "keepalive_idle_seconds",
+            "keepalive_interval_seconds",
+            "keepalive_retries",
+            "bitmap_update_budget_bytes",
+            "previous_budget_bytes",
         ] {
             if let Some(value) = event["fields"].get(key).filter(|v| v.is_number()) {
                 fields.insert(key.into(), value.clone());

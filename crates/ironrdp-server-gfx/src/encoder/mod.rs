@@ -4,6 +4,7 @@ use core::num::NonZeroU16;
 
 use anyhow::{anyhow, Context as _, Result};
 use ironrdp_acceptor::DesktopSize;
+use ironrdp_core::Encode as _;
 use ironrdp_graphics::diff::{find_different_rects_sub, Rect};
 use ironrdp_pdu::codecs::rfx::OperatingMode;
 use ironrdp_pdu::encode_vec;
@@ -213,6 +214,17 @@ impl UpdateEncoder {
         }
     }
 
+    /// Bound each complete bitmap update below the client's hard receive limit.
+    /// Zero restores that hard limit. Pointer updates keep their negotiated cap.
+    pub(crate) fn set_bitmap_working_budget(&mut self, bytes: usize) -> usize {
+        self.limits.set_bitmap_budget(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bitmap_working_budget(&self) -> usize {
+        self.limits.bitmap_budget()
+    }
+
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
     pub(crate) fn update(&mut self, update: DisplayUpdate) -> EncoderIter<'_> {
         EncoderIter {
@@ -388,7 +400,7 @@ impl UpdateEncoder {
             .take()
             .expect("bitmap updater always Some");
 
-        let limit = self.limits.max_payload();
+        let limit = self.limits.bitmap_budget();
         let (result, updater) = tokio::task::spawn_blocking(move || {
             let result = time_warn!(
                 "Encoding bitmap",
@@ -501,18 +513,14 @@ impl BitmapUpdater {
         bitmap: &BitmapUpdate,
         limit: usize,
     ) -> Result<Option<UpdateFragmenter>> {
-        // Oversized candidates are discarded and subdivided. Do not consume a
-        // video stream's initial headers or frame index until an update fits.
-        let checkpoint = match self {
-            Self::RemoteFx(handler) => Some(handler.clone()),
-            _ => None,
-        };
+        // RemoteFX sizes its already-compressed tiles before serialization and
+        // commits its frame index only after the complete surface PDU fits.
+        if let Self::RemoteFx(handler) = self {
+            return handler.handle_with_limit(bitmap, limit);
+        }
         let output = self.handle(bitmap)?;
         if output.data.len() <= limit {
             return Ok(Some(output));
-        }
-        if let Some(handler) = checkpoint {
-            *self = Self::RemoteFx(handler);
         }
         Ok(None)
     }
@@ -604,11 +612,12 @@ impl BitmapUpdateHandler for BitmapHandler {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RemoteFxHandler {
     remotefx: RfxEncoder,
     codec_id: u8,
     desktop_size: Option<DesktopSize>,
+    output: Vec<u8>,
 }
 
 impl RemoteFxHandler {
@@ -630,6 +639,7 @@ impl RemoteFxHandler {
             remotefx: RfxEncoder::new(algo, quality, mode),
             desktop_size: Some(desktop_size),
             codec_id,
+            output: Vec::new(),
         }
     }
 
@@ -637,37 +647,40 @@ impl RemoteFxHandler {
         self.desktop_size = Some(size);
         self.remotefx.reset();
     }
+
+    fn handle_with_limit(
+        &mut self,
+        bitmap: &BitmapUpdate,
+        limit: usize,
+    ) -> Result<Option<UpdateFragmenter>> {
+        let overhead = surface_command(bitmap, self.codec_id, &[]).size();
+        let Some(payload_limit) = limit.checked_sub(overhead) else {
+            return Ok(None);
+        };
+        let result = (|| {
+            let Some(len) =
+                self.remotefx
+                    .encode(bitmap, &mut self.output, self.desktop_size, payload_limit)?
+            else {
+                return Ok(None);
+            };
+            let output = set_surface(bitmap, self.codec_id, &self.output[..len])?;
+            self.remotefx.commit_frame();
+            Ok(Some(output))
+        })();
+        // The fragmenter owns the final PDU until transmission completes. Keep
+        // only bounded serialization scratch here, even after an encode error.
+        if self.output.capacity() > rfx::MAX_CACHED_BYTES {
+            self.output = Vec::new();
+        }
+        result
+    }
 }
 
 impl BitmapUpdateHandler for RemoteFxHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        let mut buffer =
-            vec![0; usize::from(bitmap.width.get()) * usize::from(bitmap.height.get()) * 4 + 256];
-        let len = loop {
-            match self
-                .remotefx
-                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size)
-            {
-                Err(e) => match e.kind() {
-                    ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                        let size = buffer
-                            .len()
-                            .checked_mul(2)
-                            .ok_or_else(|| anyhow!("RemoteFX output size overflow"))?;
-                        buffer.resize(size, 0);
-                        debug!("encoder buffer resized to: {}", buffer.len());
-                    }
-                    _ => Err(e).context("RemoteFX encode error")?,
-                },
-                Ok(len) => break len,
-            }
-        };
-
-        // MS-RDPRFX 3.1.5 requires headers before every image; 3.1.8.3.1
-        // permits repeating them in video mode too. Keep each partition
-        // independently decodable, including after output-size retries.
-
-        set_surface(bitmap, self.codec_id, &buffer[..len])
+        self.handle_with_limit(bitmap, usize::MAX)?
+            .ok_or_else(|| anyhow!("RemoteFX output size overflow"))
     }
 }
 
@@ -793,6 +806,13 @@ fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
 }
 
 fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<UpdateFragmenter> {
+    Ok(UpdateFragmenter::new(
+        UpdateCode::SurfaceCommands,
+        encode_vec(&surface_command(bitmap, codec_id, data))?,
+    ))
+}
+
+fn surface_command<'a>(bitmap: &BitmapUpdate, codec_id: u8, data: &'a [u8]) -> SurfaceCommand<'a> {
     let destination = ExclusiveRectangle {
         left: bitmap.x,
         top: bitmap.y,
@@ -811,11 +831,7 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
         destination,
         extended_bitmap_data,
     };
-    let cmd = SurfaceCommand::SetSurfaceBits(pdu);
-    Ok(UpdateFragmenter::new(
-        UpdateCode::SurfaceCommands,
-        encode_vec(&cmd)?,
-    ))
+    SurfaceCommand::SetSurfaceBits(pdu)
 }
 
 #[cfg(test)]

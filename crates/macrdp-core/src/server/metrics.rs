@@ -140,6 +140,12 @@ impl MetricsSnapshot {
                 .flatten()
                 .map(str::to_owned),
             negotiated_client_depth: gfx.negotiated_client_depth,
+            bitmap_update_budget_bytes: matches!(
+                transport_mode.as_str(),
+                "bitmap" | "bitmap-fallback"
+            )
+            .then_some(gfx.bitmap_update_budget_bytes)
+            .flatten(),
             client_queue_depth_bytes: gfx.client_queue_depth_bytes,
             ack_suspended: gfx.frame_acknowledgements_suspended,
             clipboard_disabled: gfx.clipboard_disabled,

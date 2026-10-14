@@ -20,7 +20,19 @@ pub(super) fn error_outcome(
     for cause in error.chain() {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             return match io.kind() {
-                std::io::ErrorKind::TimedOut => ConnectionOutcome::WriteTimeout,
+                std::io::ErrorKind::TimedOut => {
+                    if io
+                        .get_ref()
+                        .is_some_and(|source| source.is::<super::output::WriteDeadlineExceeded>())
+                    {
+                        ConnectionOutcome::WriteTimeout
+                    } else {
+                        // Native TCP timeouts (including keepalive failures)
+                        // can arrive on either reads or writes. Only our typed
+                        // deadline proves that the output budget expired.
+                        ConnectionOutcome::TransportTimeout
+                    }
+                }
                 std::io::ErrorKind::UnexpectedEof => ConnectionOutcome::PeerEof,
                 std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
                     ConnectionOutcome::PeerReset
@@ -49,7 +61,7 @@ mod error_tests {
             ),
             (
                 std::io::ErrorKind::TimedOut,
-                ConnectionOutcome::WriteTimeout,
+                ConnectionOutcome::TransportTimeout,
             ),
             (
                 std::io::ErrorKind::BrokenPipe,
@@ -68,6 +80,34 @@ mod error_tests {
             error_outcome(&malformed, ConnectionOutcome::ProtocolError),
             ConnectionOutcome::ProtocolError
         );
+    }
+
+    #[test]
+    fn only_typed_output_deadlines_are_write_timeouts_through_error_contexts() {
+        use super::super::output::WriteDeadlineExceeded;
+        for deadline in [
+            WriteDeadlineExceeded::Drain,
+            WriteDeadlineExceeded::Admission,
+            WriteDeadlineExceeded::Socket,
+        ] {
+            let typed = anyhow::Error::new(std::io::Error::from(deadline))
+                .context("framed output")
+                .context("connection");
+            assert_eq!(
+                error_outcome(&typed, ConnectionOutcome::ProtocolError),
+                ConnectionOutcome::WriteTimeout
+            );
+            let untyped = anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                deadline.to_string(),
+            ))
+            .context("framed output");
+            assert_eq!(
+                error_outcome(&untyped, ConnectionOutcome::ProtocolError),
+                ConnectionOutcome::TransportTimeout,
+                "error text must not determine the timeout's origin"
+            );
+        }
     }
 }
 

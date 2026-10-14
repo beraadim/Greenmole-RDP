@@ -290,6 +290,18 @@ impl core::fmt::Debug for BitmapUpdate {
 /// See [`RdpServerDisplay`] example.
 #[async_trait::async_trait]
 pub trait RdpServerDisplayUpdates {
+    /// Poll a due pointer update between complete encoded bitmap partitions.
+    ///
+    /// This synchronous hook keeps a large bitmap dispatch from postponing
+    /// cursor shape/hide changes until the entire frame finishes. Return only
+    /// pointer variants; do not consume pending capture, resize, or graphics
+    /// updates here. Implementations should rate-limit polling and return
+    /// promptly. The server emits at most one pointer at each boundary.
+    /// Existing display providers can leave pointer delivery in `next_update`.
+    fn poll_pointer_update(&mut self) -> Option<DisplayUpdate> {
+        None
+    }
+
     /// # Cancel safety
     ///
     /// This method MUST be cancellation safe because it is used in a

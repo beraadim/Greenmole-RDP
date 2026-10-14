@@ -29,6 +29,24 @@ pub(crate) struct EncoderIter<'a> {
 }
 
 impl EncoderIter<'_> {
+    /// Encode a cursor update between complete bitmap partitions without
+    /// consuming pending damage or committing the framebuffer. The caller must
+    /// finish each fragmenter before inserting another update on the wire.
+    pub(crate) fn encode_pointer(&self, update: DisplayUpdate) -> Result<Option<UpdateFragmenter>> {
+        let output = match update {
+            DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
+            DisplayUpdate::RGBAPointer(ptr) => UpdateEncoder::rgba_pointer(ptr),
+            DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
+            DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
+            DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
+            _ => return Ok(None),
+        }?;
+        Ok(Some(limit_pointer(
+            output,
+            self.encoder.limits.max_payload(),
+        )))
+    }
+
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
     pub(crate) async fn next(&mut self) -> Option<Result<UpdateFragmenter>> {
         loop {
@@ -159,7 +177,7 @@ impl EncoderIter<'_> {
                             let Some((first, second)) = limits::split_rect(&rect) else {
                                 return Some(Err(anyhow!(
                                     "client Fast-Path update limit {} cannot fit one encoded pixel",
-                                    encoder.limits.max_payload()
+                                    encoder.limits.bitmap_budget()
                                 )));
                             };
                             pending.push(second);
@@ -178,20 +196,21 @@ impl EncoderIter<'_> {
                 State::Ended => return None,
             };
 
-            return Some(res.map(|output| {
-                // A pointer cannot be spatially partitioned. Use the client's
-                // system pointer when its receive limit cannot fit our shape.
-                if output.data.len() > encoder.limits.max_payload() {
-                    warn!(
-                        bytes = output.data.len(),
-                        limit = encoder.limits.max_payload(),
-                        "Pointer shape exceeds client update limit; using system pointer"
-                    );
-                    UpdateFragmenter::new(UpdateCode::DefaultPointer, Vec::new())
-                } else {
-                    output
-                }
-            }));
+            return Some(res.map(|output| limit_pointer(output, encoder.limits.max_payload())));
         }
+    }
+}
+
+fn limit_pointer(output: UpdateFragmenter, limit: usize) -> UpdateFragmenter {
+    // A pointer cannot be spatially partitioned. Use the client's system
+    // pointer when its negotiated receive limit cannot fit our shape.
+    if output.data.len() > limit {
+        warn!(
+            bytes = output.data.len(),
+            limit, "Pointer shape exceeds client update limit; using system pointer"
+        );
+        UpdateFragmenter::new(UpdateCode::DefaultPointer, Vec::new())
+    } else {
+        output
     }
 }

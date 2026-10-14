@@ -16,6 +16,34 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 pub(super) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_QUANTUM: usize = 16 * 1024;
 
+/// Distinguish our fixed output budget from an operating-system timeout.
+/// Keep this typed payload inside `io::Error` across framed/TLS error contexts;
+/// matching error text would mislabel a dead peer as an output deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WriteDeadlineExceeded {
+    Drain,
+    Admission,
+    Socket,
+}
+
+impl std::fmt::Display for WriteDeadlineExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Drain => "RDP output drain deadline exceeded",
+            Self::Admission => "RDP message admission deadline exceeded",
+            Self::Socket => "RDP socket write deadline exceeded",
+        })
+    }
+}
+
+impl std::error::Error for WriteDeadlineExceeded {}
+
+impl From<WriteDeadlineExceeded> for io::Error {
+    fn from(deadline: WriteDeadlineExceeded) -> Self {
+        Self::new(io::ErrorKind::TimedOut, deadline)
+    }
+}
+
 /// Encoded under the server state lock, written after releasing that lock.
 pub(super) struct ChannelOutput {
     pub(super) channel_id: u16,
@@ -100,10 +128,7 @@ impl<W: FramedWrite> SharedWriter<'_, W> {
             Ok(result) => result,
             Err(_) => {
                 self.poisoned.set(true);
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "RDP output drain deadline exceeded",
-                ))
+                Err(WriteDeadlineExceeded::Drain.into())
             }
         }
     }
@@ -127,10 +152,7 @@ impl<W: FramedWrite> SharedWriter<'_, W> {
                 Ok(guard) => guard,
                 Err(_) => {
                     self.poisoned.set(true);
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "RDP message admission deadline exceeded",
-                    ));
+                    return Err(WriteDeadlineExceeded::Admission.into());
                 }
             };
         let permit = MessagePermit {
@@ -196,10 +218,7 @@ impl<W: FramedWrite> SharedWriter<'_, W> {
             Ok(result) => result,
             Err(_) => {
                 self.poisoned.set(true);
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "RDP socket write deadline exceeded",
-                ))
+                Err(WriteDeadlineExceeded::Socket.into())
             }
         }
     }
@@ -240,10 +259,7 @@ impl<W: FramedWrite> SharedWriter<'_, W> {
                 Ok(result) => result,
                 Err(_) => {
                     self.poisoned.set(true);
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "RDP socket write deadline exceeded",
-                    ))
+                    Err(WriteDeadlineExceeded::Socket.into())
                 }
             }
         })
@@ -309,6 +325,10 @@ fn packet_batch_length(data: &[u8]) -> usize {
     }
     end
 }
+
+#[cfg(test)]
+#[path = "output_timeout_tests.rs"]
+mod timeout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -562,6 +582,20 @@ mod tests {
         let mut other = writer.clone();
         let error = writer.write_all(b"abcdefgh").await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<WriteDeadlineExceeded>(),
+            Some(&WriteDeadlineExceeded::Socket)
+        );
+        assert_eq!(
+            super::super::connection_control::error_outcome(
+                &anyhow::Error::new(error).context("display output"),
+                crate::gfx::ConnectionOutcome::ProtocolError,
+            ),
+            crate::gfx::ConnectionOutcome::WriteTimeout
+        );
         let mut prefix = [0; 4];
         peer.read_exact(&mut prefix).await.unwrap();
         assert_eq!(&prefix, b"abcd");

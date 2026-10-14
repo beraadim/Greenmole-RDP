@@ -13,12 +13,23 @@ use ironrdp_pdu::WriteCursor;
 
 use crate::BitmapUpdate;
 
-#[derive(Debug, Clone)]
+#[cfg(test)]
+#[path = "rfx_reuse_tests.rs"]
+mod reuse_tests;
+
+// Retention limits are independent of desktop size and peer capability. Active
+// candidates are bounded separately by UpdateLimits before entering the codec.
+pub(super) const MAX_CACHED_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
 pub(crate) struct RfxEncoder {
     entropy_algorithm: rfx::EntropyAlgorithm,
     quant: Quant,
     mode: OperatingMode,
     frame_index: u32,
+    data: UpdateEncoderData,
+    #[cfg(test)]
+    pub(super) compressed_tiles: usize,
 }
 
 impl RfxEncoder {
@@ -36,6 +47,9 @@ impl RfxEncoder {
             quant: quality.remotefx_quant(),
             mode,
             frame_index: 0,
+            data: UpdateEncoderData::default(),
+            #[cfg(test)]
+            compressed_tiles: 0,
         }
     }
 
@@ -50,30 +64,56 @@ impl RfxEncoder {
     pub(crate) fn encode(
         &mut self,
         bitmap: &BitmapUpdate,
-        output: &mut [u8],
+        output: &mut Vec<u8>,
         desktop_size: Option<DesktopSize>,
-    ) -> EncodeResult<usize> {
-        let mut cursor = WriteCursor::new(output);
-        let entropy_algorithm = self.entropy_algorithm;
+        max_output: usize,
+    ) -> EncodeResult<Option<usize>> {
+        let result = self.encode_prepared(bitmap, output, desktop_size, max_output);
+        self.data.trim_cache();
+        result
+    }
 
-        // header messages
+    fn encode_prepared(
+        &mut self,
+        bitmap: &BitmapUpdate,
+        output: &mut Vec<u8>,
+        desktop_size: Option<DesktopSize>,
+        max_output: usize,
+    ) -> EncodeResult<Option<usize>> {
+        let entropy_algorithm = self.entropy_algorithm;
+        let encoder = UpdateEncoder::new(bitmap, self.quant.clone(), entropy_algorithm);
+        let (tiles_x, tiles_y) = encoder.tiles_xy();
+        let count = tiles_x * tiles_y;
+        if self.data.0.len() < count {
+            self.data.0.resize_with(count, TileData::default);
+        }
+        #[cfg(test)]
+        {
+            self.compressed_tiles += count;
+        }
+        let tiles = encoder.encode(&mut self.data.0[..count])?;
+        let mut blocks = Vec::with_capacity(8);
+
+        // MS-RDPRFX 3.1.5 requires headers before every image; 3.1.8.3.1
+        // permits repeating them in video mode too. Every partition remains
+        // independently decodable, including after an oversized candidate.
         if let Some(desktop_size) = desktop_size {
             let width = desktop_size.width;
             let height = desktop_size.height;
-            Block::Sync(SyncPdu).encode(&mut cursor)?;
+            blocks.push(Block::Sync(SyncPdu));
             let context = rfx::ContextPdu {
                 flags: self.mode,
                 entropy_algorithm,
             };
-            Block::CodecChannel(CodecChannel::Context(context)).encode(&mut cursor)?;
+            blocks.push(Block::CodecChannel(CodecChannel::Context(context)));
 
             let channels = ChannelsPdu(vec![RfxChannel {
                 width: cast_length!("width", width)?,
                 height: cast_length!("height", height)?,
             }]);
-            Block::Channels(channels).encode(&mut cursor)?;
+            blocks.push(Block::Channels(channels));
 
-            Block::CodecVersions(CodecVersionsPdu).encode(&mut cursor)?;
+            blocks.push(Block::CodecVersions(CodecVersionsPdu));
         }
 
         // data messages
@@ -81,7 +121,7 @@ impl RfxEncoder {
             index: self.frame_index,
             number_of_regions: 1,
         };
-        Block::CodecChannel(CodecChannel::FrameBegin(frame_begin)).encode(&mut cursor)?;
+        blocks.push(Block::CodecChannel(CodecChannel::FrameBegin(frame_begin)));
 
         let width = bitmap.width.get();
         let height = bitmap.height.get();
@@ -92,29 +132,41 @@ impl RfxEncoder {
             height,
         }];
         let region = RegionPdu { rectangles };
-        Block::CodecChannel(CodecChannel::Region(region)).encode(&mut cursor)?;
+        blocks.push(Block::CodecChannel(CodecChannel::Region(region)));
 
-        let quant = self.quant.clone();
-
-        let (encoder, mut data) = UpdateEncoder::new(bitmap, quant.clone(), entropy_algorithm);
-        let tiles = encoder.encode(&mut data)?;
-
-        let quants = vec![quant];
+        let quants = vec![self.quant.clone()];
         let tile_set = TileSetPdu {
             entropy_algorithm,
             quants,
             tiles,
         };
-        Block::CodecChannel(CodecChannel::TileSet(tile_set)).encode(&mut cursor)?;
+        blocks.push(Block::CodecChannel(CodecChannel::TileSet(tile_set)));
 
         let frame_end = FrameEndPdu;
-        Block::CodecChannel(CodecChannel::FrameEnd(frame_end)).encode(&mut cursor)?;
+        blocks.push(Block::CodecChannel(CodecChannel::FrameEnd(frame_end)));
 
-        let len = cursor.pos();
+        // Compression is complete. Protocol sizes depend only on the resulting
+        // component lengths, so output growth never repeats DWT/RLGR work.
+        let len = blocks.iter().try_fold(0usize, |size, block| {
+            size.checked_add(block.size())
+                .ok_or_else(|| other_err!("rfxenc", "serialized size overflow"))
+        })?;
+        if len > max_output {
+            return Ok(None);
+        }
+        output.resize(len, 0);
+        let mut cursor = WriteCursor::new(output);
+        for block in blocks {
+            block.encode(&mut cursor)?;
+        }
+        debug_assert_eq!(cursor.pos(), len);
+        Ok(Some(len))
+    }
+
+    pub(super) fn commit_frame(&mut self) {
         if !self.is_image_mode() {
             self.frame_index = self.frame_index.wrapping_add(1);
         }
-        Ok(len)
     }
 }
 
@@ -124,9 +176,47 @@ pub(crate) struct UpdateEncoder<'a> {
     entropy_algorithm: rfx::EntropyAlgorithm,
 }
 
+#[derive(Debug, Default)]
 struct UpdateEncoderData(Vec<TileData>);
 
-#[derive(Clone, Default)]
+impl UpdateEncoderData {
+    fn retained_bytes(&self) -> usize {
+        self.0.capacity() * core::mem::size_of::<TileData>()
+            + self
+                .0
+                .iter()
+                .map(|tile| tile.y.capacity() + tile.cb.capacity() + tile.cr.capacity())
+                .sum::<usize>()
+    }
+
+    fn trim_cache(&mut self) {
+        if self.retained_bytes() <= MAX_CACHED_BYTES {
+            return;
+        }
+        let mut bytes = 0usize;
+        let count = self
+            .0
+            .iter()
+            .take_while(|tile| {
+                bytes += core::mem::size_of::<TileData>()
+                    + tile.y.capacity()
+                    + tile.cb.capacity()
+                    + tile.cr.capacity();
+                bytes <= MAX_CACHED_BYTES
+            })
+            .count();
+        if count < self.0.len() {
+            self.0.truncate(count);
+            self.0.shrink_to_fit();
+        }
+        // Allocators may retain spare capacity even after shrink_to_fit.
+        if self.retained_bytes() > MAX_CACHED_BYTES {
+            self.0 = Vec::new();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct TileData {
     y: Vec<u8>,
     cb: Vec<u8>,
@@ -144,21 +234,12 @@ impl<'a> UpdateEncoder<'a> {
         bitmap: &'a BitmapUpdate,
         quant: Quant,
         entropy_algorithm: rfx::EntropyAlgorithm,
-    ) -> (Self, UpdateEncoderData) {
-        let this = Self {
+    ) -> Self {
+        Self {
             bitmap,
             quant,
             entropy_algorithm,
-        };
-        let data = this.alloc_data();
-
-        (this, data)
-    }
-
-    fn alloc_data(&self) -> UpdateEncoderData {
-        let (tiles_x, tiles_y) = self.tiles_xy();
-
-        UpdateEncoderData(vec![TileData::default(); tiles_x * tiles_y])
+        }
     }
 
     fn tiles_xy(&self) -> (usize, usize) {
@@ -168,16 +249,16 @@ impl<'a> UpdateEncoder<'a> {
         )
     }
 
-    fn encode(&self, data: &'a mut UpdateEncoderData) -> EncodeResult<Vec<rfx::Tile<'a>>> {
+    fn encode<'b>(&self, data: &'b mut [TileData]) -> EncodeResult<Vec<rfx::Tile<'b>>> {
         #[cfg(feature = "rayon")]
         use rayon::prelude::*;
 
         let (tiles_x, tiles_y) = self.tiles_xy();
 
         #[cfg(not(feature = "rayon"))]
-        let chunks = data.0.iter_mut();
+        let chunks = data.iter_mut();
         #[cfg(feature = "rayon")]
-        let chunks = data.0.par_iter_mut();
+        let chunks = data.par_iter_mut();
 
         let tiles: Vec<_> = (0..tiles_y)
             .flat_map(|y| (0..tiles_x).map(move |x| (x, y)))
@@ -284,14 +365,17 @@ pub(crate) mod bench {
         tile_x: usize,
         tile_y: usize,
     ) {
-        let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let enc = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let mut data = TileData::default();
 
-        enc.encode_tile(tile_x, tile_y, &mut data.0[0])
+        enc.encode_tile(tile_x, tile_y, &mut data)
             .expect("cannot propagate error in benchmark");
     }
 
     pub fn rfx_enc(bitmap: &BitmapUpdate, quant: &Quant, algo: rfx::EntropyAlgorithm) {
-        let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let enc = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let (tiles_x, tiles_y) = enc.tiles_xy();
+        let mut data = vec![TileData::default(); tiles_x * tiles_y];
 
         enc.encode(&mut data)
             .expect("cannot propagate error in benchmark");

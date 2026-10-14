@@ -7,6 +7,7 @@ use ironrdp_graphics::diff::Rect;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct UpdateLimits {
     max_payload: usize,
+    bitmap_budget: usize,
 }
 
 impl Default for UpdateLimits {
@@ -15,6 +16,7 @@ impl Default for UpdateLimits {
         // be reassembled. Each independently encoded update fits one packet.
         Self {
             max_payload: super::fast_path::MAX_FASTPATH_UPDATE_SIZE,
+            bitmap_budget: super::fast_path::MAX_FASTPATH_UPDATE_SIZE,
         }
     }
 }
@@ -28,6 +30,7 @@ impl UpdateLimits {
             // Also bound our work if a peer announces an enormous allocation.
             // This is the maximum advertised by our own server capabilities.
             max_payload: bytes.min(16_777_215) as usize,
+            bitmap_budget: bytes.min(16_777_215) as usize,
         }
     }
 
@@ -35,11 +38,27 @@ impl UpdateLimits {
         self.max_payload
     }
 
+    pub(super) fn set_bitmap_budget(&mut self, bytes: usize) -> usize {
+        // A working budget controls latency, not negotiated capability. Avoid
+        // needlessly splitting a single RemoteFX tile for a tiny policy target;
+        // an actually smaller client receive limit must still be honored.
+        self.bitmap_budget = if bytes == 0 {
+            self.max_payload
+        } else {
+            bytes.max(16 * 1024).min(self.max_payload)
+        };
+        self.bitmap_budget
+    }
+
+    pub(super) fn bitmap_budget(self) -> usize {
+        self.bitmap_budget
+    }
+
     pub(super) fn should_partition(self, rect: &Rect) -> bool {
         // Avoid first encoding an entire desktop for a small receive buffer.
         // Keep at least one RemoteFX tile so edge padding cannot inflate the
         // amount of work; the actual encoded byte limit is checked afterward.
-        rect.width.saturating_mul(rect.height) > (self.max_payload / 4).max(64 * 64)
+        rect.width.saturating_mul(rect.height) > (self.bitmap_budget / 4).max(64 * 64)
     }
 }
 

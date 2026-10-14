@@ -37,6 +37,7 @@ export interface Metrics {
   applied_encoder_bitrate: number | null;
   encoder_bitrate_update_failures: number;
   bitmap_codec: string | null;
+  bitmap_update_budget_bytes?: number | null;
   negotiated_client_depth: number | null;
   client_queue_depth_bytes: number | null;
   ack_suspended: boolean;

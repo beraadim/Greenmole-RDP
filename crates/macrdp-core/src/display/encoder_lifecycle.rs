@@ -77,7 +77,10 @@ impl MacDisplayUpdates {
         self.encoder_startup_attempted = true;
         let width = self.capture_config.width;
         let height = self.capture_config.height;
-        let fps = self.capture_config.frame_rate as f32;
+        // Raw fallback may temporarily pace capture below the intended video
+        // rate while a previous initializer retires. Initialize AVC for the
+        // video controller's rate, which is restored when it becomes ready.
+        let fps = self.bitrate_ctrl.current_fps() as f32;
         let bitrate = self.bitrate_ctrl.current_bitrate();
         let quality = self.quality;
         let preference = self.encoder_pref;

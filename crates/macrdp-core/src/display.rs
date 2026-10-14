@@ -3,6 +3,7 @@ mod bitmap_pacing;
 mod bitmap_updates;
 pub(crate) mod capture_lifecycle;
 mod capture_recovery;
+mod cursor_fairness;
 mod damage;
 mod encoder_lifecycle;
 pub(crate) mod encoder_startup;
@@ -11,6 +12,7 @@ use native_capture::NativeCapture;
 mod event_wait;
 mod idle_encode;
 mod idle_policy;
+mod uncompressed_pacing;
 use damage::FrameDamage;
 use event_wait::DisplayWake;
 
@@ -45,11 +47,6 @@ const UNCOMPRESSED_MAX_PIXELS: u32 = 1_048_576;
 /// Keep only genuinely tiny UI/cursor rects on the uncompressed fast path
 /// once AVC is available. Larger updates should prefer hardware/software AVC.
 const UNCOMPRESSED_TINY_UI_MAX_PIXELS: u32 = 8_192;
-const UNCOMPRESSED_DUPLICATE_MIN_INTERVAL: Duration = Duration::from_millis(120);
-const UNCOMPRESSED_LARGE_UPDATE_BYTES: usize = 512 * 1024;
-const UNCOMPRESSED_LARGE_REPEAT_MIN_INTERVAL: Duration = Duration::from_millis(3_500);
-const UNCOMPRESSED_LARGE_GEOMETRY_REPEAT_MIN_INTERVAL: Duration = Duration::from_millis(1_500);
-const UNCOMPRESSED_FULL_FRAME_MIN_INTERVAL: Duration = Duration::from_millis(2_000);
 // Guacamole never acknowledges our AVC frames, so waiting for a full dozen
 // frames just burns several seconds before the usable bitmap path kicks in.
 const AVC_NO_ACK_FALLBACK_FRAMES: u32 = 4;
@@ -314,20 +311,6 @@ fn extract_bgra_rect(bgra: &[u8], stride: usize, rect: ClampedRect) -> Option<By
     }
 
     Some(Bytes::from(pixels))
-}
-
-fn fingerprint_uncompressed_rects(rects: &[UncompressedRect]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-
-    for rect in rects {
-        rect.x.hash(&mut hasher);
-        rect.y.hash(&mut hasher);
-        rect.width.hash(&mut hasher);
-        rect.height.hash(&mut hasher);
-        rect.pixel_data.as_ref().hash(&mut hasher);
-    }
-
-    hasher.finish()
 }
 
 fn fingerprint_cursor_shape(shape: &CursorShape) -> u64 {
@@ -891,12 +874,8 @@ impl RdpServerDisplay for MacDisplay {
             last_cursor_fingerprint: None,
             cursor_capture: CursorCapture::default(),
             next_cursor_poll_at: Instant::now(),
-            last_uncompressed_rects: None,
-            last_uncompressed_sent: None,
-            last_full_frame_sent: None,
-            last_large_uncompressed_fingerprint: None,
-            last_large_uncompressed_sent: None,
-            last_large_uncompressed_rects: None,
+            cursor_fairness: cursor_fairness::CursorFairness::default(),
+            uncompressed_pacing: uncompressed_pacing::UncompressedPacing::default(),
             bitrate_ctrl,
             last_applied_fps: initial_fps,
             has_pending_submit: false,
@@ -994,19 +973,8 @@ struct MacDisplayUpdates {
     cursor_capture: CursorCapture,
     /// Deadline for the next host cursor-shape poll.
     next_cursor_poll_at: Instant,
-    /// Last uncompressed rect set sent, used to suppress duplicate bursts.
-    last_uncompressed_rects: Option<Vec<ClampedRect>>,
-    /// Timestamp of the last uncompressed update emission.
-    last_uncompressed_sent: Option<Instant>,
-    /// Timestamp of the last full-frame uncompressed emission.
-    last_full_frame_sent: Option<Instant>,
-    /// Fingerprint of the last large uncompressed payload we actually sent.
-    last_large_uncompressed_fingerprint: Option<u64>,
-    /// Timestamp of the last large uncompressed payload emission.
-    last_large_uncompressed_sent: Option<Instant>,
-    /// Geometry of the last large uncompressed update, tracked independently so
-    /// tiny interleaved UI rects do not reset hotspot suppression.
-    last_large_uncompressed_rects: Option<Vec<ClampedRect>>,
+    cursor_fairness: cursor_fairness::CursorFairness,
+    uncompressed_pacing: uncompressed_pacing::UncompressedPacing,
     /// Adaptive bitrate/fps controller.
     bitrate_ctrl: BitrateController,
     /// Last FPS acknowledged by the native capturer; desired rate is kept in
@@ -1051,6 +1019,19 @@ struct MacDisplayUpdates {
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
+    fn poll_pointer_update(&mut self) -> Option<DisplayUpdate> {
+        // The transport has completed a bitmap partition. Keep the same
+        // shape deadline/cache as ordinary cursor polling, and count any
+        // emitted pointer toward fairness before the next queued core region.
+        self.cursor_fairness.graphics_sent();
+        let update = self.poll_cursor_update_if_due();
+        if update.is_some() {
+            self.cursor_fairness
+                .pointer_sent(!self.pending_bitmap_updates.is_empty());
+        }
+        update
+    }
+
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         loop {
             let resize_rx = self.resize_rx.clone();
@@ -1092,6 +1073,17 @@ impl MacDisplayUpdates {
             self.sync_encoder_startup();
             self.sync_applied_capture_fps();
             self.sync_bitmap_pacing();
+            self.sync_uncompressed_pacing();
+            let bitmap_pending = !self.pending_bitmap_updates.is_empty();
+            // A slow bitmap batch may span many cursor polling intervals.
+            // Permit one due shape/hide update before the next region, while
+            // ensuring continuous cursor changes cannot starve the batch.
+            if self.cursor_fairness.may_poll(bitmap_pending) {
+                if let Some(update) = self.poll_cursor_update_if_due() {
+                    self.cursor_fairness.pointer_sent(bitmap_pending);
+                    return Ok(Some(update));
+                }
+            }
             if !self.pending_bitmap_updates.is_empty() || self.deferred_bitmap_frame.is_some() {
                 if let Some(mut latest) = self
                     .capturer
@@ -1127,11 +1119,8 @@ impl MacDisplayUpdates {
                 };
                 self.bitmap_copy_stats.record(&materialized);
                 self.record_bitmap_audit(&materialized.update, "queued-bitmap-region");
+                self.cursor_fairness.graphics_sent();
                 return Ok(Some(DisplayUpdate::Bitmap(materialized.update)));
-            }
-
-            if let Some(update) = self.poll_cursor_update_if_due() {
-                return Ok(Some(update));
             }
 
             // Await the codec callback itself: a desktop can become idle
@@ -1196,6 +1185,19 @@ impl MacDisplayUpdates {
             }
 
             self.refresh_capture_transport_if_needed().await?;
+
+            if let Some(delay) = self.uncompressed_pacing.delay(Instant::now()) {
+                // Do not take a capture until the completed-write budget is
+                // ready. The mailbox coalesces newer pixels and damage during
+                // this wait; cursor and encoder-startup timers remain active.
+                event_wait::next_event(
+                    std::future::pending::<()>(),
+                    Some(delay),
+                    self.cursor_poll_timeout(),
+                )
+                .await;
+                continue;
+            }
 
             // Capture events and timers all return to this outer loop. A cursor
             // timeout must advance its deadline even when the desktop is idle.
@@ -1449,12 +1451,6 @@ impl MacDisplayUpdates {
                 self.sync_applied_capture_fps();
                 self.last_frame_cache = None;
                 self.skip_next_frame = false;
-                self.last_uncompressed_rects = None;
-                self.last_uncompressed_sent = None;
-                self.last_full_frame_sent = None;
-                self.last_large_uncompressed_fingerprint = None;
-                self.last_large_uncompressed_sent = None;
-                self.last_large_uncompressed_rects = None;
                 self.request_full_bitmap_updates(1);
                 self.needs_full_gfx_seed = true;
                 self.mark_client_may_be_stale("capture-recovered");
@@ -1718,14 +1714,6 @@ impl MacDisplayUpdates {
                     update.width as u32 * update.height as u32,
                     "gfx-cached-full-frame-recovery",
                 );
-                self.last_uncompressed_rects = Some(vec![ClampedRect {
-                    x: 0,
-                    y: 0,
-                    width: update.width as u32,
-                    height: update.height as u32,
-                }]);
-                self.last_uncompressed_sent = Some(Instant::now());
-                self.last_full_frame_sent = self.last_uncompressed_sent;
                 self.clear_client_stale_flag("cached-uncompressed-convergence");
                 return Some(DisplayUpdate::GfxUncompressed(update));
             }
@@ -1995,12 +1983,6 @@ impl MacDisplayUpdates {
         self.pending_visible_size = None;
         self.pending_frame_time = None;
         self.last_frame_cache = None;
-        self.last_uncompressed_rects = None;
-        self.last_uncompressed_sent = None;
-        self.last_full_frame_sent = None;
-        self.last_large_uncompressed_fingerprint = None;
-        self.last_large_uncompressed_sent = None;
-        self.last_large_uncompressed_rects = None;
         self.idle_frame_count = 0;
         self.idle_since = None;
         self.skip_next_frame = false;
@@ -2378,7 +2360,7 @@ impl MacDisplayUpdates {
         let refresh_required = self.client_may_be_stale
             || request_bitmap_fallback_full_frames
             || if session_uses_gfx {
-                self.needs_full_gfx_seed || force_full_frame_uncompressed_gfx
+                self.needs_full_gfx_seed
             } else {
                 self.needs_full_bitmap_seed || self.forced_full_bitmap_updates_remaining > 0
             };
@@ -2465,16 +2447,15 @@ impl MacDisplayUpdates {
                 }
             }
 
-            // Validation mode for Guacamole GFX compatibility: after the initial
-            // seed, keep the whole negotiated GFX session on uncompressed
-            // updates so we do not silently fall back into AVC.
+            // During encoder startup/failure or validation, send the latest
+            // uncompressed damage. The outer loop paces completed writes before
+            // taking captures; identical geometry may contain changed pixels.
             if force_full_frame_uncompressed_gfx {
                 let total_area: u32 = frame.dirty_rects.iter().map(|r| r.width * r.height).sum();
                 let use_dirty_rects = !frame.dirty_rects.is_empty()
                     && total_area > 0
                     && total_area <= UNCOMPRESSED_MAX_PIXELS
                     && !self.client_may_be_stale;
-                let rect_signature: Vec<ClampedRect>;
 
                 let rects: Vec<UncompressedRect> = if use_dirty_rects {
                     let prepared_rects = prepare_uncompressed_dirty_rects(
@@ -2482,7 +2463,6 @@ impl MacDisplayUpdates {
                         frame.height,
                         &frame.dirty_rects,
                     );
-                    rect_signature = prepared_rects.clone();
                     match &frame.data {
                         FrameData::Raw(bgra) => prepared_rects
                             .iter()
@@ -2517,27 +2497,6 @@ impl MacDisplayUpdates {
                         FrameData::PixelBuffer(_) => Vec::new(),
                     }
                 } else {
-                    rect_signature = vec![ClampedRect {
-                        x: 0,
-                        y: 0,
-                        width: frame.width,
-                        height: frame.height,
-                    }];
-
-                    if !frame.dirty_rects.is_empty()
-                        && self
-                            .last_full_frame_sent
-                            .is_some_and(|t| t.elapsed() < UNCOMPRESSED_FULL_FRAME_MIN_INTERVAL)
-                    {
-                        tracing::debug!(
-                            total_pixels = total_area,
-                            dirty_rects = frame.dirty_rects.len(),
-                            "Skipping eager full-frame uncompressed fallback"
-                        );
-                        self.mark_client_may_be_stale("full-frame-uncompressed-throttled");
-                        return Ok(None);
-                    }
-
                     let full_rect = ClampedRect {
                         x: 0,
                         y: 0,
@@ -2576,68 +2535,6 @@ impl MacDisplayUpdates {
 
                 if !rects.is_empty() {
                     let total_bytes: usize = rects.iter().map(|r| r.pixel_data.len()).sum();
-                    let large_payload_fingerprint = (total_bytes
-                        >= UNCOMPRESSED_LARGE_UPDATE_BYTES)
-                        .then(|| fingerprint_uncompressed_rects(&rects));
-
-                    if self
-                        .last_uncompressed_sent
-                        .is_some_and(|t| t.elapsed() < UNCOMPRESSED_DUPLICATE_MIN_INTERVAL)
-                        && self
-                            .last_uncompressed_rects
-                            .as_ref()
-                            .is_some_and(|prev| prev == &rect_signature)
-                    {
-                        tracing::debug!(
-                            rects = rect_signature.len(),
-                            update_kind = if use_dirty_rects {
-                                "dirty-rects"
-                            } else {
-                                "full-frame"
-                            },
-                            "Suppressing duplicate uncompressed GFX update burst"
-                        );
-                        self.mark_client_may_be_stale("duplicate-uncompressed-burst");
-                        return Ok(None);
-                    }
-
-                    if large_payload_fingerprint.is_some()
-                        && self
-                            .last_large_uncompressed_rects
-                            .as_ref()
-                            .is_some_and(|prev| prev == &rect_signature)
-                        && self.last_large_uncompressed_sent.is_some_and(|t| {
-                            t.elapsed() < UNCOMPRESSED_LARGE_GEOMETRY_REPEAT_MIN_INTERVAL
-                        })
-                    {
-                        tracing::debug!(
-                            rects = rect_signature.len(),
-                            total_bytes,
-                            fingerprint = ?large_payload_fingerprint,
-                            update_kind = if use_dirty_rects { "dirty-rects" } else { "full-frame" },
-                            "Suppressing repeated large uncompressed GFX update with same geometry"
-                        );
-                        self.mark_client_may_be_stale("large-uncompressed-geometry-repeat");
-                        return Ok(None);
-                    }
-
-                    if large_payload_fingerprint.is_some()
-                        && self
-                            .last_large_uncompressed_sent
-                            .is_some_and(|t| t.elapsed() < UNCOMPRESSED_LARGE_REPEAT_MIN_INTERVAL)
-                        && self.last_large_uncompressed_fingerprint == large_payload_fingerprint
-                    {
-                        tracing::debug!(
-                            rects = rect_signature.len(),
-                            total_bytes,
-                            fingerprint = ?large_payload_fingerprint,
-                            update_kind = if use_dirty_rects { "dirty-rects" } else { "full-frame" },
-                            "Suppressing repeated large uncompressed GFX update with identical payload"
-                        );
-                        self.mark_client_may_be_stale("large-uncompressed-payload-repeat");
-                        return Ok(None);
-                    }
-
                     if !self.logged_gfx_uncompressed_mode {
                         tracing::info!(
                             mode = "gfx-uncompressed-only",
@@ -2650,20 +2547,6 @@ impl MacDisplayUpdates {
                         self.logged_gfx_uncompressed_mode = true;
                     }
                     self.display_frame_count += 1;
-                    self.last_uncompressed_rects = Some(rect_signature.clone());
-                    self.last_uncompressed_sent = Some(Instant::now());
-                    if !use_dirty_rects {
-                        self.last_full_frame_sent = self.last_uncompressed_sent;
-                    }
-                    if let Some(fingerprint) = large_payload_fingerprint {
-                        self.last_large_uncompressed_fingerprint = Some(fingerprint);
-                        self.last_large_uncompressed_sent = self.last_uncompressed_sent;
-                        self.last_large_uncompressed_rects = Some(rect_signature.clone());
-                    } else {
-                        self.last_large_uncompressed_fingerprint = None;
-                        self.last_large_uncompressed_sent = None;
-                        self.last_large_uncompressed_rects = None;
-                    }
                     {
                         let mut st = self.gfx_state.lock().unwrap();
                         st.last_encode_ms = 0.0;
@@ -2679,19 +2562,19 @@ impl MacDisplayUpdates {
                         } else {
                             "full-frame"
                         },
-                        "Display: sending uncompressed GFX update (validation mode)"
+                        "Display: sending paced uncompressed GFX update"
                     );
                     self.record_uncompressed_audit(
                         &rects,
                         total_area,
                         if use_dirty_rects {
-                            "gfx-validation-dirty-rects"
+                            "gfx-uncompressed-dirty-rects"
                         } else {
-                            "gfx-validation-full-frame"
+                            "gfx-uncompressed-full-frame"
                         },
                     );
                     if !use_dirty_rects {
-                        self.clear_client_stale_flag("gfx-validation-full-frame");
+                        self.clear_client_stale_flag("gfx-uncompressed-full-frame");
                     }
                     return Ok(Some(DisplayUpdate::GfxUncompressed(
                         GfxUncompressedUpdate {
@@ -3557,12 +3440,10 @@ mod tests {
     use super::damage::validate_dirty_rects_against_previous_bgra;
     use super::{
         cursor_shape_to_pointer, extract_bgra_rect, fingerprint_cursor_shape,
-        fingerprint_uncompressed_rects, prepare_uncompressed_dirty_rects,
-        should_fallback_from_gfx_avc_no_ack, should_force_full_bitmap_update,
-        should_use_nv12_capture_for_gfx, ClampedRect, DIRTY_RECT_VALIDATION_TILE,
+        prepare_uncompressed_dirty_rects, should_fallback_from_gfx_avc_no_ack,
+        should_force_full_bitmap_update, should_use_nv12_capture_for_gfx, ClampedRect,
+        DIRTY_RECT_VALIDATION_TILE,
     };
-    use bytes::Bytes;
-    use ironrdp_server::UncompressedRect;
     use macrdp_capture::{CursorShape, Rect};
     use std::time::Duration;
 
@@ -3674,29 +3555,6 @@ mod tests {
         assert_eq!(
             bytes.as_ref(),
             &[4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 22, 23, 24, 25, 26, 27]
-        );
-    }
-
-    #[test]
-    fn fingerprints_change_when_payload_changes() {
-        let rect_a = UncompressedRect {
-            x: 5,
-            y: 6,
-            width: 2,
-            height: 2,
-            pixel_data: Bytes::from_static(&[1, 2, 3, 4]),
-        };
-        let rect_b = UncompressedRect {
-            x: 5,
-            y: 6,
-            width: 2,
-            height: 2,
-            pixel_data: Bytes::from_static(&[1, 2, 3, 9]),
-        };
-
-        assert_ne!(
-            fingerprint_uncompressed_rects(&[rect_a]),
-            fingerprint_uncompressed_rects(&[rect_b])
         );
     }
 
