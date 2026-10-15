@@ -39,7 +39,7 @@ use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::display_control::DisplayControlChannel;
 use crate::dynamic_channels::DynamicChannels;
-use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
+use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs, UpdateFragmenter};
 use crate::gfx::{ConnectionOutcome, GfxHandler, GfxState};
 use crate::handler::{ClientInputContext, RdpServerInputHandler};
 use crate::{builder, capabilities, SoundServerFactory};
@@ -51,6 +51,9 @@ mod tests;
 #[cfg(test)]
 #[path = "display_partition_tests.rs"]
 mod display_partition_tests;
+#[cfg(test)]
+#[path = "frame_boundary_tests.rs"]
+mod frame_boundary_tests;
 #[cfg(test)]
 #[path = "transport_tests.rs"]
 mod transport_tests;
@@ -738,6 +741,30 @@ impl RdpServer {
         Ok(state)
     }
 
+    /// Writes only complete Fast-Path updates, including negotiated markers.
+    async fn write_frame_marker(
+        marker: Option<UpdateFragmenter>,
+        writer: &mut SharedWriter<'_, impl FramedWrite>,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(usize, f64)> {
+        let Some(mut marker) = marker else {
+            return Ok((0, 0.0));
+        };
+        if marker.size_hint() > buffer.len() {
+            buffer.resize(marker.size_hint(), 0);
+        }
+        let started = std::time::Instant::now();
+        let mut bytes = 0;
+        while let Some(len) = marker.next(buffer) {
+            writer
+                .write_all(&buffer[..len])
+                .await
+                .context("failed to write surface frame marker")?;
+            bytes += len;
+        }
+        Ok((bytes, started.elapsed().as_secs_f64() * 1000.0))
+    }
+
     async fn dispatch_display_update(
         update: DisplayUpdate,
         writer: &mut SharedWriter<'_, impl FramedWrite>,
@@ -750,6 +777,16 @@ impl RdpServer {
         display_updates: &mut dyn crate::RdpServerDisplayUpdates,
     ) -> Result<(RunState, UpdateEncoder)> {
         let is_bitmap_update = matches!(&update, DisplayUpdate::Bitmap(_));
+
+        // A failed/abandoned capture batch or resize must not leave the next
+        // frame inside an old marker. Pointer-only updates may interleave while
+        // capture regions remain queued, preserving cursor responsiveness.
+        if !is_bitmap_update
+            && (matches!(&update, DisplayUpdate::Resize(_))
+                || !display_updates.bitmap_frame_pending())
+        {
+            Self::write_frame_marker(encoder.end_bitmap_frame()?, writer, buffer).await?;
+        }
 
         if let DisplayUpdate::Resize(desktop_size) = update {
             debug!(?desktop_size, "Display resize");
@@ -881,6 +918,15 @@ impl RdpServer {
             };
 
             let mut fragmenter = fragmenter.context("error while encoding")?;
+            // Delay BEGIN until actual pixels exist, so an unchanged update
+            // neither sends empty frames nor holds a client waiting for END.
+            if is_bitmap_update {
+                let (bytes, elapsed) =
+                    Self::write_frame_marker(encoder_iter.begin_bitmap_frame()?, writer, buffer)
+                        .await?;
+                bytes_written = bytes_written.saturating_add(bytes);
+                write_ms += elapsed;
+            }
             if fragmenter.size_hint() > buffer.len() {
                 buffer.resize(fragmenter.size_hint(), 0);
             }
@@ -915,6 +961,13 @@ impl RdpServer {
         }
 
         if is_bitmap_update {
+            if !display_updates.bitmap_frame_pending() {
+                let (bytes, elapsed) =
+                    Self::write_frame_marker(encoder_iter.end_bitmap_frame()?, writer, buffer)
+                        .await?;
+                bytes_written = bytes_written.saturating_add(bytes);
+                write_ms += elapsed;
+            }
             let mut state = gfx_state.lock().unwrap();
             state.record_encode_timing(encode_ms);
             state.bitmap_dispatches = state.bitmap_dispatches.saturating_add(1);
@@ -1570,6 +1623,7 @@ impl RdpServer {
             client_preferred_depth = ?client_depth,
             bitmap_wire_depth = 32,
             max_bitmap_update_bytes,
+            surface_frame_markers = encoder.surface_frame_markers(),
             "Configured bitmap transport"
         );
 

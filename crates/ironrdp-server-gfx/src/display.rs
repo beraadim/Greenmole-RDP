@@ -302,6 +302,14 @@ pub trait RdpServerDisplayUpdates {
         None
     }
 
+    /// Whether more regions of the currently dispatched capture remain queued.
+    /// Surface frame markers remain open across those regions when negotiated.
+    /// Return false once the final region is yielded, after abandoning a batch,
+    /// or before a resize. Other providers keep one frame per bitmap update.
+    fn bitmap_frame_pending(&self) -> bool {
+        false
+    }
+
     /// # Cancel safety
     ///
     /// This method MUST be cancellation safe because it is used in a

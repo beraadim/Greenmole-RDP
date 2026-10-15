@@ -1019,6 +1019,10 @@ struct MacDisplayUpdates {
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
+    fn bitmap_frame_pending(&self) -> bool {
+        !self.pending_bitmap_updates.is_empty()
+    }
+
     fn poll_pointer_update(&mut self) -> Option<DisplayUpdate> {
         // The transport has completed a bitmap partition. Keep the same
         // shape deadline/cache as ordinary cursor polling, and count any

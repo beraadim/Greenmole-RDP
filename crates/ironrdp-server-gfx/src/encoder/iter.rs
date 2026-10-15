@@ -29,6 +29,14 @@ pub(crate) struct EncoderIter<'a> {
 }
 
 impl EncoderIter<'_> {
+    pub(crate) fn begin_bitmap_frame(&mut self) -> Result<Option<UpdateFragmenter>> {
+        self.encoder.begin_bitmap_frame()
+    }
+
+    pub(crate) fn end_bitmap_frame(&mut self) -> Result<Option<UpdateFragmenter>> {
+        self.encoder.end_bitmap_frame()
+    }
+
     /// Encode a cursor update between complete bitmap partitions without
     /// consuming pending damage or committing the framebuffer. The caller must
     /// finish each fragmenter before inserting another update on the wire.

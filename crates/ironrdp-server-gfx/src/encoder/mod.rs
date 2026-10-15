@@ -27,6 +27,7 @@ use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
 mod allocation_tests;
 mod bitmap;
 mod fast_path;
+mod frame_markers;
 mod iter;
 mod limits;
 pub(crate) use iter::EncoderIter;
@@ -143,6 +144,7 @@ pub(crate) struct UpdateEncoder {
     framebuffer: Option<Framebuffer>,
     bitmap_updater: Option<BitmapUpdater>,
     limits: UpdateLimits,
+    frame_markers: frame_markers::FrameMarkers,
 }
 
 impl fmt::Debug for UpdateEncoder {
@@ -193,7 +195,13 @@ impl UpdateEncoder {
             BitmapUpdater::Bitmap(bitmap)
         };
 
+        // Surface markers only describe the Surface Commands graphics path.
+        // Legacy BitmapUpdate must remain compatible even when the client has
+        // separately advertised support for surface commands.
+        let markers_supported = surface_flags.contains(CmdFlags::FRAME_MARKER)
+            && !matches!(&bitmap_updater, BitmapUpdater::Bitmap(_));
         Ok(Self {
+            frame_markers: frame_markers::FrameMarkers::new(markers_supported),
             desktop_size,
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
@@ -231,6 +239,18 @@ impl UpdateEncoder {
             encoder: self,
             state: State::Start(update),
         }
+    }
+
+    pub(crate) fn begin_bitmap_frame(&mut self) -> Result<Option<UpdateFragmenter>> {
+        self.frame_markers.begin()
+    }
+
+    pub(crate) fn end_bitmap_frame(&mut self) -> Result<Option<UpdateFragmenter>> {
+        self.frame_markers.end()
+    }
+
+    pub(crate) fn surface_frame_markers(&self) -> bool {
+        self.frame_markers.supported()
     }
 
     pub(crate) fn set_desktop_size(&mut self, size: DesktopSize) {
