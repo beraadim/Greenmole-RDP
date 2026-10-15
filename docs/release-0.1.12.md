@@ -45,3 +45,17 @@ cursor movement during large updates and the lossless bitmap fallback.
 
 The user installs and tests this package; the release workflow does not replace
 the running Mac server or change its current settings.
+
+## Delivered artifact
+
+Built on the Mac mini on 2026-10-15 from source commit
+`80fea0da89821accf34db174740b2e86f2ffcd62`, with ad-hoc signing. The verified
+ARM64 package and its checksum/build metadata were copied to
+`/Users/beraadim/Desktop/macrdp_0.1.12_aarch64_80fea0da8982.dmg`.
+
+SHA-256: `17f34344ae840a1f345bfedc3625c64d10d88363a64dc1cc2d1c51c201ce7381`.
+
+The build verified the application signature and DMG checksum; delivery also
+checked the embedded version, source revision and architecture, rechecked the
+application signature, and compared all three Desktop files with the build
+outputs. The running server was not replaced or restarted.
