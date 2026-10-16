@@ -26,7 +26,7 @@ extern "C" {
     ) -> i32;
 }
 
-fn online_display_ids() -> Result<Vec<u32>> {
+pub(crate) fn online_display_ids() -> Result<Vec<u32>> {
     let mut capacity = 16u32;
     for _ in 0..4 {
         let mut ids = vec![0; capacity as usize];

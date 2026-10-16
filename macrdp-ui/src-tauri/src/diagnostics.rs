@@ -38,18 +38,20 @@ pub async fn export_diagnostics(
     let lifecycle = state.lifecycle_lock.lock().await;
     let config = state.ui_config.lock().await.clone();
     let history = state.diagnostic_history.lock().await.snapshot();
-    let (status, metrics, connection_count) = {
+    let (status, metrics, connection_count, supervision) = {
         let handles = state.server_handle.lock().await;
         match handles.as_ref() {
             Some(handle) => (
                 handle.status(),
                 handle.metrics(),
                 usize::from(handle.active_connection().is_some()),
+                Some(safe_supervision(&handle.diagnostics())),
             ),
             None => (
                 state.status.lock().await.clone(),
                 macrdp_core::Metrics::default(),
                 0,
+                None,
             ),
         }
     };
@@ -75,7 +77,7 @@ pub async fn export_diagnostics(
             },
         );
         let report = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -92,6 +94,7 @@ pub async fn export_diagnostics(
             },
             "permissions": permissions,
             "metrics": safe_metrics(&metrics),
+            "supervision": supervision,
             "history": history,
             "recent_events": logs,
             "privacy": "Only selected operational fields are included. Credentials, input text, clipboard contents, addresses, client names, paths, raw log messages and free-form error details are excluded."
@@ -129,9 +132,47 @@ fn service_state(value: &str) -> &'static str {
         "starting" => "starting",
         "stopping" => "stopping",
         "cleanup_pending" => "cleanup_pending",
+        "recovering" => "recovering",
         "stopped" => "stopped",
         _ => "error",
     }
+}
+
+fn safe_native_operation(value: &str) -> &str {
+    selection(
+        value,
+        &[
+            "start",
+            "start_failure_cleanup",
+            "set_frame_rate",
+            "replace",
+            "replace_stop",
+            "replace_start",
+            "stop",
+            "release_display_owner",
+            "restore_display",
+            "shutdown_display",
+            "recovery_old_stop",
+            "recovery_new_start",
+            "recovery_cancel_cleanup",
+            "recovery_probe_cleanup",
+            "recovery_unclaimed_cleanup",
+            "recovery_probe",
+        ],
+    )
+}
+
+/// Explicit selection keeps future free-form error text out of shareable exports.
+fn safe_supervision(value: &macrdp_core::supervised::SupervisionDiagnostics) -> Value {
+    json!({
+        "enabled": value.enabled,
+        "phase": selection(value.phase, &["starting", "running", "recovering", "stopping", "stopped", "error"]),
+        "worker_pid": value.worker_pid,
+        "native_operation": value.native_operation.as_deref().map(safe_native_operation),
+        "native_operation_elapsed_ms": value.native_operation_elapsed_ms,
+        "restart_count": value.restart_count,
+        "recovery_result": selection(value.recovery_result, &["none", "restored", "blocked"]),
+    })
 }
 
 fn selection<'a>(value: &str, allowed: &'a [&'a str]) -> &'a str {
@@ -292,6 +333,8 @@ fn safe_outcome(value: &str) -> &str {
             "peer_eof",
             "idle_timeout",
             "server_shutdown",
+            "native_worker_recovery",
+            "server_stopped",
             "credentials_changed",
             "handshake_timeout",
             "handshake_rejected",
@@ -328,6 +371,25 @@ fn event_category(message: &str) -> &'static str {
         ("TLS identity ready", "tls_ready"),
         ("Renewed managed TLS identity", "tls_renewed"),
         ("Screen capture started", "capture_started"),
+        (
+            "Screen capture stopped by the system",
+            "capture_system_stopped",
+        ),
+        (
+            "Native capture recovery is still pending",
+            "capture_recovery_pending",
+        ),
+        ("Slow native operation completed", "native_operation_slow"),
+        ("Server worker failure", "worker_failure"),
+        ("Isolated worker retired", "worker_retired"),
+        (
+            "Local desktop restored; restarting RDP listener",
+            "worker_restarted",
+        ),
+        (
+            "Local desktop recovery completed",
+            "local_recovery_completed",
+        ),
         (
             "Capture cleanup could not confirm stop",
             "capture_cleanup_failed",
@@ -421,10 +483,28 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             "keepalive_retries",
             "bitmap_update_budget_bytes",
             "previous_budget_bytes",
+            "operation_id",
+            "operation_elapsed_ms",
+            "recovery_elapsed_ms",
+            "elapsed_ms",
+            "worker_pid",
+            "restart_attempt",
+            "display_count",
         ] {
             if let Some(value) = event["fields"].get(key).filter(|v| v.is_number()) {
                 fields.insert(key.into(), value.clone());
             }
+        }
+        if matches!(
+            category,
+            "capture_recovery_pending" | "native_operation_slow" | "worker_failure"
+        ) {
+            fields.insert(
+                "operation".into(),
+                json!(safe_native_operation(
+                    event["fields"]["operation"].as_str().unwrap_or("")
+                )),
+            );
         }
         if category == "connection_outcome" || category == "connection_transport_ended" {
             fields.insert(

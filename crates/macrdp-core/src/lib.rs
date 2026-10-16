@@ -7,17 +7,22 @@ pub mod credentials;
 pub mod display;
 pub mod handler;
 pub mod log_bridge;
+pub mod native_watchdog;
 pub mod perf_stats;
 pub mod permissions;
 pub mod server;
+pub mod supervised;
 pub mod tls;
 
 pub use callbacks::*;
 pub use config::{config_dir, AudioConfig, ClipboardConfig, ServerConfig};
 pub use log_bridge::{flush_logs, init_log_file, log_file_path, LogBridgeLayer};
 pub use macrdp_display::{
-    run_display_helper_if_requested, DisplayBackend, DisplayGeometry, WindowMoveReport,
+    run_display_helper_if_requested, list_owned_virtual_displays,
+    wait_for_owned_virtual_display_removal, physical_display_geometry,
+    recover_stranded_windows_on_physical_display, DisplayBackend, DisplayGeometry, WindowMoveReport,
 };
 pub use server::{
     resolve_resolution, server_resources_pending, start_server, ServerHandle, StopOutcome,
 };
+pub use supervised::{run_server_helper_if_requested, start_supervised_server, start_supervised_server_with_perf, supervisor_resources_pending, SupervisedServerHandle};

@@ -18,6 +18,7 @@ import type {
 export const api = {
   startServer: () => invoke<void>("start_server"),
   stopServer: () => invoke<void>("stop_server"),
+  recoverLocalDesktop: () => invoke<void>("recover_local_desktop"),
   getServerStatus: () => invoke<ServerStatus>("get_server_status"),
   getMetrics: () => invoke<Metrics>("get_metrics"),
   getConnections: () => invoke<Connection[]>("get_connections"),

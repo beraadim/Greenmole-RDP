@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn supervised_recovery_exports_stage_age_and_result_without_free_form_text() {
+    let mut supervision = macrdp_core::supervised::SupervisionDiagnostics {
+        enabled: true,
+        phase: "recovering",
+        worker_pid: Some(42),
+        native_operation: Some("set_frame_rate".into()),
+        native_operation_elapsed_ms: 31_000,
+        restart_count: 1,
+        recovery_result: "restored",
+    };
+    let safe = safe_supervision(&supervision);
+    assert_eq!(safe["native_operation"], "set_frame_rate");
+    assert_eq!(safe["native_operation_elapsed_ms"], 31_000);
+    assert_eq!(safe["recovery_result"], "restored");
+    supervision.native_operation = Some("private-user-data".into());
+    supervision.phase = "private-user-data";
+    supervision.recovery_result = "private-user-data";
+    assert!(!safe_supervision(&supervision)
+        .to_string()
+        .contains("private-user-data"));
+    let event = json!({"level":"warn", "message":"Native capture recovery is still pending",
+        "fields":{"operation":"set_frame_rate", "operation_elapsed_ms":30000,
+            "recovery_elapsed_ms":3000, "error":"private-user-data"}});
+    let safe = summarize_bytes(format!("{event}\n").as_bytes(), false);
+    assert_eq!(safe["events"][0]["fields"]["operation"], "set_frame_rate");
+    assert!(!safe.to_string().contains("private-user-data"));
+}
+
+#[test]
 fn native_timeouts_and_keepalive_policy_preserve_only_operational_evidence() {
     let transport = json!({"level": "warn", "message": "Connection transport ended",
         "fields": {"reason": "transport_timeout", "socket_error_code": 60,

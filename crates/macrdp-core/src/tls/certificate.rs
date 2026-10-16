@@ -10,7 +10,7 @@ use x509_cert::ext::pkix::{name::GeneralName, SubjectAltName};
 const CERT_VALIDITY_DAYS: i64 = 365;
 
 /// Public identity information only; no private key or credential data.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TlsCertificateInfo {
     pub fingerprint_sha256: String,
     pub expires_at: String,

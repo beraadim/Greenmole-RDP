@@ -15,6 +15,8 @@ use macrdp_capture::{
 };
 use tokio::sync::oneshot;
 
+use crate::native_watchdog::Tracker;
+
 use super::capture_recovery::NativeRetirementFailed;
 
 mod frame_rate;
@@ -35,7 +37,11 @@ pub(super) trait NativeStream: Send + 'static {
     fn receiver(&self) -> Self::Receiver;
     fn frame_rate(&self) -> u32;
     fn set_frame_rate(&mut self, fps: u32) -> Result<()>;
-    fn replace(&mut self, configuration: Self::Configuration) -> Result<Self::Receiver>;
+    fn replace(
+        &mut self,
+        configuration: Self::Configuration,
+        tracker: &Tracker,
+    ) -> Result<Self::Receiver>;
     fn stop(&mut self) -> Result<()>;
 }
 
@@ -55,11 +61,21 @@ impl NativeStream for ScreenCapturer {
         self.set_frame_rate(fps)
     }
 
-    fn replace(&mut self, (config, audio): Self::Configuration) -> Result<Self::Receiver> {
+    fn replace(
+        &mut self,
+        (config, audio): Self::Configuration,
+        tracker: &Tracker,
+    ) -> Result<Self::Receiver> {
         // Retire the old stream before starting its replacement. All callbacks
         // and the native lease remain owned here if either operation stalls.
-        self.stop().context(NativeRetirementFailed)?;
-        *self = Self::new_blocking(config, audio)?;
+        {
+            let _operation = tracker.phase("replace_stop");
+            self.stop().context(NativeRetirementFailed)?;
+        }
+        {
+            let _operation = tracker.phase("replace_start");
+            *self = Self::new_blocking(config, audio)?;
+        }
         Ok(self.receiver())
     }
 
@@ -95,6 +111,7 @@ impl<S: NativeStream> Default for Requested<S> {
 }
 
 struct Commands<S: NativeStream> {
+    watchdog: Tracker,
     pending: Mutex<Requested<S>>,
     changed: Condvar,
     applied_fps: AtomicU32,
@@ -105,6 +122,7 @@ struct Commands<S: NativeStream> {
 
 impl<S: NativeStream> Commands<S> {
     fn request_stop(&self) {
+        self.watchdog.request_stop();
         self.pending.lock().unwrap().stop = true;
         self.changed.notify_one();
     }
@@ -132,8 +150,9 @@ impl<S: NativeStream> Commands<S> {
             if let Some(replacement) = pending.replacement.take() {
                 drop(pending);
                 let configuration = replacement.configuration;
+                let _operation = self.watchdog.phase("replace");
                 let result = stream
-                    .replace(configuration.clone())
+                    .replace(configuration.clone(), &self.watchdog)
                     .map(|receiver| (receiver, configuration));
                 self.applied_fps
                     .store(stream.frame_rate(), Ordering::Release);
@@ -159,6 +178,7 @@ impl<S: NativeStream> Commands<S> {
             if update.fps == stream.frame_rate() {
                 continue;
             }
+            let _operation = self.watchdog.phase("set_frame_rate");
             match stream.set_frame_rate(update.fps) {
                 Ok(()) => {
                     self.applied_fps
@@ -224,7 +244,16 @@ impl<S: NativeStream> CaptureWorker<S> {
         owner: impl Send + 'static,
         start: impl FnOnce() -> Result<(S, M)> + Send + 'static,
     ) -> Result<(Self, M)> {
+        Self::start_tracked(owner, start, Tracker::default()).await
+    }
+
+    async fn start_tracked<M: Send + 'static>(
+        owner: impl Send + 'static,
+        start: impl FnOnce() -> Result<(S, M)> + Send + 'static,
+        watchdog: Tracker,
+    ) -> Result<(Self, M)> {
         let commands: Arc<Commands<S>> = Arc::new(Commands {
+            watchdog,
             pending: Mutex::new(Requested::default()),
             changed: Condvar::new(),
             applied_fps: AtomicU32::new(0),
@@ -241,7 +270,11 @@ impl<S: NativeStream> CaptureWorker<S> {
                 // Declaration order also protects unwinding: native stream
                 // locals retire before their owner's lease is released.
                 let owner = owner;
-                let mut stream = match start() {
+                let started = {
+                    let _operation = commands.watchdog.phase("start");
+                    start()
+                };
+                let mut stream = match started {
                     Ok((stream, metadata)) => {
                         commands
                             .applied_fps
@@ -255,6 +288,7 @@ impl<S: NativeStream> CaptureWorker<S> {
                         stream
                     }
                     Err(error) => {
+                        let _operation = commands.watchdog.phase("start_failure_cleanup");
                         drop(owner);
                         let _ = ready_tx.send(Err(error));
                         let _ = retired_tx.send(Ok(()));
@@ -271,6 +305,10 @@ impl<S: NativeStream> CaptureWorker<S> {
 
                 let mut acknowledgement = Some(retired_tx);
                 let mut delay = Duration::from_millis(250);
+                // One phase includes repeated failed stop attempts: an Apple
+                // callback that never confirms retirement is also a stalled
+                // owner, even when each failed attempt returns promptly.
+                let retirement = commands.watchdog.phase("stop");
                 loop {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stream.stop()))
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("Native capture stop panicked")));
@@ -291,6 +329,8 @@ impl<S: NativeStream> CaptureWorker<S> {
                     }
                 }
                 drop(stream);
+                drop(retirement);
+                let _operation = commands.watchdog.phase("release_display_owner");
                 drop(owner);
                 // A successful acknowledgement proves that old capture and its
                 // lease are gone before resize can mutate display mode.

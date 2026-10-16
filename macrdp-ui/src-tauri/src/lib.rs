@@ -6,6 +6,7 @@ mod event_bridge;
 #[cfg(target_os = "macos")]
 mod own_windows;
 mod permissions;
+mod recovery;
 mod server_lifecycle;
 mod state;
 mod tray;
@@ -36,6 +37,20 @@ pub fn run() {
     if let Some(result) = macrdp_core::run_display_helper_if_requested() {
         if let Err(error) = result {
             eprintln!("Display helper failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(result) = macrdp_core::supervised::run_server_helper_if_requested() {
+        if let Err(error) = result {
+            eprintln!("Server worker failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(result) = recovery::run_command_if_requested() {
+        if let Err(error) = result {
+            eprintln!("Local desktop recovery failed: {error}");
             std::process::exit(1);
         }
         return;
@@ -75,10 +90,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Focus main window when a second instance is launched
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
-            }
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = tray::show_main_on_physical_display(&app).await {
+                    tracing::warn!(%error, "Could not show local macrdp controls");
+                }
+            });
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -89,6 +106,7 @@ pub fn run() {
 
             // Initialize application state
             state::init_app_state(&handle, log_reload.clone(), ui_config.clone())?;
+            recovery::install_control_endpoint(&handle)?;
 
             // Setup is explicit and only allowed while no remote owner exists.
             // Automatic launch never races a system dialog against virtual-display creation.
@@ -140,6 +158,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::start_server,
             commands::stop_server,
+            commands::recover_local_desktop,
             commands::get_server_status,
             commands::get_metrics,
             commands::get_connections,

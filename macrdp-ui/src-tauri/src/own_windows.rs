@@ -1,6 +1,7 @@
 //! Move our own window through AppKit on its owning thread. Accessibility must
 //! never query our PID: querying WKWebView accessibility previously crashed it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +16,42 @@ use tauri::Manager;
 /// A timed-out pending main-thread task is cancelled before the worker releases
 /// that screen. The lock also lets an already-running native move finish first.
 pub fn move_main_window(app: &tauri::AppHandle, target: DisplayGeometry) -> Result<usize> {
+    move_main_window_with_visibility(app, target, false)
+}
+
+/// Recovery must also relocate a hidden or minimized main window before
+/// showing it. This never uses the remote display worker or Accessibility.
+pub fn show_main_window_on_display(
+    app: &tauri::AppHandle,
+    target: DisplayGeometry,
+) -> Result<usize> {
+    let claimed_or_cancelled = Arc::new(AtomicBool::new(false));
+    let main_cancelled = Arc::clone(&claimed_or_cancelled);
+    let (sender, receiver) = mpsc::channel();
+    let main_app = app.clone();
+    app.run_on_main_thread(move || {
+        if !main_cancelled.swap(true, Ordering::AcqRel) {
+            let _ = sender.send(move_on_main_thread(&main_app, target, true));
+        }
+    })
+    .context("Could not schedule the local macrdp recovery window")?;
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(_) => {
+            // Unlike a remote move, this does not retain an owned display. A
+            // native AppKit call already in progress may finish later; do not
+            // make the independent recovery command wait for a hung UI thread.
+            claimed_or_cancelled.store(true, Ordering::Release);
+            bail!("The macrdp window is not responding. Local controls could not be shown.")
+        }
+    }
+}
+
+fn move_main_window_with_visibility(
+    app: &tauri::AppHandle,
+    target: DisplayGeometry,
+    reveal: bool,
+) -> Result<usize> {
     let cancelled = Arc::new(Mutex::new(false));
     let main_cancelled = Arc::clone(&cancelled);
     let (sender, receiver) = mpsc::channel();
@@ -26,7 +63,7 @@ pub fn move_main_window(app: &tauri::AppHandle, target: DisplayGeometry) -> Resu
         if *cancelled {
             return;
         }
-        let result = move_on_main_thread(&main_app, target);
+        let result = move_on_main_thread(&main_app, target, reveal);
         let _ = sender.send(result);
     })
     .context("Could not schedule the macrdp window move")?;
@@ -46,7 +83,11 @@ pub fn move_main_window(app: &tauri::AppHandle, target: DisplayGeometry) -> Resu
     }
 }
 
-fn move_on_main_thread(app: &tauri::AppHandle, target: DisplayGeometry) -> Result<usize> {
+fn move_on_main_thread(
+    app: &tauri::AppHandle,
+    target: DisplayGeometry,
+    reveal: bool,
+) -> Result<usize> {
     let mtm = MainThreadMarker::new().context("Window move requires the main thread")?;
     let screens = NSScreen::screens(mtm);
     let screen_key = NSString::from_str("NSScreenNumber");
@@ -63,10 +104,17 @@ fn move_on_main_thread(app: &tauri::AppHandle, target: DisplayGeometry) -> Resul
                 })
                 == Some(target.display_id)
         })
-        .context("The remote display is no longer available to macrdp")?;
+        .context("The selected display is no longer available to macrdp")?;
     let Some(window) = app.get_webview_window("main") else {
         return Ok(0);
     };
+    if reveal {
+        // A fullscreen window belongs to another Space. Ask AppKit to leave it
+        // before revealing recovery controls on the selected local monitor.
+        window
+            .set_fullscreen(false)
+            .context("Could not leave fullscreen for local recovery")?;
+    }
     let pointer = window
         .ns_window()
         .context("Could not access the macrdp window")?;
@@ -74,21 +122,31 @@ fn move_on_main_thread(app: &tauri::AppHandle, target: DisplayGeometry) -> Resul
     // SAFETY: Tauri owns this NSWindow and the retained webview handle above
     // stays alive for this callback. All access occurs on AppKit's main thread.
     let native = unsafe { &*pointer.cast::<NSWindow>() };
-    if !native.isVisible()
-        || native.isMiniaturized()
-        || native.styleMask().contains(NSWindowStyleMask::FullScreen)
+    if !reveal
+        && (!native.isVisible()
+            || native.isMiniaturized()
+            || native.styleMask().contains(NSWindowStyleMask::FullScreen))
     {
         return Ok(0);
     }
-    let Some(frame) = fitted_frame(native.frame(), screen.visibleFrame())? else {
-        return Ok(0);
-    };
-    native.setFrame_display(frame, true);
+    let frame = fitted_frame(native.frame(), screen.visibleFrame())?;
+    if let Some(frame) = frame {
+        native.setFrame_display(frame, true);
+    }
+    if reveal {
+        window
+            .unminimize()
+            .context("Could not restore the macrdp window")?;
+        window.show().context("Could not show the macrdp window")?;
+        window
+            .set_focus()
+            .context("Could not focus the macrdp window")?;
+    }
     tracing::info!(
         display_id = target.display_id,
         "Moved macrdp window through AppKit"
     );
-    Ok(1)
+    Ok(usize::from(frame.is_some()))
 }
 
 /// AppKit rectangles share a bottom-left logical coordinate space. Using the

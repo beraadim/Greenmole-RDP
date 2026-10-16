@@ -305,7 +305,7 @@ impl<S: Subscriber> Layer<S> for LogBridgeLayer {
     }
 }
 
-fn serialize_event(event: &tracing::Event<'_>) -> serde_json::Result<Vec<u8>> {
+pub(crate) fn serialize_event(event: &tracing::Event<'_>) -> serde_json::Result<Vec<u8>> {
     let metadata = event.metadata();
     let mut visitor = MessageVisitor::default();
     event.record(&mut visitor);
@@ -323,6 +323,20 @@ fn serialize_event(event: &tracing::Event<'_>) -> serde_json::Result<Vec<u8>> {
     }))?;
     line.push(b'\n');
     Ok(line)
+}
+
+/// Only the supervising application owns the rotating log. Child workers send
+/// bounded records through their private pipe rather than racing its rotation.
+pub(crate) fn record_forwarded_record(record: Vec<u8>) {
+    if record.len() > MAX_RECORD_BYTES
+        || record.last() != Some(&b'\n')
+        || serde_json::from_slice::<Value>(&record).is_err()
+    {
+        return;
+    }
+    if let Some(worker) = LOG_WORKER.get() {
+        worker.record(record);
+    }
 }
 
 #[derive(Default)]

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -87,14 +88,17 @@ impl PerfStats {
         self.captures_coalesced = self.captures_coalesced.saturating_add(coalesced_frames);
     }
 
-    /// Print formatted performance summary to stdout.
-    pub fn print_summary(&self) {
+    /// Render the report without writing to a worker's private protocol pipe.
+    pub fn summary(&self) -> String {
+        self.summary_for_duration(self.start_time.elapsed().as_secs_f64())
+    }
+
+    fn summary_for_duration(&self, duration: f64) -> String {
         if !self.enabled || self.total_frames == 0 {
-            println!("Performance stats not available (no frames recorded).");
-            return;
+            return "Performance stats not available (no frames recorded).\n".to_owned();
         }
 
-        let duration = self.start_time.elapsed().as_secs_f64();
+        let mut report = String::new();
         let avg_fps = self.total_frames as f64 / duration;
         let kf_pct = if self.total_frames > 0 {
             self.keyframe_count as f64 / self.total_frames as f64 * 100.0
@@ -115,50 +119,90 @@ impl PerfStats {
         // RTT stats
         let rtt = LatencyStats::compute(&self.network_rtts);
 
-        println!();
-        println!("═══════════════════════════════════════════");
-        println!("  macrdp Performance Report");
-        println!("═══════════════════════════════════════════");
-        println!("  Duration:      {:.1}s", duration);
-        println!("  Total frames:  {}", self.total_frames);
-        println!("  Avg FPS:       {:.1}", avg_fps);
-        println!("  Keyframes:     {} ({:.1}%)", self.keyframe_count, kf_pct);
-        println!("───────────────────────────────────────────");
-        println!(
+        writeln!(report).unwrap();
+        writeln!(report, "═══════════════════════════════════════════").unwrap();
+        writeln!(report, "  macrdp Performance Report").unwrap();
+        writeln!(report, "═══════════════════════════════════════════").unwrap();
+        writeln!(report, "  Duration:      {:.1}s", duration).unwrap();
+        writeln!(report, "  Total frames:  {}", self.total_frames).unwrap();
+        writeln!(report, "  Avg FPS:       {:.1}", avg_fps).unwrap();
+        writeln!(
+            report,
+            "  Keyframes:     {} ({:.1}%)",
+            self.keyframe_count, kf_pct
+        )
+        .unwrap();
+        writeln!(report, "───────────────────────────────────────────").unwrap();
+        writeln!(
+            report,
             "  Encode Latency (ms, latest {} samples):",
             self.encode_times.len()
-        );
-        println!("    Mean:   {:<7.1} Stddev: {:.1}", enc.mean, enc.stddev);
-        println!(
+        )
+        .unwrap();
+        writeln!(
+            report,
+            "    Mean:   {:<7.1} Stddev: {:.1}",
+            enc.mean, enc.stddev
+        )
+        .unwrap();
+        writeln!(
+            report,
             "    P50:    {:<7.1} P95:    {:<7.1} P99:   {:.1}",
             enc.p50, enc.p95, enc.p99
-        );
-        println!("    Min:    {:<7.1} Max:    {:.1}", enc.min, enc.max);
-        println!("───────────────────────────────────────────");
-        println!("  Frame Size (KB):");
-        println!(
+        )
+        .unwrap();
+        writeln!(
+            report,
+            "    Min:    {:<7.1} Max:    {:.1}",
+            enc.min, enc.max
+        )
+        .unwrap();
+        writeln!(report, "───────────────────────────────────────────").unwrap();
+        writeln!(report, "  Frame Size (KB):").unwrap();
+        writeln!(
+            report,
             "    Mean:   {:<7.1} P95:   {:.1}",
             size_stats.mean / 1024.0,
             size_stats.p95 / 1024.0
-        );
-        println!("  Throughput:");
-        println!("    Avg:    {:.1} Mbps", avg_mbps);
+        )
+        .unwrap();
+        writeln!(report, "  Throughput:").unwrap();
+        writeln!(report, "    Avg:    {:.1} Mbps", avg_mbps).unwrap();
         if !self.network_rtts.is_empty() {
-            println!("───────────────────────────────────────────");
-            println!("  Graphics ACK latency (ms, includes client decoding):");
-            println!("    Mean:   {:<7.1} P95:    {:.1}", rtt.mean, rtt.p95);
+            writeln!(report, "───────────────────────────────────────────").unwrap();
+            writeln!(
+                report,
+                "  Graphics ACK latency (ms, includes client decoding):"
+            )
+            .unwrap();
+            writeln!(
+                report,
+                "    Mean:   {:<7.1} P95:    {:.1}",
+                rtt.mean, rtt.p95
+            )
+            .unwrap();
         }
         let capture = LatencyStats::compute(&self.capture_queue_times);
-        println!(
+        writeln!(
+            report,
             "  Captures: {} delivered, {} coalesced",
             self.captures_delivered, self.captures_coalesced
-        );
-        println!(
+        )
+        .unwrap();
+        writeln!(
+            report,
             "  Capture queue: mean {:.1}ms, p95 {:.1}ms",
             capture.mean, capture.p95
-        );
-        println!("═══════════════════════════════════════════");
-        println!();
+        )
+        .unwrap();
+        writeln!(report, "═══════════════════════════════════════════").unwrap();
+        writeln!(report).unwrap();
+        report
+    }
+
+    /// Print the same report for command-line embedders.
+    pub fn print_summary(&self) {
+        print!("{}", self.summary());
     }
 }
 
@@ -219,6 +263,35 @@ pub fn new_shared(enabled: bool) -> SharedPerfStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_without_frames_retain_the_same_complete_line() {
+        let expected = "Performance stats not available (no frames recorded).\n";
+        assert_eq!(PerfStats::new(true).summary(), expected);
+        let mut disabled = PerfStats::new(false);
+        disabled.record_frame(3.0, 1024, true);
+        assert_eq!(disabled.summary(), expected);
+    }
+
+    #[test]
+    fn rendered_report_retains_units_percentiles_and_blank_line_boundaries() {
+        let mut stats = PerfStats::new(true);
+        stats.record_frame(2.0, 1024, true);
+        stats.record_frame(4.0, 3072, false);
+        stats.record_rtt(8.0);
+        stats.record_rtt(12.0);
+        stats.record_capture(1.0, 1);
+        stats.record_capture(3.0, 2);
+        let report = stats.summary_for_duration(10.0);
+        assert!(report.starts_with(
+            "\n═══════════════════════════════════════════\n  macrdp Performance Report\n"
+        ));
+        assert!(report.contains("  Duration:      10.0s\n  Total frames:  2\n  Avg FPS:       0.2\n  Keyframes:     1 (50.0%)\n"));
+        assert!(report.contains("  Encode Latency (ms, latest 2 samples):\n    Mean:   3.0     Stddev: 1.0\n    P50:    4.0     P95:    4.0     P99:   4.0\n"));
+        assert!(report.contains("  Frame Size (KB):\n    Mean:   2.0     P95:   3.0\n"));
+        assert!(report.contains("  Graphics ACK latency (ms, includes client decoding):\n    Mean:   10.0    P95:    12.0\n"));
+        assert!(report.ends_with("  Captures: 2 delivered, 3 coalesced\n  Capture queue: mean 2.0ms, p95 3.0ms\n═══════════════════════════════════════════\n\n"));
+    }
 
     #[test]
     fn long_sessions_bound_samples_without_losing_total_counters() {

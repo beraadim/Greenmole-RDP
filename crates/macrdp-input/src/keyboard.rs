@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::cell::RefCell;
 
+mod command;
 mod state;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -44,8 +45,7 @@ impl KeyboardInjector {
             .inject(InjectedKey::Physical(keycode), pressed, Self::post)
     }
 
-    /// Override Control for this shortcut event without pressing a synthetic
-    /// Command modifier that could affect other held keys or become stuck.
+    /// Apply Command only to this shortcut, then explicitly restore modifiers.
     pub fn inject_command_keycode(&self, keycode: u16, pressed: bool, shifted: bool) -> Result<()> {
         self.state.borrow_mut().inject(
             InjectedKey::CommandShortcut { keycode, shifted },
@@ -59,9 +59,7 @@ impl KeyboardInjector {
             InjectedKey::Physical(keycode) => keycode,
             InjectedKey::Unicode(ch) => return Self::post_unicode(ch, pressed),
             InjectedKey::CommandShortcut { keycode, shifted } => {
-                let event = Self::command_event(keycode, pressed, shifted)?;
-                event.post(CGEventTapLocation::HID);
-                return Ok(());
+                return command::post(keycode, pressed, shifted);
             }
         };
         let source = Self::source()?;
@@ -71,18 +69,6 @@ impl KeyboardInjector {
         event.post(CGEventTapLocation::HID);
         tracing::trace!(keycode, pressed, "Keyboard keycode injected");
         Ok(())
-    }
-
-    fn command_event(keycode: u16, pressed: bool, shifted: bool) -> Result<CGEvent> {
-        // Explicit flags from an isolated source avoid inheriting either Ctrl
-        // key, stale native modifiers, or the host's keyboard layout Caps state.
-        let event = CGEvent::new_keyboard_event(Self::private_source()?, keycode, pressed)
-            .map_err(|_| anyhow::anyhow!("Failed to create Command shortcut event"))?;
-        let mut flags = CGEventFlags::CGEventFlagCommand;
-        flags.set(CGEventFlags::CGEventFlagShift, shifted);
-        flags.set(CGEventFlags::CGEventFlagNumericPad, keycode == 0x4C);
-        event.set_flags(flags);
-        Ok(event)
     }
 
     /// Inject a key press or release event
@@ -178,41 +164,6 @@ impl Drop for KeyboardInjector {
     fn drop(&mut self) {
         if let Err(error) = self.release_all() {
             tracing::warn!(%error, "Failed to release held remote keys on injector drop");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core_graphics::event::{CGEventType, EventField};
-
-    #[test]
-    fn command_events_have_exact_modifiers_on_press_and_release_without_posting() {
-        // Construct but never post events: running tests must not send shortcuts
-        // to the developer's foreground application or change native modifiers.
-        for keycode in [0x08, 0x09, 0x24, 0x4C] {
-            for shifted in [false, true] {
-                for pressed in [false, true] {
-                    let event = KeyboardInjector::command_event(keycode, pressed, shifted).unwrap();
-                    let mut expected = CGEventFlags::CGEventFlagCommand;
-                    expected.set(CGEventFlags::CGEventFlagShift, shifted);
-                    expected.set(CGEventFlags::CGEventFlagNumericPad, keycode == 0x4C);
-                    assert_eq!(event.get_flags(), expected);
-                    assert_eq!(
-                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
-                        i64::from(keycode)
-                    );
-                    assert_eq!(
-                        event.get_type() as u32,
-                        if pressed {
-                            CGEventType::KeyDown
-                        } else {
-                            CGEventType::KeyUp
-                        } as u32
-                    );
-                }
-            }
         }
     }
 }

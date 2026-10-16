@@ -9,7 +9,7 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::reload;
 use tracing_subscriber::Registry;
 
-use macrdp_core::ServerHandle;
+use macrdp_core::supervised::SupervisedServerHandle as ServerHandle;
 
 use crate::ui_config::UiConfig;
 

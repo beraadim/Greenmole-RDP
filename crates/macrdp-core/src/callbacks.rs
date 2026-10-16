@@ -1,9 +1,9 @@
 //! Event callback types and ServerEventHandler trait
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Server running status
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
     pub running: bool,
     pub state: String,
@@ -28,7 +28,7 @@ impl Default for ServerStatus {
 }
 
 /// Event-level stage durations; absent values mean no measurements are available.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TimingPercentiles {
     pub samples: usize,
     pub p50_ms: Option<f64>,
@@ -51,7 +51,7 @@ impl From<ironrdp_server::gfx::TimingSummary> for TimingPercentiles {
 
 /// Independent windows: capture deliveries, encode completions and wire updates
 /// can have different counts. These are stage durations, not end-to-end latency.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Metrics {
     /// Delivered graphics updates per second; bitmap updates may be subregions.
     pub fps: u32,
@@ -120,7 +120,7 @@ pub struct Metrics {
 }
 
 /// Connection event
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event")]
 pub enum ConnectionEvent {
     #[serde(rename = "connected")]
@@ -130,7 +130,7 @@ pub enum ConnectionEvent {
 }
 
 /// Active client connection info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub client_ip: String,
     pub client_name: String,
@@ -138,7 +138,7 @@ pub struct ConnectionInfo {
 }
 
 /// Disconnection info
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DisconnectionInfo {
     pub client_ip: String,
     pub client_name: String,
@@ -151,7 +151,7 @@ pub struct DisconnectionInfo {
 }
 
 /// A single log entry
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub level: String,
     pub message: String,
@@ -159,7 +159,7 @@ pub struct LogEntry {
 }
 
 /// macOS permission status
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PermissionStatus {
     pub screen_capture: bool,
     pub accessibility: bool,
@@ -167,7 +167,7 @@ pub struct PermissionStatus {
 }
 
 /// Lightweight keyboard/input diagnostics exposed to the UI.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InputDebugState {
     pub active_modifiers: Vec<String>,
     pub suppressed_modifiers: Vec<String>,
@@ -180,7 +180,7 @@ pub struct InputDebugState {
 }
 
 /// Hot-updatable configuration
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ConfigUpdate {
     FrameRate(u32),
     BitrateKbps(u32),
@@ -308,4 +308,7 @@ pub trait ServerEventHandler: Send + Sync + 'static {
     fn on_metrics(&self, _metrics: Metrics) {}
     fn on_connection(&self, _event: ConnectionEvent) {}
     fn on_log(&self, _entry: LogEntry) {}
+    /// Benchmark text is produced in the capture worker, printed only by the
+    /// CLI parent; stdout in a worker is reserved for the private protocol.
+    fn on_performance_summary(&self, _report: String) {}
 }

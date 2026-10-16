@@ -20,7 +20,7 @@ function formatUptime(seconds: number): string {
 }
 
 const statusConfig: Record<
-  "running" | "starting" | "stopping" | "cleanup_pending" | "stopped" | "error",
+  "running" | "starting" | "recovering" | "stopping" | "cleanup_pending" | "stopped" | "error",
   { dotClass: string; glowColor: string; label: string }
 > = {
   running: {
@@ -39,6 +39,7 @@ const statusConfig: Record<
     label: "Stopped",
   },
   stopping: { dotClass: "bg-yellow", glowColor: "none", label: "Stopping..." },
+  recovering: { dotClass: "bg-yellow", glowColor: "none", label: "Recovering connection…" },
   cleanup_pending: { dotClass: "bg-yellow", glowColor: "none", label: "Waiting for cleanup" },
   error: {
     dotClass: "bg-red",
@@ -63,11 +64,12 @@ function StatusBar({
     : (state as keyof typeof statusConfig);
   const config = statusConfig[normalizedState] ?? statusConfig.stopped;
   const isError = normalizedState === "error";
-  const isLoading = loading || normalizedState === "starting";
+  const isLoading = loading || normalizedState === "starting" || normalizedState === "recovering";
   const isStopping = normalizedState === "stopping" || normalizedState === "cleanup_pending";
   const showStop =
     normalizedState === "running" ||
     normalizedState === "starting" ||
+    normalizedState === "recovering" ||
     isStopping ||
     (loading && normalizedState !== "stopped");
   const buttonsDisabled = loading && normalizedState !== "starting";

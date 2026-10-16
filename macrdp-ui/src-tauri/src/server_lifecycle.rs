@@ -60,7 +60,7 @@ pub async fn ensure_server_running(
     let bridge = TauriEventBridge::new(app.clone(), generation);
     let started = cancellable_start(
         &mut stop_requests,
-        macrdp_core::start_server(config, bridge),
+        macrdp_core::supervised::start_supervised_server(config, bridge),
     )
     .await;
     let handle = match started {

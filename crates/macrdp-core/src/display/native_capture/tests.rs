@@ -88,7 +88,7 @@ impl NativeStream for Stream {
         Ok(())
     }
 
-    fn replace(&mut self, generation: u32) -> Result<u32> {
+    fn replace(&mut self, generation: u32, _tracker: &Tracker) -> Result<u32> {
         self.observed.record(format!("replace-{generation}"));
         if let Some(gate) = self.observed.replacement_gate.lock().unwrap().take() {
             gate.wait();
@@ -151,6 +151,107 @@ async fn complete(receiver: oneshot::Receiver<()>) {
         .await
         .unwrap()
         .unwrap();
+}
+
+async fn watchdog_cleared(watchdog: &Tracker) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while watchdog.snapshot().pending {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hung_start_is_observable_after_cancellation_and_keeps_owner_until_native_returns() {
+    let (owner, stream, observed, retired) = owned_stream();
+    let (start_gate, entered, release) = gate();
+    let watchdog = Tracker::default();
+    let start = CaptureWorker::start_tracked(
+        owner,
+        move || {
+            start_gate.wait();
+            Ok((stream, ()))
+        },
+        watchdog.clone(),
+    );
+    assert!(tokio::time::timeout(Duration::from_millis(20), start)
+        .await
+        .is_err());
+    complete(entered).await;
+    let diagnostic =
+        watchdog.snapshot_at(std::time::Instant::now() + crate::native_watchdog::STALL_TIMEOUT);
+    assert_eq!(diagnostic.operation.as_deref(), Some("start"));
+    assert!(diagnostic.is_stalled() && diagnostic.stop_requested);
+    assert!(
+        observed.events().is_empty(),
+        "diagnosing a deadline cannot release native ownership"
+    );
+    release.send(()).unwrap();
+    complete(retired).await;
+    watchdog_cleared(&watchdog).await;
+    assert_eq!(
+        observed.events(),
+        ["stop", "stream-dropped", "owner-released"]
+    );
+}
+
+#[tokio::test]
+async fn hung_configuration_exposes_its_phase_while_stop_remains_responsive() {
+    let (owner, stream, observed, retired) = owned_stream();
+    let (configure, entered, release) = gate();
+    *observed.configure_gate.lock().unwrap() = Some(configure);
+    let (mut capture, ()) = CaptureWorker::start(owner, move || Ok((stream, ())))
+        .await
+        .unwrap();
+    let watchdog = capture.stop_on_drop.0.watchdog.clone();
+    capture.set_frame_rate(15);
+    complete(entered).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), capture.stop())
+            .await
+            .is_err()
+    );
+    let diagnostic =
+        watchdog.snapshot_at(std::time::Instant::now() + crate::native_watchdog::STALL_TIMEOUT);
+    assert_eq!(diagnostic.operation.as_deref(), Some("set_frame_rate"));
+    assert!(diagnostic.is_stalled() && diagnostic.stop_requested);
+    assert_eq!(capture.applied_frame_rate(), 30);
+    assert_eq!(observed.events(), ["configure-15"]);
+    release.send(()).unwrap();
+    capture.stop().await.unwrap();
+    complete(retired).await;
+    watchdog_cleared(&watchdog).await;
+    assert_eq!(
+        observed.events(),
+        ["configure-15", "stop", "stream-dropped", "owner-released"]
+    );
+}
+
+#[tokio::test]
+async fn hung_stop_preserves_owner_and_clears_deadline_only_after_native_retirement() {
+    let (owner, stream, observed, retired) = owned_stream();
+    let (stop, entered, release) = gate();
+    *observed.stop_gate.lock().unwrap() = Some(stop);
+    let (capture, ()) = CaptureWorker::start(owner, move || Ok((stream, ())))
+        .await
+        .unwrap();
+    let watchdog = capture.stop_on_drop.0.watchdog.clone();
+    drop(capture);
+    complete(entered).await;
+    let diagnostic =
+        watchdog.snapshot_at(std::time::Instant::now() + crate::native_watchdog::STALL_TIMEOUT);
+    assert_eq!(diagnostic.operation.as_deref(), Some("stop"));
+    assert!(diagnostic.is_stalled() && diagnostic.stop_requested);
+    assert_eq!(observed.events(), ["stop"]);
+    release.send(()).unwrap();
+    complete(retired).await;
+    watchdog_cleared(&watchdog).await;
+    assert_eq!(
+        observed.events(),
+        ["stop", "stream-dropped", "owner-released"]
+    );
 }
 
 #[tokio::test]

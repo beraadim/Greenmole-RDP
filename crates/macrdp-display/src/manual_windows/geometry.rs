@@ -10,6 +10,21 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// A usable titlebar lets the user move the window themselves. Preserve
+    /// those windows on any surviving local display, including windows spanning
+    /// monitors; a tiny offscreen sliver is not enough for practical recovery.
+    pub fn has_accessible_titlebar(self, screens: &[Self]) -> bool {
+        let titlebar_height = self.height.min(28.0);
+        let minimum_width = self.width.min(80.0);
+        let minimum_height = titlebar_height.min(16.0);
+        screens.iter().any(|screen| {
+            let width = (self.x + self.width).min(screen.x + screen.width) - self.x.max(screen.x);
+            let height =
+                (self.y + titlebar_height).min(screen.y + screen.height) - self.y.max(screen.y);
+            width >= minimum_width && height >= minimum_height
+        })
+    }
+
     pub fn fits_inside(self, bounds: Self) -> bool {
         self.x >= bounds.x
             && self.y >= bounds.y
@@ -242,5 +257,34 @@ mod tests {
         assert!(expected.close_to(rect(-1919.5, 32.5, 800.0, 600.0)));
         assert!(!expected.close_to(rect(-1900.0, 32.0, 800.0, 600.0)));
         assert!(!expected.close_to(rect(-1920.0, 32.0, 1000.0, 600.0)));
+    }
+
+    #[test]
+    fn local_recovery_preserves_windows_on_secondary_and_spanning_displays() {
+        let screens = [
+            rect(-1920.0, 100.0, 1920.0, 1080.0),
+            rect(0.0, 0.0, 1920.0, 1080.0),
+        ];
+        for frame in [
+            rect(-1800.0, 150.0, 900.0, 600.0),
+            rect(-200.0, 150.0, 800.0, 600.0),
+            rect(300.0, 100.0, 800.0, 600.0),
+        ] {
+            assert!(frame.has_accessible_titlebar(&screens));
+        }
+    }
+
+    #[test]
+    fn local_recovery_identifies_stranded_titlebars_and_unusable_slivers() {
+        let screens = [rect(0.0, 0.0, 1920.0, 1080.0)];
+        for frame in [
+            rect(-10000.0, 4000.0, 800.0, 600.0),
+            rect(300.0, -200.0, 800.0, 600.0),
+            rect(1910.0, 100.0, 800.0, 600.0),
+            rect(300.0, 1070.0, 800.0, 600.0),
+        ] {
+            assert!(!frame.has_accessible_titlebar(&screens));
+        }
+        assert!(rect(500.0, 100.0, 40.0, 20.0).has_accessible_titlebar(&screens));
     }
 }

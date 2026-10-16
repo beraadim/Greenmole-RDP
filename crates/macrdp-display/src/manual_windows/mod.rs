@@ -1,5 +1,5 @@
-//! Bounded manual recovery of ordinary windows on an active remote display.
-//! No snapshots, subscriptions, or disconnect restoration are installed.
+//! Bounded relocation of ordinary windows for explicit remote and local actions.
+//! No snapshots or per-window subscriptions are installed.
 
 #[cfg(target_os = "macos")]
 mod accessibility;
@@ -11,8 +11,26 @@ mod process_filter;
 #[cfg(target_os = "macos")]
 pub(crate) fn move_windows(
     target: crate::DisplayGeometry,
+    budget: crate::window_move::Budget,
+    own_windows: Box<dyn FnOnce(crate::DisplayGeometry) -> anyhow::Result<usize> + Send>,
+) -> anyhow::Result<crate::WindowMoveReport> {
+    move_windows_with_policy(target, budget, own_windows, false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn recover_stranded_windows(
+    target: crate::DisplayGeometry,
+    budget: crate::window_move::Budget,
+) -> anyhow::Result<crate::WindowMoveReport> {
+    move_windows_with_policy(target, budget, Box::new(|_| Ok(0)), true)
+}
+
+#[cfg(target_os = "macos")]
+fn move_windows_with_policy(
+    target: crate::DisplayGeometry,
     mut budget: crate::window_move::Budget,
     own_windows: Box<dyn FnOnce(crate::DisplayGeometry) -> anyhow::Result<usize> + Send>,
+    stranded_only: bool,
 ) -> anyhow::Result<crate::WindowMoveReport> {
     use anyhow::ensure;
     use std::time::{Duration, Instant};
@@ -25,7 +43,7 @@ pub(crate) fn move_windows(
     let bounds = geometry::Frame::from(target);
     ensure!(
         target.display_id != 0 && bounds.valid(),
-        "Invalid remote display geometry"
+        "Invalid window relocation display geometry"
     );
     let screens = discovery::screens()?;
     let applications = discovery::application_pids()?;
@@ -72,6 +90,9 @@ pub(crate) fn move_windows(
                     return Ok(None);
                 };
                 let frame = window.frame()?;
+                if stranded_only && frame.has_accessible_titlebar(&screens) {
+                    return Ok(Some(false));
+                }
                 let destination = frame.on_remote_display(bounds, &screens, resizable);
                 if frame.close_to(destination) {
                     return Ok(Some(false));
@@ -99,7 +120,8 @@ pub(crate) fn move_windows(
         failed = report.failed,
         app_failures = report.app_failures,
         timed_out = report.timed_out,
-        "Finished manual move of windows to the remote display"
+        stranded_only,
+        "Finished bounded window relocation"
     );
     Ok(report)
 }

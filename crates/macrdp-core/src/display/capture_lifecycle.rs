@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::Result;
 use macrdp_display::DisplayController;
 
+use crate::native_watchdog::Tracker;
+
 type Restore = Box<dyn FnOnce() -> Result<()> + Send>;
 
 struct Owner {
@@ -19,6 +21,7 @@ struct Owner {
 struct Lifecycle {
     owner: Mutex<Option<Owner>>,
     cleanup_error: Mutex<Option<String>>,
+    watchdog: Tracker,
 }
 
 #[derive(Debug)]
@@ -102,9 +105,11 @@ impl Drop for NativeCaptureLease {
                 // the final pending-request check: a later disconnect must
                 // enqueue its restoration, not mistake this for a barrier.
                 *owner = None;
+                self.0.watchdog.cleanup_finished();
             }
             (restore, requested)
         };
+        let _restoration = requested.then(|| self.0.watchdog.phase("restore_display"));
         if let Some(restore) = restore {
             if requested {
                 if let Err(error) = restore() {
@@ -129,16 +134,20 @@ impl Drop for NativeCaptureLease {
                     // Atomic with shutdown registration: a later server Stop
                     // must acquire its own barrier rather than lose its request.
                     *owner = None;
+                    self.0.watchdog.cleanup_finished();
                 }
                 shutdown
             };
             if let Some(shutdown) = shutdown {
+                let _shutdown = self.0.watchdog.phase("shutdown_display");
                 if let Err(error) = shutdown() {
                     *self.0.cleanup_error.lock().unwrap() =
                         Some(format!("Display worker shutdown failed: {error:#}"));
                     tracing::warn!(%error, "Deferred display worker shutdown failed");
                 }
-                *self.0.owner.lock().unwrap() = None;
+                let mut owner = self.0.owner.lock().unwrap();
+                *owner = None;
+                self.0.watchdog.cleanup_finished();
             }
         }
     }
@@ -149,6 +158,8 @@ impl Drop for NativeCaptureLease {
 pub(crate) fn queue_restoration(display: &DisplayController) -> Result<()> {
     let mut owner = lifecycle().owner.lock().unwrap();
     if Lifecycle::request_restore(&mut owner) {
+        lifecycle().watchdog.set_cleanup_pending(true);
+        lifecycle().watchdog.request_stop();
         return Ok(());
     }
     display.end_remote_session_async()
@@ -166,6 +177,8 @@ pub(crate) fn restore_after_capture(display: DisplayController) -> Result<()> {
             return Ok(());
         }
         if Lifecycle::request_restore(&mut owner) {
+            lifecycle().watchdog.set_cleanup_pending(true);
+            lifecycle().watchdog.request_stop();
             let current = owner.as_mut().expect("restoration owner exists");
             if current.shutdown.is_none() && !current.shutdown_started {
                 current.shutdown = Some(Box::new(move || display.shutdown_owned()));
@@ -180,12 +193,21 @@ pub(crate) fn restore_after_capture(display: DisplayController) -> Result<()> {
             restore_requested: false,
             finishing: false,
         });
+        lifecycle().watchdog.set_cleanup_pending(true);
+        lifecycle().watchdog.request_stop();
         NativeCaptureLease(lifecycle().clone())
     };
-    let restore_result = display.end_remote_session_owned();
+    let restore_result = {
+        let _restoration = lifecycle().watchdog.phase("restore_display");
+        display.end_remote_session_owned()
+    };
     // Attempt shutdown even after a completed restoration error. The worker's
     // native owner gets its final cleanup attempt before acknowledging exit.
-    let result = restore_result.and(display.shutdown_owned());
+    let shutdown_result = {
+        let _shutdown = lifecycle().watchdog.phase("shutdown_display");
+        display.shutdown_owned()
+    };
+    let result = restore_result.and(shutdown_result);
     if let Err(error) = &result {
         *lifecycle().cleanup_error.lock().unwrap() =
             Some(format!("Physical display restoration failed: {error:#}"));

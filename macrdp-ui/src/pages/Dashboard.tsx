@@ -9,6 +9,7 @@ import StatusBar from "../components/StatusBar";
 import ServerError from "../components/ServerError";
 import TimingDetails from "../components/TimingDetails";
 import MoveWindowsControl from "../components/MoveWindowsControl";
+import RecoveryControl from "../components/RecoveryControl";
 import MetricCard from "../components/MetricCard";
 import { ChartPanel } from "../components/ChartPanel";
 import { AreaChart } from "../components/AreaChart";
@@ -132,6 +133,7 @@ function Dashboard() {
       )}
 
       <MoveWindowsControl />
+      <RecoveryControl />
 
       <div className="flex gap-3">
         <ChartPanel

@@ -1,6 +1,5 @@
 use std::sync::{atomic::Ordering, Arc};
 
-use tauri::Manager;
 use tauri::State;
 
 use crate::database::Database;
@@ -33,6 +32,12 @@ pub async fn stop_server(
     .await
     .map_err(|_| "A service transition is still pending; Stop will remain available.")?;
     stop_running_server(&app, state.inner()).await
+}
+
+/// This remains available independently of a stalled capture worker or webview.
+#[tauri::command]
+pub async fn recover_local_desktop(app: tauri::AppHandle) -> Result<(), String> {
+    crate::recovery::recover_local_desktop(&app).await
 }
 
 #[tauri::command]
@@ -213,14 +218,8 @@ pub fn check_for_updates() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.show().map_err(|e: tauri::Error| e.to_string())?;
-        window
-            .set_focus()
-            .map_err(|e: tauri::Error| e.to_string())?;
-    }
-    Ok(())
+pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    crate::tray::show_main_on_physical_display(&app).await
 }
 
 #[tauri::command]
@@ -243,16 +242,14 @@ pub async fn quit_app(
     .await
     .ok();
     state.server_generation.fetch_add(1, Ordering::AcqRel);
-    // Process exit is the final recovery boundary: its display helper observes
-    // closed stdin and restores/removes the owned virtual display.
+    // Give the independent supervisor time to reap its worker and verify
+    // display removal before the application exits. If the operating system
+    // still cannot finish, worker stdin EOF remains a final safety boundary.
     let handle = state.server_handle.lock().await.as_ref().cloned();
     if let Some(handle) = handle {
-        match handle.stop().await {
-            Ok(macrdp_core::StopOutcome::Pending { reason }) => {
-                tracing::warn!(reason, "Exiting with native cleanup still pending")
-            }
+        match handle.recover_local_desktop().await {
             Err(error) => tracing::warn!(%error, "Error stopping server during quit"),
-            Ok(macrdp_core::StopOutcome::Complete) => {}
+            Ok(()) => {}
         }
     }
 

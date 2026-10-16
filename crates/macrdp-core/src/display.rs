@@ -1376,11 +1376,13 @@ impl MacDisplayUpdates {
             let display_controller = self.display_controller.clone();
             recovery.start_probe(
                 move |cancelled| {
+                    let watchdog = crate::native_watchdog::Tracker::default();
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .context("Failed to create native recovery runtime")?;
                     if let Some(mut old) = old_capture {
+                        let _operation = watchdog.phase("recovery_old_stop");
                         runtime
                             .block_on(old.stop())
                             .context(capture_recovery::NativeRetirementFailed)?;
@@ -1390,15 +1392,21 @@ impl MacDisplayUpdates {
                     }
                     let native_lease = capture_lifecycle::acquire(&display_controller)?;
                     let native_config = config.clone();
-                    let (mut capturer, ()) = runtime
-                        .block_on(NativeCapture::start(native_lease, move || {
+                    let (mut capturer, ()) = {
+                        let _operation = watchdog.phase("recovery_new_start");
+                        runtime.block_on(NativeCapture::start(native_lease, move || {
                             Ok((ScreenCapturer::new_blocking(native_config, audio_tx)?, ()))
-                        }))?;
-                    let event = runtime.block_on(async {
-                        tokio::time::timeout(Duration::from_millis(250), capturer.next_frame())
-                            .await
-                    });
+                        }))?
+                    };
+                    let event = {
+                        let _operation = watchdog.phase("recovery_probe");
+                        runtime.block_on(async {
+                            tokio::time::timeout(Duration::from_millis(250), capturer.next_frame())
+                                .await
+                        })
+                    };
                     if cancelled.load(Ordering::Acquire) {
+                        let _operation = watchdog.phase("recovery_cancel_cleanup");
                         runtime
                             .block_on(capturer.stop())
                             .context(capture_recovery::NativeRetirementFailed)?;
@@ -1408,6 +1416,7 @@ impl MacDisplayUpdates {
                         Ok(Some(macrdp_capture::CaptureEvent::Frame(frame))) => Some(frame),
                         Ok(Some(macrdp_capture::CaptureEvent::Idle)) => None,
                         _ => {
+                            let _operation = watchdog.phase("recovery_probe_cleanup");
                             runtime
                                 .block_on(capturer.stop())
                                 .context(capture_recovery::NativeRetirementFailed)?;
@@ -1421,6 +1430,8 @@ impl MacDisplayUpdates {
                     }))
                 },
                 |mut recovered| {
+                    let watchdog = crate::native_watchdog::Tracker::default();
+                    let _operation = watchdog.phase("recovery_unclaimed_cleanup");
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

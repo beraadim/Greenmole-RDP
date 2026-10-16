@@ -93,7 +93,7 @@ pub async fn set_config(
         .lock()
         .await
         .as_ref()
-        .filter(|handle| handle.status().running)
+        .filter(|handle| accepts_live_updates(&handle.status()))
         .map(|handle| handle.display_backend());
     let restart_required = {
         let mut config = state.ui_config.lock().await;
@@ -120,51 +120,84 @@ pub async fn set_config(
 
     // Display ownership changes apply on the next server start. Persist them
     // without changing the current display or moving its windows mid-session.
-    let live_result =
-        if !restart_required {
-            let guard = state.server_handle.lock().await;
-            if let Some(handle) = guard.as_ref().filter(|handle| handle.status().running) {
-                let config = state.ui_config.lock().await;
-                match key.as_str() {
-                    "frame_rate" => handle
-                        .update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate)),
-                    "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(
-                        config
-                            .bitrate_mbps
-                            .checked_mul(1000)
-                            .ok_or("Bitrate is out of range")?,
-                    )),
-                    "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(
-                        config.log_level.clone(),
-                    )),
-                    "show_cursor" => handle
-                        .update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor)),
-                    "resolution" | "hidpi_scale" => handle.update_config(
-                        macrdp_core::ConfigUpdate::Resolution(config.resolution.clone()),
-                    ),
-                    "encoder" => handle
-                        .update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
-                    "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(
-                        config.chroma_mode.clone(),
-                    )),
-                    "gfx_validation_mode" => handle.update_config(
-                        macrdp_core::ConfigUpdate::GfxValidationMode(config.gfx_validation_mode),
-                    ),
-                    "username" | "password" => {
-                        handle.update_config(macrdp_core::ConfigUpdate::Credentials {
+    let live_result = if !restart_required {
+        let guard = state.server_handle.lock().await;
+        if let Some(handle) = guard
+            .as_ref()
+            .filter(|handle| accepts_live_updates(&handle.status()))
+        {
+            let config = state.ui_config.lock().await;
+            match key.as_str() {
+                "frame_rate" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate))
+                        .await
+                }
+                "bitrate_mbps" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::BitrateKbps(
+                            config
+                                .bitrate_mbps
+                                .checked_mul(1000)
+                                .ok_or("Bitrate is out of range")?,
+                        ))
+                        .await
+                }
+                "log_level" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::LogLevel(
+                            config.log_level.clone(),
+                        ))
+                        .await
+                }
+                "show_cursor" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor))
+                        .await
+                }
+                "resolution" | "hidpi_scale" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::Resolution(
+                            config.resolution.clone(),
+                        ))
+                        .await
+                }
+                "encoder" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone()))
+                        .await
+                }
+                "chroma_mode" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::ChromaMode(
+                            config.chroma_mode.clone(),
+                        ))
+                        .await
+                }
+                "gfx_validation_mode" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::GfxValidationMode(
+                            config.gfx_validation_mode,
+                        ))
+                        .await
+                }
+                "username" | "password" => {
+                    handle
+                        .update_config(macrdp_core::ConfigUpdate::Credentials {
                             username: config.username.clone(),
                             password: config.password.clone(),
                         })
-                    }
-                    _ => Ok(()),
+                        .await
                 }
-                .map_err(|error| error.to_string())
-            } else {
-                Ok(())
+                _ => Ok(()),
             }
+            .map_err(|error| error.to_string())
         } else {
             Ok(())
-        };
+        }
+    } else {
+        Ok(())
+    };
     if let Err(error) = live_result {
         // Preferences are already durably saved. Stop the old listener rather than
         // leaving it accepting an obsolete password after a rejected live update.
@@ -189,9 +222,31 @@ pub async fn set_config(
     Ok(status)
 }
 
+/// A replacement worker must use preferences accepted during automatic
+/// recovery, particularly a changed password. The supervisor retains the
+/// service until recovery ends even though it temporarily has no listener.
+fn accepts_live_updates(status: &macrdp_core::ServerStatus) -> bool {
+    status.running || status.state == "recovering"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_and_live_preferences_are_delivered_during_recovery() {
+        let mut status = macrdp_core::ServerStatus::default();
+        assert!(!accepts_live_updates(&status));
+        status.state = "recovering".into();
+        assert!(accepts_live_updates(&status));
+        for state in ["stopping", "cleanup_pending", "error", "stopped"] {
+            status.state = state.into();
+            assert!(!accepts_live_updates(&status));
+        }
+        status.state = "running".into();
+        status.running = true;
+        assert!(accepts_live_updates(&status));
+    }
     #[test]
     fn quality_restart_notice_remains_until_applied_or_reverted() {
         let running = UiConfig::default();

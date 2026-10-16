@@ -329,6 +329,9 @@ fn validate_size(width: u16, height: u16) -> Result<()> {
 
 /// Called directly from the executable's main thread, before any CG query.
 pub(crate) fn run_child() -> Result<()> {
+    // EOF cannot wake a main thread blocked inside an Apple API. A separate
+    // thread bounds orphan ownership even if both server and UI processes die.
+    crate::parent_watchdog::start()?;
     let mut input = BufReader::new(std::io::stdin().lock());
     let mut output = BufWriter::new(std::io::stdout().lock());
     let mut owner: Option<NativeDisplay> = None;

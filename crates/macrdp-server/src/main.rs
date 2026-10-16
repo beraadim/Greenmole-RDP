@@ -11,6 +11,9 @@ struct CliEvents {
 }
 
 impl ServerEventHandler for CliEvents {
+    fn on_performance_summary(&self, report: String) {
+        println!("{report}");
+    }
     fn on_metrics(&self, metrics: macrdp_core::Metrics) {
         let mut recorder = self.recorder.lock().unwrap();
         if let Some(active) = recorder.as_mut() {
@@ -32,6 +35,9 @@ impl ServerEventHandler for CliEvents {
 fn main() -> Result<()> {
     // Display helpers must dispatch before any framework queries the desktop.
     if let Some(result) = macrdp_core::run_display_helper_if_requested() {
+        return result;
+    }
+    if let Some(result) = macrdp_core::run_server_helper_if_requested() {
         return result;
     }
     run()
@@ -72,7 +78,6 @@ async fn run() -> Result<()> {
         config.password = Some(password);
     }
 
-    let perf = cli.perf.then(|| macrdp_core::perf_stats::new_shared(true));
     let events = CliEvents {
         recorder: std::sync::Mutex::new(
             cli.metrics_jsonl
@@ -81,7 +86,7 @@ async fn run() -> Result<()> {
                 .transpose()?,
         ),
     };
-    let server = macrdp_core::server::start_server_with_perf(config, events, perf.clone()).await?;
+    let server = macrdp_core::start_supervised_server_with_perf(config, events, cli.perf).await?;
     tracing::info!(port = server.port(), "RDP server ready");
     let result = tokio::select! {
         result = tokio::signal::ctrl_c() => result.context("Failed to wait for Ctrl-C"),
@@ -99,9 +104,6 @@ async fn run() -> Result<()> {
             Err(error) => break Err(error),
         }
     };
-    if let Some(perf) = perf {
-        perf.lock().unwrap().print_summary();
-    }
     let _ = tokio::task::spawn_blocking(macrdp_core::flush_logs).await;
     result.and(stopped)
 }

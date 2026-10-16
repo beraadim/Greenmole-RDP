@@ -157,7 +157,16 @@ impl<T: Send + 'static> CaptureRecovery<T> {
             && now.saturating_duration_since(self.started_at) >= Duration::from_secs(3)
         {
             self.warned_slow_probe = true;
-            tracing::warn!("Native capture recovery is still pending; retaining one probe while fallback and controls remain active");
+            let native = crate::native_watchdog::snapshot();
+            tracing::warn!(
+                operation = native.operation.as_deref().unwrap_or("recovery_probe"),
+                operation_id = native.operation_id,
+                operation_elapsed_ms = native.elapsed_ms,
+                recovery_elapsed_ms = now.saturating_duration_since(self.started_at).as_millis() as u64,
+                stop_requested = native.stop_requested,
+                cleanup_pending = native.cleanup_pending,
+                "Native capture recovery is still pending; retaining one probe while fallback and controls remain active"
+            );
         }
     }
 

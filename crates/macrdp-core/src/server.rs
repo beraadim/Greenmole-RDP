@@ -104,7 +104,7 @@ fn native_cleanup_pending() -> bool {
 /// Also usable after a cancelled startup that never returned a ServerHandle.
 /// True while any server, display, capture, or encoder owner is still alive.
 pub fn server_resources_pending() -> bool {
-    lifecycle::pending() || native_cleanup_pending()
+    lifecycle::pending() || native_cleanup_pending() || crate::supervised::supervisor_resources_pending()
 }
 
 #[cfg(test)]

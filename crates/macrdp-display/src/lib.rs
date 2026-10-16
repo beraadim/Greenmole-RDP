@@ -19,14 +19,21 @@ mod layout;
 mod macos;
 #[cfg(any(target_os = "macos", test))]
 mod manual_windows;
+#[cfg(target_os = "macos")]
+mod parent_watchdog;
 #[cfg(any(target_os = "macos", test))]
 mod protocol;
+mod recovery;
 mod resolution;
 #[cfg(target_os = "macos")]
 mod selector;
 #[cfg(target_os = "macos")]
 mod virtual_display;
 mod window_move;
+pub use recovery::{
+    list_owned_virtual_displays, physical_display_geometry,
+    recover_stranded_windows_on_physical_display, wait_for_owned_virtual_display_removal,
+};
 pub use resolution::{resolve_desktop_size, resolve_virtual_desktop_size};
 pub use window_move::{WindowMovePreparation, WindowMoveReport};
 const HELPER_ARGUMENT: &str = "--macrdp-display-helper";

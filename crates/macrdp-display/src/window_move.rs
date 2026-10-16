@@ -3,14 +3,14 @@
 
 use crate::{DisplayGeometry, REQUEST_TIMEOUT};
 use anyhow::{ensure, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// Counts apply to the windows inspected before the operation's time limit.
 /// Minimized, fullscreen, and unsupported windows retain their existing state.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WindowMoveReport {
     pub target: DisplayGeometry,
     pub moved: usize,
