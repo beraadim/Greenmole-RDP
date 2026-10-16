@@ -95,3 +95,19 @@ does not replace or restart the running server.
 
 Native ownership follows Apple's guidance on
 [autorelease pools in long-lived background threads](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/MemoryMgmt/Articles/mmAutoreleasePools.html).
+
+## Delivered artifact
+
+Built on the Mac mini on 2026-10-16 from source commit
+`2f998c31909c0598502ba457fa648974a89027b0`, with ad-hoc signing. The verified
+ARM64 package, checksum and build metadata are on `beraadim`'s Desktop:
+
+`/Users/beraadim/Desktop/macrdp_0.1.13_aarch64_2f998c31909c.dmg`
+
+SHA-256: `6d0cc4324716343ba29ef71dd9917d2aeb148589b095680f0371bbfe0d351b00`.
+
+Packaging verified the application signature and disk-image checksum. A
+read-only mount independently confirmed the embedded version, source revision,
+ARM64 executable and application signature. All three Desktop files were
+compared with their build outputs. The running application was not replaced or
+restarted.
