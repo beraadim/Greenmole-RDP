@@ -144,3 +144,22 @@ then paste, releasing Ctrl before the letter, Shift variants, AltGr symbols,
 and reconnect. Test Windows Remote Desktop Connection and Guacamole. Live
 macOS delivery still needs this user acceptance check; the automated event
 tests deliberately do not send shortcuts into a running application.
+
+## Verified Desktop delivery
+
+Built and delivered from source commit
+`ddc9d9c52a5af6250b4a8405b0e1f76fd3563b7a`:
+
+`/Users/beraadim/Desktop/macrdp_0.1.14_aarch64_ddc9d9c52a5a.dmg`
+
+SHA-256:
+`afcc3ec03d10980438ed09b9e2b9ee5ef7879c34b2a9d3d7c253c1514aa52d2a`
+
+The 15,361,372-byte image and its checksum/build-info sidecars were copied to
+the Desktop and the destination checksum was verified. The app is ad-hoc
+signed; deep strict signature verification and disk-image verification passed.
+The image was mounted read-only to check its version, source revision and app
+signature, then detached. Three packaged-helper checks rejected extra arguments
+and invalid initialization before starting any server or querying capture.
+
+Installation and live reconnect/recovery testing remain with the user.
