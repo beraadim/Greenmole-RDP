@@ -66,7 +66,12 @@ pub fn run() {
         .with(macrdp_core::LogBridgeLayer::new())
         .init();
 
-    tracing::info!("macrdp-ui starting...");
+    tracing::info!(
+        process_id = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        revision = option_env!("MACRDP_BUILD_REVISION").unwrap_or("development"),
+        "macrdp-ui starting..."
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {

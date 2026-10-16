@@ -3,7 +3,6 @@
 use std::future::Future;
 
 use anyhow::{bail, Context as _, Result};
-use bytes::BytesMut;
 use ironrdp_async::Framed;
 use ironrdp_core::decode;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
@@ -14,10 +13,9 @@ use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::Action;
 use ironrdp_tokio::FramedRead;
 
-use super::{error_outcome, wait_for_idle_timeout, ConnectionOutcome, RdpServer, ServerEvent};
-
-const MAX_PENDING_PDUS: usize = 128;
-const MAX_PENDING_BYTES: usize = 1024 * 1024;
+use super::{
+    error_outcome, wait_for_idle_timeout, ConnectionOutcome, PendingInput, RdpServer, ServerEvent,
+};
 
 /// Classify validated input without calling a handler or changing the native
 /// desktop. Clipboard, graphics ACKs, QoE and malformed traffic must not extend
@@ -64,8 +62,9 @@ impl RdpServer {
         &mut self,
         reader: &mut Framed<impl FramedRead>,
         io_channel_id: u16,
+        mut pending: PendingInput,
         future: impl Future<Output = Result<T>>,
-    ) -> Result<Option<(T, Vec<(Action, BytesMut)>)>> {
+    ) -> Result<Option<(T, PendingInput)>> {
         let receiver = self.ev_receiver.clone();
         let mut receiver = receiver.lock().await;
         let sender = self.ev_sender.clone();
@@ -75,9 +74,16 @@ impl RdpServer {
         let deadline = tokio::time::sleep_until(deadline);
         let idle = wait_for_idle_timeout(self.input_activity.subscribe(), self.idle_timeout);
         tokio::pin!(future, deadline, idle);
-        let mut pending = Vec::new();
-        let mut pending_bytes = 0usize;
+        let mut backpressure_logged = false;
         loop {
+            if !pending.can_read() && !backpressure_logged {
+                tracing::info!(
+                    pending_pdus = pending.len(),
+                    pending_bytes = pending.bytes(),
+                    "Capture startup input buffer full; pausing socket reads until capture is ready"
+                );
+                backpressure_logged = true;
+            }
             tokio::select! {
                 biased;
                 event = receiver.controls.recv() => match event {
@@ -110,24 +116,24 @@ impl RdpServer {
                     if result.is_err() { self.record_outcome(ConnectionOutcome::CaptureError); }
                     return result.map(|ready| Some((ready, pending))).context("capture activation failed");
                 },
-                pdu = reader.read_pdu() => {
+                pdu = reader.read_pdu(), if pending.can_read() => {
                     let (action, bytes) = pdu.map_err(|error| {
                         let error = anyhow::Error::from(error);
                         self.record_outcome(error_outcome(&error, ConnectionOutcome::ProtocolError));
                         error
                     })?;
                     // Do not dispatch input against a stale capture transform.
-                    // The fixed deadline and byte/count caps prevent a peer from
-                    // filling memory while the operating system is unresponsive.
-                    if pending.len() >= MAX_PENDING_PDUS || bytes.len() > MAX_PENDING_BYTES - pending_bytes {
-                        self.record_outcome(ConnectionOutcome::ProtocolError);
-                        bail!("too much input while capture is starting");
-                    }
+                    // Stop reading at the shared replay budget rather than
+                    // disconnecting on ordinary mouse bursts during activation.
+                    // Controls, idle expiry and the fixed deadline remain live;
+                    // peer EOF is observed after readiness if the queue is full.
                     if is_user_input(&action, &bytes, io_channel_id) {
                         self.input_activity.send_replace(tokio::time::Instant::now());
                     }
-                    pending_bytes += bytes.len();
-                    pending.push((action, bytes));
+                    pending.push(action, bytes).map_err(|error| {
+                        self.record_outcome(ConnectionOutcome::ProtocolError);
+                        error
+                    })?;
                 },
             }
         }

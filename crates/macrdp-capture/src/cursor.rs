@@ -4,12 +4,17 @@ use crate::CursorShape;
 use anyhow::{Context, Result};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use image::{imageops::FilterType, RgbaImage};
+use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSCursor;
 use objc2_foundation::NSPoint;
 use std::ffi::c_void;
 
 const MAX_RDP_CURSOR_EDGE: u16 = 32;
 const MAX_NATIVE_CURSOR_EDGE: usize = 1024;
+
+#[cfg(test)]
+#[path = "cursor_memory_tests.rs"]
+mod memory_tests;
 
 pub enum CursorUpdate {
     Unchanged,
@@ -41,6 +46,13 @@ impl CursorCapture {
     }
 
     pub fn capture_if_changed(&mut self) -> Result<CursorUpdate> {
+        // Rust's long-lived RDP worker has no AppKit run loop to drain native
+        // temporaries. Each cursor lookup creates autoreleased bitmap images,
+        // even when the cursor is unchanged; release them after every poll.
+        autoreleasepool(|_| self.capture_in_pool())
+    }
+
+    fn capture_in_pool(&mut self) -> Result<CursorUpdate> {
         let cursor = NSCursor::currentSystemCursor().unwrap_or_else(NSCursor::currentCursor);
         let image = cursor.image();
         let Some(cg_image) = (unsafe {

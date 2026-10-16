@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-server"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "clap",

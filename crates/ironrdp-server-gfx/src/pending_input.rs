@@ -8,14 +8,29 @@ use ironrdp_pdu::Action;
 
 const MAX_PDUS: usize = 128;
 const MAX_BYTES: usize = 1024 * 1024;
+// TPKT's 16-bit length is the largest supported outer PDU length. Reserve room
+// for a complete read before polling the socket, then apply TCP backpressure.
+const MAX_WIRE_PDU_BYTES: usize = u16::MAX as usize;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct PendingInput {
     pdus: VecDeque<(Action, BytesMut)>,
     bytes: usize,
 }
 
 impl PendingInput {
+    pub(super) fn can_read(&self) -> bool {
+        self.pdus.len() < MAX_PDUS && self.bytes <= MAX_BYTES - MAX_WIRE_PDU_BYTES
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.pdus.len()
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub(super) fn push(&mut self, action: Action, bytes: BytesMut) -> Result<()> {
         if self.pdus.len() >= MAX_PDUS || bytes.len() > MAX_BYTES - self.bytes {
             bail!("too much input waiting for resize activation");
@@ -54,5 +69,25 @@ mod tests {
         assert!(queue.push(Action::FastPath, (&[1][..]).into()).is_err());
         queue.pop().unwrap();
         queue.push(Action::FastPath, (&[2][..]).into()).unwrap();
+    }
+
+    #[test]
+    fn socket_reads_reserve_room_for_a_complete_wire_packet() {
+        let mut queue = PendingInput::default();
+        assert!(queue.can_read());
+        queue
+            .push(
+                Action::X224,
+                vec![0; MAX_BYTES - MAX_WIRE_PDU_BYTES].as_slice().into(),
+            )
+            .unwrap();
+        assert!(queue.can_read());
+        queue
+            .push(Action::X224, vec![0; MAX_WIRE_PDU_BYTES].as_slice().into())
+            .unwrap();
+        assert!(!queue.can_read());
+        assert_eq!(queue.bytes(), MAX_BYTES);
+        queue.pop().unwrap();
+        assert!(queue.can_read());
     }
 }

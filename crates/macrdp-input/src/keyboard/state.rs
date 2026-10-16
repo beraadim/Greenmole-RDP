@@ -6,6 +6,7 @@ use anyhow::Result;
 pub(super) enum InjectedKey {
     Physical(u16),
     Unicode(u16),
+    CommandShortcut { keycode: u16, shifted: bool },
 }
 
 impl InjectedKey {
@@ -169,5 +170,32 @@ mod tests {
             state.held,
             BTreeSet::from([InjectedKey::Physical(0), InjectedKey::Physical(0x39)])
         );
+    }
+
+    #[test]
+    fn shortcut_cleanup_retains_event_flags_and_precedes_ctrl_release() {
+        let mut state = KeyboardState::default();
+        let ctrl = InjectedKey::Physical(0x3B);
+        let shortcut = InjectedKey::CommandShortcut {
+            keycode: 0x08,
+            shifted: true,
+        };
+        for key in [ctrl, shortcut, shortcut] {
+            state.inject(key, true, |_, _| Ok(())).unwrap();
+        }
+        let mut events = Vec::new();
+        state
+            .release_matching(
+                |_| true,
+                |key, pressed| {
+                    events.push((key, pressed));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(events, [(shortcut, false), (ctrl, false)]);
+        state
+            .release_matching(|_| true, |_, _| panic!("duplicate release"))
+            .unwrap();
     }
 }

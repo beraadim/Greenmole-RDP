@@ -1159,8 +1159,20 @@ impl RdpServer {
             display.activate_size(desktop_size);
             display.updates().await
         };
-        let Some((mut display_updates, pending_pdus)) = self
-            .await_capture_ready(reader, io_channel_id, activation)
+        // Replay pre-resize input first, then activation input in wire order.
+        // Share one budget across pre-resize, handshake and capture-start input
+        // so activation cannot overflow the replay queue when the lists merge.
+        let mut pending = core::mem::take(&mut self.deferred_input);
+        for frame in input_events {
+            let header = frame
+                .first()
+                .ok_or_else(|| anyhow!("empty deferred input PDU"))?;
+            let action = Action::from_fp_output_header(*header)
+                .map_err(|code| anyhow!("invalid deferred input PDU action: {code}"))?;
+            pending.push(action, frame.as_slice().into())?;
+        }
+        let Some((mut display_updates, pending)) = self
+            .await_capture_ready(reader, io_channel_id, pending, activation)
             .await?
         else {
             return Ok(RunState::Disconnect);
@@ -1187,21 +1199,6 @@ impl RdpServer {
         // Get DRDYNVC channel ID for sending GFX frames
         let drdynvc_channel_id = self.get_channel_id_by_type::<DynamicChannels>();
 
-        // Replay pre-resize input first, then activation input in wire order.
-        // Nothing is removed until a message permit protects state processing
-        // and any response from cancellation by successful reactivation.
-        let mut pending = core::mem::take(&mut self.deferred_input);
-        for frame in input_events {
-            let header = frame
-                .first()
-                .ok_or_else(|| anyhow!("empty deferred input PDU"))?;
-            let action = Action::from_fp_output_header(*header)
-                .map_err(|code| anyhow!("invalid deferred input PDU action: {code}"))?;
-            pending.push(action, frame.as_slice().into())?;
-        }
-        for (action, bytes) in pending_pdus {
-            pending.push(action, bytes)?;
-        }
         let pending = Rc::new(std::cell::RefCell::new(pending));
 
         let s = Rc::new(Mutex::new(self));

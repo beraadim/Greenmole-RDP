@@ -7,6 +7,8 @@ use ironrdp_server::{KeyboardEvent, RdpServerInputHandler};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod shortcut_tests;
+
 #[test]
 fn mouse_mapper_scales_linearly_across_resized_desktop() {
     let mapper = MouseCoordMapper::new(1920, 1200, 2560, 1305);
@@ -57,6 +59,7 @@ fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
         suppressed_ctrl_for_altgr: SuppressedCtrlState::default(),
         pending_dead_key: None,
         translated_key_releases: HashMap::new(),
+        command_shortcuts: HashMap::new(),
         debug_state: Arc::new(Mutex::new(InputDebugState::default())),
         active_connection: Arc::new(Mutex::new(None)),
         display_controller: None,
@@ -271,6 +274,7 @@ fn dead_key_composition_matches_expected_output() {
 #[derive(Debug, PartialEq, Eq)]
 enum KeyAction {
     Key(u16, bool),
+    Command(u16, bool, bool),
     Unicode(u16, bool),
     ReleaseModifiers,
     ReleaseAll,
@@ -278,6 +282,13 @@ enum KeyAction {
 
 struct RecordingKeyboard(Arc<Mutex<Vec<KeyAction>>>);
 impl KeyboardDevice for RecordingKeyboard {
+    fn inject_command_keycode(&self, key: u16, pressed: bool, shifted: bool) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(KeyAction::Command(key, pressed, shifted));
+        Ok(())
+    }
     fn inject_keycode(&self, key: u16, pressed: bool) -> anyhow::Result<()> {
         self.0.lock().unwrap().push(KeyAction::Key(key, pressed));
         Ok(())

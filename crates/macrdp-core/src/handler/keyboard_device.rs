@@ -4,6 +4,12 @@ use macrdp_input::KeyboardInjector;
 /// real handler without creating a CGEvent or changing the host keyboard state.
 pub(super) trait KeyboardDevice: Send {
     fn inject_keycode(&self, keycode: u16, pressed: bool) -> anyhow::Result<()>;
+    fn inject_command_keycode(
+        &self,
+        keycode: u16,
+        pressed: bool,
+        shifted: bool,
+    ) -> anyhow::Result<()>;
     fn inject_unicode(&self, ch: u16, pressed: bool) -> anyhow::Result<()>;
     fn release_transient_modifiers(&self) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
@@ -23,6 +29,14 @@ pub(super) trait KeyboardDevice: Send {
 }
 
 impl KeyboardDevice for KeyboardInjector {
+    fn inject_command_keycode(
+        &self,
+        keycode: u16,
+        pressed: bool,
+        shifted: bool,
+    ) -> anyhow::Result<()> {
+        self.inject_command_keycode(keycode, pressed, shifted)
+    }
     fn inject_keycode(&self, keycode: u16, pressed: bool) -> anyhow::Result<()> {
         self.inject_keycode(keycode, pressed)
     }
