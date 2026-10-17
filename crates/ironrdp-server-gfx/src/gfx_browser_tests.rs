@@ -191,3 +191,116 @@ fn raw_startup_then_avc_delta_and_resize_preserve_frame_and_surface_order() {
     assert!(state.browser_avc420);
     assert_eq!(state.channel_id, Some(7));
 }
+
+#[test]
+fn chroma_changes_wait_for_new_connection_and_survive_channel_reactivation() {
+    let mut state = GfxState::new(318, 178, false, false);
+    let negotiate = |state: &mut GfxState| {
+        state.set_client_graphics_preferences(BROWSER_AVC444_CLIENT_NAME);
+        state.avc420_supported = true;
+        state.avc444_supported = true;
+    };
+    state.begin_connection(None);
+    negotiate(&mut state);
+    state.chroma_mode = Some("avc444".into());
+    assert!(
+        !state.use_avc444(),
+        "Pending chroma must not alter an active stream"
+    );
+    state.reset_connection_state(true);
+    negotiate(&mut state);
+    assert!(
+        !state.use_avc444(),
+        "A channel/resize activation is not a new connection"
+    );
+
+    state.begin_connection(None);
+    assert!(state.avc444_enabled);
+    assert!(
+        !state.avc444_supported,
+        "Reconnect must renegotiate all capabilities"
+    );
+    negotiate(&mut state);
+    assert!(state.use_avc444());
+    let mut frame = access_unit(318, 178, true);
+    frame.h264_aux = Some(Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x7f]));
+    let pdus = unpack(&GfxHandler::create_frame_pdu(&mut state, &frame));
+    assert!(pdus
+        .iter()
+        .any(|pdu| matches!(pdu, ServerPdu::WireToSurface1(surface)
+        if surface.codec_id == Codec1Type::Avc444)));
+
+    state.chroma_mode = Some("avc420".into());
+    assert!(
+        state.use_avc444(),
+        "The reverse transition also waits for reconnect"
+    );
+    state.reset_connection_state(true);
+    negotiate(&mut state);
+    assert!(state.use_avc444());
+    state.begin_connection(None);
+    negotiate(&mut state);
+    assert!(!state.use_avc444());
+    let pdus = unpack(&GfxHandler::create_frame_pdu(&mut state, &frame));
+    assert_avc420_payload(&pdus, &frame, 1);
+    state.begin_connection(None);
+    assert!(
+        !state.avc444_enabled,
+        "The applied choice persists across later reconnects"
+    );
+}
+
+#[test]
+fn reconnect_preserves_durable_controls_but_discards_session_failures_and_metrics() {
+    let mut state = GfxState::new(320, 180, false, true);
+    state.target_frame_rate = Some(90);
+    state.target_bitrate = Some(44_000_000);
+    state.show_cursor = Some(false);
+    state.resolution = Some("1920x1080".into());
+    state.encoder_pref = Some("bitmap".into());
+    state.target_quality = Some("lossless".into());
+    state.manual_bitmap_mode = true;
+    state.chroma_mode = Some("avc444".into());
+    state.bitmap_fallback_mode = true;
+    state.avc_fallback_to_uncompressed = true;
+    state.clipboard_disabled = true;
+    state.active_encoder = Some("failed-encoder");
+    state.total_frames_sent = 42;
+    state.pending_acks = 7;
+    state.frame_id = 50;
+    state.surface_created = true;
+    state.avc420_supported = true;
+    state.avc444_supported = true;
+    state.browser_avc420 = true;
+    let controls = state.controls_receiver();
+    let peer = Some(std::net::IpAddr::from([192, 168, 86, 24]));
+    for _ in 0..2 {
+        assert_eq!(state.begin_connection(peer).as_deref(), Some("1920x1080"));
+        assert_eq!(state.peer_addr, peer);
+        assert_eq!(state.target_frame_rate, Some(90));
+        assert_eq!(state.target_bitrate, Some(44_000_000));
+        assert_eq!(state.show_cursor, Some(false));
+        assert_eq!(state.encoder_pref.as_deref(), Some("bitmap"));
+        assert_eq!(state.target_quality.as_deref(), Some("lossless"));
+        assert_eq!(state.chroma_mode.as_deref(), Some("avc444"));
+        assert!(state.avc444_enabled && state.gfx_validation_mode && state.manual_bitmap_mode);
+        assert!(state.bitmap_mode());
+        assert!(!state.avc420_supported && !state.avc444_supported && !state.browser_video());
+        assert!(
+            !state.bitmap_fallback_mode
+                && !state.avc_fallback_to_uncompressed
+                && !state.clipboard_disabled
+        );
+        assert!(!state.surface_created);
+        assert_eq!(
+            (state.total_frames_sent, state.frame_id, state.pending_acks),
+            (0, 0, 0)
+        );
+        assert_eq!(state.active_encoder, None);
+    }
+    state.notify_controls_changed();
+    assert!(
+        controls.has_changed().unwrap(),
+        "Reconnect must retain the open controls watch lane"
+    );
+}

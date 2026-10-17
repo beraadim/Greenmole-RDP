@@ -500,17 +500,11 @@ impl RdpServer {
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         let framed = TokioFramed::new(stream);
 
-        // Reset GFX state for new connection, preserving peer IP and hot-updated resolution
+        // Reset only connection-owned state. Accepted graphics settings remain
+        // durable, and pending chroma changes apply at this connection boundary.
         let pending_resolution = {
             let mut gs = self.gfx_state.lock().unwrap();
-            let w = gs.width;
-            let h = gs.height;
-            let avc444_enabled = gs.avc444_enabled;
-            let res = gs.resolution.take();
-            let gfx_validation_mode = gs.gfx_validation_mode;
-            *gs = GfxState::new(w, h, avc444_enabled, gfx_validation_mode);
-            gs.peer_addr = peer_ip;
-            res
+            gs.begin_connection(peer_ip)
         };
 
         // Apply hot-updated resolution for this new connection

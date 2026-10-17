@@ -653,6 +653,37 @@ impl GfxState {
         (base_bitrate as f32 * self.network_quality) as u32
     }
 
+    /// Begin a TCP connection with fresh protocol/metrics state while keeping
+    /// accepted user settings. Chroma is latched here, never by a GFX channel
+    /// reset or desktop resize within an existing connection.
+    pub fn begin_connection(&mut self, peer_addr: Option<std::net::IpAddr>) -> Option<String> {
+        let avc444_enabled = self
+            .chroma_mode
+            .as_deref()
+            .map_or(self.avc444_enabled, |mode| mode == "avc444");
+        let mut next = Self::new(
+            self.width,
+            self.height,
+            avc444_enabled,
+            self.gfx_validation_mode,
+        );
+        next.peer_addr = peer_addr;
+        next.target_bitrate = self.target_bitrate;
+        next.target_frame_rate = self.target_frame_rate;
+        next.show_cursor = self.show_cursor;
+        next.resolution = self.resolution.take();
+        next.encoder_pref = self.encoder_pref.take();
+        next.target_quality = self.target_quality.take();
+        next.manual_bitmap_mode = self.manual_bitmap_mode;
+        next.chroma_mode = self.chroma_mode.take();
+        // Retain the control lane as well as its current generation. Existing
+        // observers must not mistake reconnect for a closed configuration lane.
+        next.controls_changed = self.controls_changed.clone();
+        let resolution = next.resolution.clone();
+        *self = next;
+        resolution
+    }
+
     pub fn reset_connection_state(&mut self, session_uses_gfx: bool) {
         self.session_uses_gfx = session_uses_gfx;
         self.channel_id = None;

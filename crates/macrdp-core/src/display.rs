@@ -763,6 +763,11 @@ impl RdpServerDisplay for MacDisplay {
 
         let (configured_frame_rate, configured_bitrate, quality, encoder_pref, controls_rx) = {
             let gfx = self.gfx_state.lock().unwrap();
+            // Chroma was latched when this TCP connection began. A pending
+            // request must not change an active stream during a resize, but a
+            // reconnect must construct its encoders with the newly chosen mode.
+            self.mode_444 = gfx.avc444_enabled;
+            self.show_cursor = gfx.show_cursor.unwrap_or(self.show_cursor);
             let quality =
                 live_controls::quality_from_setting(gfx.target_quality.as_deref(), self.quality);
             let fps = gfx

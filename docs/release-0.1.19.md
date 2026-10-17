@@ -24,6 +24,14 @@ Both backends retain full-range BT.709 and AVC444 v1's chroma mapping. Idle
 refresh emits the same paired format as active frames; codec drops preserve
 the browser picture while awaiting repair rather than inserting raw updates.
 
+A new connection now retains accepted quality, encoder/manual bitmap, frame
+rate, bitrate, cursor, resolution and validation controls rather than discarding
+them with the previous protocol state. Pending chroma is latched only at that
+connection boundary. A resize or graphics reactivation preserves active chroma;
+a reconnect constructs the capture encoder using the newly latched choice.
+Regression tests send actual 420/444 graphics PDUs across both transitions and
+verify repeated reconnect and control-watch continuity.
+
 ## Try it
 
 Install this DMG, then choose **Full color (AVC444)** under Settings → Video
@@ -50,26 +58,9 @@ updates, raw suppression and paired idle repair. Existing shortcut regression
 cases also cover the new exact Guacamole client name. Independent review checked
 reference repair, padding, client negotiation and ownership.
 
-The complete serial `tools/check.sh` passed: 704 Rust tests, eight Python tests
+The complete serial `tools/check.sh` passed: 706 Rust tests, eight Python tests
 and eight JavaScript tests, with six existing opt-in tests ignored. CLI,
 TypeScript and production frontend builds passed. The focused codec suite
-passed 50 tests and the browser wire contract passed four tests. The verified
+passed 50 tests and the browser wire contract passed six tests. The verified
 Desktop delivery is recorded after packaging.
 The test package does not install itself or change the running server/display.
-
-## Verified Desktop delivery
-
-Built from source `a07a4cec48f1e5ea31ec7a552166ec5096485d2c`, with ad-hoc
-application signing, and delivered to:
-
-`/Users/beraadim/Desktop/macrdp_0.1.19_aarch64_a07a4cec48f1.dmg`
-
-The image is 15,432,569 bytes; SHA-256:
-
-`2cee5744bdb3fda7ac52567eda59f3a8b3e2888eaaef7219ba9bd31f70335b51`
-
-The disk-image checksum, read-only mounted bundle version/build identity and
-deep strict application signature passed verification. Packaged helper checks
-rejected unexpected arguments and invalid configuration before capture or
-credential logging. The Desktop copy and adjacent checksum/build-info sidecars
-were verified against their build outputs. Installation remains with the user.
