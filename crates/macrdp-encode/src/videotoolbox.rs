@@ -468,17 +468,6 @@ impl VtEncoder {
         Ok(())
     }
 
-    fn clear_avc444_padding(&mut self) -> Result<()> {
-        let bufs = self
-            .yuv444_buf
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no YUV444 buffers"))?;
-        bufs.y444.fill(0);
-        bufs.u444.fill(128);
-        bufs.v444.fill(128);
-        Ok(())
-    }
-
     /// Create a balanced encoder; callers selecting a preset use new_with_quality.
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
         Self::new_with_quality(width, height, fps, bitrate, mode_444, Quality::Balanced)
@@ -1533,7 +1522,6 @@ impl VideoEncoder for VtEncoder {
         stride: usize,
     ) -> Result<Avc444EncodedFrame> {
         self.validate_avc444_input(data, width, height, stride)?;
-        self.clear_avc444_padding()?;
 
         let bufs = self
             .yuv444_buf
@@ -1544,11 +1532,13 @@ impl VideoEncoder for VtEncoder {
         let h = self.height;
 
         // Step 1: BGRA → YUV444 → B-area split (only needed for aux view)
-        crate::yuv444_split::bgra_to_yuv444(
+        crate::yuv444_split::bgra_to_yuv444_padded(
             data,
             width,
             height,
             stride,
+            w,
+            h,
             &mut bufs.y444,
             &mut bufs.u444,
             &mut bufs.v444,
@@ -1822,6 +1812,16 @@ impl VideoEncoder for VtEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_avc444_single_stream_preserves_one_pixel_chroma_with_width_padding() {
+        for (width, height) in [(128, 64), (126, 60)] {
+            let mut encoder =
+                VtEncoder::new_with_quality(128, 64, 30.0, 12_000_000, true, Quality::HighQuality)
+                    .unwrap();
+            crate::color::tests::assert_avc444_fidelity(&mut encoder, width, height);
+        }
+    }
 
     #[test]
     fn actual_videotoolbox_output_preserves_colors_with_simd_and_scalar_nv12() {

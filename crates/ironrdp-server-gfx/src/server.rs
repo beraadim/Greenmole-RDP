@@ -1532,6 +1532,7 @@ impl RdpServer {
             info!(
                 session_uses_gfx = gfx_state.session_uses_gfx,
                 experimental_browser_avc420 = gfx_state.browser_avc420,
+                experimental_browser_avc444 = gfx_state.browser_avc444,
                 "Connection graphics path negotiated"
             );
         }

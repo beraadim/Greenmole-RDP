@@ -1,7 +1,7 @@
 //! Loopback-only synthetic RDP producer for Guacamole/browser integration QA.
 //!
 //! First export synthetic frames with macrdp-encode's export_avc420_fixture.
-//! Run with: <fixture-directory> <openh264|videotoolbox> <port> <cert.der> <key.der>
+//! Run with: <fixture-directory> <openh264|videotoolbox> <port> <cert.der> <key.der> [avc444]
 //! Supply a disposable self-signed DER certificate and PKCS#8 DER private key.
 //! It never opens a display, captures pixels, or accepts input. TLS-only RDP
 //! uses the public fixture credentials synthetic-fixture/synthetic-fixture
@@ -25,13 +25,19 @@ use tokio_rustls::{rustls, TlsAcceptor};
 const WIDTH: u16 = 320;
 const HEIGHT: u16 = 180;
 
+struct FixtureFrame {
+    main: Bytes,
+    auxiliary: Option<Bytes>,
+    pixels: Option<Bytes>,
+}
+
 struct SyntheticDisplay {
-    frames: Arc<Vec<Bytes>>,
+    frames: Arc<Vec<FixtureFrame>>,
     gfx: Arc<Mutex<GfxState>>,
 }
 
 struct SyntheticUpdates {
-    frames: Arc<Vec<Bytes>>,
+    frames: Arc<Vec<FixtureFrame>>,
     gfx: Arc<Mutex<GfxState>>,
     index: usize,
     seeded: bool,
@@ -83,7 +89,7 @@ impl RdpServerDisplay for SyntheticDisplay {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for SyntheticUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        let (gfx_ready, avc, bitmap, browser) = loop {
+        let (gfx_ready, avc, use_444, bitmap, browser) = loop {
             // No state is consumed until after this await, preserving the
             // display provider's cancellation-safety contract.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -93,17 +99,21 @@ impl RdpServerDisplayUpdates for SyntheticUpdates {
                 break (
                     state.has_gfx_channel(),
                     state.avc420_supported,
+                    state.use_avc444(),
                     bitmap,
-                    state.browser_avc420,
+                    state.browser_video(),
                 );
             }
         };
         if !self.reported {
-            eprintln!("Synthetic display ready: gfx={gfx_ready} avc420={avc} bitmap={bitmap} browser={browser}");
+            eprintln!("Synthetic display ready: gfx={gfx_ready} avc420={avc} avc444={use_444} bitmap={bitmap} browser={browser}");
             self.reported = true;
         }
         if bitmap {
-            let data = synthetic_pixels(self.index);
+            let data = self.frames[self.index]
+                .pixels
+                .clone()
+                .unwrap_or_else(|| synthetic_pixels(self.index));
             self.index = (self.index + 1) % self.frames.len();
             return Ok(Some(DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0,
@@ -116,7 +126,10 @@ impl RdpServerDisplayUpdates for SyntheticUpdates {
                 dirty_rects: Vec::new(),
             })));
         }
-        if !self.seeded || !avc {
+        // A paired fixture shares references between both views. If this
+        // client cannot accept 444, serve images rather than dropping half
+        // the reference chain and sending invalid main-only delta frames.
+        if !self.seeded || !avc || (self.frames[0].auxiliary.is_some() && !use_444) {
             // Exercise the startup ResetGraphics + raw image seed which must
             // remain legal before the browser's first video access unit.
             self.seeded = true;
@@ -129,7 +142,10 @@ impl RdpServerDisplayUpdates for SyntheticUpdates {
                         y: 0,
                         width: WIDTH,
                         height: HEIGHT,
-                        pixel_data: synthetic_pixels(0),
+                        pixel_data: self.frames[0]
+                            .pixels
+                            .clone()
+                            .unwrap_or_else(|| synthetic_pixels(0)),
                     }],
                 },
             )));
@@ -137,13 +153,17 @@ impl RdpServerDisplayUpdates for SyntheticUpdates {
         let index = self.index;
         self.index = (self.index + 1) % self.frames.len();
         Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-            h264_data: self.frames[index].clone(),
+            h264_data: self.frames[index].main.clone(),
             width: WIDTH,
             height: HEIGHT,
             enc_width: 320,
             enc_height: 192,
             is_keyframe: index == 0 || index == 4,
-            h264_aux: None,
+            h264_aux: if use_444 {
+                self.frames[index].auxiliary.clone()
+            } else {
+                None
+            },
         })))
     }
 }
@@ -175,6 +195,12 @@ async fn main() -> Result<()> {
             .context("Pass disposable DER certificate")?,
     );
     let private_key = PathBuf::from(arguments.next().context("Pass disposable PKCS#8 DER key")?);
+    let codec = arguments.next();
+    let mode_444 = match codec.as_deref().and_then(std::ffi::OsStr::to_str) {
+        None | Some("avc420") => false,
+        Some("avc444") => true,
+        _ => anyhow::bail!("Codec must be avc420 or avc444"),
+    };
     anyhow::ensure!(arguments.next().is_none(), "Unexpected arguments");
     anyhow::ensure!(port != 0, "Use an explicit nonzero test port");
     let tls = rustls::ServerConfig::builder()
@@ -184,17 +210,39 @@ async fn main() -> Result<()> {
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(private_key)?)),
         )?;
     let tls = TlsAcceptor::from(Arc::new(tls));
-    let mut frames = Vec::new();
-    for index in 0..6 {
-        let path = directory.join(format!("{backend}_320x180_{index}.h264"));
+    let read = |file: String| -> Result<Bytes> {
+        let path = directory.join(file);
         let length = path.metadata()?.len();
         anyhow::ensure!(
             length > 0 && length <= 8 * 1024 * 1024,
             "Invalid fixture size"
         );
-        frames.push(Bytes::from(std::fs::read(path)?));
+        Ok(Bytes::from(std::fs::read(path)?))
+    };
+    let mut frames = Vec::new();
+    for index in 0..6 {
+        let base = format!("{backend}_320x180_{index}");
+        let (main, auxiliary, pixels) = if mode_444 {
+            let pixels = read(format!("{base}.bgra"))?;
+            anyhow::ensure!(
+                pixels.len() == usize::from(WIDTH) * usize::from(HEIGHT) * 4,
+                "Invalid fixture pixel dimensions"
+            );
+            (
+                read(format!("{base}.main.h264"))?,
+                Some(read(format!("{base}.aux.h264"))?),
+                Some(pixels),
+            )
+        } else {
+            (read(format!("{base}.h264"))?, None, None)
+        };
+        frames.push(FixtureFrame {
+            main,
+            auxiliary,
+            pixels,
+        });
     }
-    let gfx = Arc::new(Mutex::new(GfxState::new(WIDTH, HEIGHT, false, false)));
+    let gfx = Arc::new(Mutex::new(GfxState::new(WIDTH, HEIGHT, mode_444, false)));
     let display = SyntheticDisplay {
         frames: Arc::new(frames),
         gfx: Arc::clone(&gfx),

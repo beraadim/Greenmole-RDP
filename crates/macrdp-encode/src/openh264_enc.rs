@@ -12,8 +12,6 @@ use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 
 pub struct OpenH264Encoder {
     encoder: Encoder,
-    /// Auxiliary encoder for AVC444 chroma stream
-    encoder_aux: Option<Encoder>,
     width: u32,
     height: u32,
     force_keyframe: bool,
@@ -22,7 +20,6 @@ pub struct OpenH264Encoder {
     target_bitrate: u32,
     bitrate_applied: bool,
     main_initialized: bool,
-    aux_initialized: bool,
     fps: f32,
     quality: Quality,
     mode_444: bool,
@@ -60,6 +57,7 @@ fn create_oh264_encoder(
     fps: f32,
     bitrate: u32,
     quality: Quality,
+    mode_444: bool,
 ) -> Result<Encoder> {
     let (min_qp, max_qp) = quality.quantizer_range()?;
     let complexity = match quality {
@@ -74,10 +72,21 @@ fn create_oh264_encoder(
         .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
         .background_detection(false)
+        // Alternating main/auxiliary views are different representations of
+        // one desktop, not scene cuts. Preserve their shared P-frame chain.
+        .scene_change_detect(!mode_444)
         .adaptive_quantization(true)
         .qp(openh264::encoder::QpRange::new(min_qp, max_qp))
         .skip_frames(false)
-        .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
+        // ScreenContentRealTime forcibly reenables scene detection inside
+        // OpenH264, turning every alternating AVC444 view into another IDR.
+        // CameraVideoRealTime permits disabling that heuristic; all screen
+        // bitrate/quantizer and no-frame-skip policy above remains in force.
+        .usage_type(if mode_444 {
+            openh264::encoder::UsageType::CameraVideoRealTime
+        } else {
+            openh264::encoder::UsageType::ScreenContentRealTime
+        })
         .complexity(complexity)
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
             fps as u32 * 5,
@@ -97,7 +106,7 @@ impl OpenH264Encoder {
         height: u32,
         stride: usize,
     ) -> Result<()> {
-        if width > self.width || height > self.height {
+        if width == 0 || height == 0 || width > self.width || height > self.height {
             anyhow::bail!(
                 "AVC444 frame too large: frame={}x{}, encoder={}x{}",
                 width,
@@ -138,17 +147,6 @@ impl OpenH264Encoder {
         Ok(())
     }
 
-    fn clear_avc444_padding(&mut self) -> Result<()> {
-        let bufs = self
-            .yuv444_bufs
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no YUV444 buffers"))?;
-        bufs.y444.fill(0);
-        bufs.u444.fill(128);
-        bufs.v444.fill(128);
-        Ok(())
-    }
-
     /// Create a balanced encoder; callers selecting a preset use new_with_quality.
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
         Self::new_with_quality(width, height, fps, bitrate, mode_444, Quality::Balanced)
@@ -163,20 +161,10 @@ impl OpenH264Encoder {
         quality: Quality,
     ) -> Result<Self> {
         let (min_qp, max_qp) = quality.quantizer_range()?;
-        let encoder = create_oh264_encoder(width, height, fps, bitrate, quality)?;
-
-        // AVC444: create auxiliary encoder with 70% bitrate
-        let encoder_aux = if mode_444 {
-            let aux_bitrate = (bitrate as f64 * 0.7) as u32;
-            let aux = create_oh264_encoder(width, height, fps, aux_bitrate, quality)?;
-            tracing::info!(
-                aux_bitrate_mbps = aux_bitrate as f64 / 1_000_000.0,
-                "AVC444 auxiliary OpenH264 encoder created"
-            );
-            Some(aux)
-        } else {
-            None
-        };
+        // MS-RDPEGFX 2.2.4.5 requires both views in one H.264 reference
+        // chain, decoded in main/auxiliary order by a single decoder.
+        let coded_fps = if mode_444 { fps * 2.0 } else { fps };
+        let encoder = create_oh264_encoder(width, height, coded_fps, bitrate, quality, mode_444)?;
 
         let vimage = VImageConverter::new()
             .map_err(|e| tracing::warn!("vImage init failed, using scalar fallback: {e}"))
@@ -204,7 +192,6 @@ impl OpenH264Encoder {
 
         Ok(Self {
             encoder,
-            encoder_aux,
             width,
             height,
             force_keyframe: false,
@@ -212,7 +199,6 @@ impl OpenH264Encoder {
             target_bitrate: bitrate,
             bitrate_applied: false,
             main_initialized: false,
-            aux_initialized: false,
             fps,
             quality,
             mode_444,
@@ -305,11 +291,6 @@ impl VideoEncoder for OpenH264Encoder {
             .encode(&yuv)
             .context("OpenH264 native startup failed")?;
         self.main_initialized = true;
-        if let Some(aux) = &mut self.encoder_aux {
-            aux.encode(&yuv)
-                .context("OpenH264 auxiliary native startup failed")?;
-            self.aux_initialized = true;
-        }
         self.bitrate_applied = true;
         self.force_keyframe = true;
         tracing::info!(quality = ?self.quality, "OpenH264 native quality and bitrate configuration accepted");
@@ -429,15 +410,10 @@ impl VideoEncoder for OpenH264Encoder {
         stride: usize,
     ) -> Result<Avc444EncodedFrame> {
         self.validate_avc444_input(data, width, height, stride)?;
-        self.clear_avc444_padding()?;
 
-        let encoder_aux = self
-            .encoder_aux
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no auxiliary encoder"))?;
-        if self.force_keyframe {
+        let requested_keyframe = self.force_keyframe;
+        if requested_keyframe {
             self.encoder.force_intra_frame();
-            encoder_aux.force_intra_frame();
             self.force_keyframe = false;
         }
         let bufs = self
@@ -449,11 +425,13 @@ impl VideoEncoder for OpenH264Encoder {
         let h = self.height;
 
         // Step 1: BGRA -> YUV444
-        crate::yuv444_split::bgra_to_yuv444(
+        crate::yuv444_split::bgra_to_yuv444_padded(
             data,
             width,
             height,
             stride,
+            w,
+            h,
             &mut bufs.y444,
             &mut bufs.u444,
             &mut bufs.v444,
@@ -476,10 +454,10 @@ impl VideoEncoder for OpenH264Encoder {
             (w as usize, h as usize),
             (w as usize, w as usize / 2, w as usize / 2),
         );
-        let main_bitstream = self
-            .encoder
-            .encode(&main_yuv)
-            .context("OpenH264 main encode failed")?;
+        let main_bitstream = self.encoder.encode(&main_yuv).map_err(|error| {
+            self.force_keyframe = true;
+            anyhow::anyhow!("OpenH264 main encode failed: {error}")
+        })?;
         let mut main_nal = Vec::new();
         main_bitstream.write_vec(&mut main_nal);
         let main_keyframe = matches!(main_bitstream.frame_type(), FrameType::IDR | FrameType::I);
@@ -494,13 +472,27 @@ impl VideoEncoder for OpenH264Encoder {
             (w as usize, h as usize),
             (w as usize, w as usize / 2, w as usize / 2),
         );
-        let aux_bitstream = encoder_aux
-            .encode(&aux_yuv)
-            .context("OpenH264 aux encode failed")?;
+        // Make both views independently identifiable on a reset; ordinary
+        // pairs retain references across the alternating views as required.
+        if main_keyframe {
+            self.encoder.force_intra_frame();
+        }
+        let aux_bitstream = self.encoder.encode(&aux_yuv).map_err(|error| {
+            // Main may already be a native reference. Never return a partial
+            // pair and make the next delivered pair self-contained.
+            self.force_keyframe = true;
+            anyhow::anyhow!("OpenH264 auxiliary encode failed: {error}")
+        })?;
         let mut aux_nal = Vec::new();
         aux_bitstream.write_vec(&mut aux_nal);
         let aux_keyframe = matches!(aux_bitstream.frame_type(), FrameType::IDR | FrameType::I);
-        self.aux_initialized = true;
+        if main_nal.is_empty()
+            || aux_nal.is_empty()
+            || (requested_keyframe && !(main_keyframe && aux_keyframe))
+        {
+            self.force_keyframe = true;
+            anyhow::bail!("OpenH264 returned an incomplete AVC444 pair or ignored a requested IDR");
+        }
 
         tracing::debug!(
             main_bytes = main_nal.len(),
@@ -534,33 +526,25 @@ impl VideoEncoder for OpenH264Encoder {
         if self.target_bitrate == bitrate_bps && (!self.main_initialized || self.bitrate_applied) {
             return Ok(());
         }
-        // The Rust wrapper initializes each native encoder lazily on its first
-        // frame. Configure an unused view instead of calling SetOption on an
-        // uninitialized codec, preserving every already-running reference chain.
-        let configured_aux = if self.encoder_aux.is_some() && !self.aux_initialized {
-            Some(create_oh264_encoder(
+        // The wrapper initializes its native codec lazily. Reconfigure before
+        // first use, otherwise preserve the active main/aux reference chain.
+        if !self.main_initialized {
+            self.encoder = create_oh264_encoder(
                 self.width,
                 self.height,
-                self.fps,
-                ((bitrate_bps as f64 * 0.7) as u32).max(1),
+                if self.mode_444 {
+                    self.fps * 2.0
+                } else {
+                    self.fps
+                },
+                bitrate_bps,
                 self.quality,
-            )?)
-        } else {
-            None
-        };
-        if !self.main_initialized {
-            let configured_main =
-                create_oh264_encoder(self.width, self.height, self.fps, bitrate_bps, self.quality)?;
-            self.encoder = configured_main;
-            if let Some(aux) = configured_aux {
-                self.encoder_aux = Some(aux);
-            }
+                self.mode_444,
+            )?;
             self.target_bitrate = bitrate_bps;
             self.bitrate_applied = false;
             return Ok(());
         }
-        // If an auxiliary update fails after the main update, the two views no
-        // longer have a confirmed common target. Retrying must not be skipped.
         self.bitrate_applied = false;
         unsafe {
             let mut bitrate_info = openh264_sys2::SBitrateInfo {
@@ -571,21 +555,7 @@ impl VideoEncoder for OpenH264Encoder {
                 openh264_sys2::ENCODER_OPTION_BITRATE,
                 &mut bitrate_info as *mut _ as *mut c_void,
             );
-            anyhow::ensure!(status == 0, "OpenH264 main bitrate update failed: {status}");
-            if let Some(aux) = self.encoder_aux.as_mut().filter(|_| self.aux_initialized) {
-                bitrate_info.iBitrate = ((bitrate_bps as f64 * 0.7) as i32).max(1);
-                let status = aux.raw_api().set_option(
-                    openh264_sys2::ENCODER_OPTION_BITRATE,
-                    &mut bitrate_info as *mut _ as *mut c_void,
-                );
-                anyhow::ensure!(
-                    status == 0,
-                    "OpenH264 auxiliary bitrate update failed: {status}"
-                );
-            }
-        }
-        if let Some(aux) = configured_aux {
-            self.encoder_aux = Some(aux);
+            anyhow::ensure!(status == 0, "OpenH264 bitrate update failed: {status}");
         }
         self.target_bitrate = bitrate_bps;
         self.bitrate_applied = true;
@@ -642,6 +612,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn actual_avc444_single_stream_preserves_one_pixel_chroma_with_width_padding() {
+        for (width, height) in [(128, 64), (126, 60)] {
+            let mut encoder = OpenH264Encoder::new_with_quality(
+                128,
+                64,
+                30.0,
+                12_000_000,
+                true,
+                Quality::HighQuality,
+            )
+            .unwrap();
+            crate::color::tests::assert_avc444_fidelity(&mut encoder, width, height);
+        }
+    }
+
     fn native_parameters(encoder: &mut Encoder) -> openh264_sys2::SEncParamExt {
         let mut parameters = openh264_sys2::SEncParamExt::default();
         let status = unsafe {
@@ -655,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn quality_presets_reach_both_native_encoders_after_lazy_bitrate_reconfiguration() {
+    fn quality_presets_reach_shared_native_encoder_after_lazy_bitrate_reconfiguration() {
         for (quality, expected, complexity) in [
             (Quality::LowLatency, (20, 40), openh264_sys2::LOW_COMPLEXITY),
             (
@@ -679,13 +665,11 @@ mod tests {
                 .unwrap();
             assert!(!output.main_view.data.is_empty());
             assert!(!output.aux_view.data.is_empty());
-            for parameters in [
-                native_parameters(&mut encoder.encoder),
-                native_parameters(encoder.encoder_aux.as_mut().unwrap()),
-            ] {
-                assert_eq!((parameters.iMinQp, parameters.iMaxQp), expected);
-                assert_eq!(parameters.iComplexityMode, complexity);
-            }
+            let parameters = native_parameters(&mut encoder.encoder);
+            assert_eq!((parameters.iMinQp, parameters.iMaxQp), expected);
+            assert_eq!(parameters.iComplexityMode, complexity);
+            assert_eq!(parameters.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
+            assert!(!parameters.bEnableSceneChangeDetect);
         }
     }
 
@@ -727,7 +711,6 @@ mod tests {
             let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 2_000_000, mode_444).unwrap();
             encoder.prepare().unwrap();
             assert!(encoder.main_initialized);
-            assert_eq!(encoder.aux_initialized, mode_444);
             assert_eq!(encoder.applied_bitrate(), Some(2_000_000));
             // A hot bitrate update is now native, not a deferred configuration.
             encoder.set_bitrate(1_000_000).unwrap();
@@ -764,19 +747,17 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_update_preserves_initialized_main_and_configures_unused_auxiliary() {
+    fn bitrate_update_preserves_initialized_encoder_before_first_auxiliary_view() {
         let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 2_000_000, true).unwrap();
         let bgra = vec![128; 64 * 64 * 4];
         encoder.encode_bgra(&bgra, 64, 64, 256).unwrap();
         assert!(encoder.main_initialized);
-        assert!(!encoder.aux_initialized);
         encoder.set_bitrate(1_000_000).unwrap();
         assert_eq!(encoder.applied_bitrate(), Some(1_000_000));
         assert!(encoder.main_initialized);
         let output = encoder.encode_bgra_444(&bgra, 64, 64, 256).unwrap();
         assert!(!output.main_view.data.is_empty());
         assert!(!output.aux_view.data.is_empty());
-        assert!(encoder.aux_initialized);
     }
 
     #[test]

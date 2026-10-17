@@ -3,6 +3,50 @@ use super::CachedFrame;
 use anyhow::Result;
 use macrdp_encode::VideoEncoder;
 
+/// AVC444 views share one codec chain and must remain a complete ordered pair,
+/// including cached idle refreshes. Sending an AVC420 keepalive would terminate
+/// browser reconstruction and lose the chroma baseline.
+pub(super) fn encode_444(
+    encoder: &mut dyn VideoEncoder,
+    cache: &CachedFrame,
+) -> Result<ironrdp_server::GfxFrameUpdate> {
+    encoder.force_keyframe();
+    let (pair, width, height) = match cache {
+        CachedFrame::Bgra {
+            data,
+            width,
+            height,
+            stride,
+        } => (
+            encoder.encode_bgra_444(data, *width, *height, *stride)?,
+            *width,
+            *height,
+        ),
+        CachedFrame::BgraPixelBuffer(buffer, width, height, _) => {
+            let pair = buffer
+                .with_locked_bgra(*width, *height, |data, stride| {
+                    encoder.encode_bgra_444(data, *width, *height, stride)
+                })
+                .ok_or_else(|| anyhow::anyhow!("Idle AVC444 pixel buffer lock failed"))??;
+            (pair, *width, *height)
+        }
+        CachedFrame::PixelBuffer(_, _, _) => anyhow::bail!("Idle AVC444 requires BGRA capture"),
+    };
+    anyhow::ensure!(
+        !pair.main_view.data.is_empty() && !pair.aux_view.data.is_empty(),
+        "Idle AVC444 returned an incomplete pair"
+    );
+    Ok(ironrdp_server::GfxFrameUpdate {
+        width: width as u16,
+        height: height as u16,
+        enc_width: pair.main_view.width as u16,
+        enc_height: pair.main_view.height as u16,
+        is_keyframe: pair.main_view.is_keyframe && pair.aux_view.is_keyframe,
+        h264_data: pair.main_view.data,
+        h264_aux: Some(pair.aux_view.data),
+    })
+}
+
 pub(super) fn submit(encoder: &mut dyn VideoEncoder, cache: &CachedFrame) -> Result<(u16, u16)> {
     encoder.force_keyframe();
     let (width, height) = match cache {
@@ -42,6 +86,7 @@ mod tests {
         forced: bool,
         submitted: bool,
         fail: bool,
+        dual: bool,
     }
     impl VideoEncoder for DelayedEncoder {
         fn backend_name(&self) -> &'static str {
@@ -57,7 +102,21 @@ mod tests {
             _: u32,
             _: usize,
         ) -> Result<Avc444EncodedFrame> {
-            unreachable!()
+            assert!(self.dual && self.forced);
+            let frame = || EncodedFrame {
+                data: if self.fail {
+                    Bytes::new()
+                } else {
+                    Bytes::from_static(&[0, 0, 1, 0x65])
+                },
+                is_keyframe: true,
+                width: 16,
+                height: 16,
+            };
+            Ok(Avc444EncodedFrame {
+                main_view: frame(),
+                aux_view: frame(),
+            })
         }
         fn set_bitrate(&mut self, _: u32) -> Result<()> {
             Ok(())
@@ -66,7 +125,7 @@ mod tests {
             self.forced = true;
         }
         fn supports_444(&self) -> bool {
-            false
+            self.dual
         }
         fn supports_pipelining(&self) -> bool {
             true
@@ -101,5 +160,25 @@ mod tests {
         };
         assert!(submit(&mut encoder, &frame()).is_err());
         assert!(!encoder.submitted);
+    }
+    #[test]
+    fn idle_avc444_keeps_both_views_even_when_encoder_can_pipeline_420() {
+        let mut encoder = DelayedEncoder {
+            dual: true,
+            ..Default::default()
+        };
+        let frame = encode_444(&mut encoder, &frame()).unwrap();
+        assert!(encoder.forced && !encoder.submitted);
+        assert!(frame.is_keyframe && frame.h264_aux.is_some());
+        assert_eq!((frame.width, frame.height), (16, 16));
+    }
+    #[test]
+    fn incomplete_idle_avc444_pair_is_never_delivered() {
+        let mut encoder = DelayedEncoder {
+            dual: true,
+            fail: true,
+            ..Default::default()
+        };
+        assert!(encode_444(&mut encoder, &frame()).is_err());
     }
 }

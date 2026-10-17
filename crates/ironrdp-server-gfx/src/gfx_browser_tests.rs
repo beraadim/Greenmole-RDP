@@ -107,6 +107,51 @@ fn browser_receives_cropped_full_frame_avc420_even_when_host_and_client_support_
 }
 
 #[test]
+fn browser_avc444_opt_in_preserves_configuration_and_negotiated_codec_limits() {
+    let mut state = GfxState::new(318, 178, true, false);
+    for name in ["GuacamoleAVC444-suffix", "guacamoleavc444", "Guacamole RDP"] {
+        state.set_client_graphics_preferences(name);
+        assert!(!state.browser_video());
+    }
+    assert!(BROWSER_AVC444_CLIENT_NAME.is_ascii());
+    assert!(BROWSER_AVC444_CLIENT_NAME.len() <= 15);
+    state.set_client_graphics_preferences(BROWSER_AVC444_CLIENT_NAME);
+    assert!(state.browser_avc444 && state.browser_video());
+    assert!(!state.browser_avc420);
+    assert!(!state.use_avc444());
+    state.avc420_supported = true;
+    state.avc444_supported = true;
+    assert!(state.use_avc444());
+    let mut frame = access_unit(318, 178, true);
+    frame.h264_aux = Some(Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x7f]));
+    let pdus = unpack(&GfxHandler::create_frame_pdu(&mut state, &frame));
+    let surface = pdus
+        .iter()
+        .find_map(|pdu| match pdu {
+            ServerPdu::WireToSurface1(surface) => Some(surface),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(surface.codec_id, Codec1Type::Avc444);
+    let pair = Avc444BitmapStream::decode(&mut ReadCursor::new(&surface.bitmap_data)).unwrap();
+    assert_eq!(pair.encoding, Encoding::LUMA_AND_CHROMA);
+    assert_eq!(pair.stream1.data, &frame.h264_data[..]);
+    assert_eq!(
+        pair.stream2.unwrap().data,
+        frame.h264_aux.as_ref().unwrap().as_ref()
+    );
+    state.avc444_enabled = false;
+    let pdus = unpack(&GfxHandler::create_frame_pdu(
+        &mut state,
+        &access_unit(318, 178, true),
+    ));
+    assert_avc420_payload(&pdus, &access_unit(318, 178, true), 2);
+    assert!(state.browser_video());
+    state.reset_connection_state(true);
+    assert!(!state.browser_video());
+}
+
+#[test]
 fn raw_startup_then_avc_delta_and_resize_preserve_frame_and_surface_order() {
     let mut state = GfxState::new(320, 180, false, false);
     state.set_client_graphics_preferences(BROWSER_AVC420_CLIENT_NAME);

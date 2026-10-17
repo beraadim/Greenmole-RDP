@@ -214,7 +214,7 @@ impl EncoderPreference {
 }
 
 /// Create an H.264 encoder based on preference.
-/// When `mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
+/// AVC444 encodes main and auxiliary views in one ordered H.264 reference chain.
 pub fn create_encoder(
     width: u32,
     height: u32,

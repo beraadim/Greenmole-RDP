@@ -22,6 +22,7 @@ fn requested_shortcuts_use_command_for_both_ctrl_keys_and_clients() {
         ("Guacamole RDP", 0x0409),
         ("Guacamole RDP", 0x0414),
         ("GuacamoleAVC420", 0x0409),
+        ("GuacamoleAVC444", 0x0409),
         ("Windows Remote Desktop", 0x0409),
     ] {
         for controls in [&[false][..], &[true][..], &[false, true][..]] {
@@ -140,6 +141,7 @@ fn altgr_and_extra_modifiers_do_not_become_command_shortcuts() {
         ("Guacamole RDP", 0x0409),
         ("Guacamole RDP", 0x0414),
         ("GuacamoleAVC420", 0x0409),
+        ("GuacamoleAVC444", 0x0409),
         ("Windows Remote Desktop", 0x0409),
     ] {
         for ctrl_extended in [false, true] {

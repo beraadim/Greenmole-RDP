@@ -70,15 +70,41 @@ pub fn bgra_to_yuv444(
     u444: &mut [u8],
     v444: &mut [u8],
 ) -> Result<()> {
+    bgra_to_yuv444_padded(bgra, width, height, stride, width, height, y444, u444, v444)
+}
+
+/// Convert the visible source into encoder-sized planes. Padding stays black
+/// and neutral chroma; row offsets must use the encoded width before splitting
+/// the auxiliary macroblocks, even when the display is not a multiple of 16.
+#[allow(clippy::too_many_arguments)]
+pub fn bgra_to_yuv444_padded(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    encoded_width: u32,
+    encoded_height: u32,
+    y444: &mut [u8],
+    u444: &mut [u8],
+    v444: &mut [u8],
+) -> Result<()> {
     let w = width as usize;
     let h = height as usize;
-    if y444.len() < w * h || u444.len() < w * h || v444.len() < w * h {
+    let output_stride = encoded_width as usize;
+    let output_len = output_stride
+        .checked_mul(encoded_height as usize)
+        .ok_or_else(|| anyhow::anyhow!("YUV444 dimensions overflow"))?;
+    anyhow::ensure!(
+        width > 0 && height > 0 && width <= encoded_width && height <= encoded_height,
+        "Invalid visible/encoded YUV444 dimensions"
+    );
+    if y444.len() < output_len || u444.len() < output_len || v444.len() < output_len {
         bail!(
             "YUV444 destination buffers too small: y={}, u={}, v={}, required={}",
             y444.len(),
             u444.len(),
             v444.len(),
-            w * h
+            output_len
         );
     }
     let min_stride = w.saturating_mul(4);
@@ -100,9 +126,12 @@ pub fn bgra_to_yuv444(
         );
     }
 
+    y444[..output_len].fill(0);
+    u444[..output_len].fill(128);
+    v444[..output_len].fill(128);
     for row in 0..h {
         let bgra_row = row * stride;
-        let yuv_row = row * w;
+        let yuv_row = row * output_stride;
         for col in 0..w {
             let px = bgra_row + col * 4;
             let b = bgra[px] as i32;

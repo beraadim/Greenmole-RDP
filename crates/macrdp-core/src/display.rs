@@ -1784,9 +1784,11 @@ impl MacDisplayUpdates {
                 self.clear_client_stale_flag("cached-avc-convergence");
                 return Some(update);
             }
-            if self.has_pending_submit {
+            if self.has_pending_submit || self.gfx_state.lock().unwrap().browser_video() {
                 // Wait for the submitted refresh; mixing in another recovery
                 // while its callback is pending would duplicate convergence.
+                // Browser video must also keep its reference chain through a
+                // temporary codec drop instead of inserting a raw image.
                 return None;
             }
         }
@@ -2126,14 +2128,34 @@ impl MacDisplayUpdates {
         let encoder = self.encoder.as_mut()?;
 
         // Check GFX readiness
-        {
+        let use_444 = {
             let state = self.gfx_state.lock().unwrap();
             if !state.is_ready() {
                 return None;
             }
-        }
+            self.mode_444 && state.use_avc444() && encoder.supports_444()
+        };
 
         let t0 = Instant::now();
+        if use_444 {
+            return match idle_encode::encode_444(encoder.as_mut(), cache) {
+                Ok(frame) => {
+                    self.last_idr_time = Instant::now();
+                    self.needs_full_gfx_seed = false;
+                    tracing::debug!(
+                        main_bytes = frame.h264_data.len(),
+                        aux_bytes = frame.h264_aux.as_ref().map_or(0, |data| data.len()),
+                        encode_ms = t0.elapsed().as_secs_f64() * 1000.0,
+                        "Sent idle AVC444 IDR pair"
+                    );
+                    Some(DisplayUpdate::GfxFrame(frame))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Idle AVC444 IDR encode failed");
+                    None
+                }
+            };
+        }
         if encoder.supports_pipelining() {
             match idle_encode::submit(encoder.as_mut(), cache) {
                 Ok(size) => {
@@ -2384,7 +2406,7 @@ impl MacDisplayUpdates {
             gfx_channel_ready,
             gfx_avc_ready,
             use_444,
-            browser_avc420,
+            browser_video,
             force_full_frame_uncompressed_gfx,
             request_bitmap_fallback_full_frames,
         ) = {
@@ -2448,7 +2470,7 @@ impl MacDisplayUpdates {
                 gfx_channel_ready,
                 gfx_avc_ready,
                 use_444,
-                state.browser_avc420,
+                state.browser_video(),
                 force_full_frame_uncompressed_gfx,
                 request_bitmap_fallback_full_frames,
             )
@@ -2478,7 +2500,7 @@ impl MacDisplayUpdates {
             // raw seed or tiny RGB patch after video starts would require
             // terminating passthrough and re-encoding the surface as images.
             // Keep raw seeds available during asynchronous encoder startup.
-            if self.needs_full_gfx_seed && !(browser_avc420 && gfx_avc_ready) {
+            if self.needs_full_gfx_seed && !(browser_video && gfx_avc_ready) {
                 let full_rect = ClampedRect {
                     x: 0,
                     y: 0,
@@ -2698,9 +2720,7 @@ impl MacDisplayUpdates {
             // immediate path once AVC is available. Larger dirty regions should
             // prefer AVC so the negotiated hardware/software encoder actually
             // gets used for meaningful screen content updates.
-            if !browser_avc420
-                && !force_full_frame_uncompressed_gfx
-                && !frame.dirty_rects.is_empty()
+            if !browser_video && !force_full_frame_uncompressed_gfx && !frame.dirty_rects.is_empty()
             {
                 let total_area: u32 = frame.dirty_rects.iter().map(|r| r.width * r.height).sum();
 

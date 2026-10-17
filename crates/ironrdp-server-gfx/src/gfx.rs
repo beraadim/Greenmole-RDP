@@ -34,6 +34,8 @@ pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
 /// It fits the 15-character RDP client-name limit and retains Guacamole's
 /// existing keyboard translation identity. This is not an authentication hint.
 pub const BROWSER_AVC420_CLIENT_NAME: &str = "GuacamoleAVC420";
+/// Separate opt-in keeps existing browser AVC420 clients on their original codec.
+pub const BROWSER_AVC444_CLIENT_NAME: &str = "GuacamoleAVC444";
 /// Guacamole/FreeRDP interop is more reliable when uncompressed surface
 /// updates follow the normal StartFrame/EndFrame sequence instead of relying
 /// on immediate application of standalone surface commands.
@@ -315,6 +317,9 @@ pub struct GfxState {
     /// The browser consumes one continuous full-frame AVC420 stream. Keep tiny
     /// updates in that stream instead of switching between video and raw RGB.
     pub browser_avc420: bool,
+    /// Browser can reconstruct AVC444 and consumes continuous full-frame video.
+    /// This hint does not enable codecs absent from the negotiated capabilities.
+    pub browser_avc444: bool,
     pub confirmed_cap: Option<CapabilitySet>,
     pub width: u16,
     pub height: u16,
@@ -434,6 +439,7 @@ impl GfxState {
             avc444_supported: false,
             avc444_enabled,
             browser_avc420: false,
+            browser_avc444: false,
             confirmed_cap: None,
             width,
             height,
@@ -657,6 +663,7 @@ impl GfxState {
         self.avc420_supported = false;
         self.avc444_supported = false;
         self.browser_avc420 = false;
+        self.browser_avc444 = false;
         self.avc_fallback_to_uncompressed = false;
         self.bitmap_fallback_mode = false;
         self.frame_id = 0;
@@ -710,6 +717,12 @@ impl GfxState {
 
     pub fn set_client_graphics_preferences(&mut self, client_name: &str) {
         self.browser_avc420 = client_name == BROWSER_AVC420_CLIENT_NAME;
+        self.browser_avc444 = client_name == BROWSER_AVC444_CLIENT_NAME;
+    }
+
+    /// Tiny raw patches would terminate browser video passthrough for this session.
+    pub fn browser_video(&self) -> bool {
+        self.browser_avc420 || self.browser_avc444
     }
 
     pub fn use_avc444(&self) -> bool {
@@ -1133,6 +1146,7 @@ impl DvcProcessor for GfxHandler {
                     avc444_client = state.avc444_supported,
                     avc444_enabled = state.avc444_enabled,
                     experimental_browser_avc420 = state.browser_avc420,
+                    experimental_browser_avc444 = state.browser_avc444,
                     bitmap_fallback_mode = state.bitmap_fallback_mode,
                     effective_mode = if state.bitmap_mode() {
                         "bitmap-fallback-preferred"
