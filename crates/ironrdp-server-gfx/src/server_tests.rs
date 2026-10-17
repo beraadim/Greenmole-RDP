@@ -918,3 +918,39 @@ async fn verify_display_control_resize(gfx_enabled: bool) {
         })
     );
 }
+
+#[test]
+fn quality_controls_restore_future_capabilities_without_expanding_current_negotiation() {
+    let mut server = admission_test_server();
+    server.set_bitmap_quality(crate::BitmapQuality::Lossless);
+    server.activation_opts = server.opts.clone();
+    server.connection_gfx_advertised = false;
+    assert!(!server.activation_opts.has_remote_fx());
+    server.apply_bitmap_quality(crate::BitmapQuality::HighQuality);
+    assert!(server.opts.has_remote_fx());
+    assert!(server.gfx_channel_enabled());
+    assert!(!server.activation_opts.has_remote_fx());
+    assert!(!server.connection_gfx_advertised);
+    assert_eq!(
+        server.gfx_state.lock().unwrap().requested_bitmap_quality(),
+        Some(crate::BitmapQuality::HighQuality)
+    );
+}
+
+#[test]
+fn dequeued_graphics_policy_cannot_overwrite_a_more_recent_user_choice() {
+    let mut server = admission_test_server();
+    server
+        .event_sender()
+        .send(ServerEvent::SetBitmapQuality(
+            crate::BitmapQuality::HighQuality,
+        ))
+        .unwrap();
+    server.apply_bitmap_quality(crate::BitmapQuality::Lossless);
+    assert_eq!(server.bitmap_quality, crate::BitmapQuality::HighQuality);
+    let state = server.gfx_state.lock().unwrap();
+    assert_eq!(
+        state.requested_bitmap_quality(),
+        Some(crate::BitmapQuality::HighQuality)
+    );
+}

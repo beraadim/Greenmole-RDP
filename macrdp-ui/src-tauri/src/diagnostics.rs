@@ -60,9 +60,12 @@ pub async fn export_diagnostics(
         .lock()
         .await
         .clone()
-        .filter(|_| status.running);
-    let configuration_state =
-        crate::configuration::configuration_status(&config, running_config.as_ref());
+        .filter(|_| crate::configuration::accepts_live_updates(&status));
+    let configuration_state = crate::configuration::configuration_status(
+        &config,
+        running_config.as_ref(),
+        &*state.unconfirmed_graphics.lock().await,
+    );
     drop(lifecycle);
     let Some(path) = save_dialog::destination(&app).await? else {
         return Ok(ExportResult { path: None });

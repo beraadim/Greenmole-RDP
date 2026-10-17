@@ -124,6 +124,16 @@ async fn dispatch(
     packets: Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
 ) -> UpdateEncoder {
     let state = Arc::new(std::sync::Mutex::new(GfxState::new(256, 128, false, false)));
+    dispatch_in_state(encoder, update, regions, packets, &state).await
+}
+
+async fn dispatch_in_state(
+    encoder: UpdateEncoder,
+    update: DisplayUpdate,
+    regions: &mut Regions,
+    packets: Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+    state: &Arc<std::sync::Mutex<GfxState>>,
+) -> UpdateEncoder {
     let mut native = Writes(packets);
     let mut writer = SharedWriter::new(&mut native, Duration::from_secs(2));
     RdpServer::dispatch_display_update(
@@ -350,4 +360,135 @@ async fn unchanged_final_region_closes_existing_frame_without_another_begin() {
     let updates = commands(&packets.borrow());
     assert_eq!(updates.len(), 1);
     assert_eq!(markers(&updates), [(0, FrameAction::End, 1)]);
+}
+
+#[tokio::test]
+async fn live_lossless_change_closes_prior_surface_frame_before_bitmap_and_restores_monotonic_markers(
+) {
+    let packets = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let state = Arc::new(std::sync::Mutex::new(GfxState::new(256, 128, false, false)));
+    let mut regions = Regions {
+        pending: true,
+        ..Default::default()
+    };
+    let mut codecs = UpdateEncoderCodecs::new();
+    codecs.set_remotefx(Some((
+        rdp::capability_sets::EntropyBits::Rlgr3,
+        7,
+        ironrdp_pdu::codecs::rfx::OperatingMode::IMAGE_MODE,
+    )));
+    let encoder = UpdateEncoder::new(
+        DesktopSize {
+            width: 256,
+            height: 128,
+        },
+        CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+        codecs,
+    )
+    .unwrap();
+    let encoder = dispatch_in_state(
+        encoder,
+        DisplayUpdate::Bitmap(bitmap(0, 128, 128)),
+        &mut regions,
+        packets.clone(),
+        &state,
+    )
+    .await;
+    assert_eq!(markers(&commands(&packets.borrow())).len(), 1);
+    state.lock().unwrap().target_quality = Some("lossless".into());
+    regions.pending = false;
+    let encoder = dispatch_in_state(
+        encoder,
+        DisplayUpdate::Bitmap(bitmap(0, 256, 128)),
+        &mut regions,
+        packets.clone(),
+        &state,
+    )
+    .await;
+    assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
+    let wire = commands(&packets.borrow());
+    let boundary = markers(&wire);
+    assert_eq!(boundary.len(), 2);
+    assert_eq!(boundary[0].1, FrameAction::Begin);
+    assert_eq!(boundary[1].1, FrameAction::End);
+    assert_eq!(boundary[0].2, boundary[1].2);
+    assert!(wire[boundary[1].0 + 1..]
+        .iter()
+        .all(|(code, _)| *code == UpdateCode::Bitmap));
+    assert_eq!(state.lock().unwrap().bitmap_codec, Some("rdp6-rle"));
+    state.lock().unwrap().target_quality = Some("high_quality".into());
+    let encoder = dispatch_in_state(
+        encoder,
+        DisplayUpdate::Bitmap(bitmap(0, 256, 128)),
+        &mut regions,
+        packets.clone(),
+        &state,
+    )
+    .await;
+    assert_eq!(encoder.bitmap_codec(), "remotefx");
+    let wire = commands(&packets.borrow());
+    let boundary = markers(&wire);
+    assert_eq!(boundary.len(), 4);
+    assert_eq!(boundary[2].1, FrameAction::Begin);
+    assert_eq!(boundary[3].1, FrameAction::End);
+    assert_eq!(boundary[2].2, boundary[3].2);
+    assert!(boundary[2].2 > boundary[0].2);
+}
+
+#[tokio::test]
+async fn already_produced_gfx_updates_finish_in_order_after_an_image_policy_request() {
+    use crate::{GfxFrameUpdate, GfxUncompressedUpdate, UncompressedRect};
+    for update in [
+        DisplayUpdate::GfxFrame(GfxFrameUpdate {
+            h264_data: bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 1, 2, 3]),
+            width: 64,
+            height: 64,
+            enc_width: 64,
+            enc_height: 64,
+            is_keyframe: true,
+            h264_aux: None,
+        }),
+        DisplayUpdate::GfxUncompressed(GfxUncompressedUpdate {
+            width: 64,
+            height: 64,
+            rects: vec![UncompressedRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                pixel_data: bytes::Bytes::from_static(&[1, 2, 3, 255]),
+            }],
+        }),
+    ] {
+        let state = Arc::new(std::sync::Mutex::new(GfxState::new(64, 64, false, false)));
+        {
+            let mut state = state.lock().unwrap();
+            state.channel_id = Some(5);
+            state.caps_confirmed = true;
+            state.avc420_supported = true;
+            state.manual_bitmap_mode = true;
+            state.target_quality = Some("lossless".into());
+        }
+        let packets = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut native = Writes(packets.clone());
+        let mut writer = SharedWriter::new(&mut native, Duration::from_secs(2));
+        RdpServer::dispatch_display_update(
+            update,
+            &mut writer,
+            1002,
+            1003,
+            &mut vec![0; 4096],
+            encoder(CmdFlags::SET_SURFACE_BITS, BitmapQuality::Balanced),
+            &state,
+            Some(1004),
+            &mut Regions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !packets.borrow().is_empty(),
+            "discarding a produced AU can poison the next P-frame after a rapid policy reversal"
+        );
+        assert_eq!(state.lock().unwrap().frame_id, 1);
+    }
 }

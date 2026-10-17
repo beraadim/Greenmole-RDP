@@ -104,7 +104,9 @@ fn native_cleanup_pending() -> bool {
 /// Also usable after a cancelled startup that never returned a ServerHandle.
 /// True while any server, display, capture, or encoder owner is still alive.
 pub fn server_resources_pending() -> bool {
-    lifecycle::pending() || native_cleanup_pending() || crate::supervised::supervisor_resources_pending()
+    lifecycle::pending()
+        || native_cleanup_pending()
+        || crate::supervised::supervisor_resources_pending()
 }
 
 #[cfg(test)]
@@ -566,6 +568,17 @@ async fn start_server_inner(
         mode_444,
         gfx_validation_mode,
     )));
+    {
+        let mut state = gfx_state.lock().unwrap();
+        state.target_quality = Some(
+            config
+                .quality
+                .clone()
+                .unwrap_or_else(|| "high_quality".into()),
+        );
+        state.encoder_pref = config.encoder.clone();
+        state.manual_bitmap_mode = encoder_pref == macrdp_encode::EncoderPreference::Bitmap;
+    }
     let input_debug_state = Arc::new(Mutex::new(InputDebugState::default()));
     let active_connection = Arc::new(Mutex::new(None::<ConnectionInfo>));
 
@@ -864,12 +877,20 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                 match update {
                     ConfigUpdate::FrameRate(fps) => {
                         tracing::info!(fps, "Hot-update: frame_rate");
-                        gfx_for_config.lock().unwrap().target_frame_rate = Some(fps.max(1));
+                        let mut state = gfx_for_config.lock().unwrap();
+                        if state.target_frame_rate != Some(fps) {
+                            state.target_frame_rate = Some(fps);
+                            state.notify_controls_changed();
+                        }
                     }
                     ConfigUpdate::BitrateKbps(kbps) => {
                         let bps = kbps * 1000;
                         tracing::info!(bitrate_kbps = kbps, "Hot-update: bitrate");
-                        gfx_for_config.lock().unwrap().target_bitrate = Some(bps);
+                        let mut state = gfx_for_config.lock().unwrap();
+                        if state.target_bitrate != Some(bps) {
+                            state.target_bitrate = Some(bps);
+                            state.notify_controls_changed();
+                        }
                     }
                     ConfigUpdate::LogLevel(level) => {
                         tracing::info!(%level, "Hot-update: log_level");
@@ -886,8 +907,32 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                         gfx_for_config.lock().unwrap().resolution = Some(res);
                     }
                     ConfigUpdate::Encoder(enc) => {
-                        tracing::info!(%enc, "Hot-update: encoder (next connection)");
-                        gfx_for_config.lock().unwrap().encoder_pref = Some(enc);
+                        tracing::info!(%enc, "Hot-update: encoder");
+                        let mut state = gfx_for_config.lock().unwrap();
+                        if state.encoder_pref.as_deref() != Some(enc.as_str()) {
+                            state.manual_bitmap_mode = enc == "bitmap";
+                            state.encoder_pref = Some(enc);
+                            state.notify_controls_changed();
+                        }
+                    }
+                    ConfigUpdate::Quality(quality) => {
+                        // Validated at the public boundary and helper protocol. Publish
+                        // before waking capture so Lossless cannot race a stale codec.
+                        let bitmap_quality = ironrdp_server::BitmapQuality::from_config(&quality)
+                            .expect("validated quality");
+                        tracing::info!(%quality, "Hot-update: image quality");
+                        {
+                            let mut state = gfx_for_config.lock().unwrap();
+                            if state.target_quality.as_deref() != Some(quality.as_str()) {
+                                state.target_quality = Some(quality);
+                                state.notify_controls_changed();
+                            }
+                        }
+                        if let Err(error) = ev_sender.send(
+                            ironrdp_server::ServerEvent::SetBitmapQuality(bitmap_quality),
+                        ) {
+                            tracing::error!(%error, "Graphics control channel unavailable");
+                        }
                     }
                     ConfigUpdate::ChromaMode(mode) => {
                         let avc444 = mode == "avc444";
@@ -899,7 +944,11 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                             gfx_validation_mode = enabled,
                             "Hot-update: gfx validation mode"
                         );
-                        gfx_for_config.lock().unwrap().gfx_validation_mode = enabled;
+                        let mut state = gfx_for_config.lock().unwrap();
+                        if state.gfx_validation_mode != enabled {
+                            state.gfx_validation_mode = enabled;
+                            state.notify_controls_changed();
+                        }
                     }
                     ConfigUpdate::Credentials { username, password } => {
                         tracing::info!(%username, "Hot-update: credentials");

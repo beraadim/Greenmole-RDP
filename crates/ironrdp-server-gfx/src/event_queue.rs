@@ -192,6 +192,7 @@ pub struct ServerEventTx {
     data: mpsc::Sender<QueuedEvent>,
     addresses: mpsc::Sender<ServerEvent>,
     credentials: watch::Sender<Option<Credentials>>,
+    bitmap_quality: watch::Sender<Option<crate::BitmapQuality>>,
     quit: watch::Sender<bool>,
     budget: Arc<Semaphore>,
     audio_budget: Arc<Semaphore>,
@@ -219,6 +220,7 @@ pub struct ServerEventRx {
 pub(super) struct ControlReceiver {
     addresses: mpsc::Receiver<ServerEvent>,
     credentials: watch::Receiver<Option<Credentials>>,
+    bitmap_quality: watch::Receiver<Option<crate::BitmapQuality>>,
     quit: watch::Receiver<bool>,
 }
 
@@ -245,12 +247,14 @@ fn channel_with_limits(capacity: usize, bytes: usize) -> (ServerEventTx, ServerE
     let (data_tx, data_rx) = mpsc::channel(capacity);
     let (addresses_tx, addresses_rx) = mpsc::channel(CONTROL_CAPACITY);
     let (credentials_tx, credentials_rx) = watch::channel(None);
+    let (quality_tx, quality_rx) = watch::channel(None);
     let (quit_tx, quit_rx) = watch::channel(false);
     (
         ServerEventTx {
             data: data_tx,
             addresses: addresses_tx,
             credentials: credentials_tx,
+            bitmap_quality: quality_tx,
             quit: quit_tx,
             budget: Arc::new(Semaphore::new(bytes)),
             audio_budget: Arc::new(Semaphore::new(AUDIO_BUDGET_US as usize)),
@@ -262,6 +266,7 @@ fn channel_with_limits(capacity: usize, bytes: usize) -> (ServerEventTx, ServerE
             controls: ControlReceiver {
                 addresses: addresses_rx,
                 credentials: credentials_rx,
+                bitmap_quality: quality_rx,
                 quit: quit_rx,
             },
             data: DataReceiver {
@@ -273,6 +278,10 @@ fn channel_with_limits(capacity: usize, bytes: usize) -> (ServerEventTx, ServerE
 }
 
 impl ServerEventTx {
+    pub(super) fn requested_bitmap_quality(&self) -> Option<crate::BitmapQuality> {
+        *self.bitmap_quality.borrow()
+    }
+
     pub fn audio_stats(&self) -> Arc<AudioQueueStats> {
         self.audio_stats.clone()
     }
@@ -469,6 +478,10 @@ impl ServerEventTx {
                 self.credentials.send_replace(Some(credentials));
                 Ok(())
             }
+            ServerEvent::SetBitmapQuality(quality) => {
+                self.bitmap_quality.send_replace(Some(quality));
+                Ok(())
+            }
             event @ ServerEvent::GetLocalAddr(_) => self
                 .addresses
                 .try_send(event)
@@ -572,6 +585,11 @@ impl ControlReceiver {
                 return Ok(ServerEvent::SetCredentials(credentials));
             }
         }
+        if self.bitmap_quality.has_changed().unwrap_or(false) {
+            if let Some(quality) = *self.bitmap_quality.borrow_and_update() {
+                return Ok(ServerEvent::SetBitmapQuality(quality));
+            }
+        }
         self.addresses.try_recv()
     }
 
@@ -587,6 +605,12 @@ impl ControlReceiver {
                     if result.is_err() { return None; }
                     if let Some(credentials) = self.credentials.borrow_and_update().clone() {
                         return Some(ServerEvent::SetCredentials(credentials));
+                    }
+                },
+                result = self.bitmap_quality.changed() => {
+                    if result.is_err() { return None; }
+                    if let Some(quality) = *self.bitmap_quality.borrow_and_update() {
+                        return Some(ServerEvent::SetBitmapQuality(quality));
                     }
                 },
                 event = self.addresses.recv() => return event,
@@ -876,6 +900,43 @@ mod tests {
             panic!("missing changed credentials");
         };
         assert_eq!(credentials.username, "latest");
+    }
+
+    #[tokio::test]
+    async fn graphics_policy_is_coalesced_and_never_competes_with_channel_data() {
+        let (sender, mut receiver) = channel_with_limits(1, 4096);
+        sender.send(wave(10)).unwrap();
+        for quality in [
+            crate::BitmapQuality::Lossless,
+            crate::BitmapQuality::HighQuality,
+        ] {
+            sender.send(ServerEvent::SetBitmapQuality(quality)).unwrap();
+        }
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ServerEvent::SetBitmapQuality(
+                crate::BitmapQuality::HighQuality
+            ))
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ServerEvent::Rdpsnd(_))
+        ));
+        let (event, ()) = tokio::join!(receiver.recv(), async {
+            tokio::task::yield_now().await;
+            sender
+                .send(ServerEvent::SetBitmapQuality(
+                    crate::BitmapQuality::Balanced,
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            event,
+            Some(ServerEvent::SetBitmapQuality(
+                crate::BitmapQuality::Balanced
+            ))
+        ));
+        assert!(!sender.is_closed());
     }
 
     #[test]

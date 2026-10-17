@@ -12,6 +12,7 @@ use native_capture::NativeCapture;
 mod event_wait;
 mod idle_encode;
 mod idle_policy;
+mod live_controls;
 mod uncompressed_pacing;
 use damage::FrameDamage;
 use event_wait::DisplayWake;
@@ -578,7 +579,7 @@ pub struct MacDisplay {
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
     show_cursor: bool,
-    base_bitrate: u32,
+    bitrate_override: Option<u32>,
     gfx_state: Arc<Mutex<GfxState>>,
     coord_mapper: MouseCoordMapper,
     /// Shared audio sender slot — updated per connection by AudioFactory
@@ -641,7 +642,7 @@ impl MacDisplay {
             encoder_pref,
             mode_444,
             show_cursor,
-            base_bitrate,
+            bitrate_override,
             gfx_state,
             coord_mapper,
             shared_audio_tx,
@@ -692,12 +693,6 @@ impl MacDisplay {
             );
             self.width = w;
             self.height = h;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
-                w as u32,
-                h as u32,
-                self.frame_rate as f32,
-                self.quality,
-            );
             // Keep the active input transform unchanged until RDP reactivation
             // has completed and a capture at the negotiated size is ready.
             self.resize_tx.send_replace(DesktopSize {
@@ -766,15 +761,34 @@ impl RdpServerDisplay for MacDisplay {
             (gfx.session_uses_gfx, gfx.is_ready())
         };
 
-        let (configured_frame_rate, configured_bitrate) = {
+        let (configured_frame_rate, configured_bitrate, quality, encoder_pref, controls_rx) = {
             let gfx = self.gfx_state.lock().unwrap();
+            let quality =
+                live_controls::quality_from_setting(gfx.target_quality.as_deref(), self.quality);
+            let fps = gfx
+                .target_frame_rate
+                .unwrap_or(self.frame_rate)
+                .clamp(1, 240);
             (
-                gfx.target_frame_rate
-                    .unwrap_or(self.frame_rate)
-                    .clamp(1, 240),
+                fps,
                 gfx.target_bitrate
-                    .unwrap_or(self.base_bitrate)
+                    .or(self.bitrate_override)
+                    .unwrap_or_else(|| {
+                        macrdp_encode::screen_bitrate(
+                            width as u32,
+                            height as u32,
+                            fps as f32,
+                            quality,
+                        )
+                    })
                     .clamp(1, macrdp_encode::MAX_BITRATE_BPS),
+                quality,
+                gfx.encoder_pref
+                    .as_deref()
+                    .map_or(self.encoder_pref, |preference| {
+                        macrdp_encode::EncoderPreference::from_str_opt(Some(preference))
+                    }),
+                gfx.controls_receiver(),
             )
         };
 
@@ -856,11 +870,17 @@ impl RdpServerDisplay for MacDisplay {
             encoder: None,
             encoder_startup: None,
             encoder_startup_attempted: false,
-            quality: self.quality,
+            encoder_failed: false,
+            quality,
             gfx_state: Arc::clone(&self.gfx_state),
             coord_mapper: self.coord_mapper.clone(),
             resize_rx: self.resize_tx.subscribe(),
-            encoder_pref: self.encoder_pref,
+            encoder_pref,
+            controls_rx,
+            encoder_rebuild_deadline: None,
+            settings_refresh_pending: false,
+            default_frame_rate: self.frame_rate,
+            bitrate_override: self.bitrate_override,
             mode_444: self.mode_444,
             shared_audio_tx: self.shared_audio_tx.clone(),
             display_frame_count: 0,
@@ -948,11 +968,22 @@ struct MacDisplayUpdates {
     encoder: Option<Box<dyn VideoEncoder>>,
     encoder_startup: Option<encoder_startup::Initializer<Box<dyn VideoEncoder>>>,
     encoder_startup_attempted: bool,
+    /// A failed or stalled codec remains disabled for this capture. User
+    /// toggles must not bypass the session's automatic recovery decision.
+    encoder_failed: bool,
     quality: Quality,
     gfx_state: Arc<Mutex<GfxState>>,
     coord_mapper: MouseCoordMapper,
     resize_rx: tokio::sync::watch::Receiver<DesktopSize>,
     encoder_pref: macrdp_encode::EncoderPreference,
+    controls_rx: tokio::sync::watch::Receiver<u64>,
+    /// Video-to-video changes hold the last presented image while the bounded
+    /// native initializer builds a new quantizer policy. No raw frame may
+    /// accidentally terminate the browser's active passthrough during this wait.
+    encoder_rebuild_deadline: Option<Instant>,
+    settings_refresh_pending: bool,
+    default_frame_rate: u32,
+    bitrate_override: Option<u32>,
     mode_444: bool,
     shared_audio_tx: Option<SharedAudioTx>,
     display_frame_count: u64,
@@ -1038,11 +1069,20 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         loop {
+            self.sync_live_graphics_settings();
             let resize_rx = self.resize_rx.clone();
+            let mut controls_rx = self.controls_rx.clone();
             let width = self.capture_config.width;
             let height = self.capture_config.height;
             tokio::select! {
                 biased;
+                changed = controls_rx.changed() => {
+                    if changed.is_ok() {
+                        self.controls_rx.borrow_and_update();
+                        continue;
+                    }
+                    return self.next_frame_update().await;
+                }
                 size = ironrdp_server::wait_for_display_resize(resize_rx.clone(), width, height) => {
                     match size {
                         Some(_) => {
@@ -1074,7 +1114,22 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 impl MacDisplayUpdates {
     async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
         'updates: loop {
+            self.sync_live_graphics_settings();
             self.sync_encoder_startup();
+            if self.waiting_for_encoder_rebuild() {
+                if let Some(update) = self.poll_cursor_update_if_due() {
+                    return Ok(Some(update));
+                }
+                // The native mailbox continues coalescing fresh capture pixels.
+                // Control and resize selection remain active around this wait.
+                event_wait::next_event(
+                    std::future::pending::<()>(),
+                    Some(Duration::from_millis(100)),
+                    self.cursor_poll_timeout(),
+                )
+                .await;
+                continue;
+            }
             self.sync_applied_capture_fps();
             self.sync_bitmap_pacing();
             self.sync_uncompressed_pacing();
@@ -1164,6 +1219,7 @@ impl MacDisplayUpdates {
                         // The codec moves native invalidation to its bounded
                         // retirement worker, retaining callbacks and input there.
                         self.encoder = None;
+                        self.encoder_failed = true;
                         {
                             let mut state = self.gfx_state.lock().unwrap();
                             state.active_encoder = None;
@@ -1189,6 +1245,27 @@ impl MacDisplayUpdates {
             }
 
             self.refresh_capture_transport_if_needed().await?;
+
+            if self.settings_refresh_pending {
+                if let Some(frame) = self
+                    .capturer
+                    .as_mut()
+                    .and_then(NativeCapture::try_latest_image)
+                {
+                    self.record_capture_delivery();
+                    self.cache_latest_frame(&frame);
+                    self.deferred_bitmap_frame = Some(frame);
+                }
+                self.settings_refresh_pending = false;
+                if let Some(update) = self.send_cached_full_frame_recovery() {
+                    return Ok(Some(update));
+                }
+                // A pending AVC callback will be collected at the top of the
+                // loop. Missing RGB cache waits for the replacement BGRA stream.
+                if self.has_pending_submit {
+                    continue;
+                }
+            }
 
             if let Some(delay) = self.uncompressed_pacing.delay(Instant::now()) {
                 // Do not take a capture until the completed-write budget is
@@ -1588,7 +1665,7 @@ impl MacDisplayUpdates {
             || gfx.last_ack_frame == 0
             || gfx.frame_acknowledgements_suspended
             || gfx.avc_fallback_to_uncompressed
-            || gfx.bitmap_fallback_mode
+            || gfx.bitmap_mode()
     }
 
     fn mark_client_may_be_stale(&mut self, reason: &'static str) {
@@ -1695,7 +1772,7 @@ impl MacDisplayUpdates {
     fn send_cached_full_frame_recovery(&mut self) -> Option<DisplayUpdate> {
         let (session_uses_gfx, gfx_channel_ready, gfx_avc_ready) = {
             let state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_fallback_mode;
+            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_mode();
             let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
             let gfx_avc_ready =
                 gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
@@ -1818,7 +1895,7 @@ impl MacDisplayUpdates {
             gfx.last_ack_frame,
             gfx.gfx_validation_mode,
             gfx.avc_fallback_to_uncompressed,
-            gfx.bitmap_fallback_mode,
+            gfx.bitmap_mode(),
             self.encoder_pref,
             self.mode_444 && !gfx.browser_avc420,
             self.needs_full_gfx_seed,
@@ -1886,9 +1963,10 @@ impl MacDisplayUpdates {
             let gfx = self.gfx_state.lock().unwrap();
             (
                 gfx.target_frame_rate
-                    .unwrap_or(self.bitrate_ctrl.target_fps())
+                    .unwrap_or(self.default_frame_rate)
                     .clamp(1, 240),
                 gfx.target_bitrate
+                    .or(self.bitrate_override)
                     .map(|bps| bps.clamp(1, macrdp_encode::MAX_BITRATE_BPS)),
             )
         };
@@ -1896,9 +1974,17 @@ impl MacDisplayUpdates {
             self.bitrate_ctrl.set_target_fps(configured_fps);
             self.apply_capture_fps(configured_fps, "config-hot-update");
         }
-        if let Some(bitrate) =
-            configured_bitrate.filter(|bps| *bps != self.bitrate_ctrl.base_bitrate())
-        {
+        let bitrate = configured_bitrate
+            .unwrap_or_else(|| {
+                macrdp_encode::screen_bitrate(
+                    self.capture_config.width,
+                    self.capture_config.height,
+                    configured_fps as f32,
+                    self.quality,
+                )
+            })
+            .clamp(1, macrdp_encode::MAX_BITRATE_BPS);
+        if bitrate != self.bitrate_ctrl.base_bitrate() {
             self.bitrate_ctrl.set_target_bitrate(bitrate);
             self.apply_encoder_bitrate(bitrate);
             tracing::info!(
@@ -1944,7 +2030,7 @@ impl MacDisplayUpdates {
                 self.bitmap_perf_dispatches = gfx.bitmap_dispatches;
                 self.bitmap_perf_bytes = gfx.bitmap_wire_bytes;
             }
-            if gfx.session_uses_gfx && !gfx.bitmap_fallback_mode {
+            if gfx.session_uses_gfx && !gfx.bitmap_mode() {
                 return;
             }
             bitmap_pacing::BitmapCosts {
@@ -2099,6 +2185,7 @@ impl MacDisplayUpdates {
                     "Sent idle IDR keepalive"
                 );
                 self.last_idr_time = Instant::now();
+                self.needs_full_gfx_seed = false;
                 let (vis_w, vis_h) = match cache {
                     CachedFrame::Bgra { width, height, .. } => (*width as u16, *height as u16),
                     CachedFrame::BgraPixelBuffer(_, w, h, _) => (*w as u16, *h as u16),
@@ -2302,7 +2389,7 @@ impl MacDisplayUpdates {
             request_bitmap_fallback_full_frames,
         ) = {
             let mut state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_fallback_mode;
+            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_mode();
             let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
             let gfx_avc_ready =
                 gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
@@ -2316,7 +2403,7 @@ impl MacDisplayUpdates {
             if gfx_avc_ready
                 && !state.gfx_validation_mode
                 && !state.frame_acknowledgements_suspended
-                && !state.bitmap_fallback_mode
+                && !state.bitmap_mode()
                 && should_fallback_from_gfx_avc_no_ack(
                     state.frame_id,
                     state.last_ack_frame,

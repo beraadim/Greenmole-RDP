@@ -190,8 +190,10 @@ pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u3
 }
 
 /// Encoder preference
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderPreference {
+    /// Explicit classic RDP bitmap transport; never construct a video encoder.
+    Bitmap,
     /// OpenH264 CPU encoder — full P-frame support, higher latency (~40ms)
     Software,
     /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames
@@ -203,6 +205,7 @@ pub enum EncoderPreference {
 impl EncoderPreference {
     pub fn from_str_opt(s: Option<&str>) -> Self {
         match s.map(|s| s.to_lowercase()).as_deref() {
+            Some("bitmap") => Self::Bitmap,
             Some("hardware") | Some("gpu") | Some("videotoolbox") | Some("vt") => Self::Hardware,
             Some("software") | Some("cpu") | Some("openh264") | Some("oh264") => Self::Software,
             _ => Self::Auto,
@@ -221,6 +224,10 @@ pub fn create_encoder(
     mode_444: bool,
     bitrate: u32,
 ) -> Result<Box<dyn VideoEncoder>> {
+    anyhow::ensure!(
+        preference != EncoderPreference::Bitmap,
+        "Bitmap desktop transport bypasses H.264 encoding"
+    );
     quality.quantizer_range()?;
     let bitrate = bitrate.clamp(1, MAX_BITRATE_BPS);
     let enc_w = align16(width);
@@ -254,4 +261,36 @@ pub fn create_encoder(
     );
     let encoder = OpenH264Encoder::new_with_quality(enc_w, enc_h, fps, bitrate, mode_444, quality)?;
     Ok(Box::new(encoder))
+}
+
+#[cfg(test)]
+mod transport_selection_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_bitmap_never_constructs_a_video_encoder() {
+        assert_eq!(
+            EncoderPreference::from_str_opt(Some("bitmap")),
+            EncoderPreference::Bitmap
+        );
+        for quality in [
+            Quality::LowLatency,
+            Quality::Balanced,
+            Quality::HighQuality,
+            Quality::Lossless,
+        ] {
+            let error = create_encoder(
+                16,
+                16,
+                30.0,
+                quality,
+                EncoderPreference::Bitmap,
+                false,
+                1_000_000,
+            )
+            .err()
+            .expect("Bitmap selection must bypass all native codecs");
+            assert!(error.to_string().contains("Bitmap desktop transport"));
+        }
+    }
 }

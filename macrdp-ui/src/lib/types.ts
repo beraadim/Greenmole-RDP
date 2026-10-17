@@ -138,8 +138,8 @@ export interface UiConfig {
   frame_rate: number;
   bitrate_mbps: number;
   quality: "low_latency" | "balanced" | "high_quality" | "lossless";
-  encoder: string;
-  chroma_mode: string;
+  encoder: "auto" | "software" | "hardware" | "bitmap";
+  chroma_mode: "avc420" | "avc444";
   bind_address: string;
   idle_timeout_secs: number;
   username: string;
@@ -178,4 +178,5 @@ export interface ConfigurationStatus {
   running: boolean;
   restart_required: boolean;
   pending_restart: string[];
+  pending_live: string[];
 }

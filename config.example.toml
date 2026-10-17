@@ -54,7 +54,9 @@ frame_rate = 60
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 
 # Image quality preset (CLI default: high_quality; desktop default: balanced).
-# Desktop changes require a service restart and reconnect.
+# Desktop quality and encoder controls apply while the service is running.
+# CLI configuration files are read at startup. Switching back from images to
+# browser AVC420 may require reconnecting the client; the service can stay up.
 # Options:
 #   "low_latency"  — faster video encoding and smaller RemoteFX updates
 #   "balanced"     — moderate video detail; standard RemoteFX quantization
@@ -64,12 +66,13 @@ frame_rate = 60
 # force-lossless connection option when comparing pixel fidelity.
 quality = "high_quality"
 
-# H.264 encoder selection
+# Graphics encoder selection
 # Default: software
 # Options:
-#   "software"  — OpenH264 (CPU), full P-frame support, ~40ms encode latency
-#   "hardware"  — VideoToolbox (GPU), ~6ms encode latency, requires macOS
+#   "software"  — OpenH264 video encoding
+#   "hardware"  — VideoToolbox hardware video encoding, requires macOS
 #   "auto"      — same as software
+#   "bitmap"    — classic bitmap updates; compression follows the quality preset
 encoder = "hardware"
 
 # Chroma subsampling mode

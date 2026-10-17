@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{atomic::AtomicU64, Arc};
 
 use serde::Serialize;
@@ -48,6 +48,9 @@ pub struct AppState {
     /// Settings used to start this service, plus accepted live updates. Kept in
     /// the backend so pending restart changes survive window/navigation changes.
     pub running_config: Mutex<Option<UiConfig>>,
+    /// Ambiguous live acknowledgements remain retryable even after the desired
+    /// value returns to the last accepted snapshot. Never persisted to disk.
+    pub(crate) unconfirmed_graphics: Mutex<BTreeSet<&'static str>>,
     pub log_reload: LogReloadHandle,
     pub window_move_lock: Mutex<()>,
     pub diagnostic_export_lock: Mutex<()>,
@@ -68,6 +71,7 @@ impl AppState {
             server_handle: Arc::new(Mutex::new(None)),
             ui_config: Mutex::new(ui_config),
             running_config: Mutex::new(None),
+            unconfirmed_graphics: Mutex::new(BTreeSet::new()),
             log_reload,
             window_move_lock: Mutex::new(()),
             diagnostic_export_lock: Mutex::new(()),

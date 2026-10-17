@@ -316,3 +316,122 @@ fn alpha_plane_for_narrow_tall_updates_stays_within_wire_length_limits() {
         }
     }
 }
+
+fn remote_fx_quants(output: &UpdateFragmenter) -> (bool, Vec<Quant>) {
+    let SurfaceCommand::SetSurfaceBits(surface) = ironrdp_core::decode(&output.data).unwrap()
+    else {
+        panic!("expected RemoteFX surface bits");
+    };
+    let mut cursor = ReadCursor::new(surface.extended_bitmap_data.data);
+    let mut sync = false;
+    let mut quants = Vec::new();
+    while !cursor.is_empty() {
+        match decode_cursor::<Block<'_>>(&mut cursor).unwrap() {
+            Block::Sync(_) => sync = true,
+            Block::CodecChannel(CodecChannel::TileSet(set)) => quants.extend(set.quants),
+            _ => {}
+        }
+    }
+    (sync, quants)
+}
+
+#[tokio::test]
+async fn live_quality_changes_repaint_unchanged_pixels_with_new_quantization_and_lossless_transport(
+) {
+    let mut codecs = UpdateEncoderCodecs::new();
+    codecs.set_remotefx(Some((EntropyBits::Rlgr3, 3, OperatingMode::IMAGE_MODE)));
+    let mut encoder = UpdateEncoder::new(
+        DesktopSize {
+            width: 64,
+            height: 64,
+        },
+        CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+        codecs,
+    )
+    .unwrap();
+    let mut bitmap = fixture(64, 64, false);
+    bitmap.x = 0;
+    bitmap.y = 0;
+    let first = encoder
+        .update(DisplayUpdate::Bitmap(bitmap.clone()))
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        remote_fx_quants(&first).1,
+        [BitmapQuality::Balanced.remotefx_quant()]
+    );
+    // Drain through completion so the framebuffer has the original lossy source.
+    let mut iter = encoder.update(DisplayUpdate::Bitmap(bitmap.clone()));
+    while iter.next().await.is_some() {}
+    assert!(encoder
+        .update(DisplayUpdate::Bitmap(bitmap.clone()))
+        .next()
+        .await
+        .is_none());
+    assert!(encoder.set_quality(BitmapQuality::HighQuality).unwrap());
+    assert!(!encoder.set_quality(BitmapQuality::HighQuality).unwrap());
+    let high = encoder
+        .update(DisplayUpdate::Bitmap(bitmap.clone()))
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    let (sync, quants) = remote_fx_quants(&high);
+    assert!(
+        sync,
+        "recreated RemoteFX state must carry its initialization headers"
+    );
+    assert_eq!(quants, [BitmapQuality::HighQuality.remotefx_quant()]);
+    assert!(encoder.set_quality(BitmapQuality::Lossless).unwrap());
+    assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
+    assert!(!encoder.surface_frame_markers());
+    let lossless = encoder
+        .update(DisplayUpdate::Bitmap(bitmap.clone()))
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    let decoded: BitmapUpdateData<'_> = ironrdp_core::decode(&lossless.data).unwrap();
+    assert!(!decoded.rectangles.is_empty());
+    assert!(encoder.set_quality(BitmapQuality::Balanced).unwrap());
+    assert_eq!(encoder.bitmap_codec(), "remotefx");
+    assert!(encoder.surface_frame_markers());
+    let restored = encoder
+        .update(DisplayUpdate::Bitmap(bitmap))
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        remote_fx_quants(&restored).1,
+        [BitmapQuality::Balanced.remotefx_quant()]
+    );
+}
+
+#[test]
+fn live_quality_cannot_enable_a_codec_absent_from_the_negotiated_capabilities() {
+    for initial in [BitmapQuality::Balanced, BitmapQuality::Lossless] {
+        let mut codecs = UpdateEncoderCodecs::new();
+        codecs.set_quality(initial);
+        let mut encoder = UpdateEncoder::new(
+            DesktopSize {
+                width: 64,
+                height: 64,
+            },
+            CmdFlags::empty(),
+            codecs,
+        )
+        .unwrap();
+        for quality in [
+            BitmapQuality::HighQuality,
+            BitmapQuality::Lossless,
+            BitmapQuality::Performance,
+        ] {
+            encoder.set_quality(quality).unwrap();
+            assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
+            assert!(!encoder.surface_frame_markers());
+        }
+    }
+}

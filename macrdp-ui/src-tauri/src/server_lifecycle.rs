@@ -86,6 +86,9 @@ pub async fn ensure_server_running(
         }
     };
 
+    // A fresh worker started from the durable configuration, so ambiguous
+    // acknowledgements from its predecessor no longer require a retry.
+    state.unconfirmed_graphics.lock().await.clear();
     if *stop_requests.borrow() != stop_epoch {
         *state.server_handle.lock().await = Some(handle);
         *state.running_config.lock().await = Some(started_config);

@@ -16,6 +16,7 @@ pub(super) fn apply_update(config: &mut ServerConfig, update: &ConfigUpdate) {
         ConfigUpdate::ShowCursor(value) => config.show_cursor = Some(*value),
         ConfigUpdate::Resolution(value) => config.resolution = Some(value.clone()),
         ConfigUpdate::Encoder(value) => config.encoder = Some(value.clone()),
+        ConfigUpdate::Quality(value) => config.quality = Some(value.clone()),
         ConfigUpdate::ChromaMode(value) => config.chroma_mode = Some(value.clone()),
         ConfigUpdate::GfxValidationMode(value) => config.gfx_validation_mode = Some(*value),
         ConfigUpdate::Credentials { username, password } => {
@@ -65,10 +66,14 @@ mod tests {
         );
         apply_update(&mut config, &ConfigUpdate::FrameRate(45));
         apply_update(&mut config, &ConfigUpdate::BitrateKbps(123_000));
+        apply_update(&mut config, &ConfigUpdate::Quality("lossless".into()));
+        apply_update(&mut config, &ConfigUpdate::Encoder("bitmap".into()));
         assert_eq!(config.username.as_deref(), Some("replacement-user"));
         assert_eq!(config.password.as_deref(), Some("replacement-secret"));
         assert_eq!(config.frame_rate, 45);
         assert_eq!(config.bitrate_mbps, Some(123));
+        assert_eq!(config.quality.as_deref(), Some("lossless"));
+        assert_eq!(config.encoder.as_deref(), Some("bitmap"));
     }
 
     #[test]

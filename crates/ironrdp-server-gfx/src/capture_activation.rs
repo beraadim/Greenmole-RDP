@@ -98,6 +98,9 @@ impl RdpServer {
                         self.record_outcome(ConnectionOutcome::CredentialsChanged);
                         return Ok(None);
                     }
+                    Some(ServerEvent::SetBitmapQuality(quality)) => {
+                        self.apply_bitmap_quality(quality);
+                    }
                     Some(_) => unreachable!("only server controls use this lane"),
                 },
                 reason = sender.failure() => {

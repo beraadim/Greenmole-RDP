@@ -398,6 +398,12 @@ pub struct GfxState {
     pub resolution: Option<String>,
     /// Hot-updatable: encoder preference (set via ConfigUpdate)
     pub encoder_pref: Option<String>,
+    /// Requested image/video quality, retained across connection recovery.
+    pub target_quality: Option<String>,
+    /// Explicit user selection, separate from connection-local failure fallback.
+    pub manual_bitmap_mode: bool,
+    /// Coalescing wake-up for controls while capture is idle or awaiting encoding.
+    controls_changed: tokio::sync::watch::Sender<u64>,
     /// Backend instantiated by capture, rather than the configured preference.
     pub active_encoder: Option<&'static str>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
@@ -478,12 +484,37 @@ impl GfxState {
             show_cursor: None,
             resolution: None,
             encoder_pref: None,
+            target_quality: None,
+            manual_bitmap_mode: false,
+            controls_changed: tokio::sync::watch::channel(0).0,
             active_encoder: None,
             chroma_mode: None,
             gfx_validation_mode,
             avc_fallback_to_uncompressed: false,
             bitmap_fallback_mode: false,
         }
+    }
+
+    pub fn controls_receiver(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.controls_changed.subscribe()
+    }
+
+    pub fn notify_controls_changed(&mut self) {
+        self.controls_changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// User image modes do not erase negotiated capabilities or failure state.
+    pub fn bitmap_mode(&self) -> bool {
+        self.manual_bitmap_mode
+            || self.bitmap_fallback_mode
+            || self.target_quality.as_deref() == Some("lossless")
+    }
+
+    pub fn requested_bitmap_quality(&self) -> Option<crate::BitmapQuality> {
+        self.target_quality
+            .as_deref()
+            .and_then(crate::BitmapQuality::from_config)
     }
 
     pub fn next_frame_id(&mut self) -> u32 {
@@ -1103,7 +1134,7 @@ impl DvcProcessor for GfxHandler {
                     avc444_enabled = state.avc444_enabled,
                     experimental_browser_avc420 = state.browser_avc420,
                     bitmap_fallback_mode = state.bitmap_fallback_mode,
-                    effective_mode = if state.bitmap_fallback_mode {
+                    effective_mode = if state.bitmap_mode() {
                         "bitmap-fallback-preferred"
                     } else if state.use_avc444() {
                         "gfx-avc444"
@@ -1548,5 +1579,35 @@ mod tests {
         assert_eq!(state.total_frames_sent, 1);
         assert_eq!(state.last_write_ms, 2.5);
         assert!(state.start_time.is_some());
+    }
+}
+
+#[cfg(test)]
+mod graphics_controls_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn graphics_wakeup_retains_latest_policy_through_session_reset() {
+        let mut state = GfxState::new(640, 480, true, false);
+        let mut changed = state.controls_receiver();
+        state.target_quality = Some("lossless".into());
+        state.manual_bitmap_mode = true;
+        state.encoder_pref = Some("bitmap".into());
+        state.notify_controls_changed();
+        changed.changed().await.unwrap();
+        assert_eq!(*changed.borrow_and_update(), 1);
+        state.reset_connection_state(true);
+        assert_eq!(state.target_quality.as_deref(), Some("lossless"));
+        assert_eq!(state.encoder_pref.as_deref(), Some("bitmap"));
+        assert!(state.bitmap_mode());
+        assert!(!changed.has_changed().unwrap());
+        state.target_quality = Some("high_quality".into());
+        state.manual_bitmap_mode = false;
+        assert!(!state.bitmap_mode());
+        state.bitmap_fallback_mode = true;
+        assert!(
+            state.bitmap_mode(),
+            "user selection must not erase failure fallback"
+        );
     }
 }

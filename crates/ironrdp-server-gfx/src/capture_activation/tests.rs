@@ -386,3 +386,23 @@ async fn oversized_activation_timeout_returns_an_error_without_panicking() {
         .to_string()
         .contains("exceeds the clock's supported range"));
 }
+
+#[tokio::test]
+async fn quality_changes_during_capture_start_do_not_abort_the_connection() {
+    let mut server = server();
+    server
+        .event_sender()
+        .send(ServerEvent::SetBitmapQuality(
+            crate::BitmapQuality::Lossless,
+        ))
+        .unwrap();
+    let (stream, _peer) = tokio::io::duplex(64);
+    let (mut reader, _writer) = split_tokio_framed(TokioFramed::new(stream));
+    let result = server
+        .await_capture_ready(&mut reader, 1003, PendingInput::default(), async { Ok(()) })
+        .await
+        .unwrap();
+    assert!(result.is_some());
+    assert_eq!(server.bitmap_quality, crate::BitmapQuality::Lossless);
+    assert!(!server.quit_requested);
+}

@@ -75,7 +75,8 @@ pub struct ServerConfig {
     /// Image quality: low_latency, balanced, high_quality, lossless (default: high_quality).
     /// Lossless uses full-color bitmap updates without video/RemoteFX quantization.
     pub quality: Option<String>,
-    /// H.264 encoder: software, hardware, auto (default: software)
+    /// Encoder: software, hardware, auto, or bitmap (default: software).
+    /// Bitmap uses the negotiated image transport instead of H.264.
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,
@@ -137,6 +138,22 @@ impl ServerConfig {
                 "low_latency" | "balanced" | "high_quality" | "lossless"
             )),
             "quality must be low_latency, balanced, high_quality or lossless"
+        );
+        anyhow::ensure!(
+            self.encoder.as_deref().map_or(true, |encoder| matches!(
+                encoder.to_ascii_lowercase().as_str(),
+                "auto"
+                    | "software"
+                    | "cpu"
+                    | "openh264"
+                    | "oh264"
+                    | "hardware"
+                    | "gpu"
+                    | "videotoolbox"
+                    | "vt"
+                    | "bitmap"
+            )),
+            "encoder must be auto, software, hardware or bitmap"
         );
         anyhow::ensure!(
             self.cert_path.is_some() == self.key_path.is_some(),
@@ -300,6 +317,34 @@ mod tests {
         assert!(config.validate().is_err());
         config.bitrate_mbps = Some(50);
         config.password = Some(String::new());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn bitmap_and_legacy_encoder_names_are_validated_and_saved() {
+        let mut config = ServerConfig::default();
+        config.username = Some("fixture".into());
+        config.password = Some("fixture".into());
+        for encoder in [
+            "auto",
+            "software",
+            "hardware",
+            "bitmap",
+            "CPU",
+            "openh264",
+            "oh264",
+            "GPU",
+            "videotoolbox",
+            "vt",
+            "BITMAP",
+        ] {
+            config.encoder = Some(encoder.into());
+            config.validate().unwrap();
+            let saved = toml::to_string(&config).unwrap();
+            let restored: ServerConfig = toml::from_str(&saved).unwrap();
+            assert_eq!(restored.encoder.as_deref(), Some(encoder));
+        }
+        config.encoder = Some("bitmaps".into());
         assert!(config.validate().is_err());
     }
 

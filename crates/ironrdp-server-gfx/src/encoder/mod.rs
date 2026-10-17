@@ -60,7 +60,7 @@ impl CodecId {
 }
 
 #[cfg_attr(feature = "__bench", visibility::make(pub))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct UpdateEncoderCodecs {
     remotefx: Option<(EntropyBits, u8, OperatingMode)>,
     limits: UpdateLimits,
@@ -145,6 +145,9 @@ pub(crate) struct UpdateEncoder {
     bitmap_updater: Option<BitmapUpdater>,
     limits: UpdateLimits,
     frame_markers: frame_markers::FrameMarkers,
+    /// Only codecs accepted in this activation may be used by live quality changes.
+    negotiated_codecs: UpdateEncoderCodecs,
+    surface_flags: CmdFlags,
 }
 
 impl fmt::Debug for UpdateEncoder {
@@ -206,7 +209,30 @@ impl UpdateEncoder {
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
             limits: codecs.limits,
+            negotiated_codecs: codecs,
+            surface_flags,
         })
+    }
+
+    /// Rebuild codec state at a complete update boundary. Repaint unchanged pixels
+    /// because raising quality must repair detail previously lost by quantization.
+    pub(crate) fn set_quality(&mut self, quality: crate::BitmapQuality) -> Result<bool> {
+        if self.negotiated_codecs.quality == quality {
+            return Ok(false);
+        }
+        let mut codecs = self.negotiated_codecs.clone();
+        codecs.set_quality(quality);
+        let replacement = Self::new(self.desktop_size, self.surface_flags, codecs)?;
+        self.frame_markers
+            .set_supported(replacement.frame_markers.supported());
+        self.bitmap_updater = replacement.bitmap_updater;
+        self.negotiated_codecs = replacement.negotiated_codecs;
+        self.framebuffer = None;
+        Ok(true)
+    }
+
+    pub(crate) fn negotiated_quality(&self) -> crate::BitmapQuality {
+        self.negotiated_codecs.quality
     }
 
     pub(crate) fn bitmap_codec(&self) -> &'static str {

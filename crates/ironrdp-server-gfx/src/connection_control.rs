@@ -181,6 +181,9 @@ impl RdpServer {
                         // rather than allowing revoked credentials to log in.
                         bail!("credentials changed during {stage}");
                     }
+                    Some(ServerEvent::SetBitmapQuality(quality)) => {
+                        self.apply_bitmap_quality(quality);
+                    }
                     Some(_) => unreachable!("only server controls use this lane"),
                     None => {
                         self.record_outcome(ConnectionOutcome::ServerShutdown);

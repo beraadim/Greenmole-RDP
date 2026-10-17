@@ -171,7 +171,7 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
-    /// Set quality before codec negotiation. Changing it requires reconnecting.
+    /// Set the initial quality policy. Runtime changes use `ServerEvent::SetBitmapQuality`.
     pub fn with_bitmap_quality(mut self, quality: BitmapQuality) -> Self {
         self.state.bitmap_quality = quality;
         self

@@ -230,10 +230,11 @@ impl UiConfig {
                 self.bitrate_mbps = integer_in_range(value, key, 1, 1000)? as u32;
             }
             "encoder" => {
-                self.encoder = value
-                    .as_str()
-                    .ok_or("encoder must be a string")?
-                    .to_string();
+                let encoder = value.as_str().ok_or("encoder must be a string")?;
+                if !matches!(encoder, "auto" | "software" | "hardware" | "bitmap") {
+                    return Err("Unknown encoder selection".into());
+                }
+                self.encoder = encoder.into();
             }
             "quality" => {
                 let quality = value.as_str().ok_or("quality must be a string")?;
@@ -246,10 +247,11 @@ impl UiConfig {
                 self.quality = quality.into();
             }
             "chroma_mode" => {
-                self.chroma_mode = value
-                    .as_str()
-                    .ok_or("chroma_mode must be a string")?
-                    .to_string();
+                let chroma = value.as_str().ok_or("chroma_mode must be a string")?;
+                if !matches!(chroma, "avc420" | "avc444") {
+                    return Err("Unknown video color detail selection".into());
+                }
+                self.chroma_mode = chroma.into();
             }
             "gfx_validation_mode" => {
                 self.gfx_validation_mode = value
@@ -366,7 +368,6 @@ impl UiConfig {
         matches!(
             key,
             "display_backend"
-                | "quality"
                 | "bind_address"
                 | "port"
                 | "idle_timeout_secs"
@@ -429,7 +430,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn quality_defaults_migrate_and_presets_persist_into_restart_configuration() {
+    fn quality_defaults_migrate_and_presets_persist_without_requiring_restart() {
         let legacy: UiConfig = toml::from_str("username = 'fixture-user'").unwrap();
         assert_eq!(legacy.quality, "balanced");
         let directory = tempfile::tempdir().unwrap();
@@ -437,8 +438,10 @@ mod tests {
         let mut config = legacy;
         config.password = "fixture-secret".into();
         for preset in ["low_latency", "balanced", "high_quality", "lossless"] {
-            assert!(config.set_field("quality", &json!(preset)).unwrap());
-            assert!(config.requires_restart("quality", Some(DisplayBackend::Main)));
+            assert!(!config.set_field("quality", &json!(preset)).unwrap());
+            for backend in [DisplayBackend::Main, DisplayBackend::Virtual] {
+                assert!(!config.requires_restart("quality", Some(backend)));
+            }
             config
                 .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
                 .unwrap();
@@ -450,6 +453,41 @@ mod tests {
             assert!(config.set_field("quality", &value).is_err());
             assert_eq!(config.quality, "lossless");
         }
+    }
+
+    #[test]
+    fn bitmap_encoder_round_trips_and_graphics_updates_reject_unknown_values() {
+        let mut config = UiConfig::default();
+        for encoder in ["auto", "software", "hardware", "bitmap"] {
+            assert!(!config.set_field("encoder", &json!(encoder)).unwrap());
+            let encoded = toml::to_string(&config).unwrap();
+            let restored: UiConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(restored.encoder, encoder);
+            assert_eq!(
+                restored.to_server_config().encoder.as_deref(),
+                Some(encoder)
+            );
+        }
+        let original = serde_json::to_value(&config).unwrap();
+        for (key, values) in [
+            (
+                "encoder",
+                [json!("BITMAP"), json!("unknown"), json!(0), json!(null)],
+            ),
+            (
+                "chroma_mode",
+                [json!("AVC444"), json!("unknown"), json!(true), json!(null)],
+            ),
+        ] {
+            for value in values {
+                assert!(config.set_field(key, &value).is_err());
+                assert_eq!(serde_json::to_value(&config).unwrap(), original);
+            }
+        }
+        config.set_field("quality", &json!("lossless")).unwrap();
+        assert!(!config.set_field("encoder", &json!("hardware")).unwrap());
+        assert!(!config.set_field("encoder", &json!("bitmap")).unwrap());
+        assert_eq!(config.encoder, "bitmap");
     }
 
     #[test]

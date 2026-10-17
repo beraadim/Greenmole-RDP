@@ -28,7 +28,7 @@ impl super::MacDisplayUpdates {
         let (enabled, normal_avc, costs, backlog) = {
             let gfx = self.gfx_state.lock().unwrap();
             let active_gfx =
-                gfx.session_uses_gfx && !gfx.bitmap_fallback_mode && gfx.has_gfx_channel();
+                gfx.session_uses_gfx && !gfx.bitmap_mode() && gfx.has_gfx_channel();
             let fallback = self.encoder.is_none()
                 || !gfx.avc420_supported
                 || gfx.gfx_validation_mode

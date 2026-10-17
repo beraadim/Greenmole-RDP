@@ -26,6 +26,14 @@ impl FrameMarkers {
         self.supported
     }
 
+    pub(super) fn set_supported(&mut self, supported: bool) {
+        assert!(
+            self.open_id.is_none(),
+            "close the current frame before changing codecs"
+        );
+        self.supported = supported;
+    }
+
     pub(super) fn begin(&mut self) -> Result<Option<UpdateFragmenter>> {
         if !self.supported || self.open_id.is_some() {
             return Ok(None);

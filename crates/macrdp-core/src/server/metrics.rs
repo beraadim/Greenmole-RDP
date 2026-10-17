@@ -23,7 +23,7 @@ fn derive_transport_mode(gfx: &GfxState) -> String {
         return "bitmap".to_string();
     }
 
-    if gfx.bitmap_fallback_mode {
+    if gfx.bitmap_mode() {
         return "bitmap-fallback".to_string();
     }
 
@@ -280,6 +280,28 @@ mod tests {
         assert_eq!(
             MetricsSnapshot::default().sample(&gfx).encoder_mode,
             "bitmap"
+        );
+        gfx.bitmap_fallback_mode = false;
+        gfx.manual_bitmap_mode = true;
+        let metrics = MetricsSnapshot::default().sample(&gfx);
+        assert_eq!(metrics.transport_mode, "bitmap-fallback");
+        assert_eq!(metrics.encoder_mode, "bitmap");
+        assert_eq!(
+            metrics.bitrate_mode,
+            "Wire throughput only (bitmap updates)"
+        );
+
+        gfx.manual_bitmap_mode = false;
+        gfx.target_quality = Some("lossless".into());
+        assert_eq!(
+            MetricsSnapshot::default().sample(&gfx).encoder_mode,
+            "bitmap"
+        );
+        gfx.target_quality = Some("high_quality".into());
+        gfx.active_encoder = Some("videotoolbox");
+        assert_eq!(
+            MetricsSnapshot::default().sample(&gfx).encoder_mode,
+            "videotoolbox / avc420"
         );
     }
 

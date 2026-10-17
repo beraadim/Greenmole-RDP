@@ -222,6 +222,10 @@ impl RdpServerSecurity {
 pub struct RdpServer {
     opts: RdpServerOptions,
     bitmap_quality: crate::BitmapQuality,
+    available_bitmap_codecs: BitmapCodecs,
+    /// Frozen advertised policy; runtime controls must not expand this connection.
+    activation_opts: RdpServerOptions,
+    connection_gfx_advertised: bool,
     // FIXME: replace with a channel and poll/process the handler?
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
@@ -255,6 +259,7 @@ pub enum ServerEvent {
     ClipboardFileContentsRequest(FileContentsRequest),
     Rdpsnd(RdpsndServerMessage),
     SetCredentials(Credentials),
+    SetBitmapQuality(crate::BitmapQuality),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
 }
 
@@ -298,8 +303,13 @@ impl RdpServer {
         if let Some(snd) = sound_factory.as_mut() {
             snd.set_sender(ev_sender.clone());
         }
+        let available_bitmap_codecs = opts.codecs.clone();
+        let activation_opts = opts.clone();
         Self {
             opts,
+            available_bitmap_codecs,
+            activation_opts,
+            connection_gfx_advertised: false,
             bitmap_quality: crate::BitmapQuality::default(),
             handler: Arc::new(Mutex::new(handler)),
             display: Arc::new(Mutex::new(display)),
@@ -342,8 +352,21 @@ impl RdpServer {
     }
 
     pub(crate) fn set_bitmap_quality(&mut self, quality: crate::BitmapQuality) {
+        self.opts.codecs = self.available_bitmap_codecs.clone();
         quality.restrict_codecs(&mut self.opts.codecs);
         self.bitmap_quality = quality;
+    }
+
+    fn apply_bitmap_quality(&mut self, quality: crate::BitmapQuality) {
+        // Controls are coalesced. A previously dequeued value must never replace
+        // a newer request published while waiting for the server lock.
+        let quality = self.ev_sender.requested_bitmap_quality().unwrap_or(quality);
+        self.set_bitmap_quality(quality);
+        let mut state = self.gfx_state.lock().unwrap();
+        if state.requested_bitmap_quality() != Some(quality) {
+            state.target_quality = Some(quality.config_name().into());
+            state.notify_controls_changed();
+        }
     }
 
     fn gfx_channel_enabled(&self) -> bool {
@@ -506,7 +529,9 @@ impl RdpServer {
         }
 
         let size = self.display.lock().await.size().await;
-        let capabilities = capabilities::capabilities(&self.opts, size);
+        self.activation_opts = self.opts.clone();
+        self.connection_gfx_advertised = self.gfx_channel_enabled();
+        let capabilities = capabilities::capabilities(&self.activation_opts, size);
         let mut acceptor = Acceptor::new(
             self.opts.security.flag(),
             size,
@@ -608,6 +633,9 @@ impl RdpServer {
                         }
                         ServerEvent::SetCredentials(creds) => {
                             self.set_credentials(Some(creds));
+                        }
+                        ServerEvent::SetBitmapQuality(quality) => {
+                            self.apply_bitmap_quality(quality);
                         }
                         ev => {
                             debug!("Unexpected event {:?}", ev);
@@ -777,6 +805,20 @@ impl RdpServer {
         display_updates: &mut dyn crate::RdpServerDisplayUpdates,
     ) -> Result<(RunState, UpdateEncoder)> {
         let is_bitmap_update = matches!(&update, DisplayUpdate::Bitmap(_));
+        let requested_quality = gfx_state.lock().unwrap().requested_bitmap_quality();
+        if let Some(quality) = requested_quality {
+            if encoder.negotiated_quality() != quality {
+                Self::write_frame_marker(encoder.end_bitmap_frame()?, writer, buffer).await?;
+                encoder.set_quality(quality)?;
+                let codec = encoder.bitmap_codec();
+                gfx_state.lock().unwrap().bitmap_codec = Some(codec);
+                info!(
+                    ?quality,
+                    bitmap_codec = codec,
+                    "Applied live bitmap quality"
+                );
+            }
+        }
 
         // A failed/abandoned capture batch or resize must not leave the next
         // frame inside an old marker. Pointer-only updates may interleave while
@@ -1035,6 +1077,10 @@ impl RdpServer {
                 self.set_credentials(Some(creds));
                 None
             }
+            ServerEvent::SetBitmapQuality(quality) => {
+                self.apply_bitmap_quality(quality);
+                None
+            }
             ServerEvent::Rdpsnd(s) => {
                 let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
                     warn!("No rdpsnd channel, dropping event");
@@ -1286,6 +1332,7 @@ impl RdpServer {
         let event_credentials = Rc::clone(&changed_credentials);
         let mut ev_receiver = ev_receiver.lock().await;
         let ServerEventRx { controls, data } = &mut *ev_receiver;
+        let controls_server = Rc::clone(&this);
         let dispatch_controls = async move {
             loop {
                 match controls.recv().await {
@@ -1301,6 +1348,11 @@ impl RdpServer {
                         // Revoked credentials must not retain an active session.
                         *event_credentials.borrow_mut() = Some(credentials);
                         break Ok(RunState::Disconnect);
+                    }
+                    Some(ServerEvent::SetBitmapQuality(quality)) => {
+                        // The active encoder reads the same policy before its next
+                        // complete display update; this only prepares future activations.
+                        controls_server.lock().await.apply_bitmap_quality(quality);
                     }
                     Some(_) => unreachable!("only server controls use this lane"),
                 }
@@ -1464,7 +1516,7 @@ impl RdpServer {
         self.static_channels = result.static_channels;
         {
             let mut gfx_state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = self.gfx_channel_enabled()
+            let session_uses_gfx = self.connection_gfx_advertised
                 && self.get_channel_id_by_type::<DynamicChannels>().is_some();
             if !result.reactivation {
                 gfx_state.reset_connection_state(session_uses_gfx);
@@ -1574,25 +1626,25 @@ impl RdpServer {
                             // 3.1.5.1), including Image RemoteFX clients.
                             CodecProperty::RemoteFx(
                                 rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
-                            ) if self.opts.has_remote_fx() => {
+                            ) if self.activation_opts.has_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx_capability(codec.id, caps);
                                 }
                             }
                             CodecProperty::ImageRemoteFx(
                                 rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
-                            ) if self.opts.has_image_remote_fx() => {
+                            ) if self.activation_opts.has_image_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx_capability(codec.id, caps);
                                 }
                             }
                             CodecProperty::NsCodec(_) => (),
                             #[cfg(feature = "qoi")]
-                            CodecProperty::Qoi if self.opts.has_qoi() => {
+                            CodecProperty::Qoi if self.activation_opts.has_qoi() => {
                                 update_codecs.set_qoi(Some(codec.id));
                             }
                             #[cfg(feature = "qoiz")]
-                            CodecProperty::QoiZ if self.opts.has_qoiz() => {
+                            CodecProperty::QoiZ if self.activation_opts.has_qoiz() => {
                                 update_codecs.set_qoiz(Some(codec.id));
                             }
                             _ => (),

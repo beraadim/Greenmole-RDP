@@ -16,6 +16,26 @@ pub enum BitmapQuality {
 }
 
 impl BitmapQuality {
+    /// Parse the shared public configuration spelling without silently changing policy.
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "low_latency" => Some(Self::Performance),
+            "balanced" => Some(Self::Balanced),
+            "high_quality" => Some(Self::HighQuality),
+            "lossless" => Some(Self::Lossless),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn config_name(self) -> &'static str {
+        match self {
+            Self::Performance => "low_latency",
+            Self::Balanced => "balanced",
+            Self::HighQuality => "high_quality",
+            Self::Lossless => "lossless",
+        }
+    }
+
     pub(crate) fn restrict_codecs(self, codecs: &mut BitmapCodecs) {
         if self == Self::Lossless {
             codecs.0.retain(|codec| {

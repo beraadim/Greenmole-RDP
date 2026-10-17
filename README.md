@@ -70,8 +70,8 @@ frame_rate = 60
 hidpi_scale = 2    # Retina 上 2 倍缩放获得 4K
 
 # 编码
-quality = "high_quality"    # low_latency / balanced / high_quality
-encoder = "hardware"        # hardware (GPU) / software (CPU)
+quality = "high_quality"    # low_latency / balanced / high_quality / lossless
+encoder = "hardware"        # hardware / software / auto / bitmap
 chroma_mode = "avc420"      # avc420 (兼容) / avc444 (最佳画质)
 bitrate_mbps = 50           # 目标码率 (Mbps)
 

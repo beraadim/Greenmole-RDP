@@ -188,6 +188,7 @@ pub enum ConfigUpdate {
     ShowCursor(bool),
     Resolution(String),
     Encoder(String),
+    Quality(String),
     ChromaMode(String),
     GfxValidationMode(bool),
     Credentials { username: String, password: String },
@@ -202,6 +203,7 @@ impl std::fmt::Debug for ConfigUpdate {
             Self::ShowCursor(value) => f.debug_tuple("ShowCursor").field(value).finish(),
             Self::Resolution(value) => f.debug_tuple("Resolution").field(value).finish(),
             Self::Encoder(value) => f.debug_tuple("Encoder").field(value).finish(),
+            Self::Quality(value) => f.debug_tuple("Quality").field(value).finish(),
             Self::ChromaMode(value) => f.debug_tuple("ChromaMode").field(value).finish(),
             Self::GfxValidationMode(value) => {
                 f.debug_tuple("GfxValidationMode").field(value).finish()
@@ -247,6 +249,20 @@ impl ConfigUpdate {
                 (1..=1_000_000).contains(kbps),
                 "bitrate must be between 1 and 1000000 Kbps"
             ),
+            Self::Quality(quality) => anyhow::ensure!(
+                matches!(
+                    quality.as_str(),
+                    "low_latency" | "balanced" | "high_quality" | "lossless"
+                ),
+                "quality must be low_latency, balanced, high_quality or lossless"
+            ),
+            Self::Encoder(encoder) => anyhow::ensure!(
+                matches!(
+                    encoder.as_str(),
+                    "auto" | "software" | "hardware" | "bitmap"
+                ),
+                "encoder must be auto, software, hardware or bitmap"
+            ),
             Self::Credentials { username, password } => {
                 anyhow::ensure!(
                     !username.trim().is_empty(),
@@ -277,6 +293,24 @@ mod config_update_tests {
         }
         for kbps in [1, 1_000_000] {
             assert!(ConfigUpdate::BitrateKbps(kbps).validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn graphics_updates_roundtrip_and_reject_unknown_policies() {
+        for quality in ["low_latency", "balanced", "high_quality", "lossless"] {
+            let update = ConfigUpdate::Quality(quality.into());
+            let serialized = serde_json::to_vec(&update).unwrap();
+            let decoded: ConfigUpdate = serde_json::from_slice(&serialized).unwrap();
+            assert!(matches!(decoded, ConfigUpdate::Quality(ref value) if value == quality));
+            decoded.validate().unwrap();
+        }
+        for encoder in ["auto", "software", "hardware", "bitmap"] {
+            ConfigUpdate::Encoder(encoder.into()).validate().unwrap();
+        }
+        for invalid in ["", "HIGH_QUALITY", "high", "balanced ", "unknown"] {
+            assert!(ConfigUpdate::Quality(invalid.into()).validate().is_err());
+            assert!(ConfigUpdate::Encoder(invalid.into()).validate().is_err());
         }
     }
 
