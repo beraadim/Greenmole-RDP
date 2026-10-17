@@ -65,6 +65,24 @@ native ownership, capability limits, cancellation and UI feedback.
 Existing codec-failure fallback remains latched for its capture/session; toggling
 settings does not retry a failed or stuck codec without a fresh connection.
 The dashboard identifies explicit bitmap/Lossless output correctly, and legacy
-startup encoder aliases remain supported. Package verification and the Desktop
-delivery identity are recorded after build. Test preparation does not install
+startup encoder aliases remain supported. Test preparation does not install
 the app or change the user's running server or display.
+
+## Verified Desktop delivery
+
+Built from committed source `dfb47e26f3dce29f616eb294392717a6a64247fe`
+with ad-hoc application signing. Delivered locally to the Mac mini as:
+
+`/Users/beraadim/Desktop/macrdp_0.1.18_aarch64_dfb47e26f3dc.dmg`
+
+The image is 15,432,919 bytes. Its SHA-256 is:
+
+`8456be3a6746ef4e517d2132461b38cf40b627e46336be414d8d438c0daf85a3`
+
+The adjacent `.sha256` and `.build-info.json` files identify the same image and
+source revision. Verification passed for the disk-image checksum, a read-only
+mount, the bundled version/build identity and the application's deep strict
+code signature. Packaged helper checks rejected unexpected arguments and
+invalid startup configuration before capture or credential logging. The
+Desktop copy and both sidecars were verified against their build outputs.
+The user installs this testing build; the existing service was left running.
