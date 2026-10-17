@@ -61,3 +61,21 @@ production frontend builds passed. The loopback-only `avc420_fixture_server`
 example also compiled; it can serve the synthetic encoded fixtures through the
 actual RDP stack without capturing a screen or injecting input. Its unencrypted
 test listener is restricted to IPv4 loopback and is not part of the app.
+
+## Verified Desktop delivery
+
+Built from source commit `c38c41c2c6e10ec39913932819f3fdd8a14fad22` and delivered
+locally to the Mac mini:
+
+`/Users/beraadim/Desktop/macrdp_0.1.16_aarch64_c38c41c2c6e1.dmg`
+
+SHA-256:
+`e8a5fad8a337fff2b49680f4bf889563f692d0a6691423eba29982b323f6f975`
+
+The 15,367,780-byte image and checksum/build-info sidecars were copied to the
+Desktop, with destination hashes checked. Ad-hoc deep strict signature
+verification and disk-image verification passed. A read-only image mount
+confirmed app version, source revision and signature, then was detached.
+Three packaged-helper smoke checks rejected unexpected arguments and invalid
+frame-rate initialization before starting a server or querying capture.
+Installation remains with the user.
