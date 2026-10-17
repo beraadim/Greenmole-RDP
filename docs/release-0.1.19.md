@@ -64,3 +64,22 @@ TypeScript and production frontend builds passed. The focused codec suite
 passed 50 tests and the browser wire contract passed six tests. The verified
 Desktop delivery is recorded after packaging.
 The test package does not install itself or change the running server/display.
+
+## Verified Desktop delivery
+
+Built from corrected source `f28df9c168f3f7d62deb183d73350c4eb51a0982`, with
+ad-hoc application signing, and delivered to:
+
+`/Users/beraadim/Desktop/macrdp_0.1.19_aarch64_f28df9c168f3.dmg`
+
+The final image is 15,434,158 bytes; SHA-256:
+
+`f3e35fd52ca73717afd8bf2441232611d5b2247a36dad8805419f079f8ef6709`
+
+The disk-image checksum, read-only mounted bundle version/build identity and
+deep strict application signature passed verification. Packaged helper checks
+rejected unexpected arguments and invalid configuration before capture or
+credential logging. The Desktop image and adjacent checksum/build-info sidecars
+were verified against their build outputs. The earlier 0.1.19 testing image is
+superseded and archived outside the Desktop; use this reconnect-corrected build.
+Installation remains with the user.
