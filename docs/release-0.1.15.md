@@ -67,3 +67,27 @@ and a visible popover. The remote session should remain connected. Test the
 native Quit item separately: the server and its owned virtual display should
 stop. Reconnect after relaunch and test Ctrl+A, Ctrl+X and Ctrl+V in a text editor;
 ordinary typing afterwards should not require pressing Alt to clear modifiers.
+
+## Verified Desktop delivery
+
+Built and delivered from source commit
+`6acea5d7cdd2533c15f6b78386461259ccd36cce`:
+
+`/Users/beraadim/Desktop/macrdp_0.1.15_aarch64_6acea5d7cdd2.dmg`
+
+SHA-256:
+`0d0a8925178da60bf4e6cde0064f0cc366934750075025e8ef36c348ec8409e6`
+
+The 15,368,646-byte image and checksum/build-info sidecars were copied to the
+Mac mini Desktop, with the destination checksum verified. The ad-hoc signed
+app passed deep strict signature verification. Disk-image verification passed;
+the image was mounted read-only to verify the packaged app's version, source
+revision and signature, then detached.
+
+Three packaged-helper smoke checks rejected extra server-helper arguments,
+extra recovery arguments and an invalid frame-rate configuration before UI,
+capture or server startup. Exit codes matched expectations, stdout was empty
+and fixture credentials were absent from diagnostics. The installed app,
+running server and owned virtual display were left in place for uninterrupted
+use. Installation and native close/reopen/Quit and shortcut acceptance testing
+remain with the user.
