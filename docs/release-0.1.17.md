@@ -65,3 +65,21 @@ The running application and its remote display are not replaced or restarted
 by preparation of this release. Installation and live-session testing remain
 with the user. Browser AVC420 activation still requires a supported HTTPS
 browser, the Display experiment enabled and a full disconnect/reconnect.
+
+## Verified Desktop delivery
+
+Built from source commit `03487866056d181eea3b53e6b95b95384ee59823` and delivered
+to the Mac mini Desktop:
+
+`/Users/beraadim/Desktop/macrdp_0.1.17_aarch64_03487866056d.dmg`
+
+SHA-256:
+`17df3948f88b30225454a20b39f4589b2cdb3a9fb26c394278c4b2233aa102b7`
+
+The 15,368,133-byte image and checksum/build-info sidecars were copied with
+verified destination hashes. Disk-image verification, a read-only mount,
+embedded version/source/architecture inspection and the app's ad-hoc deep
+strict signature checks passed. Three packaged helper argument/initialization
+smoke checks rejected their invalid inputs before server or capture startup.
+The owned mount was detached after inspection. Preparation did not install the
+package or restart the user's application, server or remote display.
