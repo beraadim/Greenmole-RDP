@@ -59,8 +59,11 @@ by the synthetic codec or browser checks.
 tests, with six existing opt-in experiments ignored. The CLI, TypeScript and
 production frontend builds passed. The loopback-only `avc420_fixture_server`
 example also compiled; it can serve the synthetic encoded fixtures through the
-actual RDP stack without capturing a screen or injecting input. Its unencrypted
+actual RDP stack without capturing a screen or injecting input. Its synthetic
 test listener is restricted to IPv4 loopback and is not part of the app.
+The integration fixture was subsequently hardened to require a disposable TLS
+certificate because FreeRDP rejects the library's unencrypted test mode; this
+example-only change does not alter the packaged app.
 
 ## Verified Desktop delivery
 

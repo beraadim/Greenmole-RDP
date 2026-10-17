@@ -1,9 +1,10 @@
 //! Loopback-only synthetic RDP producer for Guacamole/browser integration QA.
 //!
 //! First export synthetic frames with macrdp-encode's export_avc420_fixture.
-//! Then run this example with: <fixture-directory> <openh264|videotoolbox> [port]
-//! It never opens a display, captures pixels, accepts input, or reads a secret.
-//! Unencrypted RDP is deliberately restricted to the IPv4 loopback interface.
+//! Run with: <fixture-directory> <openh264|videotoolbox> <port> <cert.der> <key.der>
+//! Supply a disposable self-signed DER certificate and PKCS#8 DER private key.
+//! It never opens a display, captures pixels, or accepts input. TLS-only RDP
+//! without authentication is restricted to the IPv4 loopback interface.
 
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate, PixelFormat,
     RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, UncompressedRect,
 };
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::{rustls, TlsAcceptor};
 
 const WIDTH: u16 = 320;
 const HEIGHT: u16 = 180;
@@ -160,16 +163,26 @@ async fn main() -> Result<()> {
     );
     let port: u16 = arguments
         .next()
-        .map(|port| {
-            port.to_str()
-                .context("Invalid port")?
-                .parse()
-                .context("Invalid port")
-        })
-        .transpose()?
-        .unwrap_or(33990);
+        .context("Pass loopback test port")?
+        .to_str()
+        .context("Invalid port")?
+        .parse()
+        .context("Invalid port")?;
+    let certificate = PathBuf::from(
+        arguments
+            .next()
+            .context("Pass disposable DER certificate")?,
+    );
+    let private_key = PathBuf::from(arguments.next().context("Pass disposable PKCS#8 DER key")?);
     anyhow::ensure!(arguments.next().is_none(), "Unexpected arguments");
     anyhow::ensure!(port != 0, "Use an explicit nonzero test port");
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(std::fs::read(certificate)?)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(private_key)?)),
+        )?;
+    let tls = TlsAcceptor::from(Arc::new(tls));
     let mut frames = Vec::new();
     for index in 0..6 {
         let path = directory.join(format!("{backend}_320x180_{index}.h264"));
@@ -187,13 +200,21 @@ async fn main() -> Result<()> {
     };
     let mut server = RdpServer::builder()
         .with_addr(([127, 0, 0, 1], port))
-        .with_no_security()
+        .with_tls(tls)
         .with_no_input()
         .with_display_handler(display)
         .build();
     server.set_gfx_state(gfx);
     eprintln!(
-        "Synthetic-only RDP fixture on 127.0.0.1:{port} ({backend}); no desktop capture or input"
+        "Synthetic-only TLS RDP fixture on 127.0.0.1:{port} ({backend}); no desktop capture or input"
     );
-    server.run().await
+    let listener =
+        tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port))).await?;
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        eprintln!("Synthetic RDP test connection from {peer}");
+        if let Err(error) = server.run_connection(stream).await {
+            eprintln!("Synthetic RDP test connection ended: {error:#}");
+        }
+    }
 }
