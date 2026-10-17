@@ -96,3 +96,30 @@ its authentication behavior.
 One parallel rerun hit an existing clipboard test's empty private-pasteboard
 assertion. The exact test passed in isolation; no clipboard production code
 changed. The final complete run serialized native tests, retaining all assertions.
+
+## Verified Desktop delivery
+
+Built from source commit `02350147ee662da54f6633867f4c23e95d925547` and delivered
+to the Mac mini Desktop:
+
+`/Users/beraadim/Desktop/macrdp_0.1.16_aarch64_02350147ee66.dmg`
+
+SHA-256:
+`72989ed4cc1018d0b6823b4f5f40722935b62ceeb20a2521bbf8d7cde8466aff`
+
+The 15,367,483-byte image and checksum/build-info sidecars were copied with
+verified destination hashes. Disk-image validation, read-only mount inspection
+and ad-hoc deep strict signature checks passed. The mounted app reports the
+expected version, architecture and source revision. Three packaged-helper smoke
+checks reject unexpected arguments and invalid initialization before starting a
+server or querying capture. The image mount was detached after inspection.
+Only the superseded interim 0.1.16 image and its two verified sidecars were
+removed; installation and live-session testing remain with the user.
+
+Guacamole 1.6.1-private.13 was deployed on Oberon with configuration and runtime
+settings preserved. Its exact packaged browser bundle and final guacd runtime
+passed the synthetic end-to-end path with both real encoders: twelve presented
+video frames, injected decoder failure, fresh complete native image repair and
+an ordinary image-only reconnect. Sampled RGB errors were at most three levels
+per channel. Temporary fixture services and SSH forwards were removed. These
+functional checks do not measure a live desktop's performance.
