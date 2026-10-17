@@ -1,3 +1,4 @@
+mod app_lifecycle;
 mod commands;
 mod configuration;
 mod database;
@@ -90,12 +91,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = tray::show_main_on_physical_display(&app).await {
-                    tracing::warn!(%error, "Could not show local macrdp controls");
-                }
-            });
+            app_lifecycle::request_show_main(app, "second_instance");
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -181,6 +177,7 @@ pub fn run() {
             window_commands::get_window_move_status,
             window_commands::move_windows_to_remote,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running macrdp-ui");
+        .build(tauri::generate_context!())
+        .expect("error while building macrdp-ui")
+        .run(app_lifecycle::handle_run_event);
 }

@@ -32,6 +32,7 @@ pub type LogReloadHandle = reload::Handle<EnvFilter, Registry>;
 
 /// Application-wide shared state.
 pub struct AppState {
+    pub(crate) exit: crate::app_lifecycle::ExitState,
     /// Serializes start/stop/settings transitions without blocking read-only polling.
     pub lifecycle_lock: Mutex<()>,
     pub stop_requests: tokio::sync::watch::Sender<u64>,
@@ -55,6 +56,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(log_reload: LogReloadHandle, ui_config: UiConfig) -> Self {
         Self {
+            exit: Default::default(),
             lifecycle_lock: Mutex::new(()),
             stop_requests: tokio::sync::watch::channel(0).0,
             server_generation: AtomicU64::new(0),

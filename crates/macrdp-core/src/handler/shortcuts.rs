@@ -42,6 +42,8 @@ impl MacInputHandler {
             return None;
         }
         let (keycode, label) = match key {
+            (0x1E, false) => (0x00, "Ctrl+A -> Cmd+A"),
+            (0x2D, false) => (0x07, "Ctrl+X -> Cmd+X"),
             (0x2E, false) => (0x08, "Ctrl+C -> Cmd+C"),
             (0x2F, false) => (0x09, "Ctrl+V -> Cmd+V"),
             (0x1C, false) => (0x24, "Ctrl+Enter -> Cmd+Enter"),

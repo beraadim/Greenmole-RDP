@@ -26,6 +26,8 @@ fn requested_shortcuts_use_command_for_both_ctrl_keys_and_clients() {
         for controls in [&[false][..], &[true][..], &[false, true][..]] {
             for shifted in [false, true] {
                 for (code, extended, native) in [
+                    (0x1E, false, 0x00),
+                    (0x2D, false, 0x07),
                     (0x2E, false, 0x08),
                     (0x2F, false, 0x09),
                     (0x1C, false, 0x24),
@@ -59,33 +61,39 @@ fn requested_shortcuts_use_command_for_both_ctrl_keys_and_clients() {
 
 #[test]
 fn shortcut_repeat_and_release_keep_the_original_mapping_after_ctrl_release() {
-    let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
-    key(&mut handler, 0x1D, false, true);
-    key(&mut handler, 0x2E, false, true);
-    key(&mut handler, 0x2E, false, true);
-    key(&mut handler, 0x2F, false, true);
-    key(&mut handler, 0x1D, false, false);
-    events.lock().unwrap().clear();
-    // Even a layout refresh cannot reinterpret an outstanding key release.
-    handler.update_client_context(ClientInputContext::default());
-    key(&mut handler, 0x2E, false, true);
-    key(&mut handler, 0x2F, false, false);
-    key(&mut handler, 0x2E, false, false);
-    assert_eq!(
-        *events.lock().unwrap(),
-        [
-            KeyAction::Command(0x08, true, false),
-            KeyAction::Command(0x09, false, false),
-            KeyAction::Command(0x08, false, false),
-        ]
-    );
-    assert!(handler.command_shortcuts.is_empty());
+    for ctrl_extended in [false, true] {
+        for (first, first_native, second, second_native) in
+            [(0x2E, 0x08, 0x2F, 0x09), (0x2D, 0x07, 0x1E, 0x00)]
+        {
+            let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
+            key(&mut handler, 0x1D, ctrl_extended, true);
+            key(&mut handler, first, false, true);
+            key(&mut handler, first, false, true);
+            key(&mut handler, second, false, true);
+            key(&mut handler, 0x1D, ctrl_extended, false);
+            events.lock().unwrap().clear();
+            // Even a layout refresh cannot reinterpret an outstanding key release.
+            handler.update_client_context(ClientInputContext::default());
+            key(&mut handler, first, false, true);
+            key(&mut handler, second, false, false);
+            key(&mut handler, first, false, false);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    KeyAction::Command(first_native, true, false),
+                    KeyAction::Command(second_native, false, false),
+                    KeyAction::Command(first_native, false, false),
+                ]
+            );
+            assert!(handler.command_shortcuts.is_empty());
+        }
+    }
 }
 
 #[test]
 fn plain_text_and_other_control_combinations_keep_existing_behavior() {
     let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
-    for code in [0x2E, 0x2F] {
+    for code in [0x1E, 0x2D, 0x2E, 0x2F] {
         key(&mut handler, code, false, true);
         key(&mut handler, code, false, false);
     }
@@ -99,9 +107,17 @@ fn plain_text_and_other_control_combinations_keep_existing_behavior() {
         .lock()
         .unwrap()
         .contains(&KeyAction::Unicode(b'v' as u16, true)));
+    assert!(events
+        .lock()
+        .unwrap()
+        .contains(&KeyAction::Unicode(b'a' as u16, true)));
+    assert!(events
+        .lock()
+        .unwrap()
+        .contains(&KeyAction::Unicode(b'x' as u16, true)));
     assert!(events.lock().unwrap().contains(&KeyAction::Key(0x24, true)));
     key(&mut handler, 0x1D, false, true);
-    for (code, native) in [(0x1E, 0x00), (0x2D, 0x07), (0x0F, 0x30), (0x01, 0x35)] {
+    for (code, native) in [(0x1F, 0x01), (0x2C, 0x06), (0x0F, 0x30), (0x01, 0x35)] {
         key(&mut handler, code, false, true);
         key(&mut handler, code, false, false);
         assert!(events
@@ -121,6 +137,8 @@ fn altgr_and_extra_modifiers_do_not_become_command_shortcuts() {
     for (name, layout) in [
         ("Windows Remote Desktop", 0x0414),
         ("Guacamole RDP", 0x0409),
+        ("Guacamole RDP", 0x0414),
+        ("Windows Remote Desktop", 0x0409),
     ] {
         for ctrl_extended in [false, true] {
             for modifier_first in [false, true] {
@@ -135,7 +153,7 @@ fn altgr_and_extra_modifiers_do_not_become_command_shortcuts() {
                     for (code, extended) in order {
                         key(&mut handler, code, extended, true);
                     }
-                    for code in [0x2E, 0x2F, 0x1C] {
+                    for code in [0x1E, 0x2D, 0x2E, 0x2F, 0x1C] {
                         key(&mut handler, code, false, true);
                         key(&mut handler, code, false, false);
                     }
@@ -144,7 +162,10 @@ fn altgr_and_extra_modifiers_do_not_become_command_shortcuts() {
                         .unwrap()
                         .iter()
                         .any(|event| matches!(event, KeyAction::Command(..))));
-                    if layout == 0x0414 && modifier == (0x38, true) {
+                    if name == "Windows Remote Desktop"
+                        && layout == 0x0414
+                        && modifier == (0x38, true)
+                    {
                         key(&mut handler, 0x03, false, true);
                         assert!(events
                             .lock()
@@ -158,11 +179,11 @@ fn altgr_and_extra_modifiers_do_not_become_command_shortcuts() {
 }
 
 #[test]
-fn copy_then_paste_while_holding_ctrl_does_not_leak_into_following_text() {
+fn editing_shortcuts_while_holding_ctrl_do_not_leak_into_following_text() {
     let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
     handler.pending_dead_key = Some('^');
     key(&mut handler, 0x1D, false, true);
-    for code in [0x2E, 0x2F] {
+    for code in [0x1E, 0x2D, 0x2E, 0x2F] {
         key(&mut handler, code, false, true);
         key(&mut handler, code, false, false);
         assert!(handler.modifier_state.left_ctrl);
@@ -183,7 +204,7 @@ fn copy_then_paste_while_holding_ctrl_does_not_leak_into_following_text() {
             .iter()
             .filter(|event| matches!(event, KeyAction::Command(..)))
             .count(),
-        4
+        8
     );
     assert_eq!(
         handler
@@ -198,33 +219,58 @@ fn copy_then_paste_while_holding_ctrl_does_not_leak_into_following_text() {
 
 #[test]
 fn synchronize_disconnect_and_reconnect_clear_held_shortcuts() {
-    for reset in 0..3 {
-        let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
-        key(&mut handler, 0x1D, false, true);
-        key(&mut handler, 0x2E, false, true);
-        assert_eq!(handler.command_shortcuts.len(), 1);
-        match reset {
-            0 => handler.keyboard(KeyboardEvent::Synchronize(
-                ironrdp_server::SynchronizeFlags::empty(),
-            )),
-            1 => handler.on_disconnect(),
-            _ => handler.on_connect(
-                ClientInputContext {
-                    client_name: "Guacamole RDP".into(),
-                    keyboard_layout: 0x0409,
-                },
-                None,
-            ),
+    for (code, text) in [(0x2E, 'c'), (0x2D, 'x'), (0x1E, 'a')] {
+        for reset in 0..3 {
+            let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
+            key(&mut handler, 0x1D, false, true);
+            key(&mut handler, code, false, true);
+            assert_eq!(handler.command_shortcuts.len(), 1);
+            match reset {
+                0 => handler.keyboard(KeyboardEvent::Synchronize(
+                    ironrdp_server::SynchronizeFlags::empty(),
+                )),
+                1 => handler.on_disconnect(),
+                _ => handler.on_connect(
+                    ClientInputContext {
+                        client_name: "Guacamole RDP".into(),
+                        keyboard_layout: 0x0409,
+                    },
+                    None,
+                ),
+            }
+            assert_eq!(events.lock().unwrap().last(), Some(&KeyAction::ReleaseAll));
+            assert!(handler.command_shortcuts.is_empty());
+            events.lock().unwrap().clear();
+            key(&mut handler, code, false, true);
+            key(&mut handler, code, false, false);
+            assert!(events
+                .lock()
+                .unwrap()
+                .contains(&KeyAction::Unicode(text as u16, true)));
+            assert!(!events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, KeyAction::Command(..))));
         }
-        assert_eq!(events.lock().unwrap().last(), Some(&KeyAction::ReleaseAll));
-        assert!(handler.command_shortcuts.is_empty());
+    }
+}
+
+#[test]
+fn pressing_ctrl_after_text_started_does_not_turn_a_repeat_into_cut_or_select_all() {
+    for (code, text) in [(0x2D, 'x'), (0x1E, 'a')] {
+        let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
+        key(&mut handler, code, false, true);
+        key(&mut handler, 0x1D, false, true);
         events.lock().unwrap().clear();
-        key(&mut handler, 0x2E, false, true);
-        key(&mut handler, 0x2E, false, false);
+        key(&mut handler, code, false, true);
+        key(&mut handler, code, false, false);
+        assert!(handler.command_shortcuts.is_empty());
+        assert!(handler.translated_key_releases.is_empty());
         assert!(events
             .lock()
             .unwrap()
-            .contains(&KeyAction::Unicode(b'c' as u16, true)));
+            .contains(&KeyAction::Unicode(text as u16, false)));
         assert!(!events
             .lock()
             .unwrap()

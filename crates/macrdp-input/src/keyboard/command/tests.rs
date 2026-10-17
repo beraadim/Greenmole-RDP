@@ -12,7 +12,7 @@ fn snapshot(flags: CGEventFlags) -> ModifierSnapshot {
 #[test]
 fn every_shortcut_press_repeat_and_release_ends_with_explicit_command_release() {
     // Inspect native events without posting shortcuts to the user's desktop.
-    for keycode in [0x08, 0x09, 0x24, 0x4C] {
+    for keycode in [0x00, 0x07, 0x08, 0x09, 0x24, 0x4C] {
         for shifted in [false, true] {
             for pressed in [true, true, false] {
                 let native = CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagAlphaShift;

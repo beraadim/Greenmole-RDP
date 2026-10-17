@@ -19,7 +19,14 @@ pub fn setup_tray(handle: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
         None::<&str>,
     )?;
     let show = MenuItem::with_id(handle, "show-main", "Open macrdp", true, None::<&str>)?;
-    let menu = Menu::with_items(handle, &[&show, &recover])?;
+    let quit = MenuItem::with_id(
+        handle,
+        "quit-macrdp",
+        "Quit macrdp and stop server",
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(handle, &[&show, &recover, &quit])?;
     tray.set_menu(Some(menu))?;
     tray.set_show_menu_on_left_click(false)?;
     tray.on_menu_event(|app, event| {
@@ -34,10 +41,15 @@ pub fn setup_tray(handle: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
             }
             "show-main" => {
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) = show_main_on_physical_display(&app).await {
-                        tracing::warn!(%error, "Could not open macrdp on a local display");
+                    if let Err(error) = show_main_window(&app).await {
+                        tracing::warn!(%error, "Could not open macrdp controls");
                     }
                 });
+            }
+            "quit-macrdp" => {
+                if let Err(error) = crate::app_lifecycle::request_quit(&app) {
+                    tracing::error!(%error, "Could not request shutdown from tray");
+                }
             }
             _ => {}
         }
@@ -57,21 +69,51 @@ pub fn setup_tray(handle: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Reopen on the screen the user is operating, whether physical or remote.
+/// The server and its virtual display remain running.
+pub async fn show_main_window(handle: &AppHandle) -> Result<(), String> {
+    let app = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        crate::own_windows::show_main_window(&app)?;
+        #[cfg(not(target_os = "macos"))]
+        reveal_main_window(&app)?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| format!("Window reveal task failed: {error}"))?
+    .map_err(|error| format!("{error:#}"))
+}
+
 /// Queries run off the UI thread and bypass every server-owned mutex. AppKit
 /// handles the app's own window on its main thread, without Accessibility calls.
 pub async fn show_main_on_physical_display(handle: &AppHandle) -> Result<(), String> {
     let app = handle.clone();
     tokio::task::spawn_blocking(move || {
-        let target = macrdp_core::physical_display_geometry()?;
         #[cfg(target_os = "macos")]
-        crate::own_windows::show_main_window_on_display(&app, target)?;
+        crate::own_windows::show_main_window_on_display(
+            &app,
+            macrdp_core::physical_display_geometry(),
+        )?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (app, target);
+        reveal_main_window(&app)?;
         Ok::<(), anyhow::Error>(())
     })
     .await
     .map_err(|error| format!("Local window recovery task failed: {error}"))?
     .map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_main_window(app: &AppHandle) -> anyhow::Result<()> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| anyhow::anyhow!("The macrdp main window is unavailable"))?;
+    let results = [window.unminimize(), window.show(), window.set_focus()];
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 fn toggle_popover(handle: &AppHandle, click: PhysicalPosition<f64>) {

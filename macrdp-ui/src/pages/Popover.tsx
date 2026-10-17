@@ -51,9 +51,12 @@ function Popover() {
     }
   };
 
-  const handleQuit = () => {
-    if (window.confirm("Quit macrdp?")) {
-      api.quitApp();
+  const handleQuit = async () => {
+    setActionError(null);
+    try {
+      await api.quitApp();
+    } catch (error) {
+      setActionError(String(error));
     }
   };
 
@@ -101,7 +104,7 @@ function Popover() {
               variant="destructive"
               size="icon-xs"
               onClick={handleQuit}
-              title="Quit"
+              title="Quit macrdp and stop server"
             >
               <LogOut className="h-3.5 w-3.5" />
             </Button>

@@ -1,4 +1,4 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 
 use tauri::State;
 
@@ -219,7 +219,7 @@ pub fn check_for_updates() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    crate::tray::show_main_on_physical_display(&app).await
+    crate::tray::show_main_window(&app).await
 }
 
 #[tauri::command]
@@ -228,33 +228,8 @@ pub fn open_system_preferences(pane: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn quit_app(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    state
-        .stop_requests
-        .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-    let _lifecycle = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        state.lifecycle_lock.lock(),
-    )
-    .await
-    .ok();
-    state.server_generation.fetch_add(1, Ordering::AcqRel);
-    // Give the independent supervisor time to reap its worker and verify
-    // display removal before the application exits. If the operating system
-    // still cannot finish, worker stdin EOF remains a final safety boundary.
-    let handle = state.server_handle.lock().await.as_ref().cloned();
-    if let Some(handle) = handle {
-        match handle.recover_local_desktop().await {
-            Err(error) => tracing::warn!(%error, "Error stopping server during quit"),
-            Ok(()) => {}
-        }
-    }
-
-    app.exit(0);
-    Ok(())
+pub fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    crate::app_lifecycle::request_quit(&app)
 }
 
 #[tauri::command]

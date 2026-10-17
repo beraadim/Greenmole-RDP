@@ -18,9 +18,15 @@ pub async fn ensure_server_running(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
 ) -> Result<(), String> {
+    if state.exit.requested() {
+        return Err("macrdp is quitting.".into());
+    }
     let mut stop_requests = state.stop_requests.subscribe();
     let stop_epoch = *stop_requests.borrow_and_update();
     let _lifecycle = state.lifecycle_lock.lock().await;
+    if state.exit.requested() {
+        return Err("macrdp is quitting.".into());
+    }
     if *stop_requests.borrow() != stop_epoch {
         return Err("Server startup cancelled by Stop".into());
     }
