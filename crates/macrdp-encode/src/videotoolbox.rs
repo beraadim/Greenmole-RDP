@@ -4,7 +4,6 @@
 //! Accepts BGRA pixel data and outputs Annex B H.264 NAL units.
 
 use anyhow::Result;
-use bytes::Bytes;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -12,8 +11,10 @@ use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 
 mod callback;
+mod outcome;
 mod ownership;
 use callback::encode_callback;
+use outcome::{CallbackDiagnostics, KeyframeRequests, NativeOutput};
 use ownership::{NativeSession, OwnedCf, OwnedPixelBuffer};
 
 static RETIREMENTS: std::sync::OnceLock<crate::retirement::RetirementPool> =
@@ -347,10 +348,11 @@ unsafe fn set_optional_property(
 
 #[derive(Default)]
 struct CallbackCtx {
-    output: std::sync::Mutex<Option<(Vec<u8>, bool)>>, // (nal_data, is_keyframe)
+    output: std::sync::Mutex<Option<NativeOutput>>,
     ready: std::sync::Condvar,
     has_data: std::sync::atomic::AtomicBool,
     completion: crate::completion::EncodeCompletion,
+    diagnostics: CallbackDiagnostics,
 }
 
 /// Every callback exit, including malformed/error output, wakes its consumer.
@@ -442,7 +444,7 @@ pub struct VtEncoder {
     fps: f32,
     mode_444: bool,
     yuv444_buf: Option<Yuv444Buffers>,
-    pending_force_keyframe: bool,
+    keyframes: KeyframeRequests,
     /// vImage SIMD converter for BGRA→NV12 acceleration.
     vimage: Option<VImageConverter>,
 }
@@ -534,7 +536,7 @@ impl VtEncoder {
             fps,
             mode_444,
             yuv444_buf,
-            pending_force_keyframe: false,
+            keyframes: KeyframeRequests::default(),
             vimage,
         })
     }
@@ -1211,7 +1213,7 @@ impl VtEncoder {
         frame_count: u64,
         frame_properties: CFDictionaryRef,
         wait_budget: std::time::Duration,
-    ) -> Result<(Vec<u8>, bool)> {
+    ) -> Result<NativeOutput> {
         ctx.completion.begin();
         // Reset callback state
         {
@@ -1271,7 +1273,7 @@ impl VtEncoder {
 
         let result = {
             let mut guard = ctx.output.lock().unwrap();
-            guard.take().unwrap_or_default()
+            guard.take().unwrap_or(NativeOutput::Failed)
         };
 
         Ok(result)
@@ -1314,7 +1316,7 @@ impl VtEncoder {
     fn collect_session_frame(
         ctx: &Arc<CallbackCtx>,
         timeout: std::time::Duration,
-    ) -> Result<Option<(Vec<u8>, bool)>> {
+    ) -> Result<Option<NativeOutput>> {
         let guard = ctx.output.lock().unwrap();
         let (mut guard, _) = ctx
             .ready
@@ -1326,36 +1328,6 @@ impl VtEncoder {
             Ok(guard.take())
         } else {
             Ok(None)
-        }
-    }
-
-    fn finish_collected_output(
-        collected: Option<(Vec<u8>, bool)>,
-        completed: bool,
-        width: u32,
-        height: u32,
-        pending_force_keyframe: &mut bool,
-    ) -> Option<EncodedFrame> {
-        match collected {
-            Some((nal_data, is_keyframe)) if !nal_data.is_empty() => Some(EncodedFrame {
-                data: Bytes::from(nal_data),
-                is_keyframe,
-                width,
-                height,
-            }),
-            _ if completed => {
-                // The native encoder may have advanced its reference pictures
-                // even if parsing rejected the completed access unit. The next
-                // P-frame must never depend on pixels the client did not get.
-                *pending_force_keyframe = true;
-                Some(EncodedFrame {
-                    data: Bytes::new(),
-                    is_keyframe: false,
-                    width,
-                    height,
-                })
-            }
-            _ => None,
         }
     }
 
@@ -1416,9 +1388,9 @@ impl VideoEncoder for VtEncoder {
             stride,
         )?;
 
-        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
+        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
 
-        let (nal_data, is_keyframe) = Self::encode_session_frame(
+        let output = Self::encode_session_frame(
             self.native.session,
             &self.native.callback_ctx,
             pixel_buffer.as_ptr(),
@@ -1429,10 +1401,18 @@ impl VideoEncoder for VtEncoder {
                 .as_ref()
                 .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
-        )?;
+        )
+        .map_err(|error| {
+            self.keyframes.request();
+            error
+        })?;
 
-        self.pending_force_keyframe = false;
+        self.keyframes.submitted();
+        self.keyframes.complete(&output);
         self.frame_count += 1;
+        let encoded = output.into_frame(self.width, self.height);
+        let nal_data = &encoded.data;
+        let is_keyframe = encoded.is_keyframe;
 
         // NAL type diagnostic for first 10 frames
         if self.frame_count <= 10 {
@@ -1498,12 +1478,7 @@ impl VideoEncoder for VtEncoder {
             );
         }
 
-        Ok(EncodedFrame {
-            data: Bytes::from(nal_data),
-            is_keyframe,
-            width: self.width,
-            height: self.height,
-        })
+        Ok(encoded)
     }
 
     fn encode_pixel_buffer(
@@ -1516,17 +1491,17 @@ impl VideoEncoder for VtEncoder {
             "Cannot encode a null pixel buffer"
         );
         if force_keyframe {
-            self.pending_force_keyframe = true;
+            self.keyframes.request();
         }
 
         let frame_duration = (600.0 / self.fps as f64) as i64;
         let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let duration = CMTime::make(frame_duration, 600);
 
-        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
+        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
 
         // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
-        let (nal_data, is_keyframe) = Self::encode_session_frame(
+        let output = Self::encode_session_frame(
             self.native.session,
             &self.native.callback_ctx,
             pixel_buffer_ptr,
@@ -1537,17 +1512,17 @@ impl VideoEncoder for VtEncoder {
                 .as_ref()
                 .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
-        )?;
+        )
+        .map_err(|error| {
+            self.keyframes.request();
+            error
+        })?;
 
-        self.pending_force_keyframe = false;
+        self.keyframes.submitted();
+        self.keyframes.complete(&output);
         self.frame_count += 1;
 
-        Ok(EncodedFrame {
-            data: Bytes::from(nal_data),
-            is_keyframe,
-            width: self.width,
-            height: self.height,
-        })
+        Ok(output.into_frame(self.width, self.height))
     }
 
     fn encode_bgra_444(
@@ -1593,7 +1568,7 @@ impl VideoEncoder for VtEncoder {
         let frame_duration = (600.0 / self.fps as f64) as i64;
         let duration = CMTime::make(frame_duration, 600);
 
-        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
+        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
 
         // Step 2: Encode main view — standard YUV420 from B-area split
         let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
@@ -1605,7 +1580,7 @@ impl VideoEncoder for VtEncoder {
             &bufs.main_view.u,
             &bufs.main_view.v,
         )?;
-        let (main_nal, main_keyframe) = Self::encode_session_frame(
+        let main_output = Self::encode_session_frame(
             self.native.session,
             &self.native.callback_ctx,
             main_pb.as_ptr(),
@@ -1616,7 +1591,11 @@ impl VideoEncoder for VtEncoder {
                 .as_ref()
                 .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
-        )?;
+        )
+        .map_err(|error| {
+            self.keyframes.request();
+            error
+        })?;
 
         // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
         // Force IDR on aux too if main was forced, to keep both streams in sync
@@ -1629,8 +1608,14 @@ impl VideoEncoder for VtEncoder {
             &bufs.aux_view.y,
             &bufs.aux_view.u,
             &bufs.aux_view.v,
-        )?;
-        let (aux_nal, aux_keyframe) = Self::encode_session_frame(
+        )
+        .map_err(|error| {
+            // Main may already be a native reference; no partial pair is
+            // delivered if allocating the auxiliary input fails.
+            self.keyframes.request();
+            error
+        })?;
+        let aux_output = Self::encode_session_frame(
             self.native.session,
             &self.native.callback_ctx,
             aux_pb.as_ptr(),
@@ -1641,30 +1626,35 @@ impl VideoEncoder for VtEncoder {
                 .as_ref()
                 .map_or(std::ptr::null(), OwnedCf::as_ptr),
             low_latency_wait_budget(self.fps),
-        )?;
+        )
+        .map_err(|error| {
+            self.keyframes.request();
+            error
+        })?;
 
-        self.pending_force_keyframe = false;
+        self.keyframes.submitted();
+        let usable = self.keyframes.complete_pair(&main_output, &aux_output);
         self.frame_count += 1;
+        let main = main_output.into_frame(w, h);
+        let auxiliary = aux_output.into_frame(w, h);
 
         tracing::debug!(
             frame = self.frame_count,
-            main_bytes = main_nal.len(),
-            aux_bytes = aux_nal.len(),
+            main_bytes = main.data.len(),
+            aux_bytes = auxiliary.data.len(),
             "AVC444 dual-stream encode"
         );
 
         Ok(Avc444EncodedFrame {
-            main_view: EncodedFrame {
-                data: Bytes::from(main_nal),
-                is_keyframe: main_keyframe,
-                width: w,
-                height: h,
+            main_view: if usable {
+                main
+            } else {
+                NativeOutput::Dropped.into_frame(w, h)
             },
-            aux_view: EncodedFrame {
-                data: Bytes::from(aux_nal),
-                is_keyframe: aux_keyframe,
-                width: w,
-                height: h,
+            aux_view: if usable {
+                auxiliary
+            } else {
+                NativeOutput::Dropped.into_frame(w, h)
             },
         })
     }
@@ -1696,7 +1686,7 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn force_keyframe(&mut self) {
-        self.pending_force_keyframe = true;
+        self.keyframes.request();
     }
 
     fn supports_444(&self) -> bool {
@@ -1738,7 +1728,7 @@ impl VideoEncoder for VtEncoder {
             stride,
         )?;
         let (pts, duration) = self.make_pts_duration();
-        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
+        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
 
         let result = Self::submit_session_frame(
             self.native.session,
@@ -1754,11 +1744,14 @@ impl VideoEncoder for VtEncoder {
         match result {
             Ok(()) => {
                 self.replace_pending_input_buffer(pixel_buffer);
-                self.pending_force_keyframe = false;
+                self.keyframes.submitted();
                 self.frame_count += 1;
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.keyframes.request();
+                Err(e)
+            }
         }
     }
 
@@ -1769,7 +1762,7 @@ impl VideoEncoder for VtEncoder {
         );
         self.native.callback_ctx.completion.begin();
         let (pts, duration) = self.make_pts_duration();
-        let frame_props = Self::make_force_keyframe_props(self.pending_force_keyframe)?;
+        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
         anyhow::ensure!(!ptr.is_null(), "Cannot encode a null pixel buffer");
         let pixel_buffer = unsafe { OwnedPixelBuffer::new(CVPixelBufferRetain(ptr))? };
 
@@ -1787,11 +1780,14 @@ impl VideoEncoder for VtEncoder {
         match result {
             Ok(()) => {
                 self.replace_pending_input_buffer(pixel_buffer);
-                self.pending_force_keyframe = false;
+                self.keyframes.submitted();
                 self.frame_count += 1;
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.keyframes.request();
+                Err(e)
+            }
         }
     }
 
@@ -1808,24 +1804,18 @@ impl VideoEncoder for VtEncoder {
             return Ok(None);
         }
         let collected = Self::collect_session_frame(&self.native.callback_ctx, timeout)?;
-        if self
+        let completed = self
             .native
             .callback_ctx
             .has_data
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.clear_pending_input_buffer();
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !completed {
+            return Ok(None);
         }
-        Ok(Self::finish_collected_output(
-            collected,
-            self.native
-                .callback_ctx
-                .has_data
-                .load(std::sync::atomic::Ordering::Acquire),
-            self.width,
-            self.height,
-            &mut self.pending_force_keyframe,
-        ))
+        self.clear_pending_input_buffer();
+        let output = collected.unwrap_or(NativeOutput::Failed);
+        self.keyframes.complete(&output);
+        Ok(Some(output.into_frame(self.width, self.height)))
     }
 }
 
@@ -1874,11 +1864,11 @@ mod tests {
                 .is_none()
         );
         assert!(ctx.completion.timing().is_none());
-        *ctx.output.lock().unwrap() = Some((vec![1, 2, 3], true));
+        *ctx.output.lock().unwrap() = Some(NativeOutput::Encoded(vec![1, 2, 3], true));
         drop(CallbackFinished(&ctx));
         assert_eq!(
             VtEncoder::collect_session_frame(&ctx, std::time::Duration::ZERO).unwrap(),
-            Some((vec![1, 2, 3], true))
+            Some(NativeOutput::Encoded(vec![1, 2, 3], true))
         );
     }
 
@@ -1902,36 +1892,6 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(ctx.has_data.load(std::sync::atomic::Ordering::Acquire));
-        assert!(ctx.output.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn rejected_completed_output_forces_idr_but_a_pending_callback_does_not() {
-        let mut force_keyframe = false;
-        assert!(
-            VtEncoder::finish_collected_output(None, false, 640, 480, &mut force_keyframe)
-                .is_none()
-        );
-        assert!(!force_keyframe);
-
-        for output in [None, Some((Vec::new(), false))] {
-            force_keyframe = false;
-            let dropped =
-                VtEncoder::finish_collected_output(output, true, 640, 480, &mut force_keyframe)
-                    .unwrap();
-            assert!(dropped.data.is_empty());
-            assert!(force_keyframe);
-        }
-        // Successful output must not consume an independently pending request.
-        let frame = VtEncoder::finish_collected_output(
-            Some((vec![0, 0, 0, 1, 0x41], false)),
-            true,
-            640,
-            480,
-            &mut force_keyframe,
-        )
-        .unwrap();
-        assert_eq!(&frame.data[..], &[0, 0, 0, 1, 0x41]);
-        assert!(force_keyframe);
+        assert_eq!(*ctx.output.lock().unwrap(), Some(NativeOutput::Failed));
     }
 }

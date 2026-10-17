@@ -1,4 +1,5 @@
 //! Native callback parsing validates complete, possibly segmented CMBlockBuffers.
+use super::outcome::{CallbackEvent, FRAME_DROPPED};
 use super::*;
 use crate::avcc::{self, MAX_ENCODED_BYTES};
 use std::borrow::Cow;
@@ -96,7 +97,7 @@ pub(super) extern "C" fn encode_callback(
     ref_con: *mut c_void,
     _source: *mut c_void,
     status: OSStatus,
-    _info_flags: VTEncodeInfoFlags,
+    info_flags: VTEncodeInfoFlags,
     sample: CMSampleBufferRef,
 ) {
     if ref_con.is_null() {
@@ -104,30 +105,107 @@ pub(super) extern "C" fn encode_callback(
     }
     let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
     let _finished = CallbackFinished(ctx);
-    if status != 0 || sample.is_null() {
-        tracing::warn!(
+    let output = if status != 0 {
+        ctx.diagnostics.record(
+            CallbackEvent::Failure,
             status,
-            null_buf = sample.is_null(),
-            "VT encode callback error"
+            info_flags,
+            Some(&"native compression error"),
         );
-        return;
-    }
-    // No Rust unwind may cross Apple's C callback boundary. Malformed output
-    // completes with no frame, allowing the normal recovery path to run.
-    match std::panic::catch_unwind(|| unsafe { extract(sample) }) {
-        Ok(Ok(output)) => {
-            *ctx.output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(output);
+        NativeOutput::Failed
+    } else if sample.is_null() && info_flags & FRAME_DROPPED != 0 {
+        ctx.diagnostics
+            .record(CallbackEvent::Dropped, status, info_flags, None);
+        NativeOutput::Dropped
+    } else if sample.is_null() {
+        // Apple permits a null sample for dropped frames and says the flag
+        // MAY be set. With no explicit flag, retain conservative repair while
+        // recording the ambiguity once per interval instead of flooding logs.
+        ctx.diagnostics
+            .record(CallbackEvent::UnexpectedEmpty, status, info_flags, None);
+        NativeOutput::Failed
+    } else {
+        // No Rust unwind may cross Apple's C callback boundary. Malformed output
+        // completes with no frame, allowing the normal recovery path to run.
+        match std::panic::catch_unwind(|| unsafe { extract(sample) }) {
+            Ok(Ok((data, keyframe))) if !data.is_empty() => {
+                ctx.diagnostics
+                    .record(CallbackEvent::Encoded, status, info_flags, None);
+                NativeOutput::Encoded(data, keyframe)
+            }
+            Ok(Ok(_)) => {
+                ctx.diagnostics.record(
+                    CallbackEvent::Failure,
+                    status,
+                    info_flags,
+                    Some(&"empty encoded access unit"),
+                );
+                NativeOutput::Failed
+            }
+            Ok(Err(error)) => {
+                ctx.diagnostics
+                    .record(CallbackEvent::Failure, status, info_flags, Some(&error));
+                NativeOutput::Failed
+            }
+            Err(_) => {
+                ctx.diagnostics
+                    .record(CallbackEvent::ParserPanic, status, info_flags, None);
+                NativeOutput::Failed
+            }
         }
-        Ok(Err(error)) => tracing::warn!(%error, "Rejected malformed VideoToolbox output"),
-        Err(_) => tracing::error!("VideoToolbox output parser panicked; dropping frame"),
-    }
+    };
+    *ctx.output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(output);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn null_native_completions_distinguish_explicit_drops_from_failures() {
+        for (status, flags, expected, category) in [
+            (0, FRAME_DROPPED, NativeOutput::Dropped, 1),
+            (0, FRAME_DROPPED | 1, NativeOutput::Dropped, 1),
+            (0, 0, NativeOutput::Failed, 2),
+            (0, 1, NativeOutput::Failed, 2),
+            (-1, FRAME_DROPPED, NativeOutput::Failed, 3),
+        ] {
+            let ctx = Arc::new(CallbackCtx::default());
+            ctx.completion.begin();
+            let mut completion = ctx.completion.subscribe();
+            assert!(
+                VtEncoder::collect_session_frame(&ctx, std::time::Duration::ZERO)
+                    .unwrap()
+                    .is_none()
+            );
+            encode_callback(
+                Arc::as_ptr(&ctx) as *mut c_void,
+                std::ptr::null_mut(),
+                status,
+                flags,
+                std::ptr::null(),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                completion.wait_for(|timing| timing.is_some()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(ctx.completion.timing().is_some());
+            assert!(ctx.has_data.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(
+                VtEncoder::collect_session_frame(&ctx, std::time::Duration::ZERO).unwrap(),
+                Some(expected)
+            );
+            let mut counts = [0; 4];
+            counts[category] = 1;
+            assert_eq!(ctx.diagnostics.counts(), counts);
+        }
+    }
+
     extern "C" {
         static kCFAllocatorNull: CFAllocatorRef;
         fn CMBlockBufferCreateWithMemoryBlock(
