@@ -1,6 +1,6 @@
 //! YUV444 preprocessing for AVC444 dual-stream encoding.
 //!
-//! Implements BGRA → YUV444 conversion (BT.601) and the B-area pixel mapping
+//! Implements BGRA → YUV444 conversion (full-range BT.709) and the B-area pixel mapping
 //! defined in MS-RDPEGFX §3.3.8.3.2 for splitting a YUV444 frame into two
 //! standard YUV420 frames (Main View + Auxiliary View).
 
@@ -55,17 +55,12 @@ impl Yuv420Frame {
     }
 }
 
-/// Convert a BGRA frame to full-resolution YUV444 planes using BT.601 **full range**.
+/// Convert a BGRA frame to full-resolution YUV444 planes using BT.709 **full range**.
 ///
 /// The output planes `y444`, `u444`, `v444` must each be at least `width * height` bytes.
 /// BGRA byte order: B[0], G[1], R[2], A[3].
 ///
-/// BT.601 full range (Y: 0-255, UV: 0-255) — matches NV12 '420f' format:
-/// ```text
-/// Y =  (77*R + 150*G + 29*B) >> 8
-/// U = (-43*R -  85*G + 128*B) >> 8 + 128
-/// V = (128*R - 107*G -  21*B) >> 8 + 128
-/// ```
+/// MS-RDPEGFX §3.3.8.3.1 uses full-range BT.709 for both AVC420 and AVC444.
 pub fn bgra_to_yuv444(
     bgra: &[u8],
     width: u32,
@@ -114,15 +109,13 @@ pub fn bgra_to_yuv444(
             let g = bgra[px + 1] as i32;
             let r = bgra[px + 2] as i32;
 
-            // BT.601 full range (no +16 offset on Y, full 0-255 range)
-            let y = (77 * r + 150 * g + 29 * b) >> 8;
-            let u = ((-43 * r - 85 * g + 128 * b) >> 8) + 128;
-            let v = ((128 * r - 107 * g - 21 * b) >> 8) + 128;
+            let y = crate::color::luma(r, g, b);
+            let (u, v) = crate::color::chroma(r, g, b);
 
             let idx = yuv_row + col;
-            y444[idx] = y.clamp(0, 255) as u8;
-            u444[idx] = u.clamp(0, 255) as u8;
-            v444[idx] = v.clamp(0, 255) as u8;
+            y444[idx] = y;
+            u444[idx] = u;
+            v444[idx] = v;
         }
     }
 
@@ -254,15 +247,15 @@ mod tests {
         buf
     }
 
-    /// Reference BT.601 full-range conversion for a single pixel
-    fn ref_bt601(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-        let ri = r as i32;
-        let gi = g as i32;
-        let bi = b as i32;
-        let y = ((77 * ri + 150 * gi + 29 * bi) >> 8).clamp(0, 255) as u8;
-        let u = (((-43 * ri - 85 * gi + 128 * bi) >> 8) + 128).clamp(0, 255) as u8;
-        let v = (((128 * ri - 107 * gi - 21 * bi) >> 8) + 128).clamp(0, 255) as u8;
-        (y, u, v)
+    /// Independent floating-point reference from the normative BT.709 matrix.
+    fn ref_bt709(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        let (r, g, b) = (f64::from(r), f64::from(g), f64::from(b));
+        let clamp = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+        (
+            clamp(0.2126 * r + 0.7152 * g + 0.0722 * b),
+            clamp(-0.1146 * r - 0.3854 * g + 0.5 * b + 128.0),
+            clamp(0.5 * r - 0.4542 * g - 0.0458 * b + 128.0),
+        )
     }
 
     #[test]
@@ -285,7 +278,7 @@ mod tests {
         )
         .unwrap();
 
-        let (exp_y, exp_u, exp_v) = ref_bt601(200, 100, 50);
+        let (exp_y, exp_u, exp_v) = ref_bt709(200, 100, 50);
         for i in 0..size {
             assert_eq!(y444[i], exp_y, "Y mismatch at pixel {i}");
             assert_eq!(u444[i], exp_u, "U mismatch at pixel {i}");
@@ -316,7 +309,7 @@ mod tests {
 
         bgra_to_yuv444(&bgra, w, h, stride, &mut y444, &mut u444, &mut v444).unwrap();
 
-        let (exp_y, exp_u, exp_v) = ref_bt601(90, 60, 30);
+        let (exp_y, exp_u, exp_v) = ref_bt709(90, 60, 30);
         for i in 0..size {
             assert_eq!(y444[i], exp_y, "Y mismatch at pixel {i}");
             assert_eq!(u444[i], exp_u, "U mismatch at pixel {i}");
@@ -581,7 +574,7 @@ mod tests {
         yuv444_split_to_yuv420(&y444, &u444, &v444, w, h, &mut main_view, &mut aux_view);
 
         // For a uniform color, all YUV444 values are the same pixel repeated
-        let (exp_y, exp_u, exp_v) = ref_bt601(240, 160, 80);
+        let (exp_y, exp_u, exp_v) = ref_bt709(240, 160, 80);
 
         // B1: main Y should all be exp_y
         assert!(main_view.y.iter().all(|&v| v == exp_y), "uniform B1 check");

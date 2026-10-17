@@ -30,6 +30,28 @@ The browser experimental path retains Guacamole's software-decoded image
 baseline for recovery. macrdp's graphics indicator describes Mac-to-gateway RDP
 transport; Guacamole's Display menu reports actual browser video status.
 
+## Consistent video and fallback colors
+
+Real browser integration exposed a color conversion mismatch: padded OpenH264
+frames used limited-range BT.601, while accelerated conversions used full-range
+BT.601 and H.264 metadata left the matrix or range unspecified. RDP decoders
+apply full-range BT.709, so colored desktop content could change brightness or
+hue between browser video and Guacamole's decoded image fallback.
+
+Capture, scalar and vImage conversions now consistently use full-range BT.709,
+as required by [MS-RDPEGFX §3.3.8.3.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/954d7546-6873-4466-95c8-20a7569c43e5).
+Both encoders explicitly signal matching color primaries, transfer function,
+matrix and full range in their H.264 output. The shared conversion also keeps
+AVC444 consistent. Padded software frames average each 2×2 chroma block rather
+than sampling only its top-left pixel.
+
+Zero-copy NV12 capture explicitly selects the same matrix. Its assignment uses
+the permanent native CoreGraphics BT.709 constant: the pinned ScreenCaptureKit
+1.5.4 string setter creates a temporary CFString, but Apple's configuration
+property does not retain that value. Bypassing that setter avoids leaving a
+dangling native reference. A configuration readback test verifies the matrix
+without starting screen capture.
+
 ## Testing and activation
 
 Synthetic tests exercise AVC wire framing, visible crop versus macroblock
@@ -39,6 +61,10 @@ The maintained `macrdp-encode` example `export_avc420_fixture` exports generated
 quadrants and a moving marker through both real encoders; it never captures the
 user's desktop. The browser tests use those real IDR/P/forced-IDR sequences to
 check WebCodecs rendering and image fallback.
+Real encode/decode tests also check saturated red, green and blue, black, white
+and gray through scalar, accelerated and padded inputs. They verify reconstructed
+RGB values against the independent RDP inverse matrix, rather than checking
+dimensions or gray pixels alone.
 
 After installing the Desktop DMG, choose Balanced or High quality in macrdp and
 hardware encoding when available. In Guacamole over HTTPS, open the connection
@@ -55,30 +81,18 @@ by the synthetic codec or browser checks.
 
 ## Automated validation
 
-`tools/check.sh` passed: 664 Rust tests, eight Python tests and eight JavaScript
+`RUST_TEST_THREADS=1 tools/check.sh` passed: 668 Rust tests, eight Python tests and eight JavaScript
 tests, with six existing opt-in experiments ignored. The CLI, TypeScript and
-production frontend builds passed. The loopback-only `avc420_fixture_server`
+production frontend builds passed. Focused color validation included all 37
+encoder tests and 31 capture tests. The loopback-only `avc420_fixture_server`
 example also compiled; it can serve the synthetic encoded fixtures through the
 actual RDP stack without capturing a screen or injecting input. Its synthetic
 test listener is restricted to IPv4 loopback and is not part of the app.
-The integration fixture was subsequently hardened to require a disposable TLS
-certificate because FreeRDP rejects the library's unencrypted test mode; this
-example-only change does not alter the packaged app.
+The fixture requires a disposable TLS certificate and the public test-only
+credentials `synthetic-fixture` / `synthetic-fixture`, satisfying the existing
+acceptor policy. These example-only settings do not alter the packaged app or
+its authentication behavior.
 
-## Verified Desktop delivery
-
-Built from source commit `c38c41c2c6e10ec39913932819f3fdd8a14fad22` and delivered
-locally to the Mac mini:
-
-`/Users/beraadim/Desktop/macrdp_0.1.16_aarch64_c38c41c2c6e1.dmg`
-
-SHA-256:
-`e8a5fad8a337fff2b49680f4bf889563f692d0a6691423eba29982b323f6f975`
-
-The 15,367,780-byte image and checksum/build-info sidecars were copied to the
-Desktop, with destination hashes checked. Ad-hoc deep strict signature
-verification and disk-image verification passed. A read-only image mount
-confirmed app version, source revision and signature, then was detached.
-Three packaged-helper smoke checks rejected unexpected arguments and invalid
-frame-rate initialization before starting a server or querying capture.
-Installation remains with the user.
+One parallel rerun hit an existing clipboard test's empty private-pasteboard
+assertion. The exact test passed in isolation; no clipboard production code
+changed. The final complete run serialized native tests, retaining all assertions.

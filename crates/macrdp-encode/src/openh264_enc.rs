@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use openh264::encoder::{Encoder, EncoderConfig, FrameType};
+use openh264::encoder::{Encoder, EncoderConfig, FrameType, VuiConfig};
 use openh264::formats::YUVSlices;
 
 use crate::color_convert::VImageConverter;
@@ -69,6 +69,7 @@ fn create_oh264_encoder(
         Quality::Lossless => unreachable!("lossless rejected before codec configuration"),
     };
     let config = EncoderConfig::new()
+        .vui(VuiConfig::bt709_full())
         .bitrate(openh264::encoder::BitRate::from_bps(bitrate))
         .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
@@ -251,15 +252,31 @@ fn bgra_to_yuv420_padded(
             let g = bgra[bgra_offset + 1] as i32;
             let r = bgra[bgra_offset + 2] as i32;
 
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[row * ew + col] = y.clamp(0, 255) as u8;
-
-            if row % 2 == 0 && col % 2 == 0 {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                let uv_idx = (row / 2) * uv_w + (col / 2);
-                u_plane[uv_idx] = u.clamp(0, 255) as u8;
-                v_plane[uv_idx] = v.clamp(0, 255) as u8;
+            y_plane[row * ew + col] = crate::color::luma(r, g, b);
+        }
+    }
+    // Match the SIMD converter's 2x2 chroma average, including odd visible
+    // edges. Sampling only the top-left pixel causes avoidable color aliasing.
+    for row in (0..sh).step_by(2) {
+        for col in (0..sw).step_by(2) {
+            let mut rgb = [0i32; 3];
+            let mut count = 0;
+            for y in row..(row + 2).min(sh) {
+                for x in col..(col + 2).min(sw) {
+                    let offset = y * stride + x * 4;
+                    if let Some(pixel) = bgra.get(offset..offset + 3) {
+                        rgb[0] += i32::from(pixel[2]);
+                        rgb[1] += i32::from(pixel[1]);
+                        rgb[2] += i32::from(pixel[0]);
+                        count += 1;
+                    }
+                }
+            }
+            if count != 0 {
+                let (u, v) = crate::color::chroma(rgb[0] / count, rgb[1] / count, rgb[2] / count);
+                let index = (row / 2) * uv_w + col / 2;
+                u_plane[index] = u;
+                v_plane[index] = v;
             }
         }
     }
@@ -269,7 +286,7 @@ impl VideoEncoder for OpenH264Encoder {
     fn prepare(&mut self) -> Result<()> {
         let y_size = (self.width * self.height) as usize;
         let uv_size = y_size / 4;
-        self.yuv_buf[..y_size].fill(16);
+        self.yuv_buf[..y_size].fill(0);
         self.yuv_buf[y_size..].fill(128);
         let (y, uv) = self.yuv_buf.split_at(y_size);
         let (u, v) = uv.split_at(uv_size);
@@ -592,6 +609,38 @@ impl VideoEncoder for OpenH264Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_openh264_output_preserves_colors_with_simd_scalar_and_padding() {
+        for (simd, width, height) in [(true, 128, 64), (false, 128, 64), (true, 126, 60)] {
+            let mut encoder = OpenH264Encoder::new_with_quality(
+                128,
+                64,
+                30.0,
+                3_000_000,
+                false,
+                Quality::HighQuality,
+            )
+            .unwrap();
+            if !simd {
+                encoder.vimage = None;
+            }
+            crate::color::tests::assert_encoded_color_fidelity(&mut encoder, width, height);
+            let parameters = native_parameters(&mut encoder.encoder);
+            let layer = &parameters.sSpatialLayers[0];
+            assert!(
+                layer.bVideoSignalTypePresent && layer.bColorDescriptionPresent && layer.bFullRange
+            );
+            assert_eq!(
+                (
+                    layer.uiColorPrimaries,
+                    layer.uiTransferCharacteristics,
+                    layer.uiColorMatrix
+                ),
+                (1, 1, 1)
+            );
+        }
+    }
 
     fn native_parameters(encoder: &mut Encoder) -> openh264_sys2::SEncParamExt {
         let mut parameters = openh264_sys2::SEncParamExt::default();

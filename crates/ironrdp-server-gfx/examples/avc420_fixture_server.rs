@@ -4,7 +4,8 @@
 //! Run with: <fixture-directory> <openh264|videotoolbox> <port> <cert.der> <key.der>
 //! Supply a disposable self-signed DER certificate and PKCS#8 DER private key.
 //! It never opens a display, captures pixels, or accepts input. TLS-only RDP
-//! without authentication is restricted to the IPv4 loopback interface.
+//! uses the public fixture credentials synthetic-fixture/synthetic-fixture
+//! and is restricted to the IPv4 loopback interface.
 
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::PathBuf;
@@ -15,8 +16,8 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_server::gfx::GfxState;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate, PixelFormat,
-    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, UncompressedRect,
+    BitmapUpdate, Credentials, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
+    PixelFormat, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, UncompressedRect,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
@@ -205,6 +206,14 @@ async fn main() -> Result<()> {
         .with_display_handler(display)
         .build();
     server.set_gfx_state(gfx);
+    // The production acceptor deliberately rejects missing credentials for
+    // TLS ClientInfo authentication. These public fixture-only values cannot
+    // authenticate against the user's real server or control a local desktop.
+    server.set_credentials(Some(Credentials {
+        username: "synthetic-fixture".into(),
+        password: "synthetic-fixture".into(),
+        domain: None,
+    }));
     eprintln!(
         "Synthetic-only TLS RDP fixture on 127.0.0.1:{port} ({backend}); no desktop capture or input"
     );

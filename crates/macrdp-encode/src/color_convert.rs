@@ -64,11 +64,11 @@ const KV_IMAGE_NO_FLAGS: u32 = 0;
 
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
-    /// Pre-computed BT.601 matrix constant provided by Apple.
-    /// Declared as: `extern const vImage_ARGBToYpCbCrMatrix *kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4`
+    /// Pre-computed BT.709 matrix constant provided by Apple.
+    /// Declared as: `extern const vImage_ARGBToYpCbCrMatrix *kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2`
     /// i.e. this symbol IS the pointer itself.
-    #[link_name = "kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4"]
-    static MATRIX_BT601_PTR: *const VImageARGBToYpCbCrMatrix;
+    #[link_name = "kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2"]
+    static MATRIX_BT709_PTR: *const VImageARGBToYpCbCrMatrix;
 
     /// Build conversion info from a colour matrix + pixel range + format pair.
     fn vImageConvert_ARGBToYpCbCr_GenerateConversion(
@@ -118,7 +118,7 @@ pub struct VImageConverter {
 }
 
 impl VImageConverter {
-    /// Create a new converter using BT.601 full-range (0-255 for Y/Cb/Cr).
+    /// Create a new converter using RDP's BT.709 full-range (0-255 for Y/Cb/Cr).
     pub fn new() -> Result<Self, String> {
         // Full-range: Yp_bias=0, CbCr_bias=128, all max=255, all min=0
         let pixel_range = VImageYpCbCrPixelRange {
@@ -142,7 +142,7 @@ impl VImageConverter {
         // Generate I420 conversion info
         let err = unsafe {
             vImageConvert_ARGBToYpCbCr_GenerateConversion(
-                MATRIX_BT601_PTR,
+                MATRIX_BT709_PTR,
                 &pixel_range as *const _,
                 &mut i420_info as *mut _,
                 KV_IMAGE_ARGB8888,
@@ -159,7 +159,7 @@ impl VImageConverter {
         // Generate NV12 conversion info
         let err = unsafe {
             vImageConvert_ARGBToYpCbCr_GenerateConversion(
-                MATRIX_BT601_PTR,
+                MATRIX_BT709_PTR,
                 &pixel_range as *const _,
                 &mut nv12_info as *mut _,
                 KV_IMAGE_ARGB8888,
@@ -474,7 +474,7 @@ mod tests {
             .bgra_to_nv12(&bgra, w, h, stride, &mut y_out, &mut uv_out)
             .expect("bgra_to_nv12 failed");
 
-        // For uniform gray (128,128,128), BT.601 full-range Y should be ~128
+        // For uniform gray (128,128,128), BT.709 full-range Y should be ~128
         // Allow some tolerance for rounding differences
         for (i, &y) in y_out.iter().enumerate() {
             assert!(

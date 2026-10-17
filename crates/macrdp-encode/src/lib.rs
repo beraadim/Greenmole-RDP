@@ -2,6 +2,7 @@
 
 #[cfg(any(target_os = "macos", test))]
 mod avcc;
+mod color;
 #[cfg(target_os = "macos")]
 pub mod color_convert;
 mod completion;

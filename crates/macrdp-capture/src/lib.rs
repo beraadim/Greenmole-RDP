@@ -211,7 +211,7 @@ fn build_stream_config(
 ) -> SCStreamConfiguration {
     let frame_interval = CMTime::new(1, config.frame_rate as i32);
 
-    SCStreamConfiguration::new()
+    let stream = SCStreamConfiguration::new()
         .with_width(width)
         .with_height(height)
         .with_scales_to_fit(true)
@@ -224,7 +224,41 @@ fn build_stream_config(
         .with_captures_audio(captures_audio)
         .with_sample_rate(AudioSampleRate::Rate48000)
         .with_channel_count(AudioChannelCount::Stereo)
-        .with_excludes_current_process_audio(true)
+        .with_excludes_current_process_audio(true);
+    if matches!(config.pixel_format, CapturePixelFormat::Nv12) {
+        set_rdp_color_matrix(&stream);
+    }
+    stream
+}
+
+/// The pinned ScreenCaptureKit 1.5.4 bridge creates a temporary Swift string
+/// for colorMatrix, but Apple's property is `assign`, not retained. Passing
+/// that temporary leaves a dangling CFString. Use the process-lifetime system
+/// constant directly so zero-copy 420f capture and RDP's BT.709 decoder agree.
+fn set_rdp_color_matrix(configuration: &SCStreamConfiguration) {
+    #[repr(C)]
+    struct CfMatrixString {
+        _opaque: [u8; 0],
+    }
+    // SAFETY: this is the opaque CFStringRef pointer ABI declared by Apple's
+    // colorMatrix property. The pointee is never accessed or constructed here.
+    unsafe impl objc2::encode::RefEncode for CfMatrixString {
+        const ENCODING_REF: objc2::encode::Encoding =
+            objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CFString", &[]));
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        static kCGDisplayStreamYCbCrMatrix_ITU_R_709_2: *const CfMatrixString;
+    }
+    // SAFETY: the pinned wrapper declares #[repr(transparent)] over its
+    // retained SCStreamConfiguration object pointer. This borrows that pointer
+    // without changing ownership. The exported CFString is valid for the
+    // process lifetime, satisfying the native property's unretained contract.
+    unsafe {
+        let object = *std::ptr::from_ref(configuration).cast::<*mut objc2::runtime::AnyObject>();
+        let _: () = objc2::msg_send![object,
+            setColorMatrix: kCGDisplayStreamYCbCrMatrix_ITU_R_709_2];
+    }
 }
 
 /// Normalize metadata at the capture boundary so downstream paths always use pixels.
@@ -1003,6 +1037,48 @@ impl std::fmt::Debug for SafePixelBuffer {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn native_nv12_configuration_keeps_the_rdp_color_matrix_without_starting_capture() {
+        let config = CaptureConfig {
+            display_id: 1,
+            width: 320,
+            height: 180,
+            frame_rate: 30,
+            pixel_format: CapturePixelFormat::Nv12,
+            show_cursor: false,
+        };
+        let stream = build_stream_config(320, 180, &config, false);
+        assert_eq!(stream.color_matrix().as_deref(), Some("ITU_R_709_2"));
+
+        let bgra_config = CaptureConfig {
+            pixel_format: CapturePixelFormat::Bgra,
+            ..config
+        };
+        let bgra_stream = build_stream_config(320, 180, &bgra_config, false);
+        // The pinned Swift getter assumes a non-null CFString and cannot
+        // safely read BGRA's unset matrix. Query the nullable native property
+        // directly, with its exact Objective-C pointer encoding.
+        #[repr(C)]
+        struct OptionalCfMatrix {
+            _opaque: [u8; 0],
+        }
+        // SAFETY: this models only Apple's opaque nullable CFStringRef ABI;
+        // no pointee is dereferenced or constructed by the test.
+        unsafe impl objc2::encode::RefEncode for OptionalCfMatrix {
+            const ENCODING_REF: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+                &objc2::encode::Encoding::Struct("__CFString", &[]),
+            );
+        }
+        // SAFETY: the pinned #[repr(transparent)] wrapper retains the object
+        // throughout this read. Returning a nullable borrowed pointer does not
+        // transfer ownership or dereference the native CFString.
+        let matrix: *const OptionalCfMatrix = unsafe {
+            let object = *std::ptr::from_ref(&bgra_stream).cast::<*mut objc2::runtime::AnyObject>();
+            objc2::msg_send![object, colorMatrix]
+        };
+        assert!(matrix.is_null(), "BGRA must retain its unset color matrix");
+    }
 
     #[tokio::test]
     async fn native_stop_notification_acknowledges_retirement_and_wakes_frame_delivery() {

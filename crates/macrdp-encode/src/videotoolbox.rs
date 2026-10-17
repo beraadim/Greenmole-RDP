@@ -247,6 +247,9 @@ extern "C" {
     static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
     static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
     static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
+    static kCVImageBufferColorPrimaries_ITU_R_709_2: CFStringRef;
+    static kCVImageBufferTransferFunction_ITU_R_709_2: CFStringRef;
+    static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
     static kCMFormatDescriptionExtension_FullRangeVideo: CFStringRef;
 }
 
@@ -605,6 +608,28 @@ impl VtEncoder {
                 kCFBooleanTrue,
                 "RealTime",
             )?;
+            // A generic H.264 decoder uses SPS VUI, while RDP decoders use
+            // the protocol's full-range BT.709 matrix. Make both agree with
+            // our 420f input rather than leaving color interpretation inferred.
+            for (key, value, name) in [
+                (
+                    kVTCompressionPropertyKey_ColorPrimaries,
+                    kCVImageBufferColorPrimaries_ITU_R_709_2,
+                    "ColorPrimaries",
+                ),
+                (
+                    kVTCompressionPropertyKey_TransferFunction,
+                    kCVImageBufferTransferFunction_ITU_R_709_2,
+                    "TransferFunction",
+                ),
+                (
+                    kVTCompressionPropertyKey_YCbCrMatrix,
+                    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                    "YCbCrMatrix",
+                ),
+            ] {
+                set_required_property(session, key, value, name)?;
+            }
             set_required_property(
                 session,
                 kVTCompressionPropertyKey_AllowFrameReordering,
@@ -777,18 +802,17 @@ impl VtEncoder {
                     let (b10, g10, r10) = (*p10 as i32, *p10.add(1) as i32, *p10.add(2) as i32);
                     let (b11, g11, r11) = (*p11 as i32, *p11.add(1) as i32, *p11.add(2) as i32);
 
-                    *y_dst0.add(c0) = ((77 * r00 + 150 * g00 + 29 * b00) >> 8) as u8;
-                    *y_dst0.add(c1) = ((77 * r01 + 150 * g01 + 29 * b01) >> 8) as u8;
-                    *y_dst1.add(c0) = ((77 * r10 + 150 * g10 + 29 * b10) >> 8) as u8;
-                    *y_dst1.add(c1) = ((77 * r11 + 150 * g11 + 29 * b11) >> 8) as u8;
+                    *y_dst0.add(c0) = crate::color::luma(r00, g00, b00);
+                    *y_dst0.add(c1) = crate::color::luma(r01, g01, b01);
+                    *y_dst1.add(c0) = crate::color::luma(r10, g10, b10);
+                    *y_dst1.add(c1) = crate::color::luma(r11, g11, b11);
 
                     let rb = (r00 + r01 + r10 + r11) >> 2;
                     let gb = (g00 + g01 + g10 + g11) >> 2;
                     let bb = (b00 + b01 + b10 + b11) >> 2;
-                    *uv_dst.add(col * 2) =
-                        (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    *uv_dst.add(col * 2 + 1) =
-                        (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
+                    let (u, v) = crate::color::chroma(rb, gb, bb);
+                    *uv_dst.add(col * 2) = u;
+                    *uv_dst.add(col * 2 + 1) = v;
                 }
             }
 
@@ -906,7 +930,7 @@ impl VtEncoder {
         }
     }
 
-    /// Convert I420 (YUV420) frame to BGRA using BT.601 reverse transform.
+    /// Convert I420 (YUV420) frame to BGRA using RDP's full-range BT.709 inverse.
     fn yuv420_to_bgra(frame: &crate::yuv444_split::Yuv420Frame) -> Vec<u8> {
         let w = frame.width as usize;
         let h = frame.height as usize;
@@ -918,16 +942,15 @@ impl VtEncoder {
                 let y_idx = row * w + col;
                 let uv_idx = (row / 2) * uv_w + (col / 2);
 
-                let y = frame.y.get(y_idx).copied().unwrap_or(16) as i32;
+                let y = frame.y.get(y_idx).copied().unwrap_or(0) as i32;
                 let u = frame.u.get(uv_idx).copied().unwrap_or(128) as i32;
                 let v = frame.v.get(uv_idx).copied().unwrap_or(128) as i32;
 
-                let c = y - 16;
                 let d = u - 128;
                 let e = v - 128;
-                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+                let r = (y + ((103_206 * e + 32_768) >> 16)).clamp(0, 255) as u8;
+                let g = (y - ((12_276 * d + 30_679 * e + 32_768) >> 16)).clamp(0, 255) as u8;
+                let b = (y + ((121_609 * d + 32_768) >> 16)).clamp(0, 255) as u8;
 
                 let px = (row * w + col) * 4;
                 bgra[px] = b;
@@ -940,7 +963,7 @@ impl VtEncoder {
     }
 
     /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
-    /// BT.601 full range: Y=0-255, UV=0-255.
+    /// BT.709 full range: Y=0-255, UV=0-255.
     #[allow(dead_code)]
     fn create_nv12_from_bgra(
         session: VTCompressionSessionRef,
@@ -982,7 +1005,7 @@ impl VtEncoder {
             let rows = sh.min(h);
             let cols = sw.min(w);
 
-            // Y plane: full resolution, BT.601 full range
+            // Y plane: full resolution, BT.709 full range
             for row in 0..rows {
                 let bgra_row = row * stride;
                 let y_row = row * y_bpr;
@@ -991,11 +1014,11 @@ impl VtEncoder {
                     let b = data[px] as i32;
                     let g = data[px + 1] as i32;
                     let r = data[px + 2] as i32;
-                    *y_base.add(y_row + col) = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+                    *y_base.add(y_row + col) = crate::color::luma(r, g, b);
                 }
             }
 
-            // UV plane: half resolution, 2x2 averaged, BT.601 full range
+            // UV plane: half resolution, 2x2 averaged, BT.709 full range
             let uv_rows = rows / 2;
             let uv_cols = cols / 2;
             for row in 0..uv_rows {
@@ -1020,8 +1043,7 @@ impl VtEncoder {
                     rb >>= 2;
                     gb >>= 2;
                     bb >>= 2; // /4
-                    let u = (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    let v = (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
+                    let (u, v) = crate::color::chroma(rb, gb, bb);
                     let off = uv_row_off + col * 2;
                     *uv_base.add(off) = u;
                     *uv_base.add(off + 1) = v;
@@ -1810,6 +1832,19 @@ impl VideoEncoder for VtEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_videotoolbox_output_preserves_colors_with_simd_and_scalar_nv12() {
+        for simd in [true, false] {
+            let mut encoder =
+                VtEncoder::new_with_quality(128, 64, 30.0, 3_000_000, false, Quality::HighQuality)
+                    .unwrap();
+            if !simd {
+                encoder.vimage = None;
+            }
+            crate::color::tests::assert_encoded_color_fidelity(&mut encoder, 128, 64);
+        }
+    }
 
     #[test]
     fn malformed_bgra_layouts_are_rejected_before_native_conversion() {
