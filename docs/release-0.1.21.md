@@ -29,9 +29,8 @@ implemented. Existing native AVC420 steady-state capture remains zero-copy.
 
 Guacamole private.16 separately reduces browser packet parsing and protocol
 blob dispatch overhead. Its source is frozen at
-`db83cdf0680d4aa8b4a7304cf03f27e7d3cb5dc6`; it is prepared independently from
-the running private.15 gateway. Verified Desktop delivery is recorded after
-the ad-hoc signed package finishes building.
+`db83cdf0680d4aa8b4a7304cf03f27e7d3cb5dc6`; it was built and tested in isolation before the user authorized deployment.
+The verified Desktop delivery and matching gateway release are recorded below.
 No live Mac application, capture, display or input is changed during this work.
 
 Delivered test package: `/Users/beraadim/Desktop/macrdp_0.1.21_aarch64_ef58df08a45c.dmg`
@@ -51,3 +50,9 @@ matched-image builds, read-only preflight and all four exact packaged-bundle
 AVC420/AVC444 × VideoToolbox/OpenH264 playback/fallback/image-reconnect cases.
 These isolated checks do not constitute acceptance testing on the user's older
 client. Guacamole deployment is recorded independently in its repository.
+
+After explicit user approval, Guacamole private.16 was deployed on Oberon with
+configuration and runtime settings preserved. The served browser bundle matches
+the exact bundle used by all four integration cases; both runtime containers
+have zero restarts and no critical startup entries, and the private.15 rollback
+images are retained. The user still installs the Mac test DMG independently.
