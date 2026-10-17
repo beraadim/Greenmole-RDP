@@ -45,3 +45,21 @@ Guacamole private.15 separately repairs desktop-size browser decoding and
 includes real-browser tests at 2560×1264. The test DMG remains ad-hoc signed.
 No live macrdp installation, display or user input is changed while preparing
 this test DMG; the user installs and tests the new application.
+
+Delivered test package: `/Users/beraadim/Desktop/macrdp_0.1.20_aarch64_3d7f2a46978f.dmg`
+
+- Source revision: `3d7f2a46978f7ce9839740351a92852ecd6bda4a`.
+- SHA-256: `db34feab33befdd7c23edd19e97f85a2e0ae445a74d88f9ba756e851ef9466b8`.
+- Size: 15,437,578 bytes; aarch64, ad-hoc signed.
+- The read-only DMG checksum, application signature, packaged version/revision
+  and metadata sidecar match. Packaged helper argument and invalid-configuration
+  rejection checks passed without exposing the synthetic password.
+- The DMG, checksum and build metadata were copied atomically to the Desktop
+  and verified again after copying. The running application remains unchanged.
+
+The matching Guacamole private.15 implementation is frozen at
+`78e80a4996d075b53b9a0791bfba1ce97ca29b8c`. Its release checks passed 285
+native tests in each of three configurations, 247 Chrome tests and 40 frontend
+tests; Firefox passed 244 tests with three capability-dependent skips. See the
+Guacamole repository's private.15 release record for its deployed image and
+packaged-browser verification.
