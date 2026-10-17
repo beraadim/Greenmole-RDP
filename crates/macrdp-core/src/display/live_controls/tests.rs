@@ -158,7 +158,20 @@ fn replacing_a_codec_abandons_its_pending_output_without_collecting_it() {
     let mut pending = true;
     let mut size = Some((16, 16));
     let mut at = Some(Instant::now());
-    abandon_video(&mut encoder, &mut startup, &mut pending, &mut size, &mut at);
+    let mut avc444 = Some(super::super::video_encode::Pending::new(
+        Instant::now(),
+        16,
+        16,
+    ));
+    abandon_video(
+        &mut encoder,
+        &mut startup,
+        &mut pending,
+        &mut size,
+        &mut at,
+        &mut avc444,
+    );
+    assert!(avc444.is_none());
     assert!(encoder.is_none() && startup.is_none() && !pending && size.is_none() && at.is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
@@ -178,7 +191,20 @@ fn live_change_cancels_startup_without_adopting_late_codec_or_accumulating_worke
     );
     let mut encoder = None;
     let (mut pending, mut size, mut at) = (false, None, None);
-    abandon_video(&mut encoder, &mut startup, &mut pending, &mut size, &mut at);
+    let mut avc444 = Some(super::super::video_encode::Pending::new(
+        Instant::now(),
+        16,
+        16,
+    ));
+    abandon_video(
+        &mut encoder,
+        &mut startup,
+        &mut pending,
+        &mut size,
+        &mut at,
+        &mut avc444,
+    );
+    assert!(avc444.is_none());
     assert!(startup.is_none() && encoder.is_none());
     for _ in 0..10 {
         assert!(

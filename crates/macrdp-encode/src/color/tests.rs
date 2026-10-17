@@ -125,12 +125,11 @@ pub(crate) fn assert_avc444_fidelity(encoder: &mut dyn VideoEncoder, width: u32,
                 pixels[offset..offset + 4].copy_from_slice(&color);
             }
         }
-        let pair = encoder
-            .encode_bgra_444(&pixels, width, height, width as usize * 4)
-            .unwrap();
+        let pair = complete_avc444(encoder, &pixels, width, height).unwrap();
         assert!(!pair.main_view.data.is_empty() && !pair.aux_view.data.is_empty());
         if frame == 0 || frame == 4 {
-            assert!(pair.main_view.is_keyframe && pair.aux_view.is_keyframe);
+            assert!(pair.main_view.is_keyframe);
+            assert!(!pair.aux_view.is_keyframe);
         } else {
             assert!(
                 !pair.main_view.is_keyframe && !pair.aux_view.is_keyframe,
@@ -197,5 +196,31 @@ pub(crate) fn assert_avc444_fidelity(encoder: &mut dyn VideoEncoder, width: u32,
             encoder.backend_name(),
             subsampled_error / f64::from(width * height * 3)
         );
+    }
+}
+
+/// Hardware completion may span multiple event-loop turns. Test the real
+/// retained pair rather than forcing an unbounded native CompleteFrames flush.
+fn complete_avc444(
+    encoder: &mut dyn VideoEncoder,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> anyhow::Result<crate::Avc444EncodedFrame> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match encoder.encode_bgra_444(pixels, width, height, width as usize * 4) {
+            Err(error)
+                if error.downcast_ref::<crate::Avc444EncodeError>()
+                    == Some(&crate::Avc444EncodeError::Pending) =>
+            {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "Native AVC444 test completion deadline elapsed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => return result,
+        }
     }
 }

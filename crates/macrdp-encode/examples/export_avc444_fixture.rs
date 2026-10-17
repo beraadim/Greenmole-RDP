@@ -5,7 +5,9 @@
 use std::{fmt::Write, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
-use macrdp_encode::{create_encoder, EncoderPreference, Quality};
+use macrdp_encode::{
+    create_encoder, Avc444EncodeError, Avc444EncodedFrame, EncoderPreference, Quality, VideoEncoder,
+};
 use openh264::{decoder::Decoder, formats::YUVSource};
 
 fn pixels(width: u32, height: u32, frame: u32) -> Vec<u8> {
@@ -59,26 +61,125 @@ fn copy_i420(source: &impl YUVSource) -> Vec<u8> {
     bytes
 }
 
+/// Fixture export is intentionally synchronous, but its deadline never flushes
+/// native callbacks. The actual server resumes these pairs on completion wakes.
+fn complete_pair(
+    encoder: &mut dyn VideoEncoder,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Avc444EncodedFrame> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match encoder.encode_bgra_444(pixels, width, height, width as usize * 4) {
+            Err(error)
+                if error.downcast_ref::<Avc444EncodeError>()
+                    == Some(&Avc444EncodeError::Pending) =>
+            {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "Synthetic pair completion deadline elapsed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
     let output = PathBuf::from(arguments.next().context("Pass an output directory")?);
+    let mut sizes = vec![(320u32, 180u32), (352, 208), (318, 178)];
+    let mut preferences = vec![EncoderPreference::Software, EncoderPreference::Hardware];
+    let mut fps = 30.0f32;
+    let mut frame_count = 6u32;
+    let mut bitrate = 12_000_000u32;
+    while let Some(flag) = arguments.next() {
+        match flag.to_str() {
+            Some("--size") => {
+                let width = arguments
+                    .next()
+                    .context("--size requires width and height")?
+                    .to_string_lossy()
+                    .parse()?;
+                let height = arguments
+                    .next()
+                    .context("--size requires height")?
+                    .to_string_lossy()
+                    .parse()?;
+                anyhow::ensure!(
+                    width > 0
+                        && height > 0
+                        && width <= 4096
+                        && height <= 4096
+                        && width % 2 == 0
+                        && height % 2 == 0,
+                    "Synthetic dimensions must be even and within 2..4096"
+                );
+                sizes = vec![(width, height)];
+            }
+            Some("--fps") => {
+                fps = arguments
+                    .next()
+                    .context("--fps requires a value")?
+                    .to_string_lossy()
+                    .parse()?
+            }
+            Some("--frames") => {
+                frame_count = arguments
+                    .next()
+                    .context("--frames requires a value")?
+                    .to_string_lossy()
+                    .parse()?
+            }
+            Some("--bitrate") => {
+                bitrate = arguments
+                    .next()
+                    .context("--bitrate requires a value")?
+                    .to_string_lossy()
+                    .parse()?
+            }
+            Some("--backend") => {
+                preferences = match arguments
+                    .next()
+                    .context("--backend requires a value")?
+                    .to_str()
+                {
+                    Some("hardware") => vec![EncoderPreference::Hardware],
+                    Some("software") => vec![EncoderPreference::Software],
+                    Some("both") => vec![EncoderPreference::Software, EncoderPreference::Hardware],
+                    _ => anyhow::bail!("--backend must be hardware, software, or both"),
+                }
+            }
+            _ => anyhow::bail!("Unknown argument: {}", flag.to_string_lossy()),
+        }
+    }
     anyhow::ensure!(
-        arguments.next().is_none(),
-        "Only one output directory is accepted"
+        fps.is_finite() && (1.0..=240.0).contains(&fps),
+        "Synthetic fps must be within 1..240"
+    );
+    anyhow::ensure!(
+        (1..=1000).contains(&frame_count),
+        "Synthetic frame count must be within 1..1000"
+    );
+    anyhow::ensure!(
+        (1..=macrdp_encode::MAX_BITRATE_BPS).contains(&bitrate),
+        "Invalid bitrate"
     );
     fs::create_dir_all(&output)?;
     let mut manifest = String::from("{\"synthetic\":true,\"codec\":\"avc444\",\"version\":1,\"singleDecoder\":true,\"pattern\":{\"left\":96,\"top\":96,\"right\":224,\"bottom\":144},\"sequences\":[");
     let mut first = true;
-    for preference in [EncoderPreference::Software, EncoderPreference::Hardware] {
-        for (width, height) in [(320u32, 180u32), (352, 208), (318, 178)] {
+    for preference in preferences {
+        for &(width, height) in &sizes {
             let mut encoder = create_encoder(
                 width,
                 height,
-                30.0,
+                fps,
                 Quality::HighQuality,
                 preference,
                 true,
-                12_000_000,
+                bitrate,
             )?;
             encoder.prepare()?;
             encoder.force_keyframe();
@@ -90,21 +191,20 @@ fn main() -> Result<()> {
             first = false;
             write!(manifest, "{{\"name\":\"{name}\",\"backend\":\"{backend}\",\"width\":{width},\"height\":{height},\"frames\":[")?;
             let mut decoder = Decoder::new()?;
-            for frame in 0u32..6 {
+            for frame in 0u32..frame_count {
                 if frame == 4 {
                     encoder.force_keyframe();
                 }
                 let pixels = pixels(width, height, frame);
-                let encoded =
-                    encoder.encode_bgra_444(&pixels, width, height, width as usize * 4)?;
+                let encoded = complete_pair(encoder.as_mut(), &pixels, width, height)?;
                 anyhow::ensure!(
                     !encoded.main_view.data.is_empty() && !encoded.aux_view.data.is_empty(),
                     "Incomplete synthetic pair"
                 );
                 if frame == 0 || frame == 4 {
                     anyhow::ensure!(
-                        encoded.main_view.is_keyframe && encoded.aux_view.is_keyframe,
-                        "Requested pair IDR was not produced"
+                        encoded.main_view.is_keyframe,
+                        "Requested main IDR was not produced"
                     );
                 }
                 let base = format!("{name}_{frame}");
@@ -148,7 +248,7 @@ fn main() -> Result<()> {
                 if frame != 0 {
                     manifest.push(',');
                 }
-                write!(manifest, "{{\"mainFile\":\"{main_file}\",\"auxFile\":\"{aux_file}\",\"sourceFile\":\"{source_file}\",\"sourceYuvFile\":\"{yuv_file}\",\"mainDecodedFile\":\"{}\",\"auxDecodedFile\":\"{}\",\"timestamp\":{},\"keyframe\":{},\"mainKeyframe\":{},\"auxKeyframe\":{},\"encodedWidth\":{ew},\"encodedHeight\":{eh}}}", decoded_files[0], decoded_files[1], u64::from(frame)*33_333, encoded.main_view.is_keyframe && encoded.aux_view.is_keyframe, encoded.main_view.is_keyframe, encoded.aux_view.is_keyframe)?;
+                write!(manifest, "{{\"mainFile\":\"{main_file}\",\"auxFile\":\"{aux_file}\",\"sourceFile\":\"{source_file}\",\"sourceYuvFile\":\"{yuv_file}\",\"mainDecodedFile\":\"{}\",\"auxDecodedFile\":\"{}\",\"timestamp\":{},\"keyframe\":{},\"mainKeyframe\":{},\"auxKeyframe\":{},\"encodedWidth\":{ew},\"encodedHeight\":{eh}}}", decoded_files[0], decoded_files[1], (f64::from(frame) * 1_000_000.0 / f64::from(fps)).round() as u64, encoded.main_view.is_keyframe, encoded.main_view.is_keyframe, encoded.aux_view.is_keyframe)?;
             }
             manifest.push_str("]}");
         }

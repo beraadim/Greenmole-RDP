@@ -102,14 +102,14 @@ fn wholly_dropped_avc444_pairs_only_retain_existing_requests() {
 }
 
 #[test]
-fn forced_avc444_requires_both_idrs_and_preserves_newer_requests() {
+fn forced_avc444_starts_with_main_idr_and_preserves_newer_requests() {
     let mut requests = KeyframeRequests::default();
     requests.request();
     requests.submitted();
-    assert!(requests.complete_pair(&encoded(true), &encoded(false)));
+    assert!(!requests.complete_pair(&encoded(false), &encoded(true)));
     assert!(requests.pending());
     requests.submitted();
-    assert!(requests.complete_pair(&encoded(true), &encoded(true)));
+    assert!(requests.complete_pair(&encoded(true), &encoded(false)));
     assert!(!requests.pending());
     requests.submitted();
     requests.request();

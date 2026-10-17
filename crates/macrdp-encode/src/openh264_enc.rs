@@ -472,11 +472,8 @@ impl VideoEncoder for OpenH264Encoder {
             (w as usize, h as usize),
             (w as usize, w as usize / 2, w as usize / 2),
         );
-        // Make both views independently identifiable on a reset; ordinary
-        // pairs retain references across the alternating views as required.
-        if main_keyframe {
-            self.encoder.force_intra_frame();
-        }
+        // One decoder consumes the views in order. Only main needs an IDR;
+        // auxiliary may reference that fresh main without a second large IDR.
         let aux_bitstream = self.encoder.encode(&aux_yuv).map_err(|error| {
             // Main may already be a native reference. Never return a partial
             // pair and make the next delivered pair self-contained.
@@ -486,10 +483,7 @@ impl VideoEncoder for OpenH264Encoder {
         let mut aux_nal = Vec::new();
         aux_bitstream.write_vec(&mut aux_nal);
         let aux_keyframe = matches!(aux_bitstream.frame_type(), FrameType::IDR | FrameType::I);
-        if main_nal.is_empty()
-            || aux_nal.is_empty()
-            || (requested_keyframe && !(main_keyframe && aux_keyframe))
-        {
+        if main_nal.is_empty() || aux_nal.is_empty() || (requested_keyframe && !main_keyframe) {
             self.force_keyframe = true;
             anyhow::bail!("OpenH264 returned an incomplete AVC444 pair or ignored a requested IDR");
         }
@@ -706,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_encoders_deliver_independent_first_frames_for_both_views() {
+    fn prepared_encoders_deliver_a_self_contained_initial_pair() {
         for mode_444 in [false, true] {
             let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 2_000_000, mode_444).unwrap();
             encoder.prepare().unwrap();
@@ -717,7 +711,8 @@ mod tests {
             let bgra = vec![128; 64 * 64 * 4];
             if mode_444 {
                 let frame = encoder.encode_bgra_444(&bgra, 64, 64, 256).unwrap();
-                assert!(frame.main_view.is_keyframe && frame.aux_view.is_keyframe);
+                assert!(frame.main_view.is_keyframe);
+                assert!(!frame.aux_view.is_keyframe);
                 assert!(!frame.main_view.data.is_empty() && !frame.aux_view.data.is_empty());
             } else {
                 let frame = encoder.encode_bgra(&bgra, 64, 64, 256).unwrap();

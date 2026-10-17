@@ -54,6 +54,31 @@ pub struct Avc444EncodedFrame {
     pub aux_view: EncodedFrame,
 }
 
+/// A dual-view encode is one delivery unit, including asynchronous completion.
+/// Callers may retry `Pending` with the same visible dimensions after the
+/// encoder's completion notification; the retained input remains authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Avc444EncodeError {
+    Pending,
+    /// Native rate control completed without a usable pair. The encoder has
+    /// already requested reference repair if one view became an unsent reference.
+    Dropped,
+    /// Native completion failed, rather than merely dropping a frame normally.
+    Failed,
+}
+
+impl std::fmt::Display for Avc444EncodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "AVC444 pair is awaiting native completion",
+            Self::Dropped => "AVC444 pair was dropped by native rate control",
+            Self::Failed => "AVC444 native completion failed",
+        })
+    }
+}
+
+impl std::error::Error for Avc444EncodeError {}
+
 /// Quality preset
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
@@ -100,7 +125,10 @@ pub trait VideoEncoder: Send {
     ) -> Result<EncodedFrame>;
 
     /// AVC444 dual-stream encode.
-    /// Internally performs BGRA -> YUV444 -> B-area split -> dual session encode.
+    /// Internally performs BGRA -> YUV444 -> B-area split -> ordered main/aux
+    /// encoding. An asynchronous backend returns `Avc444EncodeError::Pending`
+    /// while retaining its sole pair; call again after `encode_completion()`
+    /// wakes. That retry resumes the retained pair instead of encoding new input.
     fn encode_bgra_444(
         &mut self,
         data: &[u8],

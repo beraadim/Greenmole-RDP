@@ -14,6 +14,7 @@ mod idle_encode;
 mod idle_policy;
 mod live_controls;
 mod uncompressed_pacing;
+mod video_encode;
 use damage::FrameDamage;
 use event_wait::DisplayWake;
 
@@ -876,6 +877,8 @@ impl RdpServerDisplay for MacDisplay {
             encoder_startup: None,
             encoder_startup_attempted: false,
             encoder_failed: false,
+            video_encode_recovery: video_encode::Recovery::default(),
+            pending_avc444: None,
             quality,
             gfx_state: Arc::clone(&self.gfx_state),
             coord_mapper: self.coord_mapper.clone(),
@@ -976,6 +979,8 @@ struct MacDisplayUpdates {
     /// A failed or stalled codec remains disabled for this capture. User
     /// toggles must not bypass the session's automatic recovery decision.
     encoder_failed: bool,
+    video_encode_recovery: video_encode::Recovery,
+    pending_avc444: Option<video_encode::Pending>,
     quality: Quality,
     gfx_state: Arc<Mutex<GfxState>>,
     coord_mapper: MouseCoordMapper,
@@ -1187,6 +1192,13 @@ impl MacDisplayUpdates {
                 return Ok(Some(DisplayUpdate::Bitmap(materialized.update)));
             }
 
+            if self.pending_avc444.is_some() {
+                if let Some(update) = self.wait_for_pending_avc444().await? {
+                    return Ok(Some(update));
+                }
+                continue;
+            }
+
             // Await the codec callback itself: a desktop can become idle
             // immediately after submission, with no next capture to collect it.
             // Captures continue into the latest-frame mailbox during this wait.
@@ -1265,9 +1277,10 @@ impl MacDisplayUpdates {
                 if let Some(update) = self.send_cached_full_frame_recovery() {
                     return Ok(Some(update));
                 }
-                // A pending AVC callback will be collected at the top of the
-                // loop. Missing RGB cache waits for the replacement BGRA stream.
-                if self.has_pending_submit {
+                // Resume either video path at the top before taking another
+                // capture. A pending AVC444 pair still owns the cached image;
+                // replacing it here could hide newer damage after completion.
+                if self.has_pending_submit || self.pending_avc444.is_some() {
                     continue;
                 }
             }
@@ -1789,7 +1802,11 @@ impl MacDisplayUpdates {
                 self.clear_client_stale_flag("cached-avc-convergence");
                 return Some(update);
             }
-            if self.has_pending_submit || self.gfx_state.lock().unwrap().browser_video() {
+            let hold_video = self.encoder.is_some() && {
+                let state = self.gfx_state.lock().unwrap();
+                state.browser_video() || (self.mode_444 && state.use_avc444())
+            };
+            if self.has_pending_submit || hold_video {
                 // Wait for the submitted refresh; mixing in another recovery
                 // while its callback is pending would duplicate convergence.
                 // Browser video must also keep its reference chain through a
@@ -2126,7 +2143,7 @@ impl MacDisplayUpdates {
     /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
     /// Returns `None` if no cached frame or GFX is not ready.
     fn send_idle_idr(&mut self) -> Option<DisplayUpdate> {
-        if self.has_pending_submit {
+        if self.has_pending_submit || self.pending_avc444.is_some() {
             return None;
         }
         let cache = self.last_frame_cache.as_ref()?;
@@ -2145,6 +2162,7 @@ impl MacDisplayUpdates {
         if use_444 {
             return match idle_encode::encode_444(encoder.as_mut(), cache) {
                 Ok(frame) => {
+                    self.note_video_encode_success();
                     self.last_idr_time = Instant::now();
                     self.needs_full_gfx_seed = false;
                     tracing::debug!(
@@ -2156,7 +2174,7 @@ impl MacDisplayUpdates {
                     Some(DisplayUpdate::GfxFrame(frame))
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "Idle AVC444 IDR encode failed");
+                    self.note_video_encode_failure(&error, true, t0);
                     None
                 }
             };
@@ -2909,7 +2927,7 @@ impl MacDisplayUpdates {
                 .as_ref()
                 .map_or(false, |e| e.supports_pipelining());
 
-            if gfx_avc_ready && supports_pipeline {
+            if gfx_avc_ready && supports_pipeline && !use_444 {
                 match &frame.data {
                     FrameData::PixelBuffer(buf) => {
                         // Pipeline mode: collect previous + submit current
@@ -2941,88 +2959,78 @@ impl MacDisplayUpdates {
                         return Ok(prev_update);
                     }
                     FrameData::BgraPixelBuffer(buf) => {
-                        if !use_444 || !self.encoder.as_ref().unwrap().supports_444() {
-                            let prev_update = if self.has_pending_submit {
-                                self.collect_and_send_pending()?
-                            } else {
-                                None
-                            };
+                        let prev_update = if self.has_pending_submit {
+                            self.collect_and_send_pending()?
+                        } else {
+                            None
+                        };
 
-                            let t0_pipe = Instant::now();
-                            let submit_ok = buf
-                                .with_locked_bgra(frame.width, frame.height, |bgra, stride| {
-                                    self.encoder.as_mut().unwrap().submit_bgra(
-                                        bgra,
-                                        frame.width,
-                                        frame.height,
-                                        stride,
-                                    )
-                                })
-                                .transpose()?;
-                            if submit_ok.is_none() {
-                                tracing::warn!(
-                                    "BGRA pixel buffer lock failed during pipeline submit"
-                                );
-                                return Ok(Some(self.fallback_pointer_update()));
-                            }
-
-                            self.has_pending_submit = true;
-                            self.pending_visible_size =
-                                Some((frame.width as u16, frame.height as u16));
-                            self.pending_frame_time = Some(t0_pipe);
-                            self.display_frame_count += 1;
-
-                            self.last_frame_cache = Some(CachedFrame::BgraPixelBuffer(
-                                buf.clone_ref(),
-                                frame.width,
-                                frame.height,
-                                frame.stride,
-                            ));
-
-                            return Ok(prev_update);
+                        let t0_pipe = Instant::now();
+                        let submit_ok = buf
+                            .with_locked_bgra(frame.width, frame.height, |bgra, stride| {
+                                self.encoder.as_mut().unwrap().submit_bgra(
+                                    bgra,
+                                    frame.width,
+                                    frame.height,
+                                    stride,
+                                )
+                            })
+                            .transpose()?;
+                        if submit_ok.is_none() {
+                            tracing::warn!("BGRA pixel buffer lock failed during pipeline submit");
+                            return Ok(Some(self.fallback_pointer_update()));
                         }
+
+                        self.has_pending_submit = true;
+                        self.pending_visible_size = Some((frame.width as u16, frame.height as u16));
+                        self.pending_frame_time = Some(t0_pipe);
+                        self.display_frame_count += 1;
+
+                        self.last_frame_cache = Some(CachedFrame::BgraPixelBuffer(
+                            buf.clone_ref(),
+                            frame.width,
+                            frame.height,
+                            frame.stride,
+                        ));
+
+                        return Ok(prev_update);
                     }
                     FrameData::Raw(bytes) => {
-                        // AVC444 stays synchronous — only pipeline AVC420.
-                        // If use_444, fall through to the synchronous block below.
-                        if !use_444 || !self.encoder.as_ref().unwrap().supports_444() {
-                            let bgra = frame.data.as_bgra_bytes().unwrap();
+                        let bgra = frame.data.as_bgra_bytes().unwrap();
 
-                            // AVC420 pipeline: collect previous + submit current
-                            let prev_update = if self.has_pending_submit {
-                                self.collect_and_send_pending()?
-                            } else {
-                                None
-                            };
+                        // AVC420 pipeline: collect previous + submit current
+                        let prev_update = if self.has_pending_submit {
+                            self.collect_and_send_pending()?
+                        } else {
+                            None
+                        };
 
-                            let t0_pipe = Instant::now();
-                            self.encoder.as_mut().unwrap().submit_bgra(
-                                bgra,
-                                frame.width,
-                                frame.height,
-                                frame.stride,
-                            )?;
-                            self.has_pending_submit = true;
-                            self.pending_visible_size =
-                                Some((frame.width as u16, frame.height as u16));
-                            self.pending_frame_time = Some(t0_pipe);
-                            self.display_frame_count += 1;
+                        let t0_pipe = Instant::now();
+                        self.encoder.as_mut().unwrap().submit_bgra(
+                            bgra,
+                            frame.width,
+                            frame.height,
+                            frame.stride,
+                        )?;
+                        self.has_pending_submit = true;
+                        self.pending_visible_size = Some((frame.width as u16, frame.height as u16));
+                        self.pending_frame_time = Some(t0_pipe);
+                        self.display_frame_count += 1;
 
-                            self.last_frame_cache = Some(CachedFrame::Bgra {
-                                data: bytes.clone(),
-                                width: frame.width,
-                                height: frame.height,
-                                stride: frame.stride,
-                            });
+                        self.last_frame_cache = Some(CachedFrame::Bgra {
+                            data: bytes.clone(),
+                            width: frame.width,
+                            height: frame.height,
+                            stride: frame.stride,
+                        });
 
-                            return Ok(prev_update);
-                        }
-                        // else: AVC444 requested — fall through to synchronous block
+                        return Ok(prev_update);
                     }
                 }
             }
 
-            // ── Synchronous path (original code, also fallback when !supports_pipeline) ──
+            // Software encoding completes here. Native AVC444 can instead
+            // return Pending, retaining both views until their callbacks finish.
             if gfx_avc_ready {
                 if !self.logged_gfx_avc_mode {
                     tracing::info!(
@@ -3034,6 +3042,14 @@ impl MacDisplayUpdates {
                         "Negotiated graphics transport active"
                     );
                     self.logged_gfx_avc_mode = true;
+                }
+                if use_444 && matches!(&frame.data, FrameData::PixelBuffer(_)) {
+                    self.note_video_encode_failure(
+                        &anyhow::anyhow!("AVC444 requires a BGRA capture buffer"),
+                        true,
+                        Instant::now(),
+                    );
+                    return Ok(None);
                 }
                 let Some(encoder) = &mut self.encoder else {
                     return Ok(Some(self.fallback_pointer_update()));
@@ -3132,347 +3148,8 @@ impl MacDisplayUpdates {
                             }
                         }
                     }
-                    FrameData::BgraPixelBuffer(buf) => {
-                        let encoded = match buf.with_locked_bgra(
-                            frame.width,
-                            frame.height,
-                            |bgra, stride| {
-                                if use_444 && encoder.supports_444() {
-                                    match encoder.encode_bgra_444(
-                                        bgra,
-                                        frame.width,
-                                        frame.height,
-                                        stride,
-                                    ) {
-                                        Ok(encoded) if !encoded.main_view.data.is_empty() => {
-                                            return Ok(Some(DisplayUpdate::GfxFrame(
-                                                GfxFrameUpdate {
-                                                    h264_data: encoded.main_view.data,
-                                                    width: frame.width as u16,
-                                                    height: frame.height as u16,
-                                                    enc_width: encoded.main_view.width as u16,
-                                                    enc_height: encoded.main_view.height as u16,
-                                                    is_keyframe: encoded.main_view.is_keyframe,
-                                                    h264_aux: Some(encoded.aux_view.data),
-                                                },
-                                            )));
-                                        }
-                                        Ok(_) => {
-                                            tracing::warn!(
-                                                display_frame = self.display_frame_count,
-                                                "AVC444 encode returned EMPTY data — falling back to AVC420"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                display_frame = self.display_frame_count,
-                                                "AVC444 encode failed: {e}, falling back to AVC420"
-                                            );
-                                        }
-                                    }
-                                }
-
-                                match encoder.encode_bgra(bgra, frame.width, frame.height, stride) {
-                                    Ok(encoded) if !encoded.data.is_empty() => {
-                                        Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                            h264_data: encoded.data,
-                                            width: frame.width as u16,
-                                            height: frame.height as u16,
-                                            enc_width: encoded.width as u16,
-                                            enc_height: encoded.height as u16,
-                                            is_keyframe: encoded.is_keyframe,
-                                            h264_aux: None,
-                                        })))
-                                    }
-                                    Ok(_) => {
-                                        tracing::warn!(
-                                            display_frame = self.display_frame_count,
-                                            "H.264 encode returned EMPTY data — frame dropped!"
-                                        );
-                                        Ok(None)
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            },
-                        ) {
-                            Some(result) => result?,
-                            None => {
-                                tracing::warn!("BGRA pixel buffer lock failed during encode");
-                                return Ok(Some(self.fallback_pointer_update()));
-                            }
-                        };
-
-                        if let Some(DisplayUpdate::GfxFrame(update)) = encoded {
-                            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            let total_bytes = update.h264_data.len()
-                                + update.h264_aux.as_ref().map_or(0, |d| d.len());
-                            let is_keyframe = update.is_keyframe;
-                            tracing::debug!(
-                                display_frame = self.display_frame_count,
-                                h264_bytes = update.h264_data.len(),
-                                aux_bytes = update.h264_aux.as_ref().map_or(0, |d| d.len()),
-                                is_keyframe,
-                                encode_ms = format!("{:.1}", encode_ms),
-                                "Display: sending BGRA pixel buffer GFX frame"
-                            );
-                            {
-                                let mut st = self.gfx_state.lock().unwrap();
-                                st.record_encode_timing(encode_ms);
-                                st.last_frame_bytes = total_bytes as u32;
-                            }
-                            self.bitrate_ctrl.record_frame(FrameStats {
-                                encode_ms,
-                                frame_bytes: total_bytes as u32,
-                                is_keyframe,
-                            });
-                            if let Some(ps) = &self.perf_stats {
-                                ps.lock().unwrap().record_frame(
-                                    encode_ms,
-                                    total_bytes as u32,
-                                    is_keyframe,
-                                );
-                            }
-                            self.record_avc_audit(
-                                total_bytes as u32,
-                                encode_ms,
-                                frame.dirty_rects.len(),
-                                frame
-                                    .dirty_rects
-                                    .iter()
-                                    .map(|rect| rect.width * rect.height)
-                                    .sum(),
-                                "gfx-avc-bgra-pixel-buffer",
-                            );
-                            self.apply_adaptive_decision();
-                            let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                            if encode_ms > frame_interval_ms * 0.8 {
-                                self.skip_next_frame = true;
-                                tracing::warn!(
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                    "encode overload — skipping next frame"
-                                );
-                            }
-                            self.last_frame_cache = Some(CachedFrame::BgraPixelBuffer(
-                                buf.clone_ref(),
-                                frame.width,
-                                frame.height,
-                                frame.stride,
-                            ));
-                            if is_keyframe {
-                                self.last_idr_time = Instant::now();
-                            }
-                            self.clear_client_stale_flag("gfx-avc-bgra-pixel-buffer");
-                            return Ok(Some(DisplayUpdate::GfxFrame(update)));
-                        }
-
-                        self.mark_client_may_be_stale("bgra-pixel-buffer-empty-encode");
-                        return Ok(None);
-                    }
-                    FrameData::Raw(bytes) => {
-                        // Existing BGRA encode path — continues below
-                        let bgra = bytes.as_ref();
-
-                        let min_stride = frame.width as usize * 4;
-                        let required_len = (frame.height as usize)
-                            .saturating_sub(1)
-                            .saturating_mul(frame.stride)
-                            .saturating_add(min_stride);
-                        if frame.stride < min_stride || bgra.len() < required_len {
-                            tracing::warn!(
-                                display_frame = self.display_frame_count,
-                                width = frame.width,
-                                height = frame.height,
-                                stride = frame.stride,
-                                bgra_len = bgra.len(),
-                                required_len,
-                                min_stride,
-                                "Invalid BGRA frame layout — dropping frame"
-                            );
-                            return Ok(Some(self.fallback_pointer_update()));
-                        }
-
-                        // AVC444 dual-stream path
-                        if use_444 && encoder.supports_444() {
-                            match encoder.encode_bgra_444(
-                                bgra,
-                                frame.width,
-                                frame.height,
-                                frame.stride,
-                            ) {
-                                Ok(encoded) if !encoded.main_view.data.is_empty() => {
-                                    let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                    let total_bytes =
-                                        encoded.main_view.data.len() + encoded.aux_view.data.len();
-                                    let is_keyframe = encoded.main_view.is_keyframe;
-                                    tracing::debug!(
-                                        display_frame = self.display_frame_count,
-                                        main_bytes = encoded.main_view.data.len(),
-                                        aux_bytes = encoded.aux_view.data.len(),
-                                        is_keyframe,
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        "Display: sending AVC444 GFX frame"
-                                    );
-                                    {
-                                        let mut st = self.gfx_state.lock().unwrap();
-                                        st.record_encode_timing(encode_ms);
-                                        st.last_frame_bytes = total_bytes as u32;
-                                    }
-                                    self.bitrate_ctrl.record_frame(FrameStats {
-                                        encode_ms,
-                                        frame_bytes: total_bytes as u32,
-                                        is_keyframe,
-                                    });
-                                    if let Some(ps) = &self.perf_stats {
-                                        ps.lock().unwrap().record_frame(
-                                            encode_ms,
-                                            total_bytes as u32,
-                                            is_keyframe,
-                                        );
-                                    }
-                                    self.record_avc_audit(
-                                        total_bytes as u32,
-                                        encode_ms,
-                                        frame.dirty_rects.len(),
-                                        frame
-                                            .dirty_rects
-                                            .iter()
-                                            .map(|rect| rect.width * rect.height)
-                                            .sum(),
-                                        "gfx-avc444",
-                                    );
-                                    self.apply_adaptive_decision();
-                                    let frame_interval_ms =
-                                        1000.0 / self.capture_config.frame_rate as f64;
-                                    if encode_ms > frame_interval_ms * 0.8 {
-                                        self.skip_next_frame = true;
-                                        tracing::warn!(
-                                            encode_ms = format!("{:.1}", encode_ms),
-                                            frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                            "encode overload — skipping next frame"
-                                        );
-                                    }
-                                    self.last_frame_cache = Some(CachedFrame::Bgra {
-                                        data: bytes.clone(),
-                                        width: frame.width,
-                                        height: frame.height,
-                                        stride: frame.stride,
-                                    });
-                                    if is_keyframe {
-                                        self.last_idr_time = Instant::now();
-                                    }
-                                    self.clear_client_stale_flag("gfx-avc444-raw");
-                                    return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                        h264_data: encoded.main_view.data,
-                                        width: frame.width as u16,
-                                        height: frame.height as u16,
-                                        enc_width: encoded.main_view.width as u16,
-                                        enc_height: encoded.main_view.height as u16,
-                                        is_keyframe,
-                                        h264_aux: Some(encoded.aux_view.data),
-                                    })));
-                                }
-                                Ok(_) => {
-                                    tracing::warn!(
-                                        display_frame = self.display_frame_count,
-                                        "AVC444 encode returned EMPTY data — falling back to AVC420"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        display_frame = self.display_frame_count,
-                                        "AVC444 encode failed: {e}, falling back to AVC420"
-                                    );
-                                }
-                            }
-                        }
-
-                        // AVC420 path (default or fallback from AVC444 failure)
-                        match encoder.encode_bgra(bgra, frame.width, frame.height, frame.stride) {
-                            Ok(encoded) if !encoded.data.is_empty() => {
-                                let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                let is_keyframe = encoded.is_keyframe;
-                                tracing::debug!(
-                                    display_frame = self.display_frame_count,
-                                    h264_bytes = encoded.data.len(),
-                                    is_keyframe,
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    "Display: sending GFX frame"
-                                );
-                                {
-                                    let mut st = self.gfx_state.lock().unwrap();
-                                    st.record_encode_timing(encode_ms);
-                                    st.last_frame_bytes = encoded.data.len() as u32;
-                                }
-                                self.bitrate_ctrl.record_frame(FrameStats {
-                                    encode_ms,
-                                    frame_bytes: encoded.data.len() as u32,
-                                    is_keyframe,
-                                });
-                                if let Some(ps) = &self.perf_stats {
-                                    ps.lock().unwrap().record_frame(
-                                        encode_ms,
-                                        encoded.data.len() as u32,
-                                        is_keyframe,
-                                    );
-                                }
-                                self.record_avc_audit(
-                                    encoded.data.len() as u32,
-                                    encode_ms,
-                                    frame.dirty_rects.len(),
-                                    frame
-                                        .dirty_rects
-                                        .iter()
-                                        .map(|rect| rect.width * rect.height)
-                                        .sum(),
-                                    "gfx-avc420",
-                                );
-                                self.apply_adaptive_decision();
-                                let frame_interval_ms =
-                                    1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.8 {
-                                    self.skip_next_frame = true;
-                                    tracing::warn!(
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                        "encode overload — skipping next frame"
-                                    );
-                                }
-                                self.last_frame_cache = Some(CachedFrame::Bgra {
-                                    data: bytes.clone(),
-                                    width: frame.width,
-                                    height: frame.height,
-                                    stride: frame.stride,
-                                });
-                                if is_keyframe {
-                                    self.last_idr_time = Instant::now();
-                                }
-                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                    h264_data: encoded.data,
-                                    width: frame.width as u16,
-                                    height: frame.height as u16,
-                                    enc_width: encoded.width as u16,
-                                    enc_height: encoded.height as u16,
-                                    is_keyframe,
-                                    h264_aux: None,
-                                })));
-                            }
-                            Ok(_) => {
-                                tracing::warn!(
-                                    display_frame = self.display_frame_count,
-                                    "H.264 encode returned EMPTY data — frame dropped!"
-                                );
-                                self.mark_client_may_be_stale("raw-avc420-empty-encode");
-                                return Ok(None);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    display_frame = self.display_frame_count,
-                                    "H.264 encode failed: {e}"
-                                );
-                                self.mark_client_may_be_stale("raw-avc420-encode-error");
-                            }
-                        }
+                    FrameData::BgraPixelBuffer(_) | FrameData::Raw(_) => {
+                        return Ok(self.encode_bgra_frame(&frame, use_444, t0));
                     }
                 }
             }

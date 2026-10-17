@@ -13,6 +13,7 @@ use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 mod callback;
 mod outcome;
 mod ownership;
+mod pair;
 use callback::encode_callback;
 use outcome::{CallbackDiagnostics, KeyframeRequests, NativeOutput};
 use ownership::{NativeSession, OwnedCf, OwnedPixelBuffer};
@@ -107,10 +108,6 @@ extern "C" {
         frame_properties: CFDictionaryRef,
         source_frame_refcon: *mut c_void,
         info_flags_out: *mut VTEncodeInfoFlags,
-    ) -> OSStatus;
-    fn VTCompressionSessionCompleteFrames(
-        session: VTCompressionSessionRef,
-        complete_until_pts: CMTime,
     ) -> OSStatus;
     fn VTCompressionSessionInvalidate(session: VTCompressionSessionRef);
 
@@ -379,10 +376,6 @@ fn low_latency_wait_budget(fps: f32) -> std::time::Duration {
     std::time::Duration::from_millis(wait_ms.round() as u64)
 }
 
-fn post_flush_wait_budget(timeout: std::time::Duration) -> std::time::Duration {
-    timeout.min(std::time::Duration::from_millis(8))
-}
-
 // --- YUV444 reusable buffers for AVC444 mode ---
 
 struct Yuv444Buffers {
@@ -445,6 +438,7 @@ pub struct VtEncoder {
     mode_444: bool,
     yuv444_buf: Option<Yuv444Buffers>,
     keyframes: KeyframeRequests,
+    pending_444: Option<pair::PendingPair>,
     /// vImage SIMD converter for BGRA→NV12 acceleration.
     vimage: Option<VImageConverter>,
 }
@@ -483,17 +477,21 @@ impl VtEncoder {
     ) -> Result<Self> {
         quality.quantizer_range()?;
         let callback_ctx = Arc::new(CallbackCtx::default());
+        // Each desktop frame has two ordered native access units in AVC444.
+        // Keep their combined target bitrate while describing their true cadence.
+        let coded_fps = if mode_444 { fps * 2.0 } else { fps };
 
         // NV12 full-range input for both AVC420 and AVC444.
         // BGRA input produces video range (16-235) causing washed-out colors.
         let native = Self::create_session(
             width,
             height,
-            fps,
+            coded_fps,
             bitrate,
             &callback_ctx,
             K_CV_PIXEL_FORMAT_420F,
             quality,
+            mode_444,
         )?;
 
         let yuv444_buf = if mode_444 {
@@ -510,6 +508,7 @@ impl VtEncoder {
             width,
             height,
             fps,
+            coded_fps,
             mode_444,
             bitrate_mbps = bitrate as f64 / 1_000_000.0,
             ?quality,
@@ -522,10 +521,11 @@ impl VtEncoder {
             width,
             height,
             frame_count: 0,
-            fps,
+            fps: coded_fps,
             mode_444,
             yuv444_buf,
             keyframes: KeyframeRequests::default(),
+            pending_444: None,
             vimage,
         })
     }
@@ -540,6 +540,7 @@ impl VtEncoder {
         callback_ctx: &Arc<CallbackCtx>,
         pixel_format: u32,
         quality: Quality,
+        mode_444: bool,
     ) -> Result<NativeSession> {
         let retirement = RETIREMENTS
             .get_or_init(|| crate::retirement::RetirementPool::new(2))
@@ -550,7 +551,19 @@ impl VtEncoder {
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
                 kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
             ];
-            let spec_values = [kCFBooleanTrue, kCFBooleanTrue];
+            // Low-latency rate control may drop individual native frames. A
+            // dropped AVC444 view discards its counterpart and forces a new IDR,
+            // which can sustain bitrate debt indefinitely. Keep the normal
+            // bitrate controller for ordered pairs; RealTime, no reordering and
+            // zero frame delay still apply to both transport modes.
+            let spec_values = [
+                kCFBooleanTrue,
+                if mode_444 {
+                    kCFBooleanFalse
+                } else {
+                    kCFBooleanTrue
+                },
+            ];
             let encoder_spec = OwnedCf::dictionary(&spec_keys, &spec_values)?;
             let src_keys = [
                 kCVPixelBufferPixelFormatTypeKey,
@@ -1193,79 +1206,42 @@ impl VtEncoder {
 
     /// Encode a single frame through a VT session and wait for the callback.
     /// `frame_properties` is passed to VTCompressionSessionEncodeFrame (e.g. to force keyframe).
-    fn encode_session_frame(
-        session: VTCompressionSessionRef,
-        ctx: &Arc<CallbackCtx>,
-        pixel_buffer: CVPixelBufferRef,
-        pts: CMTime,
-        duration: CMTime,
-        frame_count: u64,
-        frame_properties: CFDictionaryRef,
-        wait_budget: std::time::Duration,
-    ) -> Result<NativeOutput> {
-        ctx.completion.begin();
-        // Reset callback state
-        {
-            let mut guard = ctx.output.lock().unwrap();
-            *guard = None;
-            ctx.has_data
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-
-        unsafe {
-            let enc_status = VTCompressionSessionEncodeFrame(
-                session,
-                pixel_buffer,
-                pts,
-                duration,
-                frame_properties,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            if enc_status != 0 {
-                anyhow::bail!("VTCompressionSessionEncodeFrame failed: {enc_status}");
+    /// Legacy synchronous users share the same one-input ownership invariant as
+    /// the async path. A deadline never flushes the native session or makes a
+    /// late callback eligible to overwrite the next input's output slot.
+    fn encode_session_frame(&mut self, pixel_buffer: OwnedPixelBuffer) -> Result<NativeOutput> {
+        anyhow::ensure!(
+            self.native.pending_input_buffer.is_none(),
+            "Previous native input is still pending"
+        );
+        let (pts, duration) = self.make_pts_duration();
+        let props = Self::make_force_keyframe_props(self.keyframes.pending())?;
+        self.native.callback_ctx.completion.begin();
+        Self::submit_session_frame(
+            self.native.session,
+            &self.native.callback_ctx,
+            pixel_buffer.as_ptr(),
+            pts,
+            duration,
+            props.as_ref().map_or(std::ptr::null(), OwnedCf::as_ptr),
+        )?;
+        self.native.pending_input_buffer = Some(pixel_buffer);
+        // Submission consumes a timestamp and carries the current IDR request,
+        // even if its callback arrives after this synchronous caller's deadline.
+        self.keyframes.submitted();
+        self.frame_count += 1;
+        match Self::collect_session_frame(
+            &self.native.callback_ctx,
+            low_latency_wait_budget(self.fps),
+        )? {
+            Some(output) => {
+                self.native.pending_input_buffer = None;
+                Ok(output)
             }
+            None => anyhow::bail!(
+                "Native callback deadline elapsed; retaining input until completion or retirement"
+            ),
         }
-
-        // Wait for callback using a fraction of the frame budget rather than
-        // a large fixed timeout. Late frames are worse than dropped frames here.
-        let timed_out;
-        {
-            let guard = ctx.output.lock().unwrap();
-            let (guard2, wait_result) = ctx
-                .ready
-                .wait_timeout_while(guard, wait_budget, |_| {
-                    !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
-                })
-                .unwrap();
-            timed_out = wait_result.timed_out();
-            drop(guard2);
-        }
-
-        if timed_out {
-            tracing::warn!(
-                frame = frame_count,
-                "VT callback timeout — forcing CompleteFrames"
-            );
-            unsafe {
-                VTCompressionSessionCompleteFrames(session, pts);
-            }
-            let guard = ctx.output.lock().unwrap();
-            let (guard2, _) = ctx
-                .ready
-                .wait_timeout_while(guard, post_flush_wait_budget(wait_budget), |_| {
-                    !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
-                })
-                .unwrap();
-            drop(guard2);
-        }
-
-        let result = {
-            let mut guard = ctx.output.lock().unwrap();
-            guard.take().unwrap_or(NativeOutput::Failed)
-        };
-
-        Ok(result)
     }
 
     /// Submit a frame for async encoding (reset callback + submit). Returns immediately.
@@ -1322,10 +1298,12 @@ impl VtEncoder {
 
     /// Compute PTS and duration for the current frame.
     fn make_pts_duration(&self) -> (CMTime, CMTime) {
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
-        (pts, duration)
+        // 600 Hz truncates 240 fps to 300 fps. Preserve sub-frame cadence for
+        // high-refresh dual-view encoding and standard fractional frame rates.
+        let scale = 60_000;
+        let frame_duration = (f64::from(scale) / f64::from(self.fps)).round().max(1.0) as i64;
+        let pts = CMTime::make(self.frame_count as i64 * frame_duration, scale);
+        (pts, CMTime::make(frame_duration, scale))
     }
 
     fn replace_pending_input_buffer(&mut self, pixel_buffer: OwnedPixelBuffer) {
@@ -1362,9 +1340,6 @@ impl VideoEncoder for VtEncoder {
         stride: usize,
     ) -> Result<EncodedFrame> {
         validate_bgra_layout(data, width, height, stride, self.width, self.height)?;
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
 
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
         let pixel_buffer = self.create_nv12_vimage(
@@ -1377,28 +1352,12 @@ impl VideoEncoder for VtEncoder {
             stride,
         )?;
 
-        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
-
-        let output = Self::encode_session_frame(
-            self.native.session,
-            &self.native.callback_ctx,
-            pixel_buffer.as_ptr(),
-            pts,
-            duration,
-            self.frame_count,
-            frame_props
-                .as_ref()
-                .map_or(std::ptr::null(), OwnedCf::as_ptr),
-            low_latency_wait_budget(self.fps),
-        )
-        .map_err(|error| {
+        let output = self.encode_session_frame(pixel_buffer).map_err(|error| {
             self.keyframes.request();
             error
         })?;
 
-        self.keyframes.submitted();
         self.keyframes.complete(&output);
-        self.frame_count += 1;
         let encoded = output.into_frame(self.width, self.height);
         let nal_data = &encoded.data;
         let is_keyframe = encoded.is_keyframe;
@@ -1483,33 +1442,14 @@ impl VideoEncoder for VtEncoder {
             self.keyframes.request();
         }
 
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
-
-        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
-
-        // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
-        let output = Self::encode_session_frame(
-            self.native.session,
-            &self.native.callback_ctx,
-            pixel_buffer_ptr,
-            pts,
-            duration,
-            self.frame_count,
-            frame_props
-                .as_ref()
-                .map_or(std::ptr::null(), OwnedCf::as_ptr),
-            low_latency_wait_budget(self.fps),
-        )
-        .map_err(|error| {
+        // Own the borrowed input through any late callback or native retirement.
+        let pixel_buffer = unsafe { OwnedPixelBuffer::new(CVPixelBufferRetain(pixel_buffer_ptr))? };
+        let output = self.encode_session_frame(pixel_buffer).map_err(|error| {
             self.keyframes.request();
             error
         })?;
 
-        self.keyframes.submitted();
         self.keyframes.complete(&output);
-        self.frame_count += 1;
 
         Ok(output.into_frame(self.width, self.height))
     }
@@ -1521,132 +1461,7 @@ impl VideoEncoder for VtEncoder {
         height: u32,
         stride: usize,
     ) -> Result<Avc444EncodedFrame> {
-        self.validate_avc444_input(data, width, height, stride)?;
-
-        let bufs = self
-            .yuv444_buf
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no YUV444 buffers"))?;
-
-        let w = self.width;
-        let h = self.height;
-
-        // Step 1: BGRA → YUV444 → B-area split (only needed for aux view)
-        crate::yuv444_split::bgra_to_yuv444_padded(
-            data,
-            width,
-            height,
-            stride,
-            w,
-            h,
-            &mut bufs.y444,
-            &mut bufs.u444,
-            &mut bufs.v444,
-        )?;
-        // Main view = standard YUV420, aux view = chroma compensation
-        crate::yuv444_split::yuv444_split_to_yuv420(
-            &bufs.y444,
-            &bufs.u444,
-            &bufs.v444,
-            w,
-            h,
-            &mut bufs.main_view,
-            &mut bufs.aux_view,
-        );
-
-        // Single encoder session, sequential: main (frame 2N) then aux (frame 2N+1).
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let duration = CMTime::make(frame_duration, 600);
-
-        let frame_props = Self::make_force_keyframe_props(self.keyframes.pending())?;
-
-        // Step 2: Encode main view — standard YUV420 from B-area split
-        let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let main_pb = Self::create_nv12_from_session_pool(
-            self.native.session,
-            w,
-            h,
-            &bufs.main_view.y,
-            &bufs.main_view.u,
-            &bufs.main_view.v,
-        )?;
-        let main_output = Self::encode_session_frame(
-            self.native.session,
-            &self.native.callback_ctx,
-            main_pb.as_ptr(),
-            main_pts,
-            duration,
-            self.frame_count,
-            frame_props
-                .as_ref()
-                .map_or(std::ptr::null(), OwnedCf::as_ptr),
-            low_latency_wait_budget(self.fps),
-        )
-        .map_err(|error| {
-            self.keyframes.request();
-            error
-        })?;
-
-        // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
-        // Force IDR on aux too if main was forced, to keep both streams in sync
-        self.frame_count += 1;
-        let aux_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let aux_pb = Self::create_nv12_from_session_pool(
-            self.native.session,
-            w,
-            h,
-            &bufs.aux_view.y,
-            &bufs.aux_view.u,
-            &bufs.aux_view.v,
-        )
-        .map_err(|error| {
-            // Main may already be a native reference; no partial pair is
-            // delivered if allocating the auxiliary input fails.
-            self.keyframes.request();
-            error
-        })?;
-        let aux_output = Self::encode_session_frame(
-            self.native.session,
-            &self.native.callback_ctx,
-            aux_pb.as_ptr(),
-            aux_pts,
-            duration,
-            self.frame_count,
-            frame_props
-                .as_ref()
-                .map_or(std::ptr::null(), OwnedCf::as_ptr),
-            low_latency_wait_budget(self.fps),
-        )
-        .map_err(|error| {
-            self.keyframes.request();
-            error
-        })?;
-
-        self.keyframes.submitted();
-        let usable = self.keyframes.complete_pair(&main_output, &aux_output);
-        self.frame_count += 1;
-        let main = main_output.into_frame(w, h);
-        let auxiliary = aux_output.into_frame(w, h);
-
-        tracing::debug!(
-            frame = self.frame_count,
-            main_bytes = main.data.len(),
-            aux_bytes = auxiliary.data.len(),
-            "AVC444 dual-stream encode"
-        );
-
-        Ok(Avc444EncodedFrame {
-            main_view: if usable {
-                main
-            } else {
-                NativeOutput::Dropped.into_frame(w, h)
-            },
-            aux_view: if usable {
-                auxiliary
-            } else {
-                NativeOutput::Dropped.into_frame(w, h)
-            },
-        })
+        self.encode_avc444(data, width, height, stride)
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {

@@ -25,12 +25,14 @@ fn abandon_video(
     pending: &mut bool,
     visible_size: &mut Option<(u16, u16)>,
     submitted_at: &mut Option<Instant>,
+    avc444: &mut Option<super::video_encode::Pending>,
 ) {
     *startup = None;
     *encoder = None;
     *pending = false;
     *visible_size = None;
     *submitted_at = None;
+    *avc444 = None;
 }
 
 /// A new complete baseline supersedes every unsent descriptor. Preserve the
@@ -150,6 +152,7 @@ impl MacDisplayUpdates {
     }
 
     pub(super) fn retire_current_encoder(&mut self) {
+        self.video_encode_recovery = Default::default();
         // VideoToolbox Drop transfers its native session, input buffers and
         // callbacks to its bounded retirement owner. Never collect this old
         // submission using the newly configured codec.
@@ -159,6 +162,7 @@ impl MacDisplayUpdates {
             &mut self.has_pending_submit,
             &mut self.pending_visible_size,
             &mut self.pending_frame_time,
+            &mut self.pending_avc444,
         );
         let mut gfx = self.gfx_state.lock().unwrap();
         gfx.active_encoder = None;

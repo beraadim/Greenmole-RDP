@@ -185,12 +185,17 @@ function Dashboard() {
       <div className="bg-card rounded-[8px] p-3">
         <div className="flex items-center justify-between gap-3 mb-2">
           <span className="text-[11px] text-text-muted font-medium">
-            Active graphics mode
+            RDP graphics mode
           </span>
           <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent uppercase tracking-[0.12em]">
             {currentTransport ?? "inactive"}
           </span>
         </div>
+        {metricsAvailable && connections.some(connection => connection.client_name.startsWith("Guacamole")) && (
+          <p className="mb-3 text-[11px] text-text-muted">
+            This is the connection to Guacamole. Check Guacamole's Display menu to confirm browser video is active.
+          </p>
+        )}
         {metricsAvailable && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] mb-3">
             <div>Capture queue: {metrics.capture_queue_ms.toFixed(1)} ms</div>

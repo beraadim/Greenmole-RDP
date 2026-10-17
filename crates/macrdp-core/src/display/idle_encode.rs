@@ -1,5 +1,5 @@
 //! Idle refresh uses the same callback/completion path as moving frames.
-use super::CachedFrame;
+use super::{video_encode, CachedFrame};
 use anyhow::Result;
 use macrdp_encode::VideoEncoder;
 
@@ -11,40 +11,20 @@ pub(super) fn encode_444(
     cache: &CachedFrame,
 ) -> Result<ironrdp_server::GfxFrameUpdate> {
     encoder.force_keyframe();
-    let (pair, width, height) = match cache {
+    match cache {
         CachedFrame::Bgra {
             data,
             width,
             height,
             stride,
-        } => (
-            encoder.encode_bgra_444(data, *width, *height, *stride)?,
-            *width,
-            *height,
-        ),
-        CachedFrame::BgraPixelBuffer(buffer, width, height, _) => {
-            let pair = buffer
-                .with_locked_bgra(*width, *height, |data, stride| {
-                    encoder.encode_bgra_444(data, *width, *height, stride)
-                })
-                .ok_or_else(|| anyhow::anyhow!("Idle AVC444 pixel buffer lock failed"))??;
-            (pair, *width, *height)
-        }
+        } => video_encode::encode_bgra(encoder, data, *width, *height, *stride, true),
+        CachedFrame::BgraPixelBuffer(buffer, width, height, _) => buffer
+            .with_locked_bgra(*width, *height, |data, stride| {
+                video_encode::encode_bgra(encoder, data, *width, *height, stride, true)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Idle AVC444 pixel buffer lock failed"))?,
         CachedFrame::PixelBuffer(_, _, _) => anyhow::bail!("Idle AVC444 requires BGRA capture"),
-    };
-    anyhow::ensure!(
-        !pair.main_view.data.is_empty() && !pair.aux_view.data.is_empty(),
-        "Idle AVC444 returned an incomplete pair"
-    );
-    Ok(ironrdp_server::GfxFrameUpdate {
-        width: width as u16,
-        height: height as u16,
-        enc_width: pair.main_view.width as u16,
-        enc_height: pair.main_view.height as u16,
-        is_keyframe: pair.main_view.is_keyframe && pair.aux_view.is_keyframe,
-        h264_data: pair.main_view.data,
-        h264_aux: Some(pair.aux_view.data),
-    })
+    }
 }
 
 pub(super) fn submit(encoder: &mut dyn VideoEncoder, cache: &CachedFrame) -> Result<(u16, u16)> {

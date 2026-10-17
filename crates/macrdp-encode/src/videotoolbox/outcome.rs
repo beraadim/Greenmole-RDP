@@ -17,7 +17,7 @@ pub(super) enum NativeOutput {
 }
 
 impl NativeOutput {
-    fn is_usable(&self) -> bool {
+    pub(super) fn is_usable(&self) -> bool {
         matches!(self, Self::Encoded(data, _) if !data.is_empty())
     }
 
@@ -25,7 +25,7 @@ impl NativeOutput {
         matches!(self, Self::Encoded(data, true) if !data.is_empty())
     }
 
-    fn needs_repair(&self) -> bool {
+    pub(super) fn needs_repair(&self) -> bool {
         matches!(self, Self::Failed) || matches!(self, Self::Encoded(data, _) if data.is_empty())
     }
 
@@ -74,11 +74,17 @@ impl KeyframeRequests {
     /// counterpart must also be discarded and can no longer be a client
     /// reference. Force repair only for that loss, failure or an older request.
     pub(super) fn complete_pair(&mut self, main: &NativeOutput, auxiliary: &NativeOutput) -> bool {
-        let usable = main.is_usable() && auxiliary.is_usable();
-        let rejected = main.needs_repair()
+        // One decoder consumes main then auxiliary. A main IDR starts a fresh
+        // chain; its auxiliary can reference that freshly delivered main.
+        // A codec that ignores a requested main IDR must not publish P output
+        // referring to earlier rejected native views.
+        let ignored_reset = self.in_flight_requested && !main.is_idr();
+        let usable = main.is_usable() && auxiliary.is_usable() && !ignored_reset;
+        let rejected = ignored_reset
+            || main.needs_repair()
             || auxiliary.needs_repair()
             || (!usable && (main.is_usable() || auxiliary.is_usable()));
-        self.finish(rejected, usable && main.is_idr() && auxiliary.is_idr());
+        self.finish(rejected, usable && main.is_idr());
         usable
     }
 
