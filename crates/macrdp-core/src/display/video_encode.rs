@@ -438,6 +438,25 @@ impl MacDisplayUpdates {
         )
     }
 
+    /// Completion duration includes native callback latency, not just CPU
+    /// preprocessing. Report expensive work without dropping the next fresh
+    /// capture: one outstanding encode and the latest-frame mailbox already
+    /// bound the queue, while the adaptive controller adjusts sustained load.
+    pub(super) fn note_video_encode_duration(&mut self, completion_ms: f64) {
+        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate.max(1) as f64;
+        if completion_ms > frame_interval_ms * 0.8 {
+            self.slow_video_encodes = self.slow_video_encodes.saturating_add(1);
+            if self.slow_video_encodes % 60 == 1 {
+                tracing::debug!(
+                    video_completion_ms = completion_ms,
+                    frame_interval_ms,
+                    slow_video_encodes = self.slow_video_encodes,
+                    "Video completion used most of capture budget; retaining the latest capture"
+                );
+            }
+        }
+    }
+
     fn finish_bgra_update(
         &mut self,
         update: GfxFrameUpdate,
@@ -489,19 +508,7 @@ impl MacDisplayUpdates {
             path,
         );
         self.apply_adaptive_decision();
-        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-        if encode_ms > frame_interval_ms * 0.8 {
-            self.skip_next_frame = true;
-            self.overload_count = self.overload_count.saturating_add(1);
-            if self.overload_count % 60 == 1 {
-                tracing::warn!(
-                    encode_ms,
-                    frame_interval_ms,
-                    overload_total = self.overload_count,
-                    "Encode overload; coalescing capture frames"
-                );
-            }
-        }
+        self.note_video_encode_duration(encode_ms);
         if is_keyframe {
             self.last_idr_time = Instant::now();
             self.needs_full_gfx_seed = false;

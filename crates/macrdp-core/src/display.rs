@@ -892,8 +892,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             shared_audio_tx: self.shared_audio_tx.clone(),
             display_frame_count: 0,
-            skip_next_frame: false,
-            overload_count: 0,
+            slow_video_encodes: 0,
             idle_frame_count: 0,
             idle_since: None,
             last_idle_refresh_attempt: Instant::now(),
@@ -997,9 +996,9 @@ struct MacDisplayUpdates {
     mode_444: bool,
     shared_audio_tx: Option<SharedAudioTx>,
     display_frame_count: u64,
-    skip_next_frame: bool,
-    /// Counter for rate-limiting encode overload warnings
-    overload_count: u64,
+    /// Counts slow video completions for bounded diagnostic logging. Native
+    /// work and the capture mailbox already bound/coalesce outstanding frames.
+    slow_video_encodes: u64,
     /// Consecutive idle events from SCK (desktop unchanged).
     idle_frame_count: u32,
     idle_since: Option<Instant>,
@@ -1444,7 +1443,6 @@ impl MacDisplayUpdates {
         self.pending_bitmap_updates.clear();
         self.pending_bitmap_frame = None;
         self.deferred_bitmap_frame = None;
-        self.skip_next_frame = false;
         self.request_full_bitmap_updates(1);
         self.needs_full_gfx_seed = true;
         self.mark_client_may_be_stale("capture-unavailable");
@@ -1560,7 +1558,6 @@ impl MacDisplayUpdates {
                 self.apply_capture_fps(desired_fps, "capture-recovery");
                 self.sync_applied_capture_fps();
                 self.last_frame_cache = None;
-                self.skip_next_frame = false;
                 self.request_full_bitmap_updates(1);
                 self.needs_full_gfx_seed = true;
                 self.mark_client_may_be_stale("capture-recovered");
@@ -2110,7 +2107,6 @@ impl MacDisplayUpdates {
         self.last_frame_cache = None;
         self.idle_frame_count = 0;
         self.idle_since = None;
-        self.skip_next_frame = false;
         self.request_full_bitmap_updates(1);
         self.needs_full_gfx_seed = true;
 
@@ -2416,12 +2412,10 @@ impl MacDisplayUpdates {
         );
         self.cache_latest_frame(&frame);
 
-        // Encode overload protection: skip this frame if previous encode took too long
-        if self.skip_next_frame {
-            self.skip_next_frame = false;
-            self.mark_client_may_be_stale("encode-overload-skip");
-            return Ok(None);
-        }
+        // The latest-frame mailbox coalesces captures while a single video
+        // encode is pending. Always consider its freshest image here: dropping
+        // another capture after completion can halve useful frame rate and lose
+        // the final desktop change until an idle recovery or another capture.
 
         // Check GFX state and AVC444 negotiation
         let (
@@ -3101,20 +3095,7 @@ impl MacDisplayUpdates {
                                     "gfx-avc-zero-copy",
                                 );
                                 self.apply_adaptive_decision();
-                                let frame_interval_ms =
-                                    1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.95 {
-                                    self.skip_next_frame = true;
-                                    self.overload_count += 1;
-                                    if self.overload_count % 60 == 1 {
-                                        tracing::warn!(
-                                            encode_ms = format!("{:.1}", encode_ms),
-                                            frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                            overload_total = self.overload_count,
-                                            "encode overload — skipping frames"
-                                        );
-                                    }
-                                }
+                                self.note_video_encode_duration(encode_ms);
                                 // Cache frame for idle IDR re-encoding
                                 self.last_frame_cache = Some(CachedFrame::PixelBuffer(
                                     buf.clone_ref(),

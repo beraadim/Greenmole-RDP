@@ -141,7 +141,6 @@ impl MacDisplayUpdates {
         self.bitrate_ctrl.set_target_fps(fps);
         self.bitrate_ctrl.on_idle_recovery();
         self.apply_capture_fps(fps, "image-settings-hot-update");
-        self.skip_next_frame = false;
         self.request_full_bitmap_updates(1);
         self.needs_full_gfx_seed = true;
         self.settings_refresh_pending = true;
