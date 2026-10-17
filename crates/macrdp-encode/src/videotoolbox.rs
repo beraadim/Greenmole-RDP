@@ -1307,6 +1307,36 @@ impl VtEncoder {
         }
     }
 
+    fn finish_collected_output(
+        collected: Option<(Vec<u8>, bool)>,
+        completed: bool,
+        width: u32,
+        height: u32,
+        pending_force_keyframe: &mut bool,
+    ) -> Option<EncodedFrame> {
+        match collected {
+            Some((nal_data, is_keyframe)) if !nal_data.is_empty() => Some(EncodedFrame {
+                data: Bytes::from(nal_data),
+                is_keyframe,
+                width,
+                height,
+            }),
+            _ if completed => {
+                // The native encoder may have advanced its reference pictures
+                // even if parsing rejected the completed access unit. The next
+                // P-frame must never depend on pixels the client did not get.
+                *pending_force_keyframe = true;
+                Some(EncodedFrame {
+                    data: Bytes::new(),
+                    is_keyframe: false,
+                    width,
+                    height,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Compute PTS and duration for the current frame.
     fn make_pts_duration(&self) -> (CMTime, CMTime) {
         let frame_duration = (600.0 / self.fps as f64) as i64;
@@ -1764,28 +1794,16 @@ impl VideoEncoder for VtEncoder {
         {
             self.clear_pending_input_buffer();
         }
-        match collected {
-            Some((nal_data, is_keyframe)) => Ok(Some(EncodedFrame {
-                data: Bytes::from(nal_data),
-                is_keyframe,
-                width: self.width,
-                height: self.height,
-            })),
-            None if self
-                .native
+        Ok(Self::finish_collected_output(
+            collected,
+            self.native
                 .callback_ctx
                 .has_data
-                .load(std::sync::atomic::Ordering::Acquire) =>
-            {
-                Ok(Some(EncodedFrame {
-                    data: Bytes::new(),
-                    is_keyframe: false,
-                    width: self.width,
-                    height: self.height,
-                }))
-            }
-            None => Ok(None),
-        }
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.width,
+            self.height,
+            &mut self.pending_force_keyframe,
+        ))
     }
 }
 
@@ -1850,5 +1868,35 @@ mod tests {
         .unwrap();
         assert!(ctx.has_data.load(std::sync::atomic::Ordering::Acquire));
         assert!(ctx.output.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejected_completed_output_forces_idr_but_a_pending_callback_does_not() {
+        let mut force_keyframe = false;
+        assert!(
+            VtEncoder::finish_collected_output(None, false, 640, 480, &mut force_keyframe)
+                .is_none()
+        );
+        assert!(!force_keyframe);
+
+        for output in [None, Some((Vec::new(), false))] {
+            force_keyframe = false;
+            let dropped =
+                VtEncoder::finish_collected_output(output, true, 640, 480, &mut force_keyframe)
+                    .unwrap();
+            assert!(dropped.data.is_empty());
+            assert!(force_keyframe);
+        }
+        // Successful output must not consume an independently pending request.
+        let frame = VtEncoder::finish_collected_output(
+            Some((vec![0, 0, 0, 1, 0x41], false)),
+            true,
+            640,
+            480,
+            &mut force_keyframe,
+        )
+        .unwrap();
+        assert_eq!(&frame.data[..], &[0, 0, 0, 1, 0x41]);
+        assert!(force_keyframe);
     }
 }

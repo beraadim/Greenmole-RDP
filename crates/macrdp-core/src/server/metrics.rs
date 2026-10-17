@@ -38,7 +38,7 @@ fn derive_transport_mode(gfx: &GfxState) -> String {
     }
 
     if gfx.avc420_supported {
-        if gfx.avc444_supported && gfx.avc444_enabled {
+        if gfx.use_avc444() {
             "gfx-avc444".to_string()
         } else {
             "gfx-avc420".to_string()

@@ -30,6 +30,10 @@ pub use connection_outcome::ConnectionOutcome;
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+/// Opt-in transport hint used only by our experimental browser AVC420 client.
+/// It fits the 15-character RDP client-name limit and retains Guacamole's
+/// existing keyboard translation identity. This is not an authentication hint.
+pub const BROWSER_AVC420_CLIENT_NAME: &str = "GuacamoleAVC420";
 /// Guacamole/FreeRDP interop is more reliable when uncompressed surface
 /// updates follow the normal StartFrame/EndFrame sequence instead of relying
 /// on immediate application of standalone surface commands.
@@ -308,6 +312,9 @@ pub struct GfxState {
     pub avc444_supported: bool,
     /// Whether AVC444 is enabled by server config (chroma_mode = "avc444")
     pub avc444_enabled: bool,
+    /// The browser consumes one continuous full-frame AVC420 stream. Keep tiny
+    /// updates in that stream instead of switching between video and raw RGB.
+    pub browser_avc420: bool,
     pub confirmed_cap: Option<CapabilitySet>,
     pub width: u16,
     pub height: u16,
@@ -420,6 +427,7 @@ impl GfxState {
             avc420_supported: false,
             avc444_supported: false,
             avc444_enabled,
+            browser_avc420: false,
             confirmed_cap: None,
             width,
             height,
@@ -617,6 +625,7 @@ impl GfxState {
         self.confirmed_cap = None;
         self.avc420_supported = false;
         self.avc444_supported = false;
+        self.browser_avc420 = false;
         self.avc_fallback_to_uncompressed = false;
         self.bitmap_fallback_mode = false;
         self.frame_id = 0;
@@ -666,6 +675,14 @@ impl GfxState {
 
     pub fn has_gfx_channel(&self) -> bool {
         self.channel_id.is_some() && self.caps_confirmed
+    }
+
+    pub fn set_client_graphics_preferences(&mut self, client_name: &str) {
+        self.browser_avc420 = client_name == BROWSER_AVC420_CLIENT_NAME;
+    }
+
+    pub fn use_avc444(&self) -> bool {
+        self.avc444_supported && self.avc444_enabled && !self.browser_avc420
     }
 
     /// Retire the current surface before reusing ID 0 on this graphics channel.
@@ -814,7 +831,7 @@ impl GfxHandler {
         };
 
         // Choose AVC444 or AVC420 path based on available data and negotiated caps
-        let use_avc444 = frame.h264_aux.is_some() && state.avc444_supported && state.avc444_enabled;
+        let use_avc444 = frame.h264_aux.is_some() && state.use_avc444();
 
         if use_avc444 {
             // AVC444 path: WireToSurface1 + Avc444BitmapStream
@@ -1084,10 +1101,11 @@ impl DvcProcessor for GfxHandler {
                     avc420 = state.avc420_supported,
                     avc444_client = state.avc444_supported,
                     avc444_enabled = state.avc444_enabled,
+                    experimental_browser_avc420 = state.browser_avc420,
                     bitmap_fallback_mode = state.bitmap_fallback_mode,
                     effective_mode = if state.bitmap_fallback_mode {
                         "bitmap-fallback-preferred"
-                    } else if state.avc444_supported && state.avc444_enabled {
+                    } else if state.use_avc444() {
                         "gfx-avc444"
                     } else if state.avc420_supported {
                         "gfx-avc420"
@@ -1193,6 +1211,10 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+#[path = "gfx_browser_tests.rs"]
+mod browser_tests;
 
 #[cfg(test)]
 mod tests {

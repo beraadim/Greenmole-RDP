@@ -65,6 +65,10 @@ path = "src/lib.rs"
 test = true
 doctest = true
 
+[[example]]
+name = "avc420_fixture_server"
+path = "examples/avc420_fixture_server.rs"
+
 [dependencies.anyhow]
 version = "1.0"
 

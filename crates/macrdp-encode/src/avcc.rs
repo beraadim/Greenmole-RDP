@@ -20,6 +20,35 @@ pub(crate) fn append_nal(output: &mut Vec<u8>, nal: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Every IDR is a decoder entry point, including after a browser reconnect or
+/// resolution change. Keep its format description in-band instead of relying
+/// on parameter sets from a previous access unit or a native decoder cache.
+pub(crate) fn self_contained_idr<'a>(
+    slices: &[u8],
+    parameter_sets: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut has_sps = false;
+    let mut has_pps = false;
+    for parameter in parameter_sets {
+        let header = parameter
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Empty H.264 parameter set"))?;
+        anyhow::ensure!(header & 0x80 == 0, "Invalid H.264 parameter-set header");
+        has_sps |= header & 0x1f == 7;
+        has_pps |= header & 0x1f == 8;
+        append_nal(&mut output, parameter)?;
+    }
+    anyhow::ensure!(has_sps && has_pps, "H.264 IDR is missing SPS or PPS");
+    anyhow::ensure!(
+        output.len().saturating_add(slices.len()) <= MAX_ENCODED_BYTES,
+        "Encoded frame plus parameter sets exceeds output limit"
+    );
+    output.try_reserve(slices.len())?;
+    output.extend_from_slice(slices);
+    Ok(output)
+}
+
 pub(crate) fn convert(data: &[u8], length_size: usize) -> Result<(Vec<u8>, bool)> {
     anyhow::ensure!(
         matches!(length_size, 1 | 2 | 4),
@@ -88,5 +117,31 @@ mod tests {
             assert!(convert(&data, size).is_err());
         }
         assert!(!convert(&[1, 0x41], 1).unwrap().1);
+    }
+
+    #[test]
+    fn idr_carries_parameter_sets_before_its_slices_for_new_decoders() {
+        let sps = [0x67, 0x42, 0xc0, 0x1f];
+        let pps = [0x68, 0xce, 0x3c, 0x80];
+        let slices = [0, 0, 0, 1, 0x65, 0xb8];
+        let output = self_contained_idr(&slices, [&sps[..], &pps[..]]).unwrap();
+        assert_eq!(
+            output,
+            [
+                0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0, 1,
+                0x65, 0xb8
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_or_invalid_idr_format_is_rejected_instead_of_poisoning_decoder() {
+        let sps = [0x67, 0x42, 0xc0, 0x1f];
+        let pps = [0x68, 0xce, 0x3c, 0x80];
+        let slices = [0, 0, 0, 1, 0x65, 0xb8];
+        for parameters in [vec![], vec![&sps[..]], vec![&pps[..]], vec![&[][..]]] {
+            assert!(self_contained_idr(&slices, parameters).is_err());
+        }
+        assert!(self_contained_idr(&slices, [&sps[..], &pps[..], &[0xe8][..]]).is_err());
     }
 }

@@ -22,7 +22,7 @@ impl MacDisplayUpdates {
             let gfx = self.gfx_state.lock().unwrap();
             (
                 accepts_avc(&gfx, self.quality),
-                self.mode_444 && gfx.avc444_supported && gfx.avc444_enabled,
+                self.mode_444 && gfx.use_avc444(),
             )
         };
         if !eligible {

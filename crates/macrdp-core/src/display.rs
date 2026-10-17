@@ -47,8 +47,8 @@ const UNCOMPRESSED_MAX_PIXELS: u32 = 1_048_576;
 /// Keep only genuinely tiny UI/cursor rects on the uncompressed fast path
 /// once AVC is available. Larger updates should prefer hardware/software AVC.
 const UNCOMPRESSED_TINY_UI_MAX_PIXELS: u32 = 8_192;
-// Guacamole never acknowledges our AVC frames, so waiting for a full dozen
-// frames just burns several seconds before the usable bitmap path kicks in.
+// Older Guacamole clients did not acknowledge AVC frames. Keep their bounded
+// image fallback while honoring real ACKs and explicit ACK suspension.
 const AVC_NO_ACK_FALLBACK_FRAMES: u32 = 4;
 const AVC_NO_ACK_FALLBACK_MAX_AGE: Duration = Duration::from_millis(1_200);
 const BITMAP_SPLIT_MAX_REGIONS: usize = 12;
@@ -1820,7 +1820,7 @@ impl MacDisplayUpdates {
             gfx.avc_fallback_to_uncompressed,
             gfx.bitmap_fallback_mode,
             self.encoder_pref,
-            self.mode_444,
+            self.mode_444 && !gfx.browser_avc420,
             self.needs_full_gfx_seed,
         ) || (!gfx.session_uses_gfx
             && gfx.is_ready()
@@ -2297,6 +2297,7 @@ impl MacDisplayUpdates {
             gfx_channel_ready,
             gfx_avc_ready,
             use_444,
+            browser_avc420,
             force_full_frame_uncompressed_gfx,
             request_bitmap_fallback_full_frames,
         ) = {
@@ -2305,7 +2306,7 @@ impl MacDisplayUpdates {
             let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
             let gfx_avc_ready =
                 gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
-            let use_444 = self.mode_444 && state.avc444_supported && state.avc444_enabled;
+            let use_444 = self.mode_444 && state.use_avc444();
             let mut request_bitmap_fallback_full_frames = false;
             let oldest_pending_age = state
                 .frame_send_times
@@ -2360,6 +2361,7 @@ impl MacDisplayUpdates {
                 gfx_channel_ready,
                 gfx_avc_ready,
                 use_444,
+                state.browser_avc420,
                 force_full_frame_uncompressed_gfx,
                 request_bitmap_fallback_full_frames,
             )
@@ -2385,7 +2387,11 @@ impl MacDisplayUpdates {
         }
 
         if gfx_channel_ready {
-            if self.needs_full_gfx_seed {
+            // The browser's first encoded frame is a self-contained IDR. A
+            // raw seed or tiny RGB patch after video starts would require
+            // terminating passthrough and re-encoding the surface as images.
+            // Keep raw seeds available during asynchronous encoder startup.
+            if self.needs_full_gfx_seed && !(browser_avc420 && gfx_avc_ready) {
                 let full_rect = ClampedRect {
                     x: 0,
                     y: 0,
@@ -2605,7 +2611,10 @@ impl MacDisplayUpdates {
             // immediate path once AVC is available. Larger dirty regions should
             // prefer AVC so the negotiated hardware/software encoder actually
             // gets used for meaningful screen content updates.
-            if !force_full_frame_uncompressed_gfx && !frame.dirty_rects.is_empty() {
+            if !browser_avc420
+                && !force_full_frame_uncompressed_gfx
+                && !frame.dirty_rects.is_empty()
+            {
                 let total_area: u32 = frame.dirty_rects.iter().map(|r| r.width * r.height).sum();
 
                 let allow_uncompressed_dirty_rects = if gfx_avc_ready {

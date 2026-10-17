@@ -68,7 +68,7 @@ unsafe fn extract(sample: CMSampleBufferRef) -> Result<(Vec<u8>, bool)> {
         return Ok((slices, false));
     }
     anyhow::ensure!(parameter_count <= 256, "Too many H.264 parameter sets");
-    let mut output = Vec::new();
+    let mut parameter_sets = Vec::new();
     for index in 0..parameter_count {
         let mut pointer = std::ptr::null();
         let mut size = 0;
@@ -87,15 +87,9 @@ unsafe fn extract(sample: CMSampleBufferRef) -> Result<(Vec<u8>, bool)> {
             !pointer.is_null() && size > 0 && size <= MAX_ENCODED_BYTES,
             "Invalid H.264 parameter set"
         );
-        avcc::append_nal(&mut output, std::slice::from_raw_parts(pointer, size))?;
+        parameter_sets.push(std::slice::from_raw_parts(pointer, size));
     }
-    anyhow::ensure!(
-        output.len().saturating_add(slices.len()) <= MAX_ENCODED_BYTES,
-        "Encoded frame plus parameter sets exceeds output limit"
-    );
-    output.try_reserve(slices.len())?;
-    output.extend_from_slice(&slices);
-    Ok((output, true))
+    Ok((avcc::self_contained_idr(&slices, parameter_sets)?, true))
 }
 
 pub(super) extern "C" fn encode_callback(
