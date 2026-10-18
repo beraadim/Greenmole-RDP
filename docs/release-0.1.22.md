@@ -55,8 +55,8 @@ warnings remain.
 The tests did not create a remote display or move live application windows. The
 opt-in live display smoke test now explicitly warns that it gathers/restores
 windows and was not run against the active desktop. Three-monitor acceptance
-below remains for the user after installing the package. DMG build, checksum,
-source revision and Desktop delivery will be recorded after packaging.
+below remains for the user after installing the package. The release build,
+read-only image inspection and Desktop delivery completed successfully.
 
 Manual acceptance testing after the user installs the DMG must cover three
 physical displays with ordinary windows at distinct positions and sizes:
@@ -74,3 +74,20 @@ physical displays with ordinary windows at distinct positions and sizes:
   unresponsive application without blocking cleanup indefinitely.
 
 See [virtual display setup and the full test procedure](virtual-display.md).
+
+## Verified Desktop delivery
+
+Test package: `/Users/beraadim/Desktop/macrdp_0.1.22_aarch64_19a43bfe4f26.dmg`
+
+- Source revision: `19a43bfe4f26655c28db71ec6bdd59f42689f0b9`.
+- SHA-256: `640c8fa3ede140fb3bc02b580526e11b5117d53e7c9d90977dc93623a697b848`.
+- Size: 15,464,430 bytes; aarch64, ad-hoc signed.
+- DMG checksum, deep strict application signature, packaged version, build
+  revision and metadata sidecar match the committed source.
+- Packaged display/server/recovery helper argument rejection and invalid
+  server-configuration checks passed without exposing the fixture credential.
+  No valid server or desktop recovery action was launched.
+- The DMG, checksum and build metadata were copied atomically to the Mac mini
+  user's Desktop and hashed again after copying. The installed application was
+  not replaced or launched; the user installs the package and tests the three
+  physical displays.
