@@ -27,7 +27,7 @@ history and connection polling races. Full serial release checks passed: 736 Rus
 tests, eight Python tests and twelve JavaScript checks, plus CLI validation,
 TypeScript and the production frontend build. Eleven focused metrics tests and
 eight UI regression tests passed. Existing compiler and bundle-size warnings
-remain. Package verification and Desktop delivery follow the source commit. Live display, input and remote-session actions
+remain. Read-only package verification and Desktop delivery completed successfully. Live display, input and remote-session actions
 are reserved for the user after installation.
 
 Connection setup also initializes graphics before notifying the input handler.
@@ -35,3 +35,23 @@ The graphics mutex is released before either callback, avoiding a lock inversion
 with coherent live metrics sampling. An actual connection-activation regression
 verifies unlocked callbacks, reset counters and timings, context/connection
 ordering, peer propagation and unchanged resize-reactivation semantics.
+
+## Verified Desktop delivery
+
+Test package: `macrdp_0.1.23_aarch64_0e3f1a70690f.dmg` on the Mac mini user's Desktop.
+
+- Source revision: `0e3f1a70690fce262909ca9ad93995e12e262805`.
+- SHA-256: `2bc00bf7d2f7606484c0febc14fbecb11598d52c3b19b2c6d2ca05fd5f410712`.
+- Size: 15,461,143 bytes; aarch64, ad-hoc signed.
+- DMG checksums, packaged application deep strict signature, release version
+  and build-info metadata match the committed source.
+- Packaged display/server/recovery helper argument rejection and CLI version
+  checks passed without launching any valid server, display or recovery action.
+- The verified DMG, checksum and metadata were copied atomically to the Desktop
+  and hashed after copying. The previous 0.1.22 Desktop package files were then
+  removed. The installed/running application was left for the user to replace.
+
+After installation, verify a listening server with no client shows zero
+connections, idle charts and no live encode latency. Connect and generate desktop
+updates to confirm the graphs resume; disconnect and verify they return to idle.
+Reconnect to confirm old timings do not reappear as the new session's work.
