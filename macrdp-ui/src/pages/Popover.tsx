@@ -13,6 +13,7 @@ import { useConnections } from "../hooks/useConnections";
 import { api } from "../lib/ipc";
 import ServerError from "../components/ServerError";
 import { formatBytes, formatDuration } from "../lib/format";
+import { hasLiveSessionMetrics } from "../lib/metricPresentation";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 
@@ -32,7 +33,7 @@ function Popover() {
   const [toggling, setToggling] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const metricsAvailable = status.running && metrics && !stale;
+  const metricsAvailable = hasLiveSessionMetrics(metrics, status.running, connections.length, stale);
   const cleanupPending = status.state === "stopping" || status.state === "cleanup_pending";
 
   const handleToggle = async () => {

@@ -1486,29 +1486,10 @@ impl RdpServer {
                 .send_replace(tokio::time::Instant::now());
         }
 
-        {
-            let mut handler = self.handler.lock().await;
-            let context = ClientInputContext {
-                client_name: result.client_name.clone(),
-                keyboard_layout: result.keyboard_layout,
-            };
-            handler.update_client_context(context.clone());
-            // Reactivation is a resize within the same connection. Preserve
-            // session state and the original connected-at timestamp across it.
-            if !result.reactivation {
-                handler.on_connect(
-                    context,
-                    self.gfx_state
-                        .lock()
-                        .unwrap()
-                        .peer_addr
-                        .map(|addr| addr.to_string()),
-                );
-            }
-        }
-
         self.static_channels = result.static_channels;
-        {
+        // Reset before publishing the connection, so observers cannot sample
+        // the previous session's graphics activity as the new client's work.
+        let peer_addr = {
             let mut gfx_state = self.gfx_state.lock().unwrap();
             let session_uses_gfx = self.connection_gfx_advertised
                 && self.get_channel_id_by_type::<DynamicChannels>().is_some();
@@ -1529,6 +1510,22 @@ impl RdpServer {
                 experimental_browser_avc444 = gfx_state.browser_avc444,
                 "Connection graphics path negotiated"
             );
+            gfx_state.peer_addr.map(|addr| addr.to_string())
+        };
+        {
+            // Callbacks may acquire connection state and then graphics state.
+            // The graphics guard above must be released before either callback.
+            let mut handler = self.handler.lock().await;
+            let context = ClientInputContext {
+                client_name: result.client_name.clone(),
+                keyboard_layout: result.keyboard_layout,
+            };
+            handler.update_client_context(context.clone());
+            // Reactivation is a resize within the same connection. Preserve
+            // session state and the original connected-at timestamp across it.
+            if !result.reactivation {
+                handler.on_connect(context, peer_addr);
+            }
         }
         if !result.reactivation {
             let mut responses = Vec::new();

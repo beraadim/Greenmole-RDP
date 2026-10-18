@@ -8,12 +8,14 @@ const POLL_INTERVAL = 5000; // 5s fallback polling
 export function useConnections() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const mountedRef = useRef(true);
+  const revisionRef = useRef(0);
 
   const fetch = useCallback(() => {
+    const revision = ++revisionRef.current;
     api
       .getConnections()
       .then((c) => {
-        if (mountedRef.current) setConnections(c);
+        if (mountedRef.current && revision === revisionRef.current) setConnections(c);
       })
       .catch(console.error);
   }, []);
@@ -26,6 +28,8 @@ export function useConnections() {
 
     // Event-driven updates (primary)
     const unlisten = listen<Connection[]>("connections", (event) => {
+      // A disconnect event supersedes any snapshot already being fetched.
+      revisionRef.current += 1;
       if (mountedRef.current) setConnections(event.payload);
     });
 
@@ -34,7 +38,8 @@ export function useConnections() {
 
     return () => {
       mountedRef.current = false;
-      unlisten.then((fn) => fn());
+      revisionRef.current += 1;
+      void unlisten.then((fn) => fn()).catch(() => {});
       clearInterval(poll);
     };
   }, [fetch]);

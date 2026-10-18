@@ -46,9 +46,11 @@ fn native_timeouts_and_keepalive_policy_preserve_only_operational_evidence() {
     assert_eq!(summary["events"][1]["fields"]["keepalive_retries"], 4);
     assert!(!summary.to_string().contains("private"));
     let mut metrics = macrdp_core::Metrics::default();
+    metrics.session_active = true;
     metrics.bitmap_update_budget_bytes = Some(32_768);
     metrics.connection_outcome = Some("transport_timeout".into());
     let exported = safe_metrics(&metrics);
+    assert_eq!(exported["session_active"], true);
     assert_eq!(exported["bitmap_update_budget_bytes"], 32_768);
     assert_eq!(exported["connection_outcome"], "transport_timeout");
 }

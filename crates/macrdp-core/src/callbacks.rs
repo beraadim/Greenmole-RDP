@@ -53,6 +53,10 @@ impl From<ironrdp_server::gfx::TimingSummary> for TimingPercentiles {
 /// can have different counts. These are stage durations, not end-to-end latency.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Metrics {
+    /// A live authenticated client exists for this snapshot. Idle heartbeats
+    /// remain fresh without implying any capture or encoding work.
+    #[serde(default)]
+    pub session_active: bool,
     /// Delivered graphics updates per second; bitmap updates may be subregions.
     pub fps: u32,
     pub bitrate_kbps: u64,

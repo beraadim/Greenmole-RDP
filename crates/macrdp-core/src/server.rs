@@ -689,6 +689,7 @@ async fn start_server_inner(
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&handle.gfx_state);
     let metrics_audio = Arc::clone(&handle.audio_stats);
+    let metrics_connection = Arc::clone(&handle.active_connection);
     let latest_metrics = Arc::clone(&handle.latest_metrics);
     let handler_for_metrics = Arc::clone(&handler);
     let worker_done = Arc::clone(&handle.terminal_result);
@@ -700,8 +701,15 @@ async fn start_server_inner(
             if worker_done.lock().unwrap().is_some() {
                 break;
             }
-            let mut metrics = snapshot.sample(&metrics_gfx.lock().unwrap());
-            audio_metrics::enrich(&mut metrics, &metrics_audio);
+            let mut metrics = {
+                // Use the lifecycle lock before graphics state, matching
+                // connection-owned actions. Do not publish callbacks under it.
+                let connection = metrics_connection.lock().unwrap();
+                snapshot.sample_live(&metrics_gfx.lock().unwrap(), connection.is_some())
+            };
+            if metrics.session_active {
+                audio_metrics::enrich(&mut metrics, &metrics_audio);
+            }
             *latest_metrics.lock().unwrap() = metrics.clone();
             handler_for_metrics.on_metrics(metrics);
         }

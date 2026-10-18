@@ -82,6 +82,26 @@ pub(super) struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
+    /// Sample live activity without presenting a completed frame as new work.
+    /// Keep totals and the fixed outcome for diagnostics; final session metrics
+    /// use `sample()` directly and retain their complete timing summaries.
+    pub(super) fn sample_live(&mut self, gfx: &GfxState, session_active: bool) -> Metrics {
+        let mut metrics = self.sample(gfx);
+        if session_active {
+            metrics.session_active = true;
+            metrics
+        } else {
+            Metrics {
+                sample_id: metrics.sample_id,
+                timestamp: metrics.timestamp,
+                timestamp_ms: metrics.timestamp_ms,
+                bytes_sent: metrics.bytes_sent,
+                connection_outcome: metrics.connection_outcome.take(),
+                ..Metrics::default()
+            }
+        }
+    }
+
     pub(super) fn sample(&mut self, gfx: &GfxState) -> Metrics {
         let now = Instant::now();
         let same_connection = self.connection_started_at == gfx.start_time;
@@ -170,6 +190,67 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_heartbeats_do_not_repeat_completed_frame_activity() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.start_time = Some(Instant::now());
+        gfx.total_bytes_sent = 4096;
+        gfx.total_frames_sent = 10;
+        gfx.record_encode_timing(3.0);
+        gfx.record_capture_queue(2.0);
+        gfx.last_write_ms = 1.0;
+        gfx.rtt_ewma_ms = 7.0;
+        gfx.pending_acks = 2;
+        gfx.applied_frame_rate = Some(60);
+        let mut snapshot = MetricsSnapshot::default();
+        let active = snapshot.sample_live(&gfx, true);
+        assert!(active.session_active);
+        assert_eq!(active.encode_ms, 3.0);
+        assert_eq!(active.encode_timings.samples, 1);
+
+        for _ in 0..3 {
+            let idle = snapshot.sample_live(&gfx, false);
+            assert!(!idle.session_active);
+            assert!(idle.sample_id > active.sample_id);
+            assert!(idle.timestamp_ms > 0);
+            assert_eq!(idle.bytes_sent, 4096);
+            assert_eq!(idle.fps, 0);
+            assert_eq!(idle.bitrate_kbps, 0);
+            assert_eq!(idle.encode_ms, 0.0);
+            assert_eq!(idle.capture_queue_ms, 0.0);
+            assert_eq!(idle.write_ms, 0.0);
+            assert_eq!(idle.rtt_ms, 0.0);
+            assert_eq!(idle.pending_acks, 0);
+            assert_eq!(idle.applied_frame_rate, None);
+            assert_eq!(idle.encode_timings.samples, 0);
+            assert!(idle.encoder_mode.is_empty());
+        }
+        // Publishing idle does not erase the completed session's evidence.
+        let final_sample = snapshot.sample(&gfx);
+        assert_eq!(final_sample.encode_ms, 3.0);
+        assert_eq!(final_sample.encode_timings.samples, 1);
+        assert_eq!(final_sample.capture_timings.samples, 1);
+    }
+
+    #[test]
+    fn new_connection_after_idle_starts_with_fresh_rates_and_timings() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        gfx.start_time = Some(Instant::now());
+        gfx.total_bytes_sent = 10_000;
+        gfx.record_encode_timing(3.0);
+        let mut snapshot = MetricsSnapshot::default();
+        snapshot.sample_live(&gfx, true);
+        snapshot.sample_live(&gfx, false);
+        gfx.reset_connection_state(false);
+        gfx.start_time = Some(Instant::now());
+        let fresh = snapshot.sample_live(&gfx, true);
+        assert!(fresh.session_active);
+        assert_eq!(fresh.bitrate_kbps, 0);
+        assert_eq!(fresh.fps, 0);
+        assert_eq!(fresh.encode_ms, 0.0);
+        assert_eq!(fresh.encode_timings.samples, 0);
+    }
 
     #[test]
     fn bitmap_metrics_identify_codec_without_claiming_an_active_video_target() {

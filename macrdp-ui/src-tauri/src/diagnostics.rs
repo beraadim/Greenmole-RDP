@@ -212,6 +212,7 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
     let value = serde_json::to_value(metrics).unwrap_or(Value::Null);
     let mut selected = serde_json::Map::new();
     for key in [
+        "session_active",
         "fps",
         "bitrate_kbps",
         "latency_ms",

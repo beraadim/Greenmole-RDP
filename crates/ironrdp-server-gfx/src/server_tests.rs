@@ -757,6 +757,148 @@ async fn resize_reactivation_refreshes_context_without_starting_a_new_session() 
     assert_eq!(lifecycle.disconnections, 0);
 }
 
+#[derive(Debug)]
+struct InputGraphicsObservation {
+    callback: &'static str,
+    client_name: String,
+    keyboard_layout: u32,
+    peer_addr: Option<String>,
+    bytes_sent: u64,
+    updates_sent: u64,
+    encode_ms: f64,
+    caps_confirmed: bool,
+    pending_acks: u32,
+}
+
+struct GraphicsInspectingInput {
+    gfx: Arc<StdMutex<GfxState>>,
+    observations: Arc<StdMutex<Vec<InputGraphicsObservation>>>,
+}
+
+impl GraphicsInspectingInput {
+    fn observe(
+        &self,
+        callback: &'static str,
+        context: ClientInputContext,
+        peer_addr: Option<String>,
+    ) {
+        // Fail immediately if activation holds graphics state through a callback;
+        // a real callback taking connection state would invert the ticker's locks.
+        let gfx = self
+            .gfx
+            .try_lock()
+            .expect("graphics lock held during callback");
+        self.observations
+            .lock()
+            .unwrap()
+            .push(InputGraphicsObservation {
+                callback,
+                client_name: context.client_name,
+                keyboard_layout: context.keyboard_layout,
+                peer_addr,
+                bytes_sent: gfx.total_bytes_sent,
+                updates_sent: gfx.total_frames_sent,
+                encode_ms: gfx.last_encode_ms,
+                caps_confirmed: gfx.caps_confirmed,
+                pending_acks: gfx.pending_acks,
+            });
+    }
+}
+
+impl RdpServerInputHandler for GraphicsInspectingInput {
+    fn update_client_context(&mut self, context: ClientInputContext) {
+        self.observe("context", context, None);
+    }
+
+    fn on_connect(&mut self, context: ClientInputContext, peer_addr: Option<String>) {
+        self.observe("connect", context, peer_addr);
+    }
+
+    fn keyboard(&mut self, _: KeyboardEvent) {}
+    fn mouse(&mut self, _: MouseEvent) {}
+}
+
+#[tokio::test]
+async fn activation_publishes_fresh_graphics_outside_the_lock_and_preserves_reactivation() {
+    let mut server = resize_test_server(Box::new(CaptureUnavailable));
+    let observations = Arc::new(StdMutex::new(Vec::new()));
+    server.handler = Arc::new(Mutex::new(Box::new(GraphicsInspectingInput {
+        gfx: Arc::clone(&server.gfx_state),
+        observations: Arc::clone(&observations),
+    })));
+    {
+        let mut gfx = server.gfx_state.lock().unwrap();
+        gfx.peer_addr = Some([127, 0, 0, 2].into());
+        gfx.total_bytes_sent = 999;
+        gfx.total_frames_sent = 99;
+        gfx.last_encode_ms = 5.0;
+        gfx.caps_confirmed = true;
+        gfx.pending_acks = 2;
+    }
+    for (reactivation, client_name) in [(false, "initial"), (true, "resized")] {
+        if reactivation {
+            let mut gfx = server.gfx_state.lock().unwrap();
+            gfx.total_bytes_sent = 100;
+            gfx.total_frames_sent = 2;
+            gfx.last_encode_ms = 3.0;
+            gfx.caps_confirmed = true;
+            gfx.pending_acks = 1;
+        }
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+        let result = AcceptorResult {
+            static_channels: StaticChannelSet::new(),
+            capabilities: Vec::new(),
+            input_events: Vec::new(),
+            user_channel_id: 1002,
+            io_channel_id: 1003,
+            reactivation,
+            client_name: client_name.to_owned(),
+            keyboard_layout: 0x0409,
+            client_desktop_size: None,
+        };
+        let error = server
+            .client_accepted(
+                &mut reader,
+                &mut writer,
+                result,
+                DesktopSize {
+                    width: 1280,
+                    height: 720,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("capture deliberately unavailable"));
+    }
+
+    let observations = observations.lock().unwrap();
+    assert_eq!(observations.len(), 3);
+    for (observation, (callback, client_name)) in observations.iter().zip([
+        ("context", "initial"),
+        ("connect", "initial"),
+        ("context", "resized"),
+    ]) {
+        assert_eq!(observation.callback, callback);
+        assert_eq!(observation.client_name, client_name);
+        assert_eq!(observation.keyboard_layout, 0x0409);
+        assert_eq!(observation.pending_acks, 0);
+    }
+    for observation in &observations[..2] {
+        assert_eq!(observation.bytes_sent, 0);
+        assert_eq!(observation.updates_sent, 0);
+        assert_eq!(observation.encode_ms, 0.0);
+        assert!(!observation.caps_confirmed);
+    }
+    assert_eq!(observations[0].peer_addr, None);
+    assert_eq!(observations[1].peer_addr.as_deref(), Some("127.0.0.2"));
+    assert_eq!(observations[2].peer_addr, None);
+    assert_eq!(observations[2].bytes_sent, 100);
+    assert_eq!(observations[2].updates_sent, 2);
+    assert_eq!(observations[2].encode_ms, 3.0);
+    assert!(observations[2].caps_confirmed);
+}
+
 struct RequestedSizeDisplay(mpsc::UnboundedSender<DesktopSize>);
 
 #[async_trait::async_trait]

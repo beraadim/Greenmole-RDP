@@ -23,6 +23,8 @@ export interface Metrics {
   timestamp: number;
   timestamp_ms: number;
   sample_id: number;
+  // Missing only when reading metrics from an older server.
+  session_active?: boolean;
   // New fields
   encode_ms: number;
   capture_queue_ms: number;

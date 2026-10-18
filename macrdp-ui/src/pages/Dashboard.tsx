@@ -4,6 +4,7 @@ import { useMetrics } from "../hooks/useMetrics";
 import { useConnections } from "../hooks/useConnections";
 import { useMetricHistory } from "../hooks/useFpsHistory";
 import { sampleAverage } from "../lib/metricHistory";
+import { hasLiveSessionMetrics } from "../lib/metricPresentation";
 import { api } from "../lib/ipc";
 import StatusBar from "../components/StatusBar";
 import ServerError from "../components/ServerError";
@@ -26,7 +27,11 @@ function Dashboard() {
   const [config, setConfig] = useState<UiConfig | null>(null);
   const [inputDebug, setInputDebug] = useState<InputDebugState | null>(null);
 
-  const metricsAvailable = status.running && metrics && !stale;
+  const metricsAvailable = hasLiveSessionMetrics(metrics, status.running, connections.length, stale);
+  const metricsEmptyText = !status.running ? "No active session" :
+    connections.length === 0 ? "Idle · no client connected" :
+    metrics?.session_active === false ? "Waiting for session data..." :
+    stale ? "Waiting for fresh data..." : "Waiting for data...";
   const bitrateHistory = useMetricHistory(
     metricsAvailable ? metrics.bitrate_kbps / 1000 : null,
     metrics?.sample_id ?? 0, metrics?.timestamp_ms ?? 0,
@@ -141,7 +146,7 @@ function Dashboard() {
           value={avgBitrate != null ? `Avg ${avgBitrate} Mbps` : undefined}
           valueColor="var(--color-green)"
           empty={chartsEmpty}
-          emptyText="Waiting for data..."
+          emptyText={metricsEmptyText}
         >
           <AreaChart data={bitrateHistory} color="var(--color-green)" />
         </ChartPanel>
@@ -151,7 +156,7 @@ function Dashboard() {
           value={avgEncode != null ? `Avg ${avgEncode} ms` : undefined}
           valueColor="var(--color-orange)"
           empty={chartsEmpty}
-          emptyText="Waiting for data..."
+          emptyText={metricsEmptyText}
         >
           <AreaChart data={encodeHistory} color="var(--color-orange)" />
         </ChartPanel>
@@ -176,7 +181,7 @@ function Dashboard() {
           formatter={(v) => v.toFixed(1)}
         />
         <MetricCard
-          value={metricsAvailable ? connections.length : null}
+          value={status.running ? connections.length : null}
           label="Connections"
           color="purple"
         />
