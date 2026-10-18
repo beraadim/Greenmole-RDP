@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use crate::virtual_display::VirtualDisplay;
 use crate::{Command, DisplayBackend, DisplayGeometry};
 
+mod window_session;
+
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
 const SETTLE_POLL: Duration = Duration::from_millis(50);
 
@@ -48,6 +50,7 @@ pub(crate) struct NativeDisplay {
     display_id: u32,
     virtual_display: Option<VirtualDisplay>,
     session_layout: Option<crate::layout::Snapshot>,
+    windows: window_session::SessionState,
 }
 
 impl NativeDisplay {
@@ -60,6 +63,7 @@ impl NativeDisplay {
                     display_id,
                     virtual_display: None,
                     session_layout: None,
+                    windows: window_session::SessionState::default(),
                 };
                 let geometry = owner.geometry()?;
                 tracing::info!(?geometry, "Pinned main display without changing its mode");
@@ -71,6 +75,7 @@ impl NativeDisplay {
                     display_id: virtual_display.id(),
                     virtual_display: Some(virtual_display),
                     session_layout: None,
+                    windows: window_session::SessionState::default(),
                 };
                 owner.wait_for_mode(width, height)?;
                 Ok(owner)
@@ -188,6 +193,7 @@ impl NativeDisplay {
             primary: CGDisplay::main().id,
             displays: self.live_layout()?,
         };
+        self.windows.capture(snapshot.primary, self.display_id);
         if snapshot.primary == self.display_id {
             // The user may have selected this screen as primary while idle.
             // Preserve that explicit arrangement on disconnect; do not invent
@@ -216,9 +222,11 @@ impl NativeDisplay {
 
     pub(crate) fn end_remote_session(&mut self) -> Result<DisplayGeometry> {
         let Some(snapshot) = &self.session_layout else {
+            self.windows.restore();
             return self.geometry();
         };
         if snapshot.primary == self.display_id {
+            self.windows.restore();
             self.session_layout = None;
             return self.geometry();
         }
@@ -235,9 +243,16 @@ impl NativeDisplay {
             primary,
             displays,
         )?;
+        // Restore frames in the original physical coordinate space while the
+        // virtual screen still exists, so removal cannot strand these windows.
+        self.windows.restore();
         self.session_layout = None;
         tracing::info!(primary, "Restored the physical primary display and layout");
         Ok(geometry)
+    }
+
+    pub(crate) fn take_window_status(&mut self) -> crate::protocol::WindowStatus {
+        self.windows.take_status()
     }
 
     fn matches_mode(&self, geometry: &DisplayGeometry, width: u16, height: u16) -> bool {
@@ -253,6 +268,7 @@ impl NativeDisplay {
         }
         if let Ok(geometry) = self.geometry() {
             if self.matches_mode(&geometry, width, height) {
+                self.windows.gather(geometry);
                 return Ok(geometry);
             }
         }
@@ -261,6 +277,7 @@ impl NativeDisplay {
             .expect("virtual owner checked")
             .apply_mode(width, height)?;
         let geometry = self.wait_for_mode(width, height)?;
+        self.windows.gather(geometry);
         tracing::info!(?geometry, "Virtual display mode ready for capture");
         Ok(geometry)
     }
@@ -381,7 +398,7 @@ impl NativeDisplay {
 
 impl Drop for NativeDisplay {
     fn drop(&mut self) {
-        if self.session_layout.is_some() {
+        if self.session_layout.is_some() || self.windows.pending() {
             if let Err(error) = self.end_remote_session() {
                 // The protocol helper intentionally has no tracing subscriber.
                 eprintln!("Could not restore the display layout during owner teardown: {error:#}");
@@ -403,6 +420,7 @@ mod tests {
             display_id,
             virtual_display: None,
             session_layout: None,
+            windows: window_session::SessionState::default(),
         };
         let error = selected.geometry().unwrap_err();
         assert!(error.to_string().contains("no longer online"));

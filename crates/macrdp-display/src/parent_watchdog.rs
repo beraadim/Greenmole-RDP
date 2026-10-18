@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-const RESTORATION_GRACE: Duration = Duration::from_secs(6);
+// A pending activation can precede bounded layout and window restoration.
+const RESTORATION_GRACE: Duration = Duration::from_secs(16);
 const POLL: Duration = Duration::from_millis(100);
 
 extern "C" {
@@ -68,7 +69,7 @@ mod tests {
             || elapsed.get() < Duration::from_secs(10),
             || start + elapsed.get(),
             |delay| elapsed.set(elapsed.get() + delay),
-            || assert_eq!(elapsed.get(), Duration::from_secs(16)),
+            || assert_eq!(elapsed.get(), Duration::from_secs(26)),
         );
     }
 

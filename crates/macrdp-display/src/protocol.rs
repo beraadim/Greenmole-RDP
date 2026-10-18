@@ -38,12 +38,27 @@ pub(crate) enum Request {
     Shutdown {},
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WindowStatus {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<crate::session_windows::PhaseReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Reply {
-    Geometry { geometry: DisplayGeometry },
+    Geometry {
+        geometry: DisplayGeometry,
+        #[serde(default)]
+        windows: WindowStatus,
+    },
     Stopped {},
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 pub(crate) fn read_message<T: DeserializeOwned>(input: &mut impl BufRead) -> Result<Option<T>> {
@@ -129,12 +144,21 @@ mod tests {
             pixel_height: 1088,
         };
         let mut bytes = Vec::new();
-        write_message(&mut bytes, &Reply::Geometry { geometry }).unwrap();
+        write_message(
+            &mut bytes,
+            &Reply::Geometry {
+                geometry,
+                windows: WindowStatus::default(),
+            },
+        )
+        .unwrap();
         match read_message::<Reply>(&mut Cursor::new(bytes))
             .unwrap()
             .unwrap()
         {
-            Reply::Geometry { geometry: observed } => assert_eq!(observed, geometry),
+            Reply::Geometry {
+                geometry: observed, ..
+            } => assert_eq!(observed, geometry),
             other => panic!("unexpected reply: {other:?}"),
         }
     }

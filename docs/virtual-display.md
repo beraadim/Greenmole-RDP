@@ -33,7 +33,8 @@ display owners during the app's usual port migration.
 
 The virtual display belongs to the logged-in macOS desktop. It becomes the main
 display while a remote client is connected, bringing the Dock and menu bar to the
-remote desktop. The previous display arrangement is restored on disconnect. It
+remote desktop. The previous display arrangement and captured window positions
+are restored on disconnect. It
 is an additional screen in the same user session, with shared keyboard, pointer,
 applications and audio. macrdp does not mirror displays or create a separate
 user login session.
@@ -51,21 +52,41 @@ initialized. Its global origin is read back from macOS after the change. Resizin
 the browser changes the same display's mode without replacing the saved physical
 display arrangement. RDP resize reactivation remains part of the same connection.
 
-macOS manages application window placement. Existing windows may remain on a
-physical screen, and applications can remember their preferred display or Space.
-The Dashboard's **Move windows to remote display** button gathers open windows
-when an app opens on the physical screen. This is a manual action, available
-while a client is connected to the virtual display. Windows already visible on
-the remote screen stay in place. Larger windows are fitted where the application
-allows it. Minimized, full-screen and unsupported windows may be skipped; the
-button reports moved, skipped and failed counts. Accessibility permission is
-required, as it is for remote keyboard and mouse input.
+Before changing the main display, macrdp snapshots normal, movable windows on
+the connected physical displays. It records each window's original display,
+position and size, including windows on the original main display. It then
+gathers windows from the original **non-main physical displays** onto the
+virtual display automatically. Windows on the original main display are left
+to macOS's normal primary-display transition, rather than moved a second time.
+The snapshot belongs to that connection; browser resizes do not replace it.
 
-There is no automatic window mover or per-window restoration on disconnect.
-macOS handles placement when the virtual display disappears. The manual action
-uses bounded Accessibility calls for other apps and main-thread AppKit for
-macrdp itself. It never queries macrdp's own Accessibility windows, which caused
-the earlier WebKit crash. Window titles and contents are not logged.
+On disconnect, macrdp restores the physical display arrangement and returns
+captured windows to their original displays, positions and sizes. If an original
+display has been disconnected, the window is fitted visibly onto a surviving
+physical display. Closed windows are ignored, and an application can constrain
+the size or placement of its windows. Minimized, full-screen and unsupported
+windows may be skipped without changing their state. Accessibility permission
+is required, as it is for remote keyboard and mouse input. Snapshot, automatic
+gather and restoration each have a three-second time budget, so an unresponsive
+app cannot block connection cleanup indefinitely. A timeout or denied access
+can therefore leave some windows for macOS to place.
+
+Window identity is retained through Accessibility objects for the lifetime of
+the session, rather than matched using titles. Window titles and contents are
+not read for identity or logged. Automatic window handling runs on the isolated
+display helper's main thread and queries GUI applications out of process; it
+never queries its own PID. The manual Dashboard action still uses main-thread
+AppKit for macrdp itself, avoiding the earlier in-process WebKit crash. Saved
+window state remains in memory and is discarded when the session ends.
+
+The Dashboard's **Move windows to remote display** button remains available
+during a virtual session for windows opened later or left on another screen.
+Windows already visible remotely stay in place, and larger windows are fitted
+where the application allows it. The button reports moved, skipped and failed
+counts. Newly opened windows are not added to the connection's original
+snapshot, so their placement when the virtual display disappears remains under
+macOS control. Using the button does not overwrite captured windows' original
+positions or sizes.
 
 Disconnect and normal server shutdown restore the prior primary display and
 display origins before removing the virtual screen. These are temporary display
@@ -131,7 +152,8 @@ and testing. Portable tests and cross-target type checking do not establish
 successful macOS display creation, capture, or Guacamole behavior.
 
 The native display smoke test is opt-in because it creates a temporary extended
-screen. Its independent observer processes verify actual mode dimensions,
+screen and now gathers/restores ordinary application windows. Run it only when
+that live desktop change is intended. Its independent observer processes verify actual mode dimensions,
 persistent display identity, physical display preservation, and cleanup:
 
 ```sh
@@ -166,12 +188,17 @@ button against real application windows after installing the DMG.
 2. Enable the virtual backend and automatic resolution, restart, and confirm no
    virtual screen exists while idle. Connect through Guacamole and confirm the
    virtual display is created and becomes primary, with the Dock
-   and menu bar are available. Existing application windows follow macOS behavior.
+   and menu bar are available. Before connecting, place ordinary windows on each
+   physical display and note their positions and sizes. Windows from non-main
+   physical displays should gather automatically; the original main display's
+   windows follow macOS's primary-display transition.
 3. Resize between 1280x720, 1920x1080, 2560x1440 and an odd viewport size such as
    2560x1305. Confirm the desktop dimensions change, not just the image scale.
    Check menu items, window controls and all four corners for pointer accuracy.
 4. Disconnect and confirm the previous primary display and arrangement return
-   and the virtual screen disappears. Reconnect with a different browser size:
+   and the virtual screen disappears. Confirm all captured windows return to
+   their original displays, positions and sizes, including those originally on
+   the main display. Reconnect with a different browser size:
    a new virtual screen is created. Only resizes within one connection keep its ID.
 5. Repeat while rapidly resizing, with a dropped network connection, and while
    stopping the server. A resize within one session must not restore the layout.
@@ -186,6 +213,15 @@ button against real application windows after installing the DMG.
    Repeat with macrdp's own window on the physical display and verify it moves
    without crashing. Disconnect while gathering and confirm cleanup still runs;
    the button must be disabled while disconnected or using the physical backend.
+9. Repeat the connect, resize and disconnect cycle with three physical displays,
+   including displays arranged to the left or above the original main display.
+   Move and resize a captured window remotely, then confirm its pre-connection
+   frame returns on disconnect. Verify that resizes do not replace the snapshot.
+10. Disconnect an original secondary display during the remote session, then
+    disconnect RDP and confirm its captured windows remain visible on a surviving
+    physical screen. Repeat with a closed window, a newly opened window,
+    minimized/full-screen windows, denied Accessibility access and an unresponsive
+    app; cleanup must remain bounded and logs must omit window titles.
 
 Capture info logs include the selected display ID, global origin, logical point
 size, output pixel size and native mode changes. Useful messages include

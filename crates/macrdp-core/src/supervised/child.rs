@@ -111,7 +111,8 @@ pub(super) fn run() -> Result<()> {
             drop(commands);
             // A native thread may prevent even a Tokio runtime's destructor from
             // returning. Parent EOF therefore has an independent process deadline.
-            std::thread::sleep(Duration::from_secs(6));
+            // Healthy display owners now also restore saved window geometry.
+            std::thread::sleep(Duration::from_secs(20));
             terminate_owned_group_after_parent_exit();
             std::process::exit(70);
         })?;

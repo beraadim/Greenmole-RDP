@@ -44,7 +44,7 @@ pub(crate) fn install_control_endpoint(app: &tauri::AppHandle) -> anyhow::Result
                 let _ = reply.send(recover_local_desktop(&app).await);
             });
             result
-                .recv_timeout(Duration::from_secs(55))
+                .recv_timeout(Duration::from_secs(80))
                 .unwrap_or_else(|_| {
                     Err("Recovery is still pending. Check macrdp's local controls and logs.".into())
                 })
@@ -101,7 +101,7 @@ async fn recover_local_desktop_inner(app: &tauri::AppHandle) -> Result<(), Strin
             .recover_local_desktop()
             .await
             .map_err(|e| format!("{e:#}")),
-        None => tokio::time::timeout(Duration::from_secs(25), async {
+        None => tokio::time::timeout(Duration::from_secs(50), async {
             // Startup cancellation can retire an unpublished worker in the
             // background. Its missing UI handle does not mean cleanup finished.
             while macrdp_core::server_resources_pending() {

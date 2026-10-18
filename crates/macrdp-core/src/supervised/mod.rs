@@ -32,7 +32,8 @@ pub use handle::{
 const HELPER_ARGUMENT: &str = "--macrdp-server-helper";
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
-const STOP_GRACE: Duration = Duration::from_secs(5);
+// Do not interrupt a healthy window/layout restoration during Stop.
+const STOP_GRACE: Duration = Duration::from_secs(20);
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
 const MAX_RESTARTS: usize = 2;
 static SUPERVISOR_OWNED: AtomicBool = AtomicBool::new(false);

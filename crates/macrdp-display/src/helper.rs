@@ -14,8 +14,9 @@ use crate::protocol::{read_message, write_message, Reply, Request};
 use crate::{normalize_size, DisplayBackend, DisplayGeometry, HELPER_ARGUMENT};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-// Owner teardown may run one bounded layout-restoration selector.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+// Allow bounded layout and window restoration before terminating an owner.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(12);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct DisplayHelper {
@@ -146,7 +147,7 @@ impl DisplayHelper {
             return self
                 .replies
                 .recv_timeout(timeout)
-                .context("Display helper did not reply within 5 seconds")?;
+                .context("Display helper did not reply within its operation deadline")?;
         }
         let deadline = Instant::now() + timeout;
         loop {
@@ -186,7 +187,15 @@ impl DisplayHelper {
             )?;
             let reply = self.receive_reply(timeout, service_owner_events)?;
             let geometry = match reply {
-                Reply::Geometry { geometry } => geometry,
+                Reply::Geometry { geometry, windows } => {
+                    for report in windows.reports {
+                        tracing::info!(?report, "Remote window session phase completed");
+                    }
+                    for warning in windows.warnings {
+                        tracing::warn!(%warning, "Remote window session warning");
+                    }
+                    geometry
+                }
                 Reply::Error { message } => bail!("Display helper: {message}"),
                 Reply::Stopped {} => bail!("Display helper stopped during a geometry request"),
             };
@@ -218,7 +227,11 @@ impl DisplayHelper {
     }
 
     pub(crate) fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
-        let geometry = self.geometry_request(Request::BeginRemoteSession {})?;
+        let geometry = self.geometry_request_with_options(
+            Request::BeginRemoteSession {},
+            SESSION_TIMEOUT,
+            false,
+        )?;
         tracing::info!(
             display_id = self.id(),
             ?geometry,
@@ -228,7 +241,11 @@ impl DisplayHelper {
     }
 
     pub(crate) fn end_remote_session(&mut self) -> Result<DisplayGeometry> {
-        let geometry = self.geometry_request(Request::EndRemoteSession {})?;
+        let geometry = self.geometry_request_with_options(
+            Request::EndRemoteSession {},
+            SESSION_TIMEOUT,
+            false,
+        )?;
         tracing::info!(
             display_id = self.id(),
             "Restored the local primary display after the remote connection"
@@ -237,7 +254,11 @@ impl DisplayHelper {
     }
 
     pub(crate) fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
-        let geometry = self.geometry_request(Request::PrepareCapture { width, height })?;
+        let geometry = self.geometry_request_with_options(
+            Request::PrepareCapture { width, height },
+            SESSION_TIMEOUT,
+            false,
+        )?;
         if let Err(error) = self.verify_requested_size(&geometry, width, height) {
             self.abort();
             return Err(error);
@@ -407,7 +428,13 @@ pub(crate) fn run_child() -> Result<()> {
         });
         match response {
             Ok(geometry) => {
-                if let Err(error) = write_message(&mut output, &Reply::Geometry { geometry }) {
+                let windows = owner
+                    .as_mut()
+                    .map(NativeDisplay::take_window_status)
+                    .unwrap_or_default();
+                if let Err(error) =
+                    write_message(&mut output, &Reply::Geometry { geometry, windows })
+                {
                     break Err(error);
                 }
                 if one_shot {

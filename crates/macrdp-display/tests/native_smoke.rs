@@ -1,4 +1,4 @@
-//! Opt-in native validation: creates and removes temporary extended displays.
+//! Opt-in native validation: creates/removes displays and gathers/restores windows.
 //! Run this single test in a logged-in macOS session with a stable display layout.
 
 #[cfg(not(target_os = "macos"))]
@@ -50,7 +50,7 @@ fn main() {
         return;
     }
     if !args.iter().any(|arg| arg == "--ignored") {
-        eprintln!("Native display smoke test skipped; pass --ignored to create temporary extended displays");
+        eprintln!("Native display smoke test skipped; pass --ignored to create temporary extended displays and gather/restore application windows");
         return;
     }
     native::run();

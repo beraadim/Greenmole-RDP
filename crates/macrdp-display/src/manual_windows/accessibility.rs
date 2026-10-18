@@ -80,6 +80,18 @@ pub(crate) fn trusted() -> bool {
 }
 
 impl Element {
+    pub(crate) fn renew_budget(&mut self, budget: &Budget) -> AxResult<()> {
+        check_budget(budget)?;
+        self.budget = budget.clone();
+        status(unsafe { AXUIElementSetMessagingTimeout(self.raw(), TIMEOUT_SECONDS) })
+    }
+
+    /// AX identity survives a window title change, and an invalid retained
+    /// reference never becomes a different window after process/PID reuse.
+    pub(crate) fn same_window(&self, other: &Self) -> bool {
+        unsafe { CFEqual(self.raw(), other.raw()) != 0 }
+    }
+
     fn raw(&self) -> CFTypeRef {
         self.value.as_CFTypeRef()
     }
@@ -215,22 +227,26 @@ impl Element {
     }
 
     pub fn set_frame(&self, frame: Frame, resizable: bool) -> AxResult<()> {
-        let point = CGPoint::new(frame.x, frame.y);
+        let mut element = self;
+        super::frame_setter::set_frame(&mut element, frame, resizable, AxError(-25200))
+    }
+}
+
+impl super::frame_setter::Backend for &Element {
+    type Error = AxError;
+
+    fn size(&mut self, frame: Frame) -> AxResult<()> {
         let size = CGSize::new(frame.width, frame.height);
-        // Shrink before moving so an oversized window can fit on the target.
-        if resizable {
-            let _ = self.write_value("AXSize", AX_SIZE, (&size as *const CGSize).cast());
-        }
-        let final_position =
-            self.write_value("AXPosition", AX_POINT, (&point as *const CGPoint).cast());
-        // Attempt position even if a size constraint rejects resizing. AX may
-        // report success while the app silently enforces another frame.
-        let actual = self.frame()?;
-        if actual.close_to(frame) {
-            return Ok(());
-        }
-        final_position?;
-        Err(AxError(-25200))
+        self.write_value("AXSize", AX_SIZE, (&size as *const CGSize).cast())
+    }
+
+    fn position(&mut self, frame: Frame) -> AxResult<()> {
+        let point = CGPoint::new(frame.x, frame.y);
+        self.write_value("AXPosition", AX_POINT, (&point as *const CGPoint).cast())
+    }
+
+    fn frame(&mut self) -> AxResult<Frame> {
+        Element::frame(self)
     }
 }
 

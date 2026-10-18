@@ -188,7 +188,9 @@ impl Worker {
         if self.inspect_displays {
             let _ = macrdp_display::wait_for_owned_virtual_display_removal(
                 &ids,
-                Duration::from_secs(4),
+                // Parent death gives the helper 16 seconds to finish its owned
+                // window/layout work; never kill the group before that grace.
+                Duration::from_secs(18),
             );
         }
         // The leader has deliberately not been reaped: group identity cannot

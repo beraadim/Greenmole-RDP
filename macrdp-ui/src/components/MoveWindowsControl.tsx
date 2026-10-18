@@ -92,7 +92,7 @@ export default function MoveWindowsControl() {
         <div className="min-w-0 flex-1">
           <div className="text-xs font-medium text-text">Remote windows</div>
           <p id={descriptionId} className="mt-1 text-[11px] text-text-muted">
-            Bring open windows from other displays onto the remote display. Minimized and full screen windows may be skipped.
+            Windows from secondary physical displays move here on connect. Use this to bring additional windows over. Minimized and full screen windows may be skipped.
           </p>
         </div>
         <Button

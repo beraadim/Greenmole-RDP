@@ -204,7 +204,7 @@ fn request_at(path: &Path) -> Result<()> {
         same_user(&stream),
         "Recovery endpoint belongs to another user"
     );
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(90)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(REQUEST)?;
     let mut reply = String::new();

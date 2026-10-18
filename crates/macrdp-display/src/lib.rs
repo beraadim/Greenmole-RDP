@@ -27,6 +27,8 @@ mod recovery;
 mod resolution;
 #[cfg(target_os = "macos")]
 mod selector;
+#[cfg(any(target_os = "macos", test))]
+mod session_windows;
 #[cfg(target_os = "macos")]
 mod virtual_display;
 mod window_move;
@@ -88,8 +90,9 @@ const MIN_VIRTUAL_HEIGHT: u16 = 200;
 const MAX_VIRTUAL_WIDTH: u16 = 3840;
 const MAX_VIRTUAL_HEIGHT: u16 = 2160;
 // Includes the native mode-settle budget, plus time for one queued operation.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+// Activation includes bounded window snapshot/gather work and native mode setup.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn normalize_size(backend: DisplayBackend, width: u16, height: u16) -> (u16, u16) {
     if backend == DisplayBackend::Main {
@@ -146,7 +149,7 @@ impl Drop for ControllerInner {
         };
         if let Err(error) = stopped.recv_timeout(SHUTDOWN_TIMEOUT) {
             tracing::warn!(%error, backend = ?self.backend,
-                "Display worker did not confirm release within 10 seconds");
+                "Display worker did not confirm release within 20 seconds");
         }
     }
 }
@@ -219,7 +222,7 @@ impl DisplayController {
             // it releases any display it created as soon as native calls return.
             ready_rx
                 .recv_timeout(REQUEST_TIMEOUT)
-                .context("Display controller did not initialize within 10 seconds")??;
+                .context("Display controller did not initialize within 20 seconds")??;
             Ok(Self(Arc::new(ControllerInner {
                 backend,
                 commands,
@@ -258,7 +261,7 @@ impl DisplayController {
     }
 
     /// Queue a single, user-requested relocation of external application windows.
-    /// This never creates a display or enables automatic window management.
+    /// This never creates a display; automatic session gathering is separate.
     pub fn queue_move_windows_to_remote(&self) -> Result<WindowMovePreparation> {
         self.queue_move_windows_to_remote_with(|_| Ok(0))
     }

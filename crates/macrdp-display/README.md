@@ -5,8 +5,13 @@ was primary at startup and only reads its geometry. `Virtual` creates one extend
 display in the existing macOS login session when a connection activates and
 changes that display's mode as the RDP viewport changes. It becomes the primary
 display, giving the remote desktop the menu bar and primary desktop behavior.
-Disconnect restores the physical primary and saved display origins, then removes
-the virtual screen. No virtual display or helper exists while disconnected. Physical
+Before primary activation, a connection snapshots ordinary movable windows on
+the physical displays, including the original main display. Activation gathers
+only windows originally on non-main physical displays; macOS handles the original
+main display's windows during the primary transition. Disconnect restores the
+physical primary and saved display origins and returns captured windows to their
+original monitors and frames, then removes the virtual screen. No virtual display
+or helper exists while disconnected. Physical
 display modes and persistent display preferences are never changed.
 
 The virtual framebuffer uses one pixel per logical point and is limited to
@@ -46,6 +51,18 @@ primary; Quartz may adjust origins to resolve gaps or overlap. `queue_remote_cap
 orders activation and capture preparation before a following disconnect even
 when the async capture task is cancelled before its blocking waiter starts.
 
+Window snapshots retain Accessibility identities in memory, not window titles.
+Snapshot, gather and restore phases each have a three-second budget; minimized,
+full-screen, unsupported and unresponsive windows can be skipped. The mover
+does not query its own PID through Accessibility. The isolated automatic helper
+queries GUI applications out of process from its main thread; the manual action
+uses main-thread AppKit for its own GUI windows. Browser resizing never recaptures
+the original frames. Restoration ignores closed windows and fits windows from
+missing monitors visibly onto surviving physical screens. Applications may
+constrain placement or size. Windows opened after the snapshot are left to
+macOS when the virtual screen disappears. The manual Dashboard gather action
+remains available and does not overwrite the original snapshot.
+
 Cloned controllers carry only channels and values across threads. Dropping the
 last controller requests helper shutdown, waits briefly for process exit, then
 forces termination if necessary. EOF also ends the helper when its parent exits.
@@ -75,7 +92,8 @@ creation, mode changes, headless operation, window placement and shutdown still
 require testing on the supported macOS versions.
 
 An ignored native smoke test creates a temporary extended screen in the current
-logged-in macOS session. It checks dimension alignment, minimum and maximum
+logged-in macOS session and gathers/restores ordinary application windows.
+Run it only when those live desktop changes are intended. It checks dimension alignment, minimum and maximum
 sizes, stable display IDs within a connection, primary-display activation through
 resizes, exact physical geometry restoration, absence while idle, removal on
 disconnect, recreation on reconnect, and final-controller-drop cleanup.

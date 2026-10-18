@@ -103,7 +103,7 @@ pub(crate) fn request_quit(app: &tauri::AppHandle) -> Result<(), String> {
         } else {
             // An unpublished worker still owns its cleanup barrier after a
             // cancelled startup. Give it the same bounded shutdown opportunity.
-            if tokio::time::timeout(Duration::from_secs(25), async {
+            if tokio::time::timeout(Duration::from_secs(50), async {
                 while macrdp_core::server_resources_pending() {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }

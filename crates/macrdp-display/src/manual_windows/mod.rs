@@ -2,10 +2,11 @@
 //! No snapshots or per-window subscriptions are installed.
 
 #[cfg(target_os = "macos")]
-mod accessibility;
+pub(crate) mod accessibility;
 #[cfg(target_os = "macos")]
-mod discovery;
-mod geometry;
+pub(crate) mod discovery;
+mod frame_setter;
+pub(crate) mod geometry;
 mod process_filter;
 
 #[cfg(target_os = "macos")]

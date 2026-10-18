@@ -49,6 +49,15 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
+    /// Each automatic session phase gets a new deadline; retained native
+    /// references must never reuse the deadline from the original snapshot.
+    pub(crate) fn for_duration(duration: Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + duration,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn expired(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
     }

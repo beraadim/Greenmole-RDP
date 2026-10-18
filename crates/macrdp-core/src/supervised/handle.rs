@@ -2,7 +2,7 @@
 use super::runtime::supervise;
 use super::{
     protocol::Snapshot, ParentCommand, Shared, StartupCancellation, SupervisorLease, WindowRequest,
-    STOP_GRACE, SUPERVISOR_OWNED,
+    SUPERVISOR_OWNED,
 };
 use crate::{callbacks::*, config::ServerConfig, tls::TlsCertificateInfo, StopOutcome};
 use anyhow::{Context, Result};
@@ -156,7 +156,8 @@ impl SupervisedServerHandle {
     pub async fn stop(&self) -> Result<StopOutcome> {
         self.shared.stopping.store(true, Ordering::Release);
         let _ = self.shared.commands.try_send(ParentCommand::Stop);
-        let until = Instant::now() + STOP_GRACE;
+        // Keep the UI responsive while the supervisor retains cleanup ownership.
+        let until = Instant::now() + Duration::from_secs(5);
         while !self.cleanup_complete() && Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -172,7 +173,7 @@ impl SupervisedServerHandle {
     pub async fn recover_local_desktop(&self) -> Result<()> {
         self.shared.stopping.store(true, Ordering::Release);
         let _ = self.shared.commands.try_send(ParentCommand::Stop);
-        tokio::time::timeout(Duration::from_secs(25), async {
+        tokio::time::timeout(Duration::from_secs(50), async {
             while !self.cleanup_complete() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

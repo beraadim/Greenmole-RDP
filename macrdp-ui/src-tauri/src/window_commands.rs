@@ -1,4 +1,4 @@
-//! Explicit, user-triggered window gathering. Never invoked by session hooks.
+//! Explicit Dashboard gathering, separate from automatic session window handling.
 
 use std::sync::Arc;
 
