@@ -1,0 +1,99 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "version": "0.1.24",
+  "status": "built and delivered for user testing",
+  "source_revision": "b30f845a80fe50423f9790ffbe3577c908b29827",
+  "verified_at_utc": "2026-10-19T08:18:17.668622+00:00",
+  "release_checks": {
+    "rust_passed": 775,
+    "rust_failed": 0,
+    "existing_opt_in_ignored": 6,
+    "python_passed": 8,
+    "javascript_passed": 11,
+    "typescript_passed": true,
+    "frontend_production_build_passed": true,
+    "privacy_tests_passed": 19,
+    "privacy_retested_after_synthetic_reaper_hardening": true,
+    "existing_compiler_and_bundle_size_warnings_remain": true
+  },
+  "package_verification": {
+    "version": "0.1.24",
+    "source_revision": "b30f845a80fe50423f9790ffbe3577c908b29827",
+    "package": "macrdp_0.1.24_aarch64_b30f845a80fe.dmg",
+    "sha256": "cafdde4911a071e93ce0be1e65707b621aae3c6eb0e6801a47a5a149b0347d72",
+    "bytes": 15560192,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-private-session-helper": true,
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--recover-local-desktop": true
+    },
+    "standalone_cli_version_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "verification_mount_removed": true
+  },
+  "desktop_delivery": {
+    "destination": "Mac mini Desktop",
+    "package": "macrdp_0.1.24_aarch64_b30f845a80fe.dmg",
+    "sha256": "cafdde4911a071e93ce0be1e65707b621aae3c6eb0e6801a47a5a149b0347d72",
+    "atomic_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "previous_installer_files_removed": [
+      "macrdp_0.1.23_aarch64_0e3f1a70690f.dmg",
+      "macrdp_0.1.23_aarch64_0e3f1a70690f.dmg.sha256",
+      "macrdp_0.1.23_aarch64_0e3f1a70690f.dmg.build-info.json",
+      "macrdp-test/macrdp_0.1.0_aarch64.dmg"
+    ],
+    "installed_and_running_application_unchanged": true,
+    "live_security_actions_run": false
+  },
+  "source_review": {
+    "independent_security_review_passed": true,
+    "source_revision": "b30f845a80fe50423f9790ffbe3577c908b29827",
+    "staged_gitleaks_passed": true,
+    "committed_source_gitleaks_passed": true,
+    "version_and_lockfile_consistency_passed": true
+  },
+  "security_policy": {
+    "opt_in_default_off": true,
+    "virtual_backend_only": true,
+    "restart_required_in_both_directions": true,
+    "authenticated_admission_before_wake_capture_or_input": true,
+    "unknown_initial_lock_state_requires_lock": true,
+    "unexpected_disconnect_stop_and_emergency_force_lock": true,
+    "positive_lock_verification_before_required_local_release": true,
+    "separate_guard_process_group": true,
+    "generation_lease_prevents_replacement_during_recovery": true,
+    "helper_and_worker_heartbeat_seconds": 5,
+    "stale_main_safety_check_seconds": 2,
+    "secure_event_input_refuses_or_ends_private_control": true,
+    "no_automatic_macos_unlock": true,
+    "no_macos_password_stored_or_entered": true,
+    "ordinary_mode_permissions_preserved": true
+  },
+  "validation_scope": {
+    "synthetic_state_and_event_construction_only": true,
+    "real_harmless_subprocess_and_pipe_fixtures": true,
+    "live_rdp_connections_started": false,
+    "active_input_taps_created": false,
+    "screen_covers_created": false,
+    "host_lock_or_unlock_actions_run": false,
+    "permission_requests_run": false,
+    "installed_application_replaced": false
+  },
+  "limitations": [
+    "Experimental guard for the shared macOS login session; not isolated login or an atomic security boundary.",
+    "Secure Event Input can refuse locked/login-screen connections or end protected sessions when secure fields activate.",
+    "Physical keys, trackpad gestures, display hotplug, relocking and actual worker failure still require user device tests.",
+    "Other trusted software, administrator access, OS overrides and physical power controls are outside this guard."
+  ],
+  "device_test_instructions": "private-sessions.md"
+}
