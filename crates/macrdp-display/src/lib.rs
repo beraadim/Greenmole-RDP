@@ -13,6 +13,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 mod helper;
+#[cfg(target_os = "macos")]
+mod identity;
 #[cfg(any(target_os = "macos", test))]
 mod layout;
 #[cfg(target_os = "macos")]
@@ -186,13 +188,26 @@ impl DisplayController {
         height: u16,
         owner: impl Send + 'static,
     ) -> Result<Self> {
+        Self::new_with_owner_and_identity_slot(backend, width, height, owner, "default".to_owned())
+    }
+
+    /// Reuse one persisted monitor identity for this logical server. Concurrent
+    /// owners of the same slot are rejected; no new identity is invented to
+    /// bypass pending native cleanup. The physical backend does not use a slot.
+    pub fn new_with_owner_and_identity_slot(
+        backend: DisplayBackend,
+        width: u16,
+        height: u16,
+        owner: impl Send + 'static,
+        identity_slot: String,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !std::env::args_os().any(|arg| arg == HELPER_ARGUMENT),
             "Display helper entry hook was not called; call run_display_helper_if_requested before application initialization"
         );
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (backend, width, height, owner);
+            let _ = (backend, width, height, owner, identity_slot);
             anyhow::bail!("Display control requires macOS");
         }
         #[cfg(target_os = "macos")]
@@ -211,6 +226,7 @@ impl DisplayController {
                         backend,
                         width,
                         height,
+                        identity_slot,
                         receiver,
                         ready_tx,
                         worker_stopping,

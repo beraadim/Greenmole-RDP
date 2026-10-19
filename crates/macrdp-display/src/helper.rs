@@ -9,6 +9,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::identity::{IdentityLease, IdentityProof};
 use crate::macos::NativeDisplay;
 use crate::protocol::{read_message, write_message, Reply, Request};
 use crate::{normalize_size, DisplayBackend, DisplayGeometry, HELPER_ARGUMENT};
@@ -32,13 +33,17 @@ impl DisplayHelper {
         self.display_id.expect("initialized helper owns a display")
     }
 
-    pub(crate) fn new(width: u16, height: u16) -> Result<Self> {
+    pub(crate) fn new(width: u16, height: u16, identity_slot: &str) -> Result<Self> {
         ensure!(
             !std::env::args_os().any(|arg| arg == HELPER_ARGUMENT),
             "Display helper entry hook was not called; refusing recursive helper launch"
         );
         let mut helper = Self::spawn()?;
-        let geometry = helper.geometry_request(Request::Initialize { width, height })?;
+        let geometry = helper.geometry_request(Request::Initialize {
+            width,
+            height,
+            identity_slot: identity_slot.to_owned(),
+        })?;
         helper.display_id = Some(geometry.display_id);
         helper.verify_requested_size(&geometry, width, height)?;
         tracing::info!(
@@ -50,13 +55,24 @@ impl DisplayHelper {
     }
 
     fn spawn() -> Result<Self> {
+        Self::spawn_with_identity(None).map(|(helper, _)| helper)
+    }
+
+    fn spawn_with_identity(
+        identity: Option<&IdentityLease>,
+    ) -> Result<(Self, Option<IdentityProof>)> {
         let executable =
             std::env::current_exe().context("Could not locate display helper executable")?;
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg(HELPER_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let proof = identity
+            .map(|identity| identity.selector_proof(&mut command))
+            .transpose()?;
+        let mut child = command
             .spawn()
             .context("Could not launch display helper process")?;
         let input = child.stdin.take().expect("piped child stdin");
@@ -88,7 +104,29 @@ impl DisplayHelper {
             usable: true,
         };
         reader.context("Could not start display helper reply reader")?;
-        Ok(helper)
+        Ok((helper, proof))
+    }
+
+    pub(crate) fn validate_identity(identity: &IdentityLease) -> Result<()> {
+        let (mut selector, proof) = Self::spawn_with_identity(Some(identity))?;
+        let request = Request::ValidateIdentity {
+            identity: proof.expect("requested identity proof"),
+        };
+        write_message(
+            selector
+                .input
+                .as_mut()
+                .context("Selector input is closed")?,
+            &request,
+        )?;
+        match selector.receive_reply(Duration::from_millis(2500), false)? {
+            Reply::IdentityAvailable {} => {
+                selector.usable = false;
+                Ok(())
+            }
+            Reply::Error { message } => bail!("Display identity preflight: {message}"),
+            _ => bail!("Unexpected display identity preflight reply"),
+        }
     }
 
     fn geometry_request(&mut self, request: Request) -> Result<DisplayGeometry> {
@@ -97,18 +135,18 @@ impl DisplayHelper {
 
     pub(crate) fn select_mode(
         display_id: u32,
-        serial: u32,
+        identity: &IdentityLease,
         width: u16,
         height: u16,
     ) -> Result<DisplayGeometry> {
         // This intentionally launches a one-shot selector from the owner helper;
         // it never creates another display owner or recursively launches itself.
-        let mut selector = Self::spawn()?;
+        let (mut selector, proof) = Self::spawn_with_identity(Some(identity))?;
         selector.display_id = Some(display_id);
         let geometry = selector.geometry_request_with_options(
             Request::SelectMode {
                 display_id,
-                serial,
+                identity: proof.expect("requested identity proof"),
                 width,
                 height,
             },
@@ -122,16 +160,16 @@ impl DisplayHelper {
 
     pub(crate) fn configure_layout(
         display_id: u32,
-        serial: u32,
+        identity: &IdentityLease,
         primary: u32,
         displays: Vec<crate::layout::Placement>,
     ) -> Result<DisplayGeometry> {
-        let mut selector = Self::spawn()?;
+        let (mut selector, proof) = Self::spawn_with_identity(Some(identity))?;
         selector.display_id = Some(display_id);
         let geometry = selector.geometry_request_with_options(
             Request::ConfigureLayout {
                 display_id,
-                serial,
+                identity: proof.expect("requested identity proof"),
                 primary,
                 displays,
             },
@@ -197,6 +235,7 @@ impl DisplayHelper {
                     geometry
                 }
                 Reply::Error { message } => bail!("Display helper: {message}"),
+                Reply::IdentityAvailable {} => bail!("Unexpected identity preflight reply"),
                 Reply::Stopped {} => bail!("Display helper stopped during a geometry request"),
             };
             ensure!(
@@ -356,6 +395,9 @@ pub(crate) fn run_child() -> Result<()> {
     let mut input = BufReader::new(std::io::stdin().lock());
     let mut output = BufWriter::new(std::io::stdout().lock());
     let mut owner: Option<NativeDisplay> = None;
+    // Retain inherited ownership beyond the native call and reply. IdentityLease
+    // also pins a duplicate until process exit for WindowServer retirement.
+    let mut selector_identity: Option<IdentityLease> = None;
     let mut acknowledge_shutdown = false;
     let outcome = loop {
         let request = match read_message::<Request>(&mut input) {
@@ -369,14 +411,45 @@ pub(crate) fn run_child() -> Result<()> {
         }
         let one_shot = matches!(
             request,
-            Request::SelectMode { .. } | Request::ConfigureLayout { .. }
+            Request::ValidateIdentity { .. }
+                | Request::SelectMode { .. }
+                | Request::ConfigureLayout { .. }
         );
+        if let Request::ValidateIdentity { identity } = request {
+            let response = (|| {
+                ensure!(
+                    owner.is_none() && selector_identity.is_none(),
+                    "Identity preflight requires a fresh selector process"
+                );
+                selector_identity = Some(IdentityLease::inherit(&identity)?);
+                crate::selector::validate_available(
+                    selector_identity.as_ref().expect("inherited identity"),
+                )
+            })();
+            match response {
+                Ok(()) => write_message(&mut output, &Reply::IdentityAvailable {})?,
+                Err(error) => {
+                    let _ = write_message(
+                        &mut output,
+                        &Reply::Error {
+                            message: format!("{error:#}"),
+                        },
+                    );
+                    break Err(error);
+                }
+            }
+            break Ok(());
+        }
         let response = autoreleasepool(|_| -> Result<DisplayGeometry> {
             match request {
-                Request::Initialize { width, height } => {
+                Request::Initialize {
+                    width,
+                    height,
+                    identity_slot,
+                } => {
                     ensure!(owner.is_none(), "Display helper was already initialized");
                     validate_size(width, height)?;
-                    owner = Some(NativeDisplay::new(DisplayBackend::Virtual, width, height)?);
+                    owner = Some(NativeDisplay::new_virtual(width, height, &identity_slot)?);
                     owner.as_ref().expect("initialized owner").geometry()
                 }
                 Request::Geometry {} => owner
@@ -400,7 +473,7 @@ pub(crate) fn run_child() -> Result<()> {
                 }
                 Request::SelectMode {
                     display_id,
-                    serial,
+                    identity,
                     width,
                     height,
                 } => {
@@ -409,11 +482,21 @@ pub(crate) fn run_child() -> Result<()> {
                         "Mode selection requires a fresh selector process"
                     );
                     validate_size(width, height)?;
-                    crate::selector::select_mode(display_id, serial, width, height)
+                    ensure!(
+                        selector_identity.is_none(),
+                        "Selector identity was already initialized"
+                    );
+                    selector_identity = Some(IdentityLease::inherit(&identity)?);
+                    crate::selector::select_mode(
+                        display_id,
+                        selector_identity.as_ref().expect("inherited identity"),
+                        width,
+                        height,
+                    )
                 }
                 Request::ConfigureLayout {
                     display_id,
-                    serial,
+                    identity,
                     primary,
                     displays,
                 } => {
@@ -421,9 +504,19 @@ pub(crate) fn run_child() -> Result<()> {
                         owner.is_none(),
                         "Layout configuration requires a fresh selector process"
                     );
-                    crate::selector::configure_layout(display_id, serial, primary, &displays)
+                    ensure!(
+                        selector_identity.is_none(),
+                        "Selector identity was already initialized"
+                    );
+                    selector_identity = Some(IdentityLease::inherit(&identity)?);
+                    crate::selector::configure_layout(
+                        display_id,
+                        selector_identity.as_ref().expect("inherited identity"),
+                        primary,
+                        &displays,
+                    )
                 }
-                Request::Shutdown {} => unreachable!(),
+                Request::ValidateIdentity { .. } | Request::Shutdown {} => unreachable!(),
             }
         });
         match response {

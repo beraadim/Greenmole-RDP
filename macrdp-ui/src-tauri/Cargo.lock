@@ -3344,7 +3344,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3384,6 +3384,9 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "core-graphics",
+ "dirs 6.0.0",
+ "getrandom 0.2.17",
+ "libc",
  "objc2",
  "objc2-foundation",
  "serde",
@@ -3433,7 +3436,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-ui"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "chrono",

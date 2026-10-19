@@ -12,7 +12,6 @@ use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{msg_send, sel};
 use objc2_foundation::{NSArray, NSPoint, NSSize, NSString};
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{MAX_VIRTUAL_HEIGHT, MAX_VIRTUAL_WIDTH};
 pub(crate) const VENDOR_ID: u32 = 0x4D52;
@@ -21,8 +20,6 @@ pub(crate) const PRODUCT_ID: u32 = 1;
 extern "C" {
     fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut AnyObject;
 }
-
-static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 struct Classes {
     descriptor: &'static AnyClass,
@@ -132,22 +129,20 @@ pub(crate) struct VirtualDisplay {
     settings: Option<Retained<AnyObject>>,
     classes: Classes,
     id: u32,
-    serial: u32,
+    identity: crate::identity::IdentityLease,
 }
 
 impl VirtualDisplay {
-    pub(crate) fn new(width: u16, height: u16) -> Result<Self> {
+    pub(crate) fn new(width: u16, height: u16, slot: &str) -> Result<Self> {
+        let identity = crate::identity::IdentityLease::acquire(slot)?;
+        // A disposable selector checks collisions without warming this owner's
+        // CoreGraphics mode cache before the virtual display becomes active.
+        crate::helper::DisplayHelper::validate_identity(&identity)?;
+        identity.validate_current()?;
         let classes = Classes::load()?;
         let descriptor = instantiate(classes.descriptor)?;
         let name = NSString::from_str("macRDP Remote Display");
-        // Each live display needs a distinct nonzero identity. The process ID
-        // distinguishes concurrently running servers; the counter distinguishes
-        // controller instances within one process. The vendor/product values
-        // below are application identifiers rather than a physical monitor ID.
-        let serial = std::process::id()
-            .wrapping_mul(65537)
-            .wrapping_add(NEXT_SERIAL.fetch_add(1, Ordering::Relaxed))
-            .max(1);
+        let serial = identity.serial();
         // SAFETY: This is a process-lifetime dispatch queue, not an Objective-C
         // object transferred from another Rust thread. All setter ABIs were
         // validated above; the descriptor retains its queue and name.
@@ -193,9 +188,10 @@ impl VirtualDisplay {
             settings: None,
             classes,
             id,
-            serial,
+            identity,
         };
         owner.apply_mode(width, height)?;
+        eprintln!("macrdp virtual display created: display_id={id} serial={serial}");
         tracing::info!(
             display_id = id,
             width,
@@ -209,8 +205,8 @@ impl VirtualDisplay {
         self.id
     }
 
-    pub(crate) fn serial(&self) -> u32 {
-        self.serial
+    pub(crate) fn identity(&self) -> &crate::identity::IdentityLease {
+        &self.identity
     }
 
     pub(crate) fn apply_mode(&mut self, width: u16, height: u16) -> Result<()> {

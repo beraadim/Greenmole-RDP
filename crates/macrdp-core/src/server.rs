@@ -501,13 +501,17 @@ async fn start_server_inner(
 
     let tls_certificate = tls::inspect_tls_certificate(&cert_path)?;
     let backend = config.display_backend;
+    // Binding-address changes should not create another remembered monitor.
+    // Same-user servers sharing a port intentionally share the ownership slot.
+    let display_identity_slot = format!("rdp-port-{}", config.port);
     let preparation_owner = owner.clone();
     let (display_controller, geometry) = tokio::task::spawn_blocking(move || {
-        let display = macrdp_display::DisplayController::new_with_owner(
+        let display = macrdp_display::DisplayController::new_with_owner_and_identity_slot(
             backend,
             1920,
             1080,
             preparation_owner,
+            display_identity_slot,
         )?;
         // Physical geometry queries can also wait on the native display worker.
         // Keep them off the async caller so startup cancellation remains usable.

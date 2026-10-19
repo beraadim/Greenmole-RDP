@@ -4,6 +4,9 @@ use core_foundation::string::CFString;
 use core_foundation_sys::string::CFStringRef;
 use std::time::{Duration, Instant};
 
+mod lease;
+use lease::WakeLease;
+
 type IOPMAssertionID = u32;
 type IOPMAssertionLevel = u32;
 type IOPMUserActiveType = u32;
@@ -12,6 +15,10 @@ type IOReturn = i32;
 const K_IOPM_ASSERTION_LEVEL_ON: IOPMAssertionLevel = 255;
 const K_IOPM_USER_ACTIVE_REMOTE: IOPMUserActiveType = 1;
 const K_IORETURN_SUCCESS: IOReturn = 0;
+// IOKit's iokit_common_err(0x2f0); activity assertions expire automatically.
+const K_IORETURN_NOT_FOUND: IOReturn = 0xe000_02f0u32 as i32;
+// powerd also reports a no-longer-existing assertion as BadArgument.
+const K_IORETURN_BAD_ARGUMENT: IOReturn = 0xe000_02c2u32 as i32;
 const WAKE_ACTIVITY_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const DISPLAY_SLEEP_ASSERTION_TYPE: &str = "PreventUserIdleDisplaySleep";
 const DISPLAY_SLEEP_REASON: &str = "macrdp remote session active";
@@ -32,23 +39,19 @@ extern "C" {
         assertion_id: *mut IOPMAssertionID,
     ) -> IOReturn;
 
-    fn IOPMAssertionRelease(assertion_id: IOPMAssertionID);
+    fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> IOReturn;
 }
 
 /// Keeps the display awake for an active remote session and nudges it awake
 /// when fresh remote input arrives.
 pub struct RemoteSessionWake {
-    display_sleep_assertion_id: Option<IOPMAssertionID>,
-    user_activity_assertion_id: IOPMAssertionID,
-    last_user_activity: Option<Instant>,
+    lease: WakeLease,
 }
 
 impl RemoteSessionWake {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            display_sleep_assertion_id: None,
-            user_activity_assertion_id: 0,
-            last_user_activity: None,
+            lease: WakeLease::default(),
         })
     }
 
@@ -65,6 +68,7 @@ impl RemoteSessionWake {
         let now = Instant::now();
         if !force
             && self
+                .lease
                 .last_user_activity
                 .is_some_and(|last| now.duration_since(last) < WAKE_ACTIVITY_MIN_INTERVAL)
         {
@@ -72,7 +76,7 @@ impl RemoteSessionWake {
         }
 
         let assertion_name = CFString::new(USER_ACTIVITY_REASON);
-        let mut assertion_id = self.user_activity_assertion_id;
+        let mut assertion_id = self.lease.user_activity_assertion_id.unwrap_or(0);
         let result = unsafe {
             IOPMAssertionDeclareUserActivity(
                 assertion_name.as_concrete_TypeRef(),
@@ -87,14 +91,14 @@ impl RemoteSessionWake {
             ));
         }
 
-        self.user_activity_assertion_id = assertion_id;
-        self.last_user_activity = Some(now);
+        self.lease.user_activity_assertion_id = Some(assertion_id);
+        self.lease.last_user_activity = Some(now);
         tracing::debug!(trigger, "Declared remote user activity for display wake");
         Ok(())
     }
 
     pub fn activate_display_sleep_assertion(&mut self) -> Result<()> {
-        if self.display_sleep_assertion_id.is_some() {
+        if self.lease.display_sleep_assertion_id.is_some() {
             return Ok(());
         }
 
@@ -116,32 +120,21 @@ impl RemoteSessionWake {
             ));
         }
 
-        self.display_sleep_assertion_id = Some(display_sleep_assertion_id);
+        self.lease.display_sleep_assertion_id = Some(display_sleep_assertion_id);
         Ok(())
     }
 
+    /// End the remote session's entire wake lease, including its timed activity
+    /// assertion. Keeping the latter until Drop would postpone local display
+    /// sleep after disconnect by as much as the display's configured idle time.
     pub fn deactivate_display_sleep_assertion(&mut self) {
-        if let Some(assertion_id) = self.display_sleep_assertion_id.take() {
-            unsafe {
-                IOPMAssertionRelease(assertion_id);
-            }
-        }
-        self.last_user_activity = None;
+        self.lease
+            .release_with(|assertion_id| unsafe { IOPMAssertionRelease(assertion_id) });
     }
 }
 
 impl Drop for RemoteSessionWake {
     fn drop(&mut self) {
-        if self.user_activity_assertion_id != 0 {
-            unsafe {
-                IOPMAssertionRelease(self.user_activity_assertion_id);
-            }
-        }
-
-        if let Some(assertion_id) = self.display_sleep_assertion_id.take() {
-            unsafe {
-                IOPMAssertionRelease(assertion_id);
-            }
-        }
+        self.deactivate_display_sleep_assertion();
     }
 }

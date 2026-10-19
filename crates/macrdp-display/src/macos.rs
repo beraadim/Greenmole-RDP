@@ -69,18 +69,20 @@ impl NativeDisplay {
                 tracing::info!(?geometry, "Pinned main display without changing its mode");
                 Ok(owner)
             }
-            DisplayBackend::Virtual => {
-                let virtual_display = VirtualDisplay::new(width, height)?;
-                let owner = Self {
-                    display_id: virtual_display.id(),
-                    virtual_display: Some(virtual_display),
-                    session_layout: None,
-                    windows: window_session::SessionState::default(),
-                };
-                owner.wait_for_mode(width, height)?;
-                Ok(owner)
-            }
+            DisplayBackend::Virtual => Self::new_virtual(width, height, "default"),
         }
+    }
+
+    pub(crate) fn new_virtual(width: u16, height: u16, identity_slot: &str) -> Result<Self> {
+        let virtual_display = VirtualDisplay::new(width, height, identity_slot)?;
+        let owner = Self {
+            display_id: virtual_display.id(),
+            virtual_display: Some(virtual_display),
+            session_layout: None,
+            windows: window_session::SessionState::default(),
+        };
+        owner.wait_for_mode(width, height)?;
+        Ok(owner)
     }
 
     pub(crate) fn geometry(&self) -> Result<DisplayGeometry> {
@@ -202,13 +204,12 @@ impl NativeDisplay {
             return self.geometry();
         }
         let displays = snapshot.promoted(self.display_id)?;
-        let serial = virtual_display.serial();
         // Retain the original before native mutation so teardown can restore it
         // even after a configuration timeout or a partially reported failure.
         self.session_layout = Some(snapshot);
         let geometry = crate::helper::DisplayHelper::configure_layout(
             self.display_id,
-            serial,
+            virtual_display.identity(),
             self.display_id,
             displays,
         )?;
@@ -232,14 +233,14 @@ impl NativeDisplay {
         }
         let live = self.live_layout()?;
         let (primary, displays) = snapshot.restored(&live, self.display_id)?;
-        let serial = self
+        let identity = self
             .virtual_display
             .as_ref()
             .context("Missing owned virtual display")?
-            .serial();
+            .identity();
         let geometry = crate::helper::DisplayHelper::configure_layout(
             self.display_id,
-            serial,
+            identity,
             primary,
             displays,
         )?;
@@ -334,12 +335,12 @@ impl NativeDisplay {
             !display.is_in_mirror_set(),
             "Refusing to change a mirrored virtual display mode"
         );
-        let serial = self
+        let identity = self
             .virtual_display
             .as_ref()
             .expect("virtual owner checked")
-            .serial();
-        crate::helper::DisplayHelper::select_mode(self.display_id, serial, width, height)?;
+            .identity();
+        crate::helper::DisplayHelper::select_mode(self.display_id, identity, width, height)?;
         Ok(true)
     }
 
@@ -432,6 +433,7 @@ mod tests {
             helper: None,
             initial_width: 1280,
             initial_height: 720,
+            identity_slot: "test".to_owned(),
         };
         let (request, _preparation) = crate::window_move::Request::new(|_| {
             panic!("disconnected action must never reach application windows")
@@ -450,6 +452,7 @@ enum WorkerOwner {
         helper: Option<crate::helper::DisplayHelper>,
         initial_width: u16,
         initial_height: u16,
+        identity_slot: String,
     },
 }
 
@@ -484,11 +487,13 @@ impl WorkerOwner {
                 helper,
                 initial_width,
                 initial_height,
+                identity_slot,
             } => {
                 if helper.is_none() {
                     *helper = Some(crate::helper::DisplayHelper::new(
                         *initial_width,
                         *initial_height,
+                        identity_slot,
                     )?);
                 }
                 helper
@@ -537,11 +542,20 @@ impl WorkerOwner {
     }
 
     fn prepare_remote_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
-        if let Self::Virtual { helper, .. } = self {
+        if let Self::Virtual {
+            helper,
+            identity_slot,
+            ..
+        } = self
+        {
             if helper.is_none() {
                 // Use the negotiated client dimensions for the very first
                 // mode; no startup-size screen or extra initial resize exists.
-                *helper = Some(crate::helper::DisplayHelper::new(width, height)?);
+                *helper = Some(crate::helper::DisplayHelper::new(
+                    width,
+                    height,
+                    identity_slot,
+                )?);
             }
         }
         let result = self
@@ -583,6 +597,7 @@ pub(crate) fn run_worker(
     backend: DisplayBackend,
     width: u16,
     height: u16,
+    identity_slot: String,
     receiver: mpsc::Receiver<Command>,
     ready: mpsc::Sender<Result<()>>,
     stopping: Arc<AtomicBool>,
@@ -594,6 +609,7 @@ pub(crate) fn run_worker(
             helper: None,
             initial_width: width,
             initial_height: height,
+            identity_slot,
         }),
     }) {
         Ok(owner) => owner,

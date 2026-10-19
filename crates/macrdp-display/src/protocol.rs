@@ -9,12 +9,30 @@ use crate::DisplayGeometry;
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
+/// Transport only; native helper code validates all fields against the inherited
+/// same-user lease descriptor before making any CoreGraphics call.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdentityProof {
+    pub serial: u32,
+    pub owner_pid: u32,
+    pub generation: [u8; 16],
+    pub fd: i32,
+    pub device: u64,
+    pub inode: u64,
+    pub slot: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
     Initialize {
         width: u16,
         height: u16,
+        identity_slot: String,
+    },
+    ValidateIdentity {
+        identity: IdentityProof,
     },
     Geometry {},
     BeginRemoteSession {},
@@ -25,13 +43,13 @@ pub(crate) enum Request {
     },
     SelectMode {
         display_id: u32,
-        serial: u32,
+        identity: IdentityProof,
         width: u16,
         height: u16,
     },
     ConfigureLayout {
         display_id: u32,
-        serial: u32,
+        identity: IdentityProof,
         primary: u32,
         displays: Vec<crate::layout::Placement>,
     },
@@ -55,6 +73,7 @@ pub(crate) enum Reply {
         #[serde(default)]
         windows: WindowStatus,
     },
+    IdentityAvailable {},
     Stopped {},
     Error {
         message: String,
@@ -130,6 +149,34 @@ mod tests {
             })
         ));
         assert!(read_message::<Request>(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn selector_identity_proof_round_trips_and_rejects_extra_fields() {
+        let proof = IdentityProof {
+            serial: 42,
+            owner_pid: 123,
+            generation: [7; 16],
+            fd: 9,
+            device: 5,
+            inode: 6,
+            slot: "rdp-port-3389".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &Request::ValidateIdentity { identity: proof }).unwrap();
+        assert!(
+            matches!(read_message::<Request>(&mut Cursor::new(bytes)).unwrap(),
+            Some(Request::ValidateIdentity { identity }) if identity.serial == 42 && identity.generation == [7; 16])
+        );
+        for invalid in [
+            br#"{"operation":"initialize","width":1928,"height":1088}"#.as_slice(),
+            br#"{"operation":"select_mode","display_id":17,"serial":42,"width":1928,"height":1088}"#,
+            br#"{"serial":42,"owner_pid":123,"generation":[1],"fd":9,"device":5,"inode":6,"slot":"default"}"#,
+            br#"{"serial":42,"owner_pid":123,"generation":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"fd":9,"device":5,"inode":6,"slot":"default","extra":true}"#,
+        ] {
+            assert!(serde_json::from_slice::<Request>(invalid).is_err());
+            assert!(serde_json::from_slice::<IdentityProof>(invalid).is_err());
+        }
     }
 
     #[test]

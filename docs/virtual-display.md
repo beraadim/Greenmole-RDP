@@ -45,6 +45,31 @@ alive for that connection. Browser resizes change its mode in place. Disconnect
 restores the previous primary display and removes the virtual screen; reconnect
 creates a new one. Server shutdown also cleans up any active display.
 
+From 0.1.25, new sessions reuse a persisted monitor serial for the same macOS
+user and RDP listening port. Changing the bind address does not change this
+identity. The standalone display-controller API uses a separate default slot.
+The descriptor's vendor, product, name and color characteristics stay fixed.
+No display or capture stream is kept alive while disconnected.
+Identity records are stored in `~/.macrdp/display-identities/`, with a private
+directory and same-user files. Keep these records when updating the application
+to preserve monitor identity.
+
+An exclusive identity lease prevents two helpers from creating the same monitor.
+Configuration selectors inherit that lease and validate a separate session
+generation, so a late selector cannot act on a subsequent session's reused
+identity. A busy or invalid identity slot rejects display creation; macrdp does
+not work around it by inventing another monitor serial. Concurrent same-user
+servers using the same port also share this slot, even on different bind IPs.
+Normal disconnect and process exit release ownership automatically; do not delete
+identity files to bypass a pending owner.
+
+macOS previously retained a new ICC profile and display UUID for successive
+sessions. Existing profiles and display preferences are left intact. Verify UUID
+and profile-count stability across reconnects on the target macOS version:
+constant descriptor identity is now provided, but the private virtual-display
+API still controls macOS's UUID/profile behavior. This change has not established
+the cause of a previously observed ColorSync/WindowServer backlog.
+
 ## Main display during a remote session
 
 The virtual display becomes primary before capture and pointer coordinates are
@@ -89,11 +114,17 @@ macOS control. Using the button does not overwrite captured windows' original
 positions or sizes.
 
 Disconnect and normal server shutdown restore the prior primary display and
-display origins before removing the virtual screen. These are temporary display
-settings, not a change to saved system preferences. The helper also attempts restoration when its parent closes
+display origins before removing the virtual screen. Configuration transactions
+use session scope rather than requesting permanent layout changes. macOS can
+still remember monitor identities and profiles. The helper also attempts restoration when its parent closes
 the control pipe. A forced termination of the helper or a changed display layout
 may prevent exact restoration. Dock autohide and macOS Spaces settings still
 control the Dock's normal appearance.
+
+Disconnect also releases both the display-sleep prevention assertion and remote
+user-activity assertion. Expired activity assertions are harmless during cleanup;
+unexpected release failures are logged and retained for a later cleanup retry.
+Local input and other applications can still delay the normal display-idle timer.
 
 ## Guacamole connection
 
