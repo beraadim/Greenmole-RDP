@@ -129,9 +129,12 @@ pub async fn request_permissions(
             "Stop the server and wait for display cleanup before requesting permissions.".into(),
         );
     }
-    let perms = tokio::task::spawn_blocking(macrdp_core::permissions::request_permissions)
-        .await
-        .map_err(|error| error.to_string())?;
+    let private_session = state.ui_config.lock().await.private_session;
+    let perms = tokio::task::spawn_blocking(move || {
+        macrdp_core::permissions::request_session_permissions(private_session)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     serde_json::to_value(perms).map_err(|error| error.to_string())
 }
 

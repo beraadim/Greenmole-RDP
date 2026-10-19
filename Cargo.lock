@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2188,6 +2188,7 @@ dependencies = [
  "macrdp-display",
  "macrdp-encode",
  "macrdp-input",
+ "macrdp-privacy",
  "rcgen",
  "ring",
  "security-framework",
@@ -2245,8 +2246,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "macrdp-privacy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "tracing",
+]
+
+[[package]]
 name = "macrdp-server"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "clap",

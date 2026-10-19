@@ -1408,16 +1408,11 @@ impl RdpServer {
         // Publish the terminal outcome while the handler still owns its
         // connection; its disconnect callback snapshots this structured reason.
         if !matches!(state, Ok(RunState::DeactivationReactivation { .. })) {
-            let fallback = match source {
-                "control" if quit_received.get() => ConnectionOutcome::ServerShutdown,
-                "control" => ConnectionOutcome::CredentialsChanged,
-                "output-queue" => ConnectionOutcome::OutputOverflow,
-                "idle-timeout" => ConnectionOutcome::IdleTimeout,
-                "display" if state.is_ok() => ConnectionOutcome::CaptureEnded,
-                "display" => ConnectionOutcome::CaptureError,
-                _ if state.is_ok() => ConnectionOutcome::ClientDisconnect,
-                _ => ConnectionOutcome::ProtocolError,
-            };
+            let fallback = crate::gfx::terminal_fallback(
+                source,
+                state.is_ok(),
+                quit_received.get(),
+            );
             let reason = match &state {
                 Err(error) => error_outcome(error, fallback),
                 Ok(_) => fallback,
@@ -1520,6 +1515,11 @@ impl RdpServer {
                 client_name: result.client_name.clone(),
                 keyboard_layout: result.keyboard_layout,
             };
+            if !result.reactivation {
+                handler
+                    .prepare_connection()
+                    .context("Platform session protection rejected the connection")?;
+            }
             handler.update_client_context(context.clone());
             // Reactivation is a resize within the same connection. Preserve
             // session state and the original connected-at timestamp across it.

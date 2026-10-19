@@ -32,6 +32,7 @@ type CategoryId = (typeof categories)[number]["id"];
 
 const restartLabels: Record<string, string> = {
   display_backend: "display", bind_address: "bind address", port: "port",
+  private_session: "guarded private session",
   idle_timeout_secs: "idle timeout", tls_cert_path: "certificate", tls_key_path: "certificate key",
   tls_server_names: "certificate names", audio_enabled: "system audio",
   clipboard_enabled: "clipboard synchronization", clipboard_file_transfer: "file transfers",
@@ -190,6 +191,23 @@ function Settings() {
 
         {activeCategory === "security" && (
           <CategorySection title="Security">
+            <SettingRow label="Guarded private session"
+              description={config.display_backend === "virtual"
+                ? "Requires service restart"
+                : "Select Virtual display under Display first"}>
+              <Switch aria-label="Guarded private session"
+                checked={config.private_session}
+                disabled={config.display_backend !== "virtual"}
+                onCheckedChange={(enabled) => updateConfig("private_session", enabled)} />
+            </SettingRow>
+            <p className="py-2 text-xs text-text-muted">
+              Hides physical screens and blocks local keyboard and pointer input
+              while connected. Restores the locked state on disconnect if this
+              Mac was locked before connecting; a guard failure locks the Mac.
+              Accessibility and Input Monitoring access are required.
+              This shares your macOS session and does not isolate it from local
+              administrator access or physical power controls.
+            </p>
             <SettingRow label="Username">
               <Input
                 type="text"
@@ -232,11 +250,17 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="main">Main display</SelectItem>
+                  <SelectItem value="main" disabled={config.private_session}>Main display</SelectItem>
                   <SelectItem value="virtual">Virtual display (experimental)</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>
+
+            {config.private_session && (
+              <p className="py-2 text-xs text-text-muted">
+                Disable Guarded private session under Security before selecting the main display.
+              </p>
+            )}
 
             {config.display_backend === "virtual" && (
               <p className="py-2 text-xs text-text-muted">

@@ -168,6 +168,8 @@ pub(super) async fn supervise(
             loop {
                 if macrdp_display::list_owned_virtual_displays()
                     .is_ok_and(|ids| ids.iter().all(|id| retirement_baseline.contains(id)))
+                    && (!config.private_session
+                        || macrdp_privacy::guard_recovery_pending().is_ok_and(|pending| !pending))
                 {
                     break;
                 }

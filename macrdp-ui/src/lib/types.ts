@@ -80,6 +80,7 @@ export interface LogEntry {
 export interface PermissionStatus {
   screen_capture: boolean;
   accessibility: boolean;
+  input_monitoring: boolean;
   microphone: boolean;
 }
 
@@ -147,6 +148,7 @@ export interface UiConfig {
   username: string;
   password: string;
   display_backend: "main" | "virtual";
+  private_session: boolean;
   resolution: string;
   show_cursor: boolean;
   audio_enabled: boolean;

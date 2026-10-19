@@ -33,6 +33,13 @@ async fn start_server_on_launch(app: tauri::AppHandle) {
 }
 
 pub fn run() {
+    if let Some(result) = macrdp_core::run_guard_helper_if_requested() {
+        if let Err(error) = result {
+            eprintln!("Private session guard failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Dispatch before AppKit/Tauri, including the single-instance plugin, can
     // query displays or activate the UI in this background owner process.
     if let Some(result) = macrdp_core::run_display_helper_if_requested() {

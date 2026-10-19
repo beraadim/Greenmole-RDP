@@ -1,5 +1,6 @@
+use crate::event_tag::{post_remote_event, private_modifier_flags, remote_event_tag};
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, EventField};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
@@ -64,8 +65,12 @@ impl MouseInjector {
     }
 
     fn source() -> Result<CGEventSource> {
-        CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
+        let state = if private_modifier_flags().is_some() {
+            CGEventSourceStateID::Private
+        } else {
+            CGEventSourceStateID::HIDSystemState
+        };
+        CGEventSource::new(state).map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
     }
 
     /// Move in global CoreGraphics points, including negative secondary-display origins.
@@ -102,7 +107,7 @@ impl MouseInjector {
         click_count: i64,
     ) -> Result<()> {
         let event = Self::create_mouse_event(event_type, button, point, click_count)?;
-        event.post(CGEventTapLocation::HID);
+        post_remote_event(&event)?;
         Ok(())
     }
 
@@ -124,6 +129,9 @@ impl MouseInjector {
         );
         let event = unsafe { CGEvent::from_ptr(event_ref) };
         event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
+        if let Some(flags) = private_modifier_flags() {
+            event.set_flags(flags);
+        }
         Ok(event)
     }
 
@@ -150,14 +158,39 @@ impl MouseInjector {
     }
 
     fn post_scroll(x: i32, y: i32) -> Result<()> {
+        let event = Self::create_scroll_event(x, y, private_modifier_flags())?;
+        post_remote_event(&event)
+    }
+
+    fn create_scroll_event(x: i32, y: i32, flags: Option<CGEventFlags>) -> Result<CGEvent> {
+        // Preserve the ordinary null-source behavior outside private mode.
+        // Guarded scrolling uses the same remote-only modifiers as clicks.
+        let source = if flags.is_some() {
+            Some(
+                CGEventSource::new(CGEventSourceStateID::Private)
+                    .map_err(|_| anyhow::anyhow!("Failed to create private scroll event source"))?,
+            )
+        } else {
+            None
+        };
         unsafe {
-            let event_ref =
-                CGEventCreateScrollWheelEvent2(std::ptr::null_mut(), SCROLL_UNIT_LINE, 2, y, x, 0);
+            let event_ref = CGEventCreateScrollWheelEvent2(
+                source
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), |source| source.as_ptr()),
+                SCROLL_UNIT_LINE,
+                2,
+                y,
+                x,
+                0,
+            );
             anyhow::ensure!(!event_ref.is_null(), "Failed to create scroll event");
             let event = CGEvent::from_ptr(event_ref);
-            event.post(CGEventTapLocation::HID);
+            if let Some(flags) = flags {
+                event.set_flags(flags);
+            }
+            Ok(event)
         }
-        Ok(())
     }
 }
 
@@ -213,7 +246,9 @@ impl MouseState {
         )?;
         self.clicks.move_to((x, y));
         self.position = (x, y);
-        tracing::trace!(x, y, ?event_type, "Mouse moved");
+        if remote_event_tag() == 0 {
+            tracing::trace!(x, y, ?event_type, "Mouse moved");
+        }
         Ok(())
     }
 
@@ -267,7 +302,9 @@ impl MouseState {
         self.pressed[button as usize] = pressed;
         self.position = (x, y);
         self.clicks = clicks;
-        tracing::trace!(?button, pressed, x, y, click_count, "Mouse button event");
+        if remote_event_tag() == 0 {
+            tracing::trace!(?button, pressed, x, y, click_count, "Mouse button event");
+        }
         Ok(())
     }
 

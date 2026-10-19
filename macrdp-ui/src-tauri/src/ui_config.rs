@@ -30,6 +30,7 @@ pub struct UiConfig {
 
     // ── Display ─────────────────────────────────────────────
     pub display_backend: DisplayBackend,
+    pub private_session: bool,
     #[serde(alias = "hidpi_scale")]
     pub resolution: String,
     pub show_cursor: bool,
@@ -73,6 +74,7 @@ impl Default for UiConfig {
             tls_key_path: String::new(),
             tls_server_names: Vec::new(),
             display_backend: DisplayBackend::Main,
+            private_session: false,
             resolution: "auto".to_string(),
             show_cursor: false,
             audio_enabled: true,
@@ -175,6 +177,9 @@ impl UiConfig {
         save_password: impl Fn(&str) -> Result<(), String>,
         delete_password: impl Fn() -> Result<(), String>,
     ) -> Result<(), String> {
+        if self.private_session && self.display_backend != DisplayBackend::Virtual {
+            return Err("Guarded private sessions require the virtual display backend".into());
+        }
         if self.password.is_empty() || self.username.trim().is_empty() {
             return Err("A nonempty username and password are required".to_string());
         }
@@ -213,7 +218,7 @@ impl UiConfig {
     }
 
     /// Update a single field by key name from a JSON value.
-    /// Listener, channel policy, idle timeout, and display backend changes require a restart. Changing the initial
+    /// Listener, channel policy, idle timeout, display backend and private-session changes require a restart. Changing the initial
     /// virtual display resolution also requires a restart so `auto` can resume
     /// following client requests. Virtual display port changes require a restart
     /// to avoid creating overlapping display owners. Other settings use their live update
@@ -289,8 +294,24 @@ impl UiConfig {
                 self.password = password;
             }
             "display_backend" => {
-                self.display_backend = serde_json::from_value(value.clone())
+                let backend = serde_json::from_value(value.clone())
                     .map_err(|_| "display_backend must be main or virtual")?;
+                if self.private_session && backend != DisplayBackend::Virtual {
+                    return Err(
+                        "Disable guarded private sessions before selecting the main display".into(),
+                    );
+                }
+                self.display_backend = backend;
+            }
+            "private_session" => {
+                let enabled = value.as_bool().ok_or("private_session must be a boolean")?;
+                if enabled && self.display_backend != DisplayBackend::Virtual {
+                    return Err(
+                        "Select the virtual display before enabling guarded private sessions"
+                            .into(),
+                    );
+                }
+                self.private_session = enabled;
             }
             "resolution" | "hidpi_scale" => {
                 self.resolution = value
@@ -368,6 +389,7 @@ impl UiConfig {
         matches!(
             key,
             "display_backend"
+                | "private_session"
                 | "bind_address"
                 | "port"
                 | "idle_timeout_secs"
@@ -390,6 +412,7 @@ impl UiConfig {
             bind_address: Some(self.bind_address.clone()),
             frame_rate: self.frame_rate,
             display_backend: self.display_backend,
+            private_session: self.private_session,
             width: 0,  // auto-detect
             height: 0, // auto-detect
             username: Some(self.username.clone()),
@@ -428,6 +451,64 @@ impl UiConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn private_sessions_migrate_persist_and_require_a_restart_in_both_directions() {
+        let mut config: UiConfig = toml::from_str("username = 'fixture-user'").unwrap();
+        assert!(!config.private_session);
+        config.password = "fixture-secret".into();
+        config
+            .set_field("display_backend", &json!("virtual"))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.toml");
+        for enabled in [true, false] {
+            assert!(config
+                .set_field("private_session", &json!(enabled))
+                .unwrap());
+            for backend in [DisplayBackend::Main, DisplayBackend::Virtual] {
+                assert!(config.requires_restart("private_session", Some(backend)));
+            }
+            config
+                .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
+                .unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            let saved: UiConfig = toml::from_str(&content).unwrap();
+            assert_eq!(saved.private_session, enabled);
+            assert_eq!(saved.to_server_config().private_session, enabled);
+            assert!(!content.contains("fixture-secret"));
+        }
+    }
+
+    #[test]
+    fn invalid_private_session_updates_do_not_weaken_saved_policy() {
+        let mut config = UiConfig::default();
+        assert!(config.set_field("private_session", &json!(true)).is_err());
+        assert!(!config.private_session);
+        config
+            .set_field("display_backend", &json!("virtual"))
+            .unwrap();
+        config.set_field("private_session", &json!(true)).unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+        for value in [json!("false"), json!(0), json!(null)] {
+            assert!(config.set_field("private_session", &value).is_err());
+            assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        }
+        assert!(config.set_field("display_backend", &json!("main")).is_err());
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        config.set_field("private_session", &json!(false)).unwrap();
+        config.set_field("display_backend", &json!("main")).unwrap();
+
+        // A hand-edited preference file must not persist an unsupported pairing.
+        config.private_session = true;
+        config.password = "fixture-secret".into();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.toml");
+        assert!(config
+            .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
+            .is_err());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn quality_defaults_migrate_and_presets_persist_without_requiring_restart() {

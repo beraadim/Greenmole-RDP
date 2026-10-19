@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
+use super::modifiers::RemoteModifiers;
 use anyhow::Result;
+use core_graphics::event::CGEventFlags;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum InjectedKey {
@@ -20,19 +22,59 @@ impl InjectedKey {
 #[derive(Default)]
 pub(super) struct KeyboardState {
     held: BTreeSet<InjectedKey>,
+    caps_lock: bool,
+    private_tag: i64,
 }
 
 impl KeyboardState {
+    pub(super) fn synchronize_private_tag(&mut self, tag: i64) {
+        if tag != self.private_tag {
+            // Each guarded session starts without inheriting local lock state.
+            // RDP's existing synchronization then applies the client's Caps state.
+            if tag != 0 {
+                self.caps_lock = false;
+            }
+            self.private_tag = tag;
+        }
+    }
+
+    pub(super) fn modifiers(&self) -> RemoteModifiers {
+        RemoteModifiers::from_keys(
+            |code| self.held.contains(&InjectedKey::Physical(code)),
+            self.caps_lock,
+        )
+    }
+
+    fn modifiers_after(&self, key: InjectedKey, pressed: bool) -> RemoteModifiers {
+        let caps_lock = self.caps_lock
+            ^ (key == InjectedKey::Physical(0x39) && pressed && !self.held.contains(&key));
+        RemoteModifiers::from_keys(
+            |code| {
+                let modifier = InjectedKey::Physical(code);
+                if modifier == key {
+                    pressed
+                } else {
+                    self.held.contains(&modifier)
+                }
+            },
+            caps_lock,
+        )
+    }
+
     pub(super) fn inject(
         &mut self,
         key: InjectedKey,
         pressed: bool,
-        mut post: impl FnMut(InjectedKey, bool) -> Result<()>,
+        mut post: impl FnMut(InjectedKey, bool, RemoteModifiers) -> Result<()>,
     ) -> Result<()> {
         if !pressed && !self.held.contains(&key) {
             return Ok(());
         }
-        post(key, pressed)?;
+        let modifiers = self.modifiers_after(key, pressed);
+        post(key, pressed, modifiers)?;
+        self.caps_lock = modifiers
+            .flags
+            .contains(CGEventFlags::CGEventFlagAlphaShift);
         if pressed {
             self.held.insert(key);
         } else {
@@ -44,7 +86,7 @@ impl KeyboardState {
     pub(super) fn release_matching(
         &mut self,
         include: impl Fn(InjectedKey) -> bool,
-        mut post: impl FnMut(InjectedKey, bool) -> Result<()>,
+        mut post: impl FnMut(InjectedKey, bool, RemoteModifiers) -> Result<()>,
     ) -> Result<()> {
         let mut keys: Vec<_> = self
             .held
@@ -66,136 +108,4 @@ impl KeyboardState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cleanup_releases_only_successful_remote_presses_including_unicode_and_repeats() {
-        let mut state = KeyboardState::default();
-        let keys = [
-            InjectedKey::Physical(0x38),
-            InjectedKey::Physical(0),
-            InjectedKey::Unicode(0xE9),
-        ];
-        let mut events = Vec::new();
-        for key in keys.into_iter().chain([keys[1]]) {
-            state
-                .inject(key, true, |key, down| {
-                    events.push((key, down));
-                    Ok(())
-                })
-                .unwrap();
-        }
-        state
-            .inject(InjectedKey::Physical(0x37), false, |_, _| {
-                panic!("unowned local key released")
-            })
-            .unwrap();
-        assert!(state
-            .inject(InjectedKey::Physical(1), true, |_, _| anyhow::bail!(
-                "post failed"
-            ))
-            .is_err());
-        events.clear();
-        state
-            .release_matching(
-                |_| true,
-                |key, down| {
-                    events.push((key, down));
-                    Ok(())
-                },
-            )
-            .unwrap();
-        state
-            .release_matching(|_| true, |_, _| panic!("duplicate cleanup"))
-            .unwrap();
-        assert_eq!(
-            events,
-            [(keys[1], false), (keys[2], false), (keys[0], false)]
-        );
-    }
-
-    #[test]
-    fn failed_release_keeps_ownership_and_does_not_prevent_other_cleanup() {
-        let mut state = KeyboardState::default();
-        let a = InjectedKey::Physical(0);
-        let shift = InjectedKey::Physical(0x38);
-        for key in [a, shift] {
-            state.inject(key, true, |_, _| Ok(())).unwrap();
-        }
-        assert!(state
-            .release_matching(
-                |_| true,
-                |key, _| {
-                    if key == a {
-                        anyhow::bail!("simulated allocation failure");
-                    }
-                    Ok(())
-                }
-            )
-            .is_err());
-        let mut retried = Vec::new();
-        state
-            .release_matching(
-                |_| true,
-                |key, _| {
-                    retried.push(key);
-                    Ok(())
-                },
-            )
-            .unwrap();
-        assert_eq!(retried, [a]);
-    }
-
-    #[test]
-    fn modifier_cleanup_preserves_regular_keys_and_caps_lock() {
-        let mut state = KeyboardState::default();
-        for code in [0, 0x39, 0x36, 0x3D] {
-            state
-                .inject(InjectedKey::Physical(code), true, |_, _| Ok(()))
-                .unwrap();
-        }
-        let mut released = Vec::new();
-        state
-            .release_matching(InjectedKey::is_modifier, |key, _| {
-                released.push(key);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            released,
-            [InjectedKey::Physical(0x36), InjectedKey::Physical(0x3D)]
-        );
-        assert_eq!(
-            state.held,
-            BTreeSet::from([InjectedKey::Physical(0), InjectedKey::Physical(0x39)])
-        );
-    }
-
-    #[test]
-    fn shortcut_cleanup_retains_event_flags_and_precedes_ctrl_release() {
-        let mut state = KeyboardState::default();
-        let ctrl = InjectedKey::Physical(0x3B);
-        let shortcut = InjectedKey::CommandShortcut {
-            keycode: 0x08,
-            shifted: true,
-        };
-        for key in [ctrl, shortcut, shortcut] {
-            state.inject(key, true, |_, _| Ok(())).unwrap();
-        }
-        let mut events = Vec::new();
-        state
-            .release_matching(
-                |_| true,
-                |key, pressed| {
-                    events.push((key, pressed));
-                    Ok(())
-                },
-            )
-            .unwrap();
-        assert_eq!(events, [(shortcut, false), (ctrl, false)]);
-        state
-            .release_matching(|_| true, |_, _| panic!("duplicate release"))
-            .unwrap();
-    }
-}
+mod tests;

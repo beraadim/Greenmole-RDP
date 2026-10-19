@@ -22,6 +22,58 @@ pub enum ConnectionOutcome {
     OutputOverflow,
 }
 
+/// Only an explicit successful client PDU is a deliberate disconnect. Internal
+/// queue closure is a failure even if its dispatch future completed normally.
+/// Platform security policy relies on this distinction when restoring lock state.
+pub(crate) fn terminal_fallback(source: &str, succeeded: bool, quit: bool) -> ConnectionOutcome {
+    match source {
+        "control" if quit => ConnectionOutcome::ServerShutdown,
+        "control" => ConnectionOutcome::CredentialsChanged,
+        "output-queue" => ConnectionOutcome::OutputOverflow,
+        "idle-timeout" => ConnectionOutcome::IdleTimeout,
+        "display" if succeeded => ConnectionOutcome::CaptureEnded,
+        "display" => ConnectionOutcome::CaptureError,
+        "pdu" if succeeded => ConnectionOutcome::ClientDisconnect,
+        _ => ConnectionOutcome::ProtocolError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_successful_peer_shutdown_is_deliberate() {
+        assert_eq!(
+            terminal_fallback("pdu", true, false),
+            ConnectionOutcome::ClientDisconnect
+        );
+        for source in [
+            "events",
+            "display",
+            "control",
+            "output-queue",
+            "idle-timeout",
+            "unknown",
+        ] {
+            for success in [true, false] {
+                assert_ne!(
+                    terminal_fallback(source, success, false),
+                    ConnectionOutcome::ClientDisconnect
+                );
+            }
+        }
+        assert_ne!(
+            terminal_fallback("pdu", false, false),
+            ConnectionOutcome::ClientDisconnect
+        );
+        assert_eq!(
+            terminal_fallback("control", true, true),
+            ConnectionOutcome::ServerShutdown
+        );
+    }
+}
+
 impl ConnectionOutcome {
     pub fn as_str(self) -> &'static str {
         match self {

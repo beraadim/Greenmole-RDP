@@ -1,10 +1,12 @@
 //! Keyboard and mouse input injection via CGEvent
 
+mod event_tag;
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
 pub mod power;
 
+pub use event_tag::{clear_remote_event_tag, set_remote_event_tag};
 pub use keyboard::KeyboardInjector;
 pub use keymap::scancode_to_keycode;
 pub use mouse::{MouseButton, MouseInjector};
@@ -14,6 +16,23 @@ pub use power::RemoteSessionWake;
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
+}
+
+/// Read Input Monitoring permission without showing a system dialog.
+pub fn check_input_monitoring_permission() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
+}
+
+/// Explicit local setup only: request Input Monitoring for guarded sessions.
+/// macOS may require reopening the application after approval.
+pub fn request_input_monitoring_permission() -> bool {
+    unsafe { CGRequestListenEventAccess() }
 }
 
 /// Check if Accessibility permission is granted (no prompt)

@@ -28,6 +28,7 @@ pub(crate) fn configuration_status(
         let running_values = serde_json::to_value(running).expect("UiConfig is serializable");
         for key in [
             "display_backend",
+            "private_session",
             "bind_address",
             "port",
             "idle_timeout_secs",
@@ -255,6 +256,35 @@ mod tests {
 
     fn status(saved: &UiConfig, running: Option<&UiConfig>) -> ConfigurationStatus {
         configuration_status(saved, running, &BTreeSet::new())
+    }
+
+    #[test]
+    fn private_session_changes_remain_pending_until_restart_or_reverted() {
+        let mut running = UiConfig::default();
+        running.display_backend = macrdp_core::DisplayBackend::Virtual;
+        for enabled in [true, false] {
+            running.private_session = !enabled;
+            let mut saved = running.clone();
+            saved
+                .set_field("private_session", &serde_json::json!(enabled))
+                .unwrap();
+            assert_eq!(
+                status(&saved, Some(&running)).pending_restart,
+                ["private_session"]
+            );
+            assert!(live_update(&saved, "private_session").unwrap().is_none());
+            // An unrelated live setting cannot acknowledge the pending guard policy.
+            saved.frame_rate = 30;
+            running.frame_rate = 30;
+            assert!(status(&saved, Some(&running)).restart_required);
+            saved
+                .set_field(
+                    "private_session",
+                    &serde_json::json!(running.private_session),
+                )
+                .unwrap();
+            assert!(!status(&saved, Some(&running)).restart_required);
+        }
     }
 
     #[test]

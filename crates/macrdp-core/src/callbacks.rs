@@ -167,6 +167,8 @@ pub struct LogEntry {
 pub struct PermissionStatus {
     pub screen_capture: bool,
     pub accessibility: bool,
+    #[serde(default)]
+    pub input_monitoring: bool,
     pub microphone: bool,
 }
 

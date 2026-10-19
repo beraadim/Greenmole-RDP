@@ -27,6 +27,7 @@ pub use timings::{StageTimings, TimingSummary};
 #[path = "connection_outcome.rs"]
 mod connection_outcome;
 pub use connection_outcome::ConnectionOutcome;
+pub(crate) use connection_outcome::terminal_fallback;
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";

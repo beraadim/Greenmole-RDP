@@ -3,6 +3,7 @@
 /// Supported pane names:
 /// - `"screen_recording"` / `"screen_capture"` — Privacy > Screen Recording
 /// - `"accessibility"` — Privacy > Accessibility
+/// - `"input_monitoring"` — Privacy > Input Monitoring
 /// - `"microphone"` — Privacy > Microphone
 pub fn open_system_preferences(pane: &str) -> Result<(), String> {
     let url = match pane {
@@ -11,6 +12,9 @@ pub fn open_system_preferences(pane: &str) -> Result<(), String> {
         }
         "accessibility" => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        }
+        "input_monitoring" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
         }
         "microphone" => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"

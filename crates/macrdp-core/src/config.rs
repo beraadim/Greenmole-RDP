@@ -55,6 +55,8 @@ pub struct ServerConfig {
     pub frame_rate: u32,
     /// Display to share: the main display or an experimental virtual display.
     pub display_backend: DisplayBackend,
+    /// Guard local screens/input during a virtual-display connection. Requires restart.
+    pub private_session: bool,
     /// Resolution width (0 = auto-detect from display)
     pub width: u32,
     /// Resolution height (0 = auto-detect from display)
@@ -105,6 +107,7 @@ impl Default for ServerConfig {
             bind_address: None,
             frame_rate: 60,
             display_backend: DisplayBackend::Main,
+            private_session: false,
             width: 0,
             height: 0,
             username: None,
@@ -132,6 +135,10 @@ impl ServerConfig {
     /// Reject unsafe/inconsistent settings before initializing the desktop or listener.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.port > 0, "port must be between 1 and 65535");
+        anyhow::ensure!(
+            !self.private_session || self.display_backend == DisplayBackend::Virtual,
+            "private_session requires display_backend = 'virtual'"
+        );
         anyhow::ensure!(
             self.quality.as_deref().map_or(true, |quality| matches!(
                 quality,
@@ -297,7 +304,31 @@ mod tests {
         assert_eq!(config.bind_address, None);
         assert_eq!(config.frame_rate, 60);
         assert_eq!(config.display_backend, DisplayBackend::Main);
+        assert!(!config.private_session);
         assert!(config.username.is_none());
+    }
+
+    #[test]
+    fn private_sessions_are_opt_in_and_require_a_virtual_display() {
+        let legacy: ServerConfig = toml::from_str("port = 13389").unwrap();
+        assert!(!legacy.private_session);
+        let mut config: ServerConfig = toml::from_str(
+            "display_backend = 'virtual'\nprivate_session = true\nusername = 'fixture'\npassword = 'fixture'",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let restored: ServerConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(restored.private_session);
+        assert_eq!(restored.display_backend, DisplayBackend::Virtual);
+        config.display_backend = DisplayBackend::Main;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("private_session requires"));
+        config.private_session = false;
+        config.validate().unwrap();
+        assert!(toml::from_str::<ServerConfig>("private_session = 'true'").is_err());
     }
 
     #[test]

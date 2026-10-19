@@ -602,6 +602,7 @@ async fn output_queue_failure_interrupts_a_stalled_display_write() {
 
 #[derive(Default)]
 struct InputLifecycle {
+    admissions: usize,
     contexts: Vec<String>,
     connections: usize,
     disconnections: usize,
@@ -610,6 +611,10 @@ struct InputLifecycle {
 struct RecordingInput(Arc<StdMutex<InputLifecycle>>);
 
 impl RdpServerInputHandler for RecordingInput {
+    fn prepare_connection(&mut self) -> Result<()> {
+        self.0.lock().unwrap().admissions += 1;
+        Ok(())
+    }
     fn update_client_context(&mut self, context: ClientInputContext) {
         self.0.lock().unwrap().contexts.push(context.client_name);
     }
@@ -752,9 +757,63 @@ async fn resize_reactivation_refreshes_context_without_starting_a_new_session() 
     }
 
     let lifecycle = lifecycle.lock().unwrap();
+    assert_eq!(lifecycle.admissions, 1);
     assert_eq!(lifecycle.contexts, ["initial", "resized"]);
     assert_eq!(lifecycle.connections, 1);
     assert_eq!(lifecycle.disconnections, 0);
+}
+
+struct RejectProtectedInput;
+
+impl RdpServerInputHandler for RejectProtectedInput {
+    fn prepare_connection(&mut self) -> Result<()> {
+        bail!("synthetic protection unavailable")
+    }
+    fn update_client_context(&mut self, _: ClientInputContext) {
+        panic!("rejected admission must not publish input context");
+    }
+    fn on_connect(&mut self, _: ClientInputContext, _: Option<String>) {
+        panic!("rejected admission must not wake or expose desktop");
+    }
+    fn keyboard(&mut self, _: KeyboardEvent) {
+        panic!("input before protection");
+    }
+    fn mouse(&mut self, _: MouseEvent) {
+        panic!("input before protection");
+    }
+}
+
+#[tokio::test]
+async fn protection_rejection_precedes_context_capture_and_channel_startup() {
+    let mut server = resize_test_server(Box::new(CaptureUnavailable));
+    server.handler = Arc::new(Mutex::new(Box::new(RejectProtectedInput)));
+    let (stream, _peer) = tokio::io::duplex(1024);
+    let (mut reader, mut writer) = split_tokio_framed(TokioFramed::new(stream));
+    let error = server
+        .client_accepted(
+            &mut reader,
+            &mut writer,
+            AcceptorResult {
+                static_channels: StaticChannelSet::new(),
+                capabilities: Vec::new(),
+                input_events: Vec::new(),
+                user_channel_id: 1002,
+                io_channel_id: 1003,
+                reactivation: false,
+                client_name: "fixture".into(),
+                keyboard_layout: 0x0409,
+                client_desktop_size: None,
+            },
+            DesktopSize {
+                width: 800,
+                height: 600,
+            },
+        )
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("synthetic protection unavailable"));
+    assert!(!message.contains("capture deliberately unavailable"));
 }
 
 #[derive(Debug)]

@@ -1,10 +1,12 @@
 //! Bound the lifetime of Command flags to a single translated keyboard event.
 
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventType};
 use core_graphics::event_source::CGEventSourceStateID;
 
+use super::modifiers::RemoteModifiers;
 use super::{CGEventSourceFlagsState, KeyboardInjector};
+use crate::event_tag::{post_remote_events, remote_event_tag};
 
 const LEFT_COMMAND: u16 = 0x37;
 const RIGHT_COMMAND: u16 = 0x36;
@@ -60,14 +62,26 @@ impl ModifierSnapshot {
     }
 }
 
-pub(super) fn post(keycode: u16, pressed: bool, shifted: bool) -> Result<()> {
+pub(super) fn post(
+    keycode: u16,
+    pressed: bool,
+    shifted: bool,
+    remote: RemoteModifiers,
+) -> Result<()> {
     // Allocate both events before posting either: a failed allocation must not
     // leave Command active with no prepared release. Post is infallible and
     // there is no await/cancellation point between the two ordered events.
-    let events = events(keycode, pressed, shifted, ModifierSnapshot::current())?;
-    for event in events {
-        event.post(CGEventTapLocation::HID);
-    }
+    let snapshot = if remote_event_tag() == 0 {
+        ModifierSnapshot::current()
+    } else {
+        ModifierSnapshot {
+            flags: remote.flags,
+            left_command: remote.left_command,
+            right_command: remote.right_command,
+        }
+    };
+    let events = events(keycode, pressed, shifted, snapshot)?;
+    post_remote_events(&events)?;
     tracing::trace!("Restored native modifiers after translated Command event");
     Ok(())
 }

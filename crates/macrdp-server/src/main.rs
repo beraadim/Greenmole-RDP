@@ -33,6 +33,9 @@ impl ServerEventHandler for CliEvents {
 }
 
 fn main() -> Result<()> {
+    if let Some(result) = macrdp_core::run_guard_helper_if_requested() {
+        return result;
+    }
     // Display helpers must dispatch before any framework queries the desktop.
     if let Some(result) = macrdp_core::run_display_helper_if_requested() {
         return result;

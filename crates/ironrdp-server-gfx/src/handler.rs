@@ -94,6 +94,12 @@ pub struct ClientInputContext {
 /// }
 /// ```
 pub trait RdpServerInputHandler: Send {
+    /// Admit an authenticated connection before input, capture or channel startup.
+    /// A platform security guard can reject access without exposing the desktop.
+    /// Resize reactivation must retain the original guard instead of opening one.
+    fn prepare_connection(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Refresh input context after initial activation and resize reactivation.
     fn update_client_context(&mut self, _context: ClientInputContext) {}
     /// Start a connection once; resize reactivation does not start a new session.

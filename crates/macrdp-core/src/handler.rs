@@ -8,6 +8,7 @@ use crate::callbacks::InputDebugState;
 
 mod keyboard_device;
 mod keyboard_events;
+mod privacy;
 mod shortcuts;
 mod translation;
 use keyboard_device::KeyboardDevice;
@@ -32,6 +33,7 @@ pub struct MacInputHandler {
     active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
     display_controller: Option<macrdp_display::DisplayController>,
     session_events: Option<SessionEvents>,
+    privacy: privacy::PrivateSession,
 }
 
 /// Records one real connection; resize reactivation does not reset its duration.
@@ -121,6 +123,7 @@ impl MacInputHandler {
             active_connection,
             display_controller,
             session_events: None,
+            privacy: privacy::PrivateSession::default(),
         }
     }
 
@@ -136,6 +139,11 @@ impl MacInputHandler {
             audio_stats,
             started_at: None,
         });
+        self
+    }
+
+    pub fn with_private_session(mut self, enabled: bool) -> Self {
+        self.privacy = privacy::PrivateSession::new(enabled);
         self
     }
 
@@ -300,11 +308,23 @@ impl MacInputHandler {
     }
 
     fn set_last_translation(&self, translation: Option<String>) {
+        if self.privacy.redact_input_diagnostics() {
+            self.debug_state.lock().unwrap().last_translation = None;
+            return;
+        }
         let mut debug = self.debug_state.lock().unwrap();
         debug.last_translation = translation;
     }
 
     fn refresh_debug_state(&self, last_event: Option<String>) {
+        if self.privacy.redact_input_diagnostics() {
+            *self.debug_state.lock().unwrap() = InputDebugState {
+                translation_profile: "private_session".into(),
+                last_event: Some("Private-session input diagnostics are redacted".into()),
+                ..Default::default()
+            };
+            return;
+        }
         let mut active_modifiers = Vec::new();
         if self.modifier_state.caps_lock {
             active_modifiers.push("caps_lock".to_string());
@@ -403,6 +423,10 @@ impl MacInputHandler {
 }
 
 impl RdpServerInputHandler for MacInputHandler {
+    fn prepare_connection(&mut self) -> anyhow::Result<()> {
+        self.privacy.prepare()
+    }
+
     fn on_connect(&mut self, context: ClientInputContext, peer_addr: Option<String>) {
         self.reset_session_input("before new session");
         self.client_context = context.clone();
@@ -435,6 +459,16 @@ impl RdpServerInputHandler for MacInputHandler {
     fn on_disconnect(&mut self) {
         // End all held input before virtual-display teardown changes geometry.
         self.reset_session_input("on disconnect");
+        let outcome = self
+            .session_events
+            .as_ref()
+            .and_then(|events| events.gfx.lock().unwrap().connection_outcome);
+        if let Err(error) = self.privacy.finish(outcome) {
+            // The independent guard keeps local barriers and locks/terminates
+            // this worker. Never advertise successful local restoration here.
+            tracing::error!(%error, "Private session lock recovery is pending");
+            return;
+        }
         let disconnected = {
             // Manual window actions hold this lock through their queue send.
             // Once disconnect starts, no action can target a later connection
@@ -498,10 +532,16 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn keyboard(&mut self, event: KeyboardEvent) {
+        if !self.privacy.input_allowed() {
+            return;
+        }
         self.handle_keyboard_event(event);
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        if !self.privacy.input_allowed() {
+            return;
+        }
         let Some(m) = &mut self.mouse else { return };
 
         if let Some(wake) = &mut self.wake {

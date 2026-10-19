@@ -96,6 +96,29 @@ async fn recover_local_desktop_inner(app: &tauri::AppHandle) -> Result<(), Strin
     }
 
     let handle = state.server_handle.lock().await.clone();
+    let fallback_private = if handle.is_none() {
+        state
+            .running_config
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|config| config.private_session)
+            || state.ui_config.lock().await.private_session
+    } else {
+        false
+    };
+    let private_recovery = private_recovery_required(
+        handle.as_ref().map(|handle| handle.private_session()),
+        fallback_private,
+    );
+    if private_recovery && handle.is_none() {
+        tokio::task::spawn_blocking(macrdp_core::lock_session_and_verify)
+            .await
+            .map_err(|error| format!("Private recovery lock task failed: {error}"))?
+            .map_err(|error| {
+                format!("Private recovery is waiting for a verified macOS lock: {error:#}")
+            })?;
+    }
     let result = match &handle {
         Some(handle) => handle
             .recover_local_desktop()
@@ -122,7 +145,9 @@ async fn recover_local_desktop_inner(app: &tauri::AppHandle) -> Result<(), Strin
         let _ = app.emit("server-status", &status);
         // Showing controls on a physical screen remains useful even if the
         // WindowServer did not acknowledge virtual-display removal.
-        let _ = crate::tray::show_main_on_physical_display(app).await;
+        if !private_recovery {
+            let _ = crate::tray::show_main_on_physical_display(app).await;
+        }
         return Err(error);
     }
 
@@ -135,6 +160,14 @@ async fn recover_local_desktop_inner(app: &tauri::AppHandle) -> Result<(), Strin
     let _ = app.emit("server-status", &*state.status.lock().await);
     let _ = app.emit("metrics", macrdp_core::Metrics::default());
     let _ = app.emit("connections", Vec::<crate::state::Connection>::new());
+
+    if private_recovery {
+        // The guard/supervisor has verified locking before releasing local
+        // protection. Do not activate windows or run accessibility moves over
+        // that login screen. The user must authenticate locally to continue.
+        tracing::info!("Private local recovery completed; Mac remains locked and server stopped");
+        return Ok(());
+    }
 
     // Removing the owned virtual display normally brings its windows back. The
     // bounded accessibility pass only gathers windows still unreachable on all
@@ -174,6 +207,12 @@ async fn recover_local_desktop_inner(app: &tauri::AppHandle) -> Result<(), Strin
     Ok(())
 }
 
+/// Saved edits are deferred until restart. Only an absent worker may fall back
+/// to the last known/preferences policy for cancellation or stranded recovery.
+fn private_recovery_required(worker_policy: Option<bool>, fallback_policy: bool) -> bool {
+    worker_policy.unwrap_or(fallback_policy)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn window_recovery_incomplete(report: &macrdp_core::WindowMoveReport) -> bool {
     report.failed > 0 || report.app_failures > 0 || report.timed_out
@@ -182,6 +221,19 @@ fn window_recovery_incomplete(report: &macrdp_core::WindowMoveReport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_uses_worker_policy_despite_pending_enable_or_disable() {
+        // Pending enable must not claim that an ordinary worker locked the Mac.
+        assert!(!private_recovery_required(Some(false), true));
+        // Pending disable must not bypass an existing worker's guarded recovery.
+        assert!(private_recovery_required(Some(true), false));
+        assert!(private_recovery_required(Some(true), true));
+        assert!(!private_recovery_required(Some(false), false));
+        // No published handle can also mean cancelled startup is still retiring.
+        assert!(private_recovery_required(None, true));
+        assert!(!private_recovery_required(None, false));
+    }
 
     #[test]
     fn recovery_reports_failures_and_deadline_without_promising_all_windows_returned() {

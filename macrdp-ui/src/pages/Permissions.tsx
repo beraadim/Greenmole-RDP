@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Monitor, MousePointer2, Check } from "lucide-react";
+import { Monitor, MousePointer2, Keyboard, Check } from "lucide-react";
 import { api } from "../lib/ipc";
 import type { PermissionStatus } from "../lib/types";
 import { useServerStatus } from "../hooks/useServerStatus";
@@ -18,10 +18,18 @@ const permissionDefs = [
     pane: "accessibility",
     icon: MousePointer2,
   },
+  {
+    key: "input_monitoring" as keyof PermissionStatus,
+    name: "Input Monitoring",
+    pane: "input_monitoring",
+    icon: Keyboard,
+    privateOnly: true,
+  },
 ];
 
 function Permissions() {
   const [perms, setPerms] = useState<PermissionStatus | null>(null);
+  const [privateSession, setPrivateSession] = useState<boolean | null>(null);
   const status = useServerStatus();
   const [requesting, setRequesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,16 +44,25 @@ function Permissions() {
   };
 
   useEffect(() => {
-    api.getPermissions().then(setPerms).catch(console.error);
-
-    const interval = setInterval(() => {
-      api.getPermissions().then(setPerms).catch(console.error);
-    }, 5000);
-
-    return () => clearInterval(interval);
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [permissions, config] = await Promise.all([api.getPermissions(), api.getConfig()]);
+        if (!cancelled) {
+          setPerms(permissions);
+          setPrivateSession(config.private_session);
+        }
+      } catch (reason) {
+        if (!cancelled) setError(String(reason));
+      }
+    };
+    void refresh();
+    const interval = setInterval(refresh, 5000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
-  const requiredGranted = perms?.screen_capture === true && perms?.accessibility === true;
+  const requiredGranted = privateSession !== null && perms?.screen_capture === true
+    && perms?.accessibility === true && (!privateSession || perms?.input_monitoring === true);
 
   return (
     <div className="flex flex-col gap-3 p-4">
@@ -70,8 +87,9 @@ function Permissions() {
 
       {!requiredGranted && (
         <div className="rounded-[8px] border border-orange/20 bg-orange/10 p-3 text-[11px] text-text-secondary">
-          Screen Recording can require reopening the app before macOS reports it
-          as granted.
+          Screen Recording and Input Monitoring can require reopening the app
+          before macOS reports approval. Input Monitoring is requested only when
+          Guarded private session is enabled in Settings.
           <p className="mt-2">Complete setup on the physical display before starting a remote connection.</p>
           <button onClick={() => void request()} disabled={requesting || serviceOwnsResources}
             className="mt-2 rounded-md bg-orange/15 px-2.5 py-1 font-medium text-orange disabled:opacity-50">
@@ -83,7 +101,7 @@ function Permissions() {
       )}
 
       <div className="flex flex-col gap-2">
-        {permissionDefs.map((def) => {
+        {permissionDefs.filter(def => !("privateOnly" in def && def.privateOnly) || privateSession).map((def) => {
           const granted = perms?.[def.key] ?? false;
           const Icon = def.icon;
           return (
@@ -109,7 +127,8 @@ function Permissions() {
                 ) : (
                   <button
                     onClick={() => api.openSystemPreferences(def.pane)}
-                    className="rounded-md bg-orange/15 px-2.5 py-1 text-[11px] font-medium text-orange transition-colors hover:bg-orange/25"
+                    disabled={def.key === "input_monitoring" && serviceOwnsResources}
+                    className="rounded-md bg-orange/15 px-2.5 py-1 text-[11px] font-medium text-orange transition-colors hover:bg-orange/25 disabled:opacity-50"
                   >
                     Open System Settings
                   </button>

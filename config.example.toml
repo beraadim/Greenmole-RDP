@@ -26,6 +26,12 @@ password = "" # Replace before use. No working default password is shipped.
 # Changes require a server restart; ordinary client resizing does not.
 display_backend = "main"
 
+# Opt-in guarded control of a virtual desktop. Requires display_backend="virtual"
+# and macOS permission to install an active input tap. Changing this needs restart.
+# Hides local screens and blocks local input; failures lock the Mac. See
+# docs/private-sessions.md for recovery, permission and security limitations.
+private_session = false
+
 # Resolution width in pixels
 # Default: 0 (auto-detect from macOS display + follow client request)
 # Set to a specific value (e.g. 1920) to force a fixed resolution

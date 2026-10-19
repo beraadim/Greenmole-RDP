@@ -480,7 +480,7 @@ async fn start_server_inner(
     });
 
     // Check without prompting before binding or preparing any remote display.
-    let perms = permissions::ensure_required_permissions()?;
+    let perms = permissions::ensure_session_permissions(config.private_session)?;
     tracing::info!(?perms, "Permission status");
 
     // TLS
@@ -781,6 +781,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             Arc::clone(&args.active_connection),
             Some(display_controller.clone()),
         )
+        .with_private_session(args.config.private_session)
         .with_events(
             Arc::clone(&args.handler),
             Arc::clone(&args.gfx_state),

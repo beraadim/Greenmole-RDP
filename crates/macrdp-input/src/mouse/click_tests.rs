@@ -474,3 +474,31 @@ fn native_mouse_events_have_the_requested_count_without_posting() {
         }
     }
 }
+
+#[test]
+fn native_normal_and_private_scroll_payloads_can_be_stamped_without_posting() {
+    use core_graphics::event::CGEventFlags;
+    use core_graphics::event_source::CGEventSourceStateID;
+    for flags in [None, Some(CGEventFlags::CGEventFlagShift)] {
+        let event = MouseInjector::create_scroll_event(2, -3, flags).unwrap();
+        crate::event_tag::stamp_remote_event(&event).unwrap();
+        assert_eq!(
+            event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID),
+            i64::from(std::process::id())
+        );
+        assert_eq!(
+            event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+            -3
+        );
+        assert_eq!(
+            event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
+            2
+        );
+        if let Some(flags) = flags {
+            assert_eq!(event.get_flags(), flags);
+            let state = event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
+            assert_ne!(state, CGEventSourceStateID::CombinedSessionState as i64);
+            assert_ne!(state, CGEventSourceStateID::HIDSystemState as i64);
+        }
+    }
+}

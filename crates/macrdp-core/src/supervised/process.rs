@@ -18,6 +18,7 @@ pub(super) struct Worker {
     pub owned_displays: HashSet<u32>,
     retired: bool,
     inspect_displays: bool,
+    private_session: bool,
 }
 
 impl Worker {
@@ -49,6 +50,7 @@ impl Worker {
             .iter()
             .copied()
             .collect();
+        let private_session = initialization.config.private_session;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -111,6 +113,7 @@ impl Worker {
             owned_displays: HashSet::new(),
             retired: false,
             inspect_displays,
+            private_session,
         })
     }
 
@@ -208,6 +211,12 @@ impl Worker {
         if self.inspect_displays {
             macrdp_display::wait_for_owned_virtual_display_removal(&ids, Duration::from_secs(5))
                 .context("Recovery blocked: an owned remote display is still present")?;
+            if self.private_session {
+                anyhow::ensure!(
+                    !macrdp_privacy::guard_recovery_pending()?,
+                    "Private session lock recovery remains pending; local protection is retained"
+                );
+            }
         }
         if let Some(error) = discovery_error {
             return Err(error).context("Cannot verify all owned remote displays were removed");

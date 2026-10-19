@@ -1,12 +1,13 @@
 [package]
 name = "macrdp-core"
-version = "0.1.23"
+version = "0.1.24"
 edition.workspace = true
 
 [dependencies]
 macrdp-display = { path = "../macrdp-display" }
 macrdp-capture = { path = "../macrdp-capture" }
 macrdp-input = { path = "../macrdp-input" }
+macrdp-privacy = { path = "../macrdp-privacy" }
 macrdp-encode = { path = "../macrdp-encode" }
 macrdp-audio = { path = "../macrdp-audio" }
 macrdp-clipboard = { path = "../macrdp-clipboard" }

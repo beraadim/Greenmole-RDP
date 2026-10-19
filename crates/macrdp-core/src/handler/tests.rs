@@ -64,7 +64,25 @@ fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
         active_connection: Arc::new(Mutex::new(None)),
         display_controller: None,
         session_events: None,
+        privacy: super::privacy::PrivateSession::default(),
     }
+}
+
+#[test]
+fn private_session_input_inspector_does_not_export_typed_content_or_modifiers() {
+    let mut handler = handler_for("fixture", 0x0409).with_private_session(true);
+    handler.pending_dead_key = Some('x');
+    handler.modifier_state.left_ctrl = true;
+    handler.set_last_translation(Some("sensitive-fixture-content".into()));
+    handler.refresh_debug_state(Some("sensitive-fixture-content".into()));
+    let debug = handler.debug_state.lock().unwrap();
+    assert!(debug.last_translation.is_none());
+    assert!(debug.pending_dead_key.is_none());
+    assert!(debug.active_modifiers.is_empty());
+    assert_eq!(debug.translation_profile, "private_session");
+    assert!(!serde_json::to_string(&*debug)
+        .unwrap()
+        .contains("sensitive-fixture-content"));
 }
 
 #[test]

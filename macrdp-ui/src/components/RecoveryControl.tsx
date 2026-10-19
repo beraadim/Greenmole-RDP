@@ -15,7 +15,7 @@ export default function RecoveryControl() {
     setFailed(false);
     try {
       await api.recoverLocalDesktop();
-      setMessage("The server is stopped. Your local desktop is available.");
+      setMessage("The server is stopped. Local recovery is complete; guarded sessions remain locked.");
     } catch (error) {
       setFailed(true);
       setMessage(String(error));
@@ -27,7 +27,7 @@ export default function RecoveryControl() {
   return (
     <div className="rounded-lg bg-card p-3 text-xs">
       <div className="flex items-center justify-between gap-3">
-        <p className="text-text-muted">If the remote display gets stuck, stop the server and bring windows back to this Mac.</p>
+        <p className="text-text-muted">Stop the server and recover this Mac. A guarded private session is locked before local control returns.</p>
         <button
           type="button"
           onClick={recover}

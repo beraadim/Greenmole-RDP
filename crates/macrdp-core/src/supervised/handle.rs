@@ -30,6 +30,7 @@ pub struct SupervisedServerHandle {
     shared: Arc<Shared>,
     certificate: TlsCertificateInfo,
     backend: DisplayBackend,
+    private_session: bool,
     port: u16,
     next_request: AtomicU64,
 }
@@ -54,6 +55,9 @@ impl Drop for SupervisedWindowMovePreparation {
 impl SupervisedServerHandle {
     pub fn display_backend(&self) -> DisplayBackend {
         self.backend
+    }
+    pub fn private_session(&self) -> bool {
+        self.private_session
     }
     pub fn port(&self) -> u16 {
         self.port
@@ -173,6 +177,13 @@ impl SupervisedServerHandle {
     pub async fn recover_local_desktop(&self) -> Result<()> {
         self.shared.stopping.store(true, Ordering::Release);
         let _ = self.shared.commands.try_send(ParentCommand::Stop);
+        if self.private_session {
+            // Recovery must never be an unprotected shortcut into the remote
+            // user's desktop, including when the worker itself is unresponsive.
+            tokio::task::spawn_blocking(macrdp_privacy::lock_session_and_verify)
+                .await
+                .context("Private recovery lock task failed")??;
+        }
         tokio::time::timeout(Duration::from_secs(50), async {
             while !self.cleanup_complete() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -225,6 +236,7 @@ pub async fn start_supervised_server_with_perf(
         safe_to_release: false,
     };
     let backend = config.display_backend;
+    let private_session = config.private_session;
     let (commands, receiver) = tokio::sync::mpsc::channel(32);
     let shared = Arc::new(Shared {
         snapshot: Mutex::new(Snapshot {
@@ -264,6 +276,7 @@ pub async fn start_supervised_server_with_perf(
         shared,
         certificate,
         backend,
+        private_session,
         port,
         next_request: AtomicU64::new(1),
     }))
