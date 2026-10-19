@@ -1,0 +1,108 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "version": "0.1.25",
+  "status": "built and delivered for user testing",
+  "source_revision": "3f622228016f67fdb249cbd3b8109a19867806cb",
+  "verified_at_utc": "2026-10-19T11:54:45.256491+00:00",
+  "release_checks": {
+    "rust_passed": 799,
+    "rust_failed": 0,
+    "existing_opt_in_ignored": 6,
+    "rust_serial_mode": true,
+    "display_library_passed": 75,
+    "new_identity_tests_passed": 14,
+    "new_selector_tests_passed": 5,
+    "new_strict_protocol_test_passed": true,
+    "new_wake_lease_tests_passed": 4,
+    "python_passed": 8,
+    "javascript_passed": 11,
+    "typescript_passed": true,
+    "frontend_production_build_passed": true,
+    "scoped_rust_formatting_passed": true,
+    "initial_serial_fixture_hang_fixed_before_complete_rerun": true,
+    "existing_untouched_workspace_formatting_differences_remain": true,
+    "existing_compiler_and_frontend_bundle_warnings_remain": true
+  },
+  "package_verification": {
+    "version": "0.1.25",
+    "source_revision": "3f622228016f67fdb249cbd3b8109a19867806cb",
+    "verified_at_utc": "2026-10-19T11:54:45.256491+00:00",
+    "package": "macrdp_0.1.25_aarch64_3f622228016f.dmg",
+    "sha256": "33d71d26ba6caef8713a9cff1876beea82d09bf1f8153703cd35137e0d3c5748",
+    "bytes": 15630792,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "image_checksum_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "mounted_read_only": true,
+    "mount_removed": true,
+    "version_and_build_metadata_verified": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--macrdp-private-session-helper": true,
+      "--recover-local-desktop": true
+    },
+    "standalone_cli_version_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helper_or_recovery_actions_invoked": false,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "macrdp_0.1.24_aarch64_b30f845a80fe.dmg",
+      "macrdp_0.1.24_aarch64_b30f845a80fe.dmg.sha256",
+      "macrdp_0.1.24_aarch64_b30f845a80fe.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "live_remote_session_started": false
+  },
+  "source_review": {
+    "independent_identity_lifecycle_review_passed": true,
+    "scoped_wake_cleanup_review_passed": true,
+    "staged_gitleaks_passed": true,
+    "committed_source_gitleaks_passed": true,
+    "version_and_lockfile_consistency_passed": true,
+    "existing_external_package_versions_changed": false
+  },
+  "identity_policy": {
+    "key": "same macOS user and RDP listening port; default slot for standalone controller API",
+    "storage": "~/.macrdp/display-identities",
+    "stable_serial_separate_from_disposable_generation": true,
+    "immutable_atomic_noreplace_publication": true,
+    "same_user_private_directory_and_single_link_files": true,
+    "symlink_fifo_and_unsafe_permission_rejection": true,
+    "no_new_identity_on_busy_or_corrupt_stable_slot": true,
+    "inherited_flock_and_bounded_process_lifetime_retention": true,
+    "fresh_generation_validation_before_native_commit": true,
+    "precommit_failure_cancels_transaction": true,
+    "fresh_process_online_identity_collision_probe": true,
+    "selector_independent_immediate_exit_deadline": true,
+    "no_saved_icc_or_system_preference_deletion": true
+  },
+  "wake_policy": {
+    "disconnect_releases_display_sleep_and_remote_user_activity": true,
+    "drop_uses_same_idempotent_cleanup": true,
+    "activity_throttle_cleared": true,
+    "expired_assertions_accepted": true,
+    "unexpected_release_failures_retained_for_retry_and_logged": true
+  },
+  "validation_scope": {
+    "identity_filesystem_and_harmless_subprocess_fixtures_only": true,
+    "fake_power_ids_and_release_functions_only": true,
+    "live_virtual_displays_created": false,
+    "live_rdp_connections_started": false,
+    "live_capture_started": false,
+    "active_input_taps_or_covers_created": false,
+    "host_lock_or_unlock_actions_run": false,
+    "permission_requests_run": false,
+    "installed_application_replaced": false
+  },
+  "limitations": [
+    "Actual CGVirtualDisplay UUID and ICC-profile reuse still requires reconnect testing on the target Mac.",
+    "Existing ICC profiles and WindowServer/ColorSync backlog are not cleared by this package.",
+    "The profile accumulation is verified but its causal relationship to the original cursor/animation slowdown is not proven.",
+    "Concurrent same-user servers on the same listening port share an identity slot even when bound to different IPs.",
+    "Guarded private-session mode inherited from0.1.24 remains experimental and off by default."
+  ],
+  "device_test_instructions": "release-0.1.25.md"
+}
