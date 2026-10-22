@@ -1,7 +1,7 @@
 {
   "schema": "macrdp-release-validation-v1",
   "version": "0.1.27",
-  "status": "source checks passed; package pending",
+  "status": "built, verified and delivered for user testing",
   "release_checks": {
     "rust_passed": 825,
     "rust_failed": 0,
@@ -44,17 +44,78 @@
     "cache_manually_overwritten": false,
     "windowserver_preferences_deleted": false,
     "services_restarted": false,
-    "automatic_application_cleanup_added": false
+    "automatic_application_cleanup_added": false,
+    "backup_durable_and_root_private": true,
+    "saved_restore_tool_dry_run_passed": true,
+    "remaining_macrdp_profiles": 1,
+    "registry_bytes_before": 453983,
+    "registry_bytes_after": 5027,
+    "os_physical_profile_creation_date_only_refresh_logged": true,
+    "preserved_profiles_byte_identical": 3,
+    "preserved_profiles_color_identity_data_identical": 4,
+    "windowserver_preferences_manually_modified": false
   },
   "source_review": {
     "independent_cleanup_review_passed": true,
     "independent_display_and_capture_review_passed": true,
-    "external_dependency_versions_changed": false
+    "external_dependency_versions_changed": false,
+    "scoped_formatting_and_diff_check_passed": true,
+    "staged_secret_scan_passed": true,
+    "committed_source_secret_scan_passed": true,
+    "version_and_lockfile_consistency_passed": true
   },
   "limitations": [
     "No claim that cursor regression is fixed; matched consecutive-session user testing is required.",
     "Topology observations may follow requested phases and CG mode data can be cached.",
     "New diagnostic app is delivered for user installation; the running app is preserved."
   ],
-  "device_test_instructions": "release-0.1.27.md"
+  "device_test_instructions": "release-0.1.27.md",
+  "source_revision": "e33e728c864f55ac040b0f56ddf84c1af837ce14",
+  "verified_at_utc": "2026-10-22T15:27:13.430661+00:00",
+  "package_verification": {
+    "version": "0.1.27",
+    "source_revision": "e33e728c864f55ac040b0f56ddf84c1af837ce14",
+    "package": "macrdp_0.1.27_aarch64_e33e728c864f.dmg",
+    "sha256": "1b01aa34f1dc8dc1803d31f74e2ba45a895e031792a8278f495b175d0743edcb",
+    "bytes": 15673721,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-private-session-helper": true,
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--recover-local-desktop": true
+    },
+    "standalone_cli_version_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "verification_mount_removed": true,
+    "verified_at_utc": "2026-10-22T15:27:13.430661+00:00",
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "macrdp_0.1.26_aarch64_48f5b790721b.dmg",
+      "macrdp_0.1.26_aarch64_48f5b790721b.dmg.build-info.json",
+      "macrdp_0.1.26_aarch64_48f5b790721b.dmg.sha256"
+    ],
+    "installed_application_replaced": false,
+    "live_remote_session_started": false
+  },
+  "maintenance_observation": {
+    "settled_cpu_interval_seconds": 10.018463958,
+    "colorsync_displayservices_cpu_percent_one_core": 0.0,
+    "colorsyncd_cpu_percent_one_core": 0.0,
+    "settled_colorsync_display_info_requests_in_nominal_120s": 0,
+    "windowserver_color_restore_wait_samples": 0,
+    "windowserver_total_main_samples": 2367,
+    "previous_degraded_wait_fraction": 0.24056408129406884,
+    "native_service_pids_unchanged": true,
+    "independent_preservation_and_stack_review_passed": true,
+    "interpretation": "Observed idle restoration workload cleared without restarting native services. Cleanup also sends registration notifications; historical registry cost is not isolated as the cause. User cursor acceptance and consecutive-session durability remain pending."
+  }
 }

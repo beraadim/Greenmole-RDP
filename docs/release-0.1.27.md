@@ -77,3 +77,37 @@ display diagnostic transport and worker bounds, capture/codec lifetime ordering,
 and preservation of watchdog deadlines. Package verification and Desktop
 delivery are recorded against the source commit after the build. No live remote
 session or display create/remove experiment was started by release checks.
+
+## Verified package and maintenance observations
+
+Test package: `macrdp_0.1.27_aarch64_e33e728c864f.dmg` on the Mac mini Desktop.
+
+- Source: `e33e728c864f55ac040b0f56ddf84c1af837ce14`.
+- SHA-256: `1b01aa34f1dc8dc1803d31f74e2ba45a895e031792a8278f495b175d0743edcb`.
+- Size: 15,673,721 bytes; aarch64, ad-hoc signed.
+- Image checksum, read-only mounted application deep strict signature, version,
+  architecture and embedded source metadata passed. The mount was removed.
+- Packaged helper argument rejection and standalone CLI version checks passed;
+  no valid helper, recovery command or remote session was invoked.
+- Desktop installer and sidecars were copied atomically and verified; the older
+  0.1.26 installer and its two sidecars were removed. The installed app was kept.
+
+The completed cleanup leaves four registrations and four ICC files, including
+one macrdp profile. The ColorSync registry decreased from 453,983 to 5,027 bytes.
+Three preserved profiles remain byte-identical to the initial backup; one
+physical profile has only the OS-refreshed creation timestamp described above.
+Independent checks confirm the current serial, all four profile color/identity
+contents and the physical topology. A saved restore tool passes its dry run;
+the earlier supported API rollback rehearsal also passed.
+
+Settled idle measurements show zero ColorSync CPU over ten seconds and zero
+display-information requests in the following nominal two-minute log window.
+WindowServer has zero color-restoration waits in 2,367 main-thread samples,
+compared with 580 of 2,411 samples before maintenance. Native service PIDs stayed
+the same. This demonstrates that the observed workload cleared; notifications
+from cleanup may also refresh transient OS state, so registry size alone is not
+isolated as the cause. Physical cursor acceptance and durability across further
+remote sessions remain user tests.
+
+[The validation record](release-0.1.27-validation.json) contains package checks
+and the limited maintenance observations without publishing host-state backups.
