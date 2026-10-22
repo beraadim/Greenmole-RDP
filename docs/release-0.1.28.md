@@ -17,10 +17,10 @@ portrait dimensions or a Safari decoder rejection.
 Initial encoder startup remains asynchronous, with one global initialization
 worker. Five seconds now produces a single slow-start notice; the hard adoption
 deadline is thirty seconds. A result completed within that deadline remains
-eligible even when the next server poll occurs later. Cancellation and results
-completed too late remain owned and destroyed by the native worker, retaining
-its admission slot until retirement finishes. No blocking join or retry loop
-is added to the RDP thread.
+eligible even when the next server poll occurs later. Cancelled or late results
+are dropped on their owning startup worker; asynchronous native cleanup
+continues blocking admission until retirement finishes. No blocking join or
+retry loop is added to the RDP thread.
 
 While accepted AVC is unavailable, Greenmole sessions use the negotiated,
 compressed bitmap path with existing damage detection, recovery and bitmap-cost
@@ -88,3 +88,24 @@ disconnect/window restoration and physical cursor responsiveness. A true native
 failure or startup longer than thirty seconds should remain on images. The
 installer is supplied for user testing; the running application is not replaced
 automatically.
+
+## Verified package
+
+Test package: `macrdp_0.1.28_aarch64_ac0350c852bd.dmg`, delivered on the Mac mini
+Desktop with SHA-256 and build metadata sidecars.
+
+- Source: `ac0350c852bd5c8d25d2ac2b77a8c3ec14333dd1`.
+- SHA-256: `5e7d6511128322956c10feab27de4fb26f516cc1681a1cdb98f9f675a6c7ced8`.
+- Size: 15,674,923 bytes; aarch64, ad-hoc signed.
+- Image checksum, read-only mounted application deep strict signature, actual
+  binary architecture, version and embedded source metadata passed. The
+  verification mount was removed.
+- Packaged helper extra-argument rejection and standalone CLI version checks
+  passed; no valid helper/recovery command or remote session was invoked.
+- Desktop copies were written atomically and verified before removing only the
+  previous 0.1.27 DMG and its two sidecars. The installed app and configuration
+  were preserved for the user to replace and test.
+
+The package verifies the implementation and generated-pixel codec path. Actual
+AVC420 browser handoff and network use on the iPhone remain device acceptance
+checks; this release does not claim to eliminate the OS service's native delay.

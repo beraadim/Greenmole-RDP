@@ -1,7 +1,7 @@
 {
   "schema": "macrdp-release-validation-v1",
   "version": "0.1.28",
-  "status": "source validated; package verification pending",
+  "status": "built, verified and delivered for user testing",
   "diagnosis": {
     "observed_native_create_ms": 25921,
     "native_create_status": 0,
@@ -49,9 +49,15 @@
   },
   "generated_portrait_hardware_validation": {
     "passed": true,
-    "dimensions": [1184, 1808],
+    "dimensions": [
+      1184,
+      1808
+    ],
     "sequential_native_instances": 2,
-    "startup_ms": [1190, 2],
+    "startup_ms": [
+      1190,
+      2
+    ],
     "valid_idr_and_exact_decoded_dimensions": true,
     "external_timeout_seconds": 45,
     "elapsed_seconds": 2.257482916,
@@ -78,7 +84,9 @@
     "external_dependency_versions_changed": false,
     "scoped_formatting_and_diff_check_passed": true,
     "staged_secret_scan_passed": true,
-    "version_and_lockfile_consistency_passed": true
+    "version_and_lockfile_consistency_passed": true,
+    "committed_source_secret_scan_passed": true,
+    "independent_package_and_delivery_safety_review_passed": true
   },
   "limitations": [
     "The native macOS cold-service blocking cause is not established or eliminated.",
@@ -86,5 +94,42 @@
     "Browser image fallback after video has already started retains existing Greenmole behavior; the live rebuild budget remains five seconds.",
     "AVC420 iPhone Safari acceptance remains a user device test after installation."
   ],
-  "device_test_instructions": "release-0.1.28.md"
+  "device_test_instructions": "release-0.1.28.md",
+  "source_revision": "ac0350c852bd5c8d25d2ac2b77a8c3ec14333dd1",
+  "verified_at_utc": "2026-10-22T18:33:43.051533+00:00",
+  "package_verification": {
+    "version": "0.1.28",
+    "source_revision": "ac0350c852bd5c8d25d2ac2b77a8c3ec14333dd1",
+    "package": "macrdp_0.1.28_aarch64_ac0350c852bd.dmg",
+    "sha256": "5e7d6511128322956c10feab27de4fb26f516cc1681a1cdb98f9f675a6c7ced8",
+    "bytes": 15674923,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "binary_architecture_verified": true,
+    "dmg_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-private-session-helper": true,
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--recover-local-desktop": true
+    },
+    "standalone_cli_version_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "verification_mount_removed": true,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "macrdp_0.1.27_aarch64_e33e728c864f.dmg",
+      "macrdp_0.1.27_aarch64_e33e728c864f.dmg.sha256",
+      "macrdp_0.1.27_aarch64_e33e728c864f.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "installed_app_metadata_and_config_unchanged": true,
+    "live_remote_session_started": false
+  }
 }
