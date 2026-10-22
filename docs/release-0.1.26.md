@@ -76,3 +76,23 @@ native probe confirmed private all-slot enumeration works on the build Mac;
 actual disable/re-enable behavior and prevention of cursor regression remain
 device tests. The ad-hoc signed package identity and Desktop delivery are
 recorded separately against the committed source after the build.
+
+## Verified Desktop delivery
+
+Test package: `macrdp_0.1.26_aarch64_48f5b790721b.dmg` on the Mac mini user's Desktop.
+
+- Source revision: `48f5b790721bcea1e3f39b4c1ccbd740308a18d6`.
+- SHA-256: `4d9122d62d441b9de36a3098ad352a8c8e95410ce02ac7f4df9f1787ec4bef57`.
+- Size: 15,619,733 bytes; aarch64, ad-hoc signed.
+- Image checksum, read-only mounted app deep strict signature, architecture,
+  release version and embedded build metadata verified. The mount was removed.
+- Packaged display/server/private/recovery helper extra-argument rejection and
+  standalone CLI version, retention option and private-helper rejection passed.
+  No valid helper, recovery, remote connection or security action was invoked.
+- DMG, checksum and build metadata copied atomically to the Desktop and hashed
+  after copying. The previous 0.1.25 installer and sidecars were then removed.
+- The installed/running application remains in place for the user to replace.
+
+[The validation record](release-0.1.26-validation.json) records package checks and
+remaining device acceptance. Hardware enable/disable and prevention of cursor
+regression have not been claimed as verified by synthetic release checks.

@@ -1,8 +1,8 @@
 {
   "schema": "macrdp-release-validation-v1",
   "version": "0.1.26",
-  "status": "source checks passed; awaiting DMG verification",
-  "source_revision": null,
+  "status": "built and delivered for user testing",
+  "source_revision": "48f5b790721bcea1e3f39b4c1ccbd740308a18d6",
   "release_checks": {
     "rust_passed": 818,
     "rust_failed": 0,
@@ -22,7 +22,8 @@
     "independent_native_and_recovery_reviews_passed": true,
     "staged_gitleaks_passed": true,
     "version_and_lockfile_consistency_passed": true,
-    "external_dependency_versions_changed": false
+    "external_dependency_versions_changed": false,
+    "committed_source_gitleaks_passed": true
   },
   "retention_policy": {
     "default": false,
@@ -54,12 +55,45 @@
     "permission_requests_run": false,
     "installed_application_replaced": false
   },
-  "package_verification": null,
+  "package_verification": {
+    "version": "0.1.26",
+    "source_revision": "48f5b790721bcea1e3f39b4c1ccbd740308a18d6",
+    "verified_at_utc": "2026-10-22T06:57:42.589773+00:00",
+    "package": "macrdp_0.1.26_aarch64_48f5b790721b.dmg",
+    "sha256": "4d9122d62d441b9de36a3098ad352a8c8e95410ce02ac7f4df9f1787ec4bef57",
+    "bytes": 15619733,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "image_checksum_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "mounted_read_only": true,
+    "mount_removed": true,
+    "version_and_build_metadata_verified": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--macrdp-private-session-helper": true,
+      "--recover-local-desktop": true
+    },
+    "standalone_cli_version_and_retention_option_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helper_or_recovery_actions_invoked": false,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "macrdp_0.1.25_aarch64_3f622228016f.dmg",
+      "macrdp_0.1.25_aarch64_3f622228016f.dmg.sha256",
+      "macrdp_0.1.25_aarch64_3f622228016f.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "live_remote_session_started": false
+  },
   "limitations": [
     "Actual private-API disable/re-enable and metadata behavior require device testing.",
     "Sleep/wake, hotplug, window restoration and guarded-mode behavior require user acceptance.",
     "Enabling/disabling and switching primary displays still change topology; no claim that cursor regression is fixed.",
     "Existing ColorSync/WindowServer state and monitor profiles are not reset or deleted."
   ],
-  "device_test_instructions": "release-0.1.26.md"
+  "device_test_instructions": "release-0.1.26.md",
+  "verified_at_utc": "2026-10-22T06:57:42.589773+00:00"
 }
