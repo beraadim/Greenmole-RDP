@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use crate::virtual_display::VirtualDisplay;
 use crate::{Command, DisplayBackend, DisplayGeometry};
 
+mod retained;
 mod window_session;
+mod worker_owner;
+use worker_owner::WorkerOwner;
 
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
 const SETTLE_POLL: Duration = Duration::from_millis(50);
@@ -51,9 +54,15 @@ pub(crate) struct NativeDisplay {
     virtual_display: Option<VirtualDisplay>,
     session_layout: Option<crate::layout::Snapshot>,
     windows: window_session::SessionState,
+    parked: bool,
+    fresh_mode_required: bool,
 }
 
 impl NativeDisplay {
+    pub(crate) fn id(&self) -> u32 {
+        self.display_id
+    }
+
     pub(crate) fn new(backend: DisplayBackend, width: u16, height: u16) -> Result<Self> {
         match backend {
             DisplayBackend::Main => {
@@ -64,6 +73,8 @@ impl NativeDisplay {
                     virtual_display: None,
                     session_layout: None,
                     windows: window_session::SessionState::default(),
+                    parked: false,
+                    fresh_mode_required: false,
                 };
                 let geometry = owner.geometry()?;
                 tracing::info!(?geometry, "Pinned main display without changing its mode");
@@ -80,12 +91,18 @@ impl NativeDisplay {
             virtual_display: Some(virtual_display),
             session_layout: None,
             windows: window_session::SessionState::default(),
+            parked: false,
+            fresh_mode_required: false,
         };
         owner.wait_for_mode(width, height)?;
         Ok(owner)
     }
 
     pub(crate) fn geometry(&self) -> Result<DisplayGeometry> {
+        ensure!(
+            !self.parked,
+            "The retained virtual display is disabled while disconnected"
+        );
         let display = CGDisplay::new(self.display_id);
         // CoreGraphics flags can report true for an ID that has disappeared.
         // Membership must be established before requesting its mode or bounds.
@@ -178,6 +195,9 @@ impl NativeDisplay {
     }
 
     pub(crate) fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
+        if self.parked {
+            return self.begin_retained_session();
+        }
         let Some(virtual_display) = &self.virtual_display else {
             return self.geometry();
         };
@@ -264,20 +284,42 @@ impl NativeDisplay {
     }
 
     pub(crate) fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
+        ensure!(
+            !self.parked,
+            "Cannot prepare capture on a disabled retained display"
+        );
         if self.virtual_display.is_none() {
             return self.geometry();
         }
-        if let Ok(geometry) = self.geometry() {
-            if self.matches_mode(&geometry, width, height) {
-                self.windows.gather(geometry);
-                return Ok(geometry);
+        if !self.fresh_mode_required {
+            if let Ok(geometry) = self.geometry() {
+                if self.matches_mode(&geometry, width, height) {
+                    self.windows.gather(geometry);
+                    return Ok(geometry);
+                }
             }
         }
         self.virtual_display
             .as_mut()
             .expect("virtual owner checked")
             .apply_mode(width, height)?;
-        let geometry = self.wait_for_mode(width, height)?;
+        let geometry = if self.fresh_mode_required {
+            // Re-enabling may restore a remembered mode. Verify/commit the
+            // requested framebuffer in a fresh process, never a cached mode.
+            let owner = self
+                .virtual_display
+                .as_ref()
+                .expect("virtual owner checked");
+            crate::helper::DisplayHelper::select_mode(
+                self.display_id,
+                owner.identity(),
+                width,
+                height,
+            )?
+        } else {
+            self.wait_for_mode(width, height)?
+        };
+        self.fresh_mode_required = false;
         self.windows.gather(geometry);
         tracing::info!(?geometry, "Virtual display mode ready for capture");
         Ok(geometry)
@@ -422,6 +464,8 @@ mod tests {
             virtual_display: None,
             session_layout: None,
             windows: window_session::SessionState::default(),
+            parked: false,
+            fresh_mode_required: false,
         };
         let error = selected.geometry().unwrap_err();
         assert!(error.to_string().contains("no longer online"));
@@ -434,6 +478,7 @@ mod tests {
             initial_width: 1280,
             initial_height: 720,
             identity_slot: "test".to_owned(),
+            retain_between_sessions: false,
         };
         let (request, _preparation) = crate::window_move::Request::new(|_| {
             panic!("disconnected action must never reach application windows")
@@ -444,152 +489,27 @@ mod tests {
         assert!(error.to_string().contains("Connect a remote client"));
         assert_eq!(owner.display_id(), 0);
     }
-}
 
-enum WorkerOwner {
-    Main(NativeDisplay),
-    Virtual {
-        helper: Option<crate::helper::DisplayHelper>,
-        initial_width: u16,
-        initial_height: u16,
-        identity_slot: String,
-    },
-}
-
-impl WorkerOwner {
-    fn move_windows(
-        &mut self,
-        budget: crate::window_move::Budget,
-        own_windows: Box<dyn FnOnce(DisplayGeometry) -> Result<usize> + Send>,
-    ) -> Result<crate::WindowMoveReport> {
-        budget.check()?;
-        ensure!(
-            matches!(
-                self,
-                Self::Virtual {
-                    helper: Some(_),
-                    ..
-                }
-            ),
-            "Connect a remote client before moving windows to its virtual display"
-        );
-        // Geometry comes from the owner helper, never from a remembered ID
-        // that macOS could have reassigned. Ownership survives this whole call.
-        let geometry = self.geometry()?;
-        budget.check()?;
-        crate::manual_windows::move_windows(geometry, budget, own_windows)
-    }
-
-    fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
-        match self {
-            Self::Main(owner) => owner.begin_remote_session(),
-            Self::Virtual {
-                helper,
-                initial_width,
-                initial_height,
-                identity_slot,
-            } => {
-                if helper.is_none() {
-                    *helper = Some(crate::helper::DisplayHelper::new(
-                        *initial_width,
-                        *initial_height,
-                        identity_slot,
-                    )?);
-                }
-                helper
-                    .as_mut()
-                    .expect("initialized session display")
-                    .begin_remote_session()
-            }
-        }
-    }
-
-    fn end_remote_session(&mut self) -> Result<()> {
-        match self {
-            Self::Main(owner) => owner.end_remote_session().map(|_| ()),
-            Self::Virtual { helper, .. } => {
-                let Some(mut owner) = helper.take() else {
-                    return Ok(());
-                };
-                let display_id = owner.id();
-                let result = owner.end_remote_session().map(|_| ());
-                // Drop and reap before acknowledging disconnect. The next
-                // queued activation may then create its own display safely.
-                drop(owner);
-                let removed = wait_for_display_removal(display_id);
-                result.and(removed)
-            }
-        }
-    }
-    fn geometry(&mut self) -> Result<DisplayGeometry> {
-        match self {
-            Self::Main(owner) => owner.geometry(),
-            Self::Virtual { helper, .. } => helper
-                .as_mut()
-                .context("No remote display exists while disconnected")?
-                .geometry(),
-        }
-    }
-
-    fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
-        match self {
-            Self::Main(owner) => owner.prepare_capture(width, height),
-            Self::Virtual { helper, .. } => helper
-                .as_mut()
-                .context("Cannot prepare capture before the remote connection begins")?
-                .prepare_capture(width, height),
-        }
-    }
-
-    fn prepare_remote_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
-        if let Self::Virtual {
-            helper,
-            identity_slot,
-            ..
-        } = self
-        {
-            if helper.is_none() {
-                // Use the negotiated client dimensions for the very first
-                // mode; no startup-size screen or extra initial resize exists.
-                *helper = Some(crate::helper::DisplayHelper::new(
-                    width,
-                    height,
-                    identity_slot,
-                )?);
-            }
-        }
-        let result = self
-            .begin_remote_session()
-            .and_then(|_| self.prepare_capture(width, height));
-        if result.is_err() {
-            if let Err(error) = self.end_remote_session() {
-                tracing::warn!(%error, "Could not fully clean up failed remote display activation");
-            }
-        }
-        result
-    }
-
-    fn display_id(&self) -> u32 {
-        match self {
-            Self::Main(owner) => owner.display_id,
-            Self::Virtual { helper, .. } => helper.as_ref().map_or(0, |owner| owner.id()),
-        }
-    }
-}
-
-fn wait_for_display_removal(display_id: u32) -> Result<()> {
-    let deadline = Instant::now() + SETTLE_TIMEOUT;
-    loop {
-        // Check membership, not stale online/active flags for a removed ID.
-        if !online_display_ids()?.contains(&display_id) {
-            tracing::info!(display_id, "Removed the disconnected remote display");
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "Disconnected virtual display {display_id} was not removed within 3 seconds"
-        );
-        std::thread::sleep(SETTLE_POLL);
+    #[test]
+    fn repeated_park_is_idempotent_and_does_not_query_geometry_or_apps() {
+        // An invalid ID and absent native object make any accidental geometry,
+        // activation, or AX work fail. Already parked means no work is needed.
+        let mut owner = NativeDisplay {
+            display_id: u32::MAX,
+            virtual_display: None,
+            session_layout: None,
+            windows: window_session::SessionState::default(),
+            parked: true,
+            fresh_mode_required: true,
+        };
+        owner.park_remote_session().unwrap();
+        owner.park_remote_session().unwrap();
+        assert!(owner
+            .geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("disabled"));
+        assert!(owner.prepare_capture(1280, 720).is_err());
     }
 }
 
@@ -598,6 +518,7 @@ pub(crate) fn run_worker(
     width: u16,
     height: u16,
     identity_slot: String,
+    retain_between_sessions: bool,
     receiver: mpsc::Receiver<Command>,
     ready: mpsc::Sender<Result<()>>,
     stopping: Arc<AtomicBool>,
@@ -610,6 +531,7 @@ pub(crate) fn run_worker(
             initial_width: width,
             initial_height: height,
             identity_slot,
+            retain_between_sessions,
         }),
     }) {
         Ok(owner) => owner,
@@ -671,6 +593,9 @@ pub(crate) fn run_worker(
         }
     }
     let display_id = owner.display_id();
+    if let Err(error) = autoreleasepool(|_| owner.shutdown()) {
+        tracing::warn!(%error, display_id, "Could not completely retire the display controller");
+    }
     autoreleasepool(|_| drop(owner));
     let _ = stopped.send(());
     tracing::info!(

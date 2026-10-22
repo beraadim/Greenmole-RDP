@@ -1,0 +1,65 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "version": "0.1.26",
+  "status": "source checks passed; awaiting DMG verification",
+  "source_revision": null,
+  "release_checks": {
+    "rust_passed": 818,
+    "rust_failed": 0,
+    "existing_opt_in_ignored": 6,
+    "rust_serial_mode": true,
+    "display_library_passed": 89,
+    "python_passed": 8,
+    "javascript_passed": 11,
+    "typescript_passed": true,
+    "frontend_production_build_passed": true,
+    "native_acceptance_executable_compiled": true,
+    "native_acceptance_default_skip_verified": true,
+    "scoped_rust_formatting_passed": true,
+    "existing_compiler_and_frontend_bundle_warnings_remain": true
+  },
+  "source_review": {
+    "independent_native_and_recovery_reviews_passed": true,
+    "staged_gitleaks_passed": true,
+    "version_and_lockfile_consistency_passed": true,
+    "external_dependency_versions_changed": false
+  },
+  "retention_policy": {
+    "default": false,
+    "virtual_backend_required": true,
+    "service_restart_required": true,
+    "lazy_first_connection_creation": true,
+    "same_helper_object_and_identity_between_sessions": true,
+    "physical_baseline_saved_before_reactivation": true,
+    "fresh_selector_verifies_requested_mode": true,
+    "capture_and_input_rejected_while_parked": true,
+    "physical_primary_and_saved_frames_restored_before_disable": true,
+    "new_remote_window_evacuation_bounded": true,
+    "semantic_parking_refusal_uses_verified_full_removal_fallback": true,
+    "fatal_protocol_errors_abort_exact_owner": true,
+    "session_scoped_native_changes_only": true,
+    "all_slot_enumeration_includes_disabled_targets": true,
+    "exact_helper_reaped_before_final_removal_verification": true,
+    "supervisor_owned_process_group_recovery_preserved": true,
+    "private_session_lock_and_capture_retirement_ordering_preserved": true
+  },
+  "validation_scope": {
+    "synthetic_lifecycle_and_window_fixtures": true,
+    "read_only_native_enumeration_probe_passed": true,
+    "live_virtual_displays_created": false,
+    "live_rdp_connections_started": false,
+    "live_capture_started": false,
+    "active_input_taps_or_covers_created": false,
+    "host_lock_or_unlock_actions_run": false,
+    "permission_requests_run": false,
+    "installed_application_replaced": false
+  },
+  "package_verification": null,
+  "limitations": [
+    "Actual private-API disable/re-enable and metadata behavior require device testing.",
+    "Sleep/wake, hotplug, window restoration and guarded-mode behavior require user acceptance.",
+    "Enabling/disabling and switching primary displays still change topology; no claim that cursor regression is fixed.",
+    "Existing ColorSync/WindowServer state and monitor profiles are not reset or deleted."
+  ],
+  "device_test_instructions": "release-0.1.26.md"
+}

@@ -148,6 +148,7 @@ export interface UiConfig {
   username: string;
   password: string;
   display_backend: "main" | "virtual";
+  reuse_virtual_display: boolean;
   private_session: boolean;
   resolution: string;
   show_cursor: boolean;

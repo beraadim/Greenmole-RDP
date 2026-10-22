@@ -30,6 +30,7 @@ pub struct UiConfig {
 
     // ── Display ─────────────────────────────────────────────
     pub display_backend: DisplayBackend,
+    pub reuse_virtual_display: bool,
     pub private_session: bool,
     #[serde(alias = "hidpi_scale")]
     pub resolution: String,
@@ -74,6 +75,7 @@ impl Default for UiConfig {
             tls_key_path: String::new(),
             tls_server_names: Vec::new(),
             display_backend: DisplayBackend::Main,
+            reuse_virtual_display: false,
             private_session: false,
             resolution: "auto".to_string(),
             show_cursor: false,
@@ -179,6 +181,9 @@ impl UiConfig {
     ) -> Result<(), String> {
         if self.private_session && self.display_backend != DisplayBackend::Virtual {
             return Err("Guarded private sessions require the virtual display backend".into());
+        }
+        if self.reuse_virtual_display && self.display_backend != DisplayBackend::Virtual {
+            return Err("Reusing a virtual display requires the virtual display backend".into());
         }
         if self.password.is_empty() || self.username.trim().is_empty() {
             return Err("A nonempty username and password are required".to_string());
@@ -301,7 +306,23 @@ impl UiConfig {
                         "Disable guarded private sessions before selecting the main display".into(),
                     );
                 }
+                if self.reuse_virtual_display && backend != DisplayBackend::Virtual {
+                    return Err(
+                        "Disable virtual display reuse before selecting the main display".into(),
+                    );
+                }
                 self.display_backend = backend;
+            }
+            "reuse_virtual_display" => {
+                let enabled = value
+                    .as_bool()
+                    .ok_or("reuse_virtual_display must be a boolean")?;
+                if enabled && self.display_backend != DisplayBackend::Virtual {
+                    return Err(
+                        "Select the virtual display before enabling virtual display reuse".into(),
+                    );
+                }
+                self.reuse_virtual_display = enabled;
             }
             "private_session" => {
                 let enabled = value.as_bool().ok_or("private_session must be a boolean")?;
@@ -389,6 +410,7 @@ impl UiConfig {
         matches!(
             key,
             "display_backend"
+                | "reuse_virtual_display"
                 | "private_session"
                 | "bind_address"
                 | "port"
@@ -412,6 +434,7 @@ impl UiConfig {
             bind_address: Some(self.bind_address.clone()),
             frame_rate: self.frame_rate,
             display_backend: self.display_backend,
+            reuse_virtual_display: self.reuse_virtual_display,
             private_session: self.private_session,
             width: 0,  // auto-detect
             height: 0, // auto-detect
@@ -451,6 +474,73 @@ impl UiConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retained_display_policy_migrates_and_persists_without_credentials() {
+        let mut config: UiConfig = toml::from_str("username = 'fixture-user'").unwrap();
+        assert!(!config.reuse_virtual_display);
+        assert!(config
+            .set_field("reuse_virtual_display", &json!(true))
+            .is_err());
+        config.password = "fixture-secret".into();
+        config
+            .set_field("display_backend", &json!("virtual"))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.toml");
+        for enabled in [true, false] {
+            assert!(config
+                .set_field("reuse_virtual_display", &json!(enabled))
+                .unwrap());
+            for backend in [DisplayBackend::Main, DisplayBackend::Virtual] {
+                assert!(config.requires_restart("reuse_virtual_display", Some(backend)));
+            }
+            config
+                .save_with_store(&path, Some(&config.password), |_| Ok(()), || Ok(()))
+                .unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            let saved: UiConfig = toml::from_str(&content).unwrap();
+            assert_eq!(saved.reuse_virtual_display, enabled);
+            assert_eq!(saved.to_server_config().reuse_virtual_display, enabled);
+            assert!(!content.contains("fixture-secret"));
+        }
+    }
+
+    #[test]
+    fn retained_display_updates_reject_invalid_values_without_changing_policy() {
+        let mut config = UiConfig::default();
+        config
+            .set_field("display_backend", &json!("virtual"))
+            .unwrap();
+        config
+            .set_field("reuse_virtual_display", &json!(true))
+            .unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+        for value in [json!("false"), json!(0), json!(null)] {
+            assert!(config.set_field("reuse_virtual_display", &value).is_err());
+            assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        }
+        assert!(config.set_field("display_backend", &json!("main")).is_err());
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        config
+            .set_field("reuse_virtual_display", &json!(false))
+            .unwrap();
+        config.set_field("display_backend", &json!("main")).unwrap();
+        // Reject inconsistent hand-edited policy before any credential write.
+        config.reuse_virtual_display = true;
+        config.password = "fixture-secret".into();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.toml");
+        assert!(config
+            .save_with_store(
+                &path,
+                Some(&config.password),
+                |_| panic!("credential write"),
+                || Ok(())
+            )
+            .is_err());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn private_sessions_migrate_persist_and_require_a_restart_in_both_directions() {

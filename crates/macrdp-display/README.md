@@ -10,8 +10,9 @@ the physical displays, including the original main display. Activation gathers
 only windows originally on non-main physical displays; macOS handles the original
 main display's windows during the primary transition. Disconnect restores the
 physical primary and saved display origins and returns captured windows to their
-original monitors and frames, then removes the virtual screen. No virtual display
-or helper exists while disconnected. Physical
+original monitors and frames. By default it then removes the virtual screen and
+helper. The opt-in retention constructor instead keeps that exact helper and
+native object with the display disabled between sessions. Physical
 display modes and persistent display preferences are never changed.
 
 The virtual framebuffer uses one pixel per logical point and is limited to
@@ -39,8 +40,10 @@ unowned, built-in or mirrored displays. The owned virtual display can be primary
 while its mode changes. The persistent owner services reconfiguration
 events while the selector runs. Actual mode pixels and global bounds return over
 bounded JSON pipes; the selector has its own native-call deadline.
-Resolution changes reuse the connection's process and display; reconnects create
-a new owner after the previous one has been removed and reaped. Main-display
+Resolution changes reuse the connection's process and display. Default reconnects
+create a new owner after the previous one has been removed and reaped. Retained
+reconnects snapshot the current physical arrangement before enabling the existing
+object, and verify the requested mode through a fresh selector. Main-display
 queries use the existing worker and never change a physical mode.
 
 Primary layout changes use another fresh selector and the same bounded native
@@ -59,8 +62,10 @@ queries GUI applications out of process from its main thread; the manual action
 uses main-thread AppKit for its own GUI windows. Browser resizing never recaptures
 the original frames. Restoration ignores closed windows and fits windows from
 missing monitors visibly onto surviving physical screens. Applications may
-constrain placement or size. Windows opened after the snapshot are left to
-macOS when the virtual screen disappears. The manual Dashboard gather action
+constrain placement or size. With default removal, windows opened after the
+snapshot are left to macOS when the virtual screen disappears. Retained mode
+performs a bounded recovery pass for remaining ordinary remote windows before
+disabling. An incomplete pass declines parking and uses full removal. The manual Dashboard gather action
 remains available and does not overwrite the original snapshot.
 
 Cloned controllers carry only channels and values across threads. Dropping the
@@ -68,6 +73,15 @@ last controller requests helper shutdown, waits briefly for process exit, then
 forces termination if necessary. EOF also ends the helper when its parent exits.
 Process exit lets WindowServer remove mode-switched virtual displays that can
 outlive release of their Objective-C owner. Reply waits and shutdown are bounded.
+
+`new_with_owner_identity_slot_and_retention` opts into server-lifetime display
+ownership. It creates nothing until the first connection; disabled displays
+provide no capture geometry. Private enable/disable symbols are checked at
+runtime, and only the exact leased virtual display may be toggled. Parking
+verifies absence from both public online and active lists. Final retirement
+reaps the helper first, then checks all display slots, including disabled ones.
+Ordinary constructors retain removal-on-disconnect behavior. No capture or
+encoding is kept running by retention.
 
 Executables embedding this crate must call `run_display_helper_if_requested()`
 at the start of `main`, before initializing the application or querying displays.
@@ -115,6 +129,12 @@ caffeinate -d -u -t 120 cargo test -p macrdp-display --test native_smoke -- --ig
 The smoke executable has its own helper entry hook and read-only observer mode.
 Its normal invocation skips display creation; `--ignored` explicitly enables
 the native test. It verifies every backing mode through a fresh observer process.
+
+Add `--retained` to the explicitly enabled smoke command to check three
+disconnect/reconnect cycles at different sizes, preservation of the same display
+ID, disabled capture rejection, physical geometry restoration and final owner
+retirement. This also changes the live desktop and requires device acceptance;
+it is not enabled by ordinary release checks.
 
 The default test run skips the native smoke test. Its Rust types can be checked from
 another host with `cargo check -p macrdp-display --tests --target aarch64-apple-darwin`.

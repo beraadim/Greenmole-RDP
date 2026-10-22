@@ -197,6 +197,7 @@ fn safe_configuration(config: &UiConfig) -> Value {
         "quality": selection(&config.quality, &["low_latency", "balanced", "high_quality", "lossless"]),
         "chroma": selection(&config.chroma_mode, &["avc420", "avc444"]),
         "display_backend": config.display_backend, "resolution": resolution,
+        "reuse_virtual_display": config.reuse_virtual_display,
         "automatic_resolution": config.resolution == "auto", "show_cursor": config.show_cursor,
         "idle_timeout_secs": config.idle_timeout_secs,
         "audio_enabled": config.audio_enabled,

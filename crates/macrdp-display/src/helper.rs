@@ -14,6 +14,9 @@ use crate::macos::NativeDisplay;
 use crate::protocol::{read_message, write_message, Reply, Request};
 use crate::{normalize_size, DisplayBackend, DisplayGeometry, HELPER_ARGUMENT};
 
+#[path = "helper_retained.rs"]
+mod retained;
+
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 // Allow bounded layout and window restoration before terminating an owner.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -26,6 +29,7 @@ pub(crate) struct DisplayHelper {
     replies: mpsc::Receiver<Result<Reply>>,
     display_id: Option<u32>,
     usable: bool,
+    parked: bool,
 }
 
 impl DisplayHelper {
@@ -102,6 +106,7 @@ impl DisplayHelper {
             replies,
             display_id: None,
             usable: true,
+            parked: false,
         };
         reader.context("Could not start display helper reply reader")?;
         Ok((helper, proof))
@@ -226,17 +231,15 @@ impl DisplayHelper {
             let reply = self.receive_reply(timeout, service_owner_events)?;
             let geometry = match reply {
                 Reply::Geometry { geometry, windows } => {
-                    for report in windows.reports {
-                        tracing::info!(?report, "Remote window session phase completed");
-                    }
-                    for warning in windows.warnings {
-                        tracing::warn!(%warning, "Remote window session warning");
-                    }
+                    log_window_status(windows);
                     geometry
                 }
                 Reply::Error { message } => bail!("Display helper: {message}"),
                 Reply::IdentityAvailable {} => bail!("Unexpected identity preflight reply"),
                 Reply::Stopped {} => bail!("Display helper stopped during a geometry request"),
+                Reply::DisplayEnabled { .. } | Reply::Parked { .. } | Reply::ParkRefused { .. } => {
+                    bail!("Unexpected display state acknowledgment during a geometry request")
+                }
             };
             ensure!(
                 geometry.display_id != 0
@@ -262,6 +265,10 @@ impl DisplayHelper {
     }
 
     pub(crate) fn geometry(&mut self) -> Result<DisplayGeometry> {
+        ensure!(
+            !self.parked,
+            "The retained virtual display is disabled while disconnected"
+        );
         self.geometry_request(Request::Geometry {})
     }
 
@@ -271,6 +278,7 @@ impl DisplayHelper {
             SESSION_TIMEOUT,
             false,
         )?;
+        self.parked = false;
         tracing::info!(
             display_id = self.id(),
             ?geometry,
@@ -293,6 +301,10 @@ impl DisplayHelper {
     }
 
     pub(crate) fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
+        ensure!(
+            !self.parked,
+            "Cannot capture a disabled retained virtual display"
+        );
         let geometry = self.geometry_request_with_options(
             Request::PrepareCapture { width, height },
             SESSION_TIMEOUT,
@@ -363,6 +375,15 @@ impl DisplayHelper {
     }
 }
 
+fn log_window_status(windows: crate::protocol::WindowStatus) {
+    for report in windows.reports {
+        tracing::info!(?report, "Remote window session phase completed");
+    }
+    for warning in windows.warnings {
+        tracing::warn!(%warning, "Remote window session warning");
+    }
+}
+
 impl Drop for DisplayHelper {
     fn drop(&mut self) {
         if self.usable {
@@ -414,6 +435,7 @@ pub(crate) fn run_child() -> Result<()> {
             Request::ValidateIdentity { .. }
                 | Request::SelectMode { .. }
                 | Request::ConfigureLayout { .. }
+                | Request::SetDisplayEnabled { .. }
         );
         if let Request::ValidateIdentity { identity } = request {
             let response = (|| {
@@ -439,6 +461,87 @@ pub(crate) fn run_child() -> Result<()> {
                 }
             }
             break Ok(());
+        }
+        if let Request::SetDisplayEnabled {
+            display_id,
+            identity,
+            enabled,
+        } = request
+        {
+            let response = (|| {
+                ensure!(
+                    owner.is_none() && selector_identity.is_none(),
+                    "Display activation requires a fresh selector process"
+                );
+                selector_identity = Some(IdentityLease::inherit(&identity)?);
+                crate::selector::set_display_enabled(
+                    display_id,
+                    selector_identity.as_ref().expect("inherited identity"),
+                    enabled,
+                )
+            })();
+            match response {
+                Ok(()) => write_message(
+                    &mut output,
+                    &Reply::DisplayEnabled {
+                        display_id,
+                        enabled,
+                    },
+                )?,
+                Err(error) => {
+                    let _ = write_message(
+                        &mut output,
+                        &Reply::Error {
+                            message: format!("{error:#}"),
+                        },
+                    );
+                    break Err(error);
+                }
+            }
+            break Ok(());
+        }
+        if matches!(request, Request::ParkRemoteSession {}) {
+            let response = autoreleasepool(|_| {
+                owner
+                    .as_mut()
+                    .context("Display helper is not initialized")?
+                    .park_remote_session()
+            });
+            match response {
+                Ok(()) => {
+                    let native = owner.as_mut().expect("parked owner");
+                    write_message(
+                        &mut output,
+                        &Reply::Parked {
+                            display_id: native.id(),
+                            windows: native.take_window_status(),
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    if let Some(native) = owner.as_mut() {
+                        if native.can_retire_after_park_refusal() {
+                            write_message(
+                                &mut output,
+                                &Reply::ParkRefused {
+                                    display_id: native.id(),
+                                    message: format!("{error:#}"),
+                                    windows: native.take_window_status(),
+                                },
+                            )?;
+                            continue;
+                        }
+                    }
+                    let _ = write_message(
+                        &mut output,
+                        &Reply::Error {
+                            message: format!("{error:#}"),
+                        },
+                    );
+                    break Err(error);
+                }
+            }
+            continue;
         }
         let response = autoreleasepool(|_| -> Result<DisplayGeometry> {
             match request {
@@ -516,7 +619,10 @@ pub(crate) fn run_child() -> Result<()> {
                         &displays,
                     )
                 }
-                Request::ValidateIdentity { .. } | Request::Shutdown {} => unreachable!(),
+                Request::ValidateIdentity { .. }
+                | Request::Shutdown {}
+                | Request::ParkRemoteSession {}
+                | Request::SetDisplayEnabled { .. } => unreachable!(),
             }
         });
         match response {

@@ -53,7 +53,11 @@ fn main() {
         eprintln!("Native display smoke test skipped; pass --ignored to create temporary extended displays and gather/restore application windows");
         return;
     }
-    native::run();
+    if args.iter().any(|arg| arg == "--retained") {
+        native::run_retained();
+    } else {
+        native::run();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -378,5 +382,80 @@ mod native {
         drop(main);
         assert!(CGDisplay::new(main_id).is_online());
         assert_eq!(native_mode_size(main_id), main_mode);
+    }
+
+    /// Explicit device acceptance for retained displays. Keep this separate from
+    /// ordinary smoke tests: disabling is private API and needs physical-host
+    /// acceptance, including Accessibility window restoration and sleep/wake.
+    pub fn run_retained() {
+        let main_id = CGDisplay::main().id;
+        assert_ne!(main_id, 0, "a logged-in desktop is required");
+        let main_mode = native_mode_size(main_id);
+        let original_ids = CGDisplay::active_displays().unwrap();
+        let main = DisplayController::new(DisplayBackend::Main, 1280, 720).unwrap();
+        let original_geometry = main.geometry().unwrap();
+        let controller = DisplayController::new_with_owner_identity_slot_and_retention(
+            DisplayBackend::Virtual,
+            1920,
+            1080,
+            (),
+            "native-retained-smoke".to_owned(),
+            true,
+        )
+        .unwrap();
+        assert!(controller.geometry().is_err());
+        observe_inventory_from_fresh_process(&original_ids);
+        let mut retained_id = None;
+        for size in [(1920, 1080), (1280, 720), (1928, 1088)] {
+            let geometry = controller
+                .queue_remote_capture(size.0, size.1)
+                .unwrap()
+                .wait()
+                .unwrap();
+            let expected_id = *retained_id.get_or_insert(geometry.display_id);
+            assert_eq!(
+                geometry.display_id, expected_id,
+                "park recreated the display"
+            );
+            assert_virtual_mode(&controller, geometry, expected_id, size);
+            observe_layout_from_fresh_process(expected_id, geometry);
+            controller.end_remote_session().unwrap();
+            controller.end_remote_session().unwrap();
+            assert_display_removed(expected_id);
+            assert!(
+                controller.geometry().is_err(),
+                "parked screen exposed capture geometry"
+            );
+            observe_inventory_from_fresh_process(&original_ids);
+            assert_eq!(main.geometry().unwrap(), original_geometry);
+            assert_eq!(native_mode_size(main_id), main_mode);
+            observe_layout_from_fresh_process(main_id, original_geometry);
+        }
+        controller.shutdown_owned().unwrap();
+        assert!(controller.shutdown_complete());
+        drop(controller);
+        observe_inventory_from_fresh_process(&original_ids);
+        assert_eq!(CGDisplay::main().id, main_id);
+        // A new owner can acquire the same slot only after final helper/selector
+        // exit has released the lease. Shutdown must retire a disabled owner too.
+        let replacement = DisplayController::new_with_owner_identity_slot_and_retention(
+            DisplayBackend::Virtual,
+            1280,
+            720,
+            (),
+            "native-retained-smoke".to_owned(),
+            true,
+        )
+        .unwrap();
+        let geometry = replacement
+            .queue_remote_capture(1280, 720)
+            .unwrap()
+            .wait()
+            .unwrap();
+        replacement.shutdown_owned().unwrap();
+        assert_display_removed(geometry.display_id);
+        observe_inventory_from_fresh_process(&original_ids);
+        assert_eq!(main.geometry().unwrap(), original_geometry);
+        eprintln!("Retained display survived three park/reactivate cycles and final shutdown");
     }
 }

@@ -222,6 +222,64 @@ impl<W: Window> Session<W> {
     }
 }
 
+/// Before retaining an inactive virtual display, evacuate ordinary windows that
+/// were created during the session or could not be restored from a snapshot.
+/// Windows already reachable on a physical screen, or belonging primarily to a
+/// different screen, are left alone. Fullscreen/minimized windows are excluded
+/// by the same native movability check used for normal restoration.
+pub(super) fn evacuate_window<W: Window>(
+    window: &mut W,
+    remote: Frame,
+    local: &[Screen],
+    budget: &Budget,
+    report: &mut PhaseReport,
+) {
+    if budget.expired() {
+        report.timed_out = true;
+        return;
+    }
+    if report.inspected >= MAX_SAVED_WINDOWS {
+        report.limit_reached = true;
+        return;
+    }
+    report.inspected += 1;
+    let (actual, resizable) = match window.inspect(budget) {
+        Ok(Some((frame, resizable))) if frame.valid() => (frame, resizable),
+        Ok(Some(_)) | Err(_) => {
+            report.failed += 1;
+            return;
+        }
+        Ok(None) => {
+            report.skipped += 1;
+            return;
+        }
+    };
+    let local_frames: Vec<_> = local.iter().map(|screen| screen.frame).collect();
+    let remote_area = actual.intersection(remote);
+    let local_area = local
+        .iter()
+        .map(|screen| actual.intersection(screen.frame))
+        .fold(0.0_f64, f64::max);
+    if remote_area <= 0.0
+        || remote_area <= local_area
+        || actual.has_accessible_titlebar(&local_frames)
+    {
+        report.skipped += 1;
+        return;
+    }
+    let Some(destination) = local
+        .iter()
+        .find(|screen| screen.primary)
+        .or_else(|| local.first())
+    else {
+        report.failed += 1;
+        return;
+    };
+    let destination = actual.relocate(remote, accessible_bounds(destination.frame), resizable);
+    apply(window, actual, destination, resizable, budget, report);
+    report.timed_out |= budget.expired();
+}
+
 fn accessible_bounds(target: Frame) -> Frame {
     Frame {
         x: target.x + 8.0,

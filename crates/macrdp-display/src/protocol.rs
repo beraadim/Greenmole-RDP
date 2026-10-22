@@ -37,6 +37,12 @@ pub(crate) enum Request {
     Geometry {},
     BeginRemoteSession {},
     EndRemoteSession {},
+    ParkRemoteSession {},
+    SetDisplayEnabled {
+        display_id: u32,
+        identity: IdentityProof,
+        enabled: bool,
+    },
     PrepareCapture {
         width: u16,
         height: u16,
@@ -74,6 +80,21 @@ pub(crate) enum Reply {
         windows: WindowStatus,
     },
     IdentityAvailable {},
+    DisplayEnabled {
+        display_id: u32,
+        enabled: bool,
+    },
+    Parked {
+        display_id: u32,
+        #[serde(default)]
+        windows: WindowStatus,
+    },
+    ParkRefused {
+        display_id: u32,
+        message: String,
+        #[serde(default)]
+        windows: WindowStatus,
+    },
     Stopped {},
     Error {
         message: String,
@@ -220,5 +241,38 @@ mod tests {
         ] {
             assert!(read_message::<Request>(&mut Cursor::new(bytes)).is_err());
         }
+    }
+
+    #[test]
+    fn parked_and_refused_replies_do_not_require_capture_geometry() {
+        for reply in [
+            Reply::Parked {
+                display_id: 17,
+                windows: WindowStatus::default(),
+            },
+            Reply::ParkRefused {
+                display_id: 17,
+                message: "bounded evacuation declined".to_owned(),
+                windows: WindowStatus::default(),
+            },
+        ] {
+            let mut bytes = Vec::new();
+            write_message(&mut bytes, &reply).unwrap();
+            let mut input = BufReader::with_capacity(2, Cursor::new(bytes));
+            match read_message::<Reply>(&mut input).unwrap().unwrap() {
+                Reply::Parked { display_id, .. } | Reply::ParkRefused { display_id, .. } => {
+                    assert_eq!(display_id, 17)
+                }
+                other => panic!("unexpected state reply: {other:?}"),
+            }
+        }
+        assert!(serde_json::from_str::<Reply>(
+            r#"{"result":"parked","display_id":17,"geometry":{}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Request>(
+            r#"{"operation":"set_display_enabled","display_id":17,"enabled":true}"#
+        )
+        .is_err());
     }
 }

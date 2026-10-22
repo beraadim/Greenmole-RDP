@@ -21,10 +21,16 @@ password = "" # Replace before use. No working default password is shipped.
 # ─── Display ───────────────────────────────────────────────────────────────────
 
 # "main" shares the main display. "virtual" creates an experimental extended
-# display in the same macOS session; move windows onto it to use them remotely.
-# The virtual display remains available until the server stops.
+# display in the same macOS session and gathers existing windows when connected.
+# Disconnect restores the physical arrangement and removes the virtual display.
 # Changes require a server restart; ordinary client resizing does not.
 display_backend = "main"
+
+# Experimental: keep the display allocated but disabled between remote sessions.
+# Requires display_backend="virtual" and a service restart. Default: false.
+# Created on the first connection; capture/encoding stop while disconnected.
+# The owning helper and display are removed when the server stops.
+reuse_virtual_display = false
 
 # Opt-in guarded control of a virtual desktop. Requires display_backend="virtual"
 # and macOS permission to install an active input tap. Changing this needs restart.

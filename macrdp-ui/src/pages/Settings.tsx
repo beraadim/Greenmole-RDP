@@ -32,6 +32,7 @@ type CategoryId = (typeof categories)[number]["id"];
 
 const restartLabels: Record<string, string> = {
   display_backend: "display", bind_address: "bind address", port: "port",
+  reuse_virtual_display: "virtual display reuse",
   private_session: "guarded private session",
   idle_timeout_secs: "idle timeout", tls_cert_path: "certificate", tls_key_path: "certificate key",
   tls_server_names: "certificate names", audio_enabled: "system audio",
@@ -250,7 +251,7 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="main" disabled={config.private_session}>Main display</SelectItem>
+                  <SelectItem value="main" disabled={config.private_session || config.reuse_virtual_display}>Main display</SelectItem>
                   <SelectItem value="virtual">Virtual display (experimental)</SelectItem>
                 </SelectContent>
               </Select>
@@ -262,12 +263,36 @@ function Settings() {
               </p>
             )}
 
+            {config.reuse_virtual_display && (
+              <p className="py-2 text-xs text-text-muted">
+                Disable virtual display reuse before selecting the main display.
+              </p>
+            )}
+
             {config.display_backend === "virtual" && (
               <p className="py-2 text-xs text-text-muted">
                 Creates a main Mac display when you connect, bringing the Dock
-                and menu bar to the remote desktop. Removes it and restores the
-                previous display arrangement when you disconnect. macOS manages
-                window placement; existing windows may stay on another screen.
+                and menu bar to the remote desktop. Restores the previous display
+                arrangement and captured window positions when you disconnect.
+              </p>
+            )}
+
+            <SettingRow label="Reuse virtual display between sessions"
+              description={config.display_backend === "virtual"
+                ? "Experimental · Off by default · Requires service restart"
+                : "Select Virtual display first"}>
+              <Switch aria-label="Reuse virtual display between sessions"
+                checked={config.reuse_virtual_display}
+                disabled={config.display_backend !== "virtual"}
+                onCheckedChange={(enabled) => updateConfig("reuse_virtual_display", enabled)} />
+            </SettingRow>
+            {config.display_backend === "virtual" && (
+              <p className="py-2 text-xs text-text-muted">
+                Creates the display on the first connection, then keeps it
+                allocated but disabled between sessions. Capture and encoding
+                stop while disconnected. The display is removed when the server
+                stops. This tests whether reduced display creation and removal
+                improves local responsiveness after remote sessions.
               </p>
             )}
 

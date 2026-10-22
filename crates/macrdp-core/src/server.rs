@@ -504,15 +504,18 @@ async fn start_server_inner(
     // Binding-address changes should not create another remembered monitor.
     // Same-user servers sharing a port intentionally share the ownership slot.
     let display_identity_slot = format!("rdp-port-{}", config.port);
+    let reuse_virtual_display = config.reuse_virtual_display;
     let preparation_owner = owner.clone();
     let (display_controller, geometry) = tokio::task::spawn_blocking(move || {
-        let display = macrdp_display::DisplayController::new_with_owner_and_identity_slot(
-            backend,
-            1920,
-            1080,
-            preparation_owner,
-            display_identity_slot,
-        )?;
+        let display =
+            macrdp_display::DisplayController::new_with_owner_identity_slot_and_retention(
+                backend,
+                1920,
+                1080,
+                preparation_owner,
+                display_identity_slot,
+                reuse_virtual_display,
+            )?;
         // Physical geometry queries can also wait on the native display worker.
         // Keep them off the async caller so startup cancellation remains usable.
         let geometry = if backend == macrdp_display::DisplayBackend::Main {
@@ -560,6 +563,7 @@ async fn start_server_inner(
         ?backend,
         ?geometry,
         virtual_display_deferred = geometry.is_none(),
+        reuse_virtual_display,
         width,
         height,
         "Prepared remote desktop negotiation"

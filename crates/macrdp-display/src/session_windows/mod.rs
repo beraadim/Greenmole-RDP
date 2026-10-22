@@ -6,6 +6,10 @@ pub(crate) use engine::PhaseReport;
 #[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
+mod parking;
+#[cfg(target_os = "macos")]
+mod parking_discovery;
+#[cfg(target_os = "macos")]
 pub(crate) use native::SessionWindows;
 
 #[cfg(test)]

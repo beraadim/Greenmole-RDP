@@ -186,6 +186,39 @@ mod tests {
     }
 
     #[test]
+    fn retained_activation_uses_the_physical_layout_saved_before_enabling() {
+        // The user selected a different physical primary and arranged screens
+        // while the virtual display was disabled. Enabling can revive another
+        // remembered arrangement; it must not replace this session's baseline.
+        let before_enable = Snapshot {
+            primary: 3,
+            displays: vec![
+                screen(1, -2560, 120, 2560, 1600),
+                screen(3, 0, 0, 1920, 1080),
+                screen(4, 1920, -200, 2560, 1440),
+            ],
+        };
+        let remembered = vec![
+            screen(1, 0, 0, 2560, 1600),
+            screen(2, -1280, 0, 1280, 720),
+            screen(3, 2560, 0, 1920, 1080),
+            screen(4, 4480, 0, 2560, 1440),
+        ];
+        let (primary, restored) = before_enable.restored(&remembered, 2).unwrap();
+        assert_eq!(primary, 3);
+        assert_eq!(&restored[..3], before_enable.displays.as_slice());
+        assert_eq!(restored[3], screen(2, -3840, 120, 1280, 720));
+        let session = Snapshot {
+            primary,
+            displays: restored.clone(),
+        };
+        let promoted = session.promoted(2).unwrap();
+        let (restored_primary, after_session) = session.restored(&promoted, 2).unwrap();
+        assert_eq!(restored_primary, primary);
+        assert_eq!(after_session, restored);
+    }
+
+    #[test]
     fn missing_primary_returns_to_remaining_physical_screen() {
         let snapshot = Snapshot {
             primary: 1,

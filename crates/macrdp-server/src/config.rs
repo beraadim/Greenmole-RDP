@@ -17,6 +17,9 @@ pub struct Cli {
     /// Share the main display or an experimental virtual display.
     #[arg(long, value_parser = ["main", "virtual"])]
     pub display_backend: Option<String>,
+    /// Experimentally keep the virtual display disabled between sessions. Requires virtual backend.
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub reuse_virtual_display: Option<bool>,
     /// Log level: trace, debug, info, warn, error.
     #[arg(long)]
     pub log_level: Option<String>,
@@ -52,6 +55,9 @@ impl Cli {
         if let Some(level) = &self.log_level {
             config.log_level = Some(level.clone());
         }
+        if let Some(reuse) = self.reuse_virtual_display {
+            config.reuse_virtual_display = reuse;
+        }
     }
 }
 
@@ -83,5 +89,29 @@ mod tests {
             .unwrap()
             .apply_overrides(&mut config);
         assert_eq!(config.display_backend, DisplayBackend::Virtual);
+    }
+
+    #[test]
+    fn retained_display_cli_can_enable_and_explicitly_disable_file_policy() {
+        let mut config = ServerConfig::default();
+        Cli::try_parse_from([
+            "macrdp",
+            "--display-backend",
+            "virtual",
+            "--reuse-virtual-display",
+        ])
+        .unwrap()
+        .apply_overrides(&mut config);
+        assert!(config.reuse_virtual_display);
+        assert_eq!(config.display_backend, DisplayBackend::Virtual);
+        Cli::try_parse_from(["macrdp"])
+            .unwrap()
+            .apply_overrides(&mut config);
+        assert!(config.reuse_virtual_display);
+        Cli::try_parse_from(["macrdp", "--reuse-virtual-display=false"])
+            .unwrap()
+            .apply_overrides(&mut config);
+        assert!(!config.reuse_virtual_display);
+        assert!(Cli::try_parse_from(["macrdp", "--reuse-virtual-display=invalid"]).is_err());
     }
 }

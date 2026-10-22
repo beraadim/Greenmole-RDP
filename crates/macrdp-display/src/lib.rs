@@ -2,8 +2,9 @@
 //!
 //! Virtual displays are extended displays in the existing macOS login session.
 //! A controller creates its virtual display when a remote connection activates,
-//! makes it primary, and restores the previous layout before removing it on
-//! disconnect. Resizing reuses the active connection's display.
+//! makes it primary, and restores the previous layout on disconnect. By default
+//! it removes the screen; an opt-in controller retains a disabled display until
+//! server shutdown. Resizing reuses the active connection's display.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+mod activation;
 #[cfg(target_os = "macos")]
 mod helper;
 #[cfg(target_os = "macos")]
@@ -157,9 +160,10 @@ impl Drop for ControllerInner {
 }
 
 /// Cheap, thread-safe handle. Only values and commands cross the channel;
-/// Virtual-display objects stay in one helper process per active connection;
-/// main-display queries stay on their worker. No helper or virtual screen exists
-/// while disconnected. Dropping the final handle also shuts down a live helper.
+/// Virtual-display objects stay in their owning helper process; main-display
+/// queries stay on their worker. Retention is opt-in and creates no display until
+/// the first connection. A disconnected retained screen is disabled and exposes
+/// no capture geometry. Dropping the final handle shuts down any live helper.
 #[derive(Clone, Debug)]
 pub struct DisplayController(Arc<ControllerInner>);
 
@@ -201,13 +205,45 @@ impl DisplayController {
         owner: impl Send + 'static,
         identity_slot: String,
     ) -> Result<Self> {
+        Self::new_with_owner_identity_slot_and_retention(
+            backend,
+            width,
+            height,
+            owner,
+            identity_slot,
+            false,
+        )
+    }
+
+    /// Optionally retain the helper and disabled display between sessions.
+    /// Native ownership still ends on shutdown; capture and input must stop
+    /// before ending each session. The physical backend never retains a screen.
+    pub fn new_with_owner_identity_slot_and_retention(
+        backend: DisplayBackend,
+        width: u16,
+        height: u16,
+        owner: impl Send + 'static,
+        identity_slot: String,
+        retain_between_sessions: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !retain_between_sessions || backend == DisplayBackend::Virtual,
+            "Retaining a virtual display requires the virtual display backend"
+        );
         anyhow::ensure!(
             !std::env::args_os().any(|arg| arg == HELPER_ARGUMENT),
             "Display helper entry hook was not called; call run_display_helper_if_requested before application initialization"
         );
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (backend, width, height, owner, identity_slot);
+            let _ = (
+                backend,
+                width,
+                height,
+                owner,
+                identity_slot,
+                retain_between_sessions,
+            );
             anyhow::bail!("Display control requires macOS");
         }
         #[cfg(target_os = "macos")]
@@ -227,6 +263,7 @@ impl DisplayController {
                         width,
                         height,
                         identity_slot,
+                        retain_between_sessions,
                         receiver,
                         ready_tx,
                         worker_stopping,
@@ -312,7 +349,8 @@ impl DisplayController {
     }
 
     /// Query current bounds of the selected display, including layout changes.
-    /// An idle virtual controller returns an error; no capture screen exists.
+    /// An idle virtual controller returns an error, including a retained disabled
+    /// screen. Callers must never use parked-screen geometry for capture/input.
     pub fn geometry(&self) -> Result<DisplayGeometry> {
         let (reply, receiver) = mpsc::channel();
         self.0
@@ -342,8 +380,9 @@ impl DisplayController {
             .context("Timed out beginning the remote display session")?
     }
 
-    /// Restore the physical primary and display origins, then remove and reap
-    /// the session's virtual display. Main-display capture is unchanged.
+    /// Restore physical primary/windows, then remove or disable the session's
+    /// virtual display according to the retention option. Capture must already
+    /// be stopped. Main-display capture is unchanged.
     pub fn end_remote_session(&self) -> Result<()> {
         let (reply, receiver) = mpsc::channel();
         self.0
@@ -359,7 +398,7 @@ impl DisplayController {
 
     /// Shutdown barrier for a dedicated native cleanup owner. Unlike the
     /// ordinary request timeout, this returns only when the display worker has
-    /// actually completed restoration and virtual-display removal. Never call
+    /// actually completed restoration and virtual-display removal or parking. Never call
     /// from a UI or async executor thread; the owner must retain its lease while
     /// waiting, including when the command queue is full or native work stalls.
     pub fn end_remote_session_owned(&self) -> Result<()> {
@@ -428,6 +467,20 @@ impl DisplayController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_rejects_physical_backend_before_native_initialization() {
+        let error = DisplayController::new_with_owner_identity_slot_and_retention(
+            DisplayBackend::Main,
+            1920,
+            1080,
+            (),
+            "default".to_owned(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("virtual display backend"));
+    }
 
     #[test]
     fn backend_config_defaults_to_main_and_rejects_unknown_names() {

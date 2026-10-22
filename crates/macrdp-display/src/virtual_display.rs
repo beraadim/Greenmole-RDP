@@ -209,6 +209,18 @@ impl VirtualDisplay {
         &self.identity
     }
 
+    pub(crate) fn validate_owned_id(&self) -> Result<()> {
+        self.identity.validate_current()?;
+        // The native object, rather than an old public display-list entry,
+        // proves that this exact owner still holds the ID while disabled.
+        let current: u32 = unsafe { msg_send![&*self.display, displayID] };
+        ensure!(
+            current != 0 && current == self.id,
+            "Retained display object changed its identity"
+        );
+        Ok(())
+    }
+
     pub(crate) fn apply_mode(&mut self, width: u16, height: u16) -> Result<()> {
         // No CoreGraphics display query may precede first activation: Tahoe can
         // otherwise cache the not-yet-active display's missing modes forever.

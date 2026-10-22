@@ -55,6 +55,9 @@ pub struct ServerConfig {
     pub frame_rate: u32,
     /// Display to share: the main display or an experimental virtual display.
     pub display_backend: DisplayBackend,
+    /// Keep the virtual display allocated but disabled between sessions. Experimental;
+    /// requires the virtual backend and a service restart. Capture remains session-scoped.
+    pub reuse_virtual_display: bool,
     /// Guard local screens/input during a virtual-display connection. Requires restart.
     pub private_session: bool,
     /// Resolution width (0 = auto-detect from display)
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
             bind_address: None,
             frame_rate: 60,
             display_backend: DisplayBackend::Main,
+            reuse_virtual_display: false,
             private_session: false,
             width: 0,
             height: 0,
@@ -135,6 +139,10 @@ impl ServerConfig {
     /// Reject unsafe/inconsistent settings before initializing the desktop or listener.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.port > 0, "port must be between 1 and 65535");
+        anyhow::ensure!(
+            !self.reuse_virtual_display || self.display_backend == DisplayBackend::Virtual,
+            "reuse_virtual_display requires display_backend = 'virtual'"
+        );
         anyhow::ensure!(
             !self.private_session || self.display_backend == DisplayBackend::Virtual,
             "private_session requires display_backend = 'virtual'"
@@ -329,6 +337,28 @@ mod tests {
         config.private_session = false;
         config.validate().unwrap();
         assert!(toml::from_str::<ServerConfig>("private_session = 'true'").is_err());
+    }
+
+    #[test]
+    fn retained_display_is_opt_in_and_rejects_an_inconsistent_backend() {
+        let legacy: ServerConfig = toml::from_str("display_backend = 'virtual'").unwrap();
+        assert!(!legacy.reuse_virtual_display);
+        let mut config: ServerConfig = toml::from_str(
+            "display_backend = 'virtual'\nreuse_virtual_display = true\nusername = 'fixture'\npassword = 'fixture'",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let restored: ServerConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(restored.reuse_virtual_display);
+        config.display_backend = DisplayBackend::Main;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("reuse_virtual_display requires"));
+        config.reuse_virtual_display = false;
+        config.validate().unwrap();
+        assert!(toml::from_str::<ServerConfig>("reuse_virtual_display = 'true'").is_err());
     }
 
     #[test]

@@ -39,17 +39,42 @@ is an additional screen in the same user session, with shared keyboard, pointer,
 applications and audio. macrdp does not mirror displays or create a separate
 user login session.
 
-Starting the server does not create a virtual display. A background helper
+Starting the server does not create a virtual display. By default, a background helper
 creates it when an authenticated remote connection starts capture and keeps it
 alive for that connection. Browser resizes change its mode in place. Disconnect
 restores the previous primary display and removes the virtual screen; reconnect
 creates a new one. Server shutdown also cleans up any active display.
 
+### Reuse the virtual display between sessions
+
+Settings > Display includes **Reuse virtual display between sessions**, an
+experimental option that is **off by default**. Enable it with the virtual
+backend selected and restart the service. CLI users can set
+`reuse_virtual_display = true` in TOML or pass `--reuse-virtual-display`;
+`--reuse-virtual-display=false` overrides an enabled file setting.
+
+The first authenticated connection creates the display normally. Disconnect
+stops capture and encoding, restores the physical display arrangement and window
+positions, and disables the retained virtual display. The next connection
+re-enables the same owned display instead of creating another object. The
+display helper and its identity lease remain owned until server shutdown;
+Stop and crash recovery still retire the helper and remove the display.
+Starting an idle server creates no display, and a disabled display must not
+remain an extended desktop available for local windows.
+
+This tests whether avoiding repeated virtual-display creation and removal
+reduces the local cursor regression observed after consecutive remote sessions.
+Enabling/disabling and switching the primary display still change desktop
+topology. It is not an established fix for a macOS or display-driver bug.
+The enable/disable operation also uses a private macOS API and is checked at
+runtime. Turn the option off and restart to return to removal on disconnect.
+
 From 0.1.25, new sessions reuse a persisted monitor serial for the same macOS
 user and RDP listening port. Changing the bind address does not change this
 identity. The standalone display-controller API uses a separate default slot.
 The descriptor's vendor, product, name and color characteristics stay fixed.
-No display or capture stream is kept alive while disconnected.
+Without the reuse option, no display is kept alive while disconnected. Capture
+and encoding stop in both modes.
 Identity records are stored in `~/.macrdp/display-identities/`, with a private
 directory and same-user files. Keep these records when updating the application
 to preserve monitor identity.
@@ -60,7 +85,8 @@ generation, so a late selector cannot act on a subsequent session's reused
 identity. A busy or invalid identity slot rejects display creation; macrdp does
 not work around it by inventing another monitor serial. Concurrent same-user
 servers using the same port also share this slot, even on different bind IPs.
-Normal disconnect and process exit release ownership automatically; do not delete
+With reuse off, normal disconnect releases ownership. With reuse on, ownership
+is retained while disabled and released at server shutdown. Do not delete
 identity files to bypass a pending owner.
 
 macOS previously retained a new ICC profile and display UUID for successive
@@ -109,12 +135,12 @@ during a virtual session for windows opened later or left on another screen.
 Windows already visible remotely stay in place, and larger windows are fitted
 where the application allows it. The button reports moved, skipped and failed
 counts. Newly opened windows are not added to the connection's original
-snapshot, so their placement when the virtual display disappears remains under
+snapshot, so their placement when the virtual display is removed or disabled remains under
 macOS control. Using the button does not overwrite captured windows' original
 positions or sizes.
 
 Disconnect and normal server shutdown restore the prior primary display and
-display origins before removing the virtual screen. Configuration transactions
+display origins before removing or disabling the virtual screen. Configuration transactions
 use session scope rather than requesting permanent layout changes. macOS can
 still remember monitor identities and profiles. The helper also attempts restoration when its parent closes
 the control pipe. A forced termination of the helper or a changed display layout
@@ -253,6 +279,14 @@ button against real application windows after installing the DMG.
     physical screen. Repeat with a closed window, a newly opened window,
     minimized/full-screen windows, denied Accessibility access and an unresponsive
     app; cleanup must remain bounded and logs must omit window titles.
+11. Enable **Reuse virtual display between sessions** and restart. Confirm no
+    display is created before the first connection. Across repeated sessions,
+    verify the same owned display is disabled after disconnect and re-enabled
+    on reconnect, with no active virtual desktop or capture while disconnected.
+    Check that captured windows and newly opened remote windows remain visible
+    on physical displays after disconnect. Stop while disconnected and confirm
+    the retained helper and display are removed. Disable reuse and restart to
+    confirm the original removal-on-disconnect behavior returns.
 
 Capture info logs include the selected display ID, global origin, logical point
 size, output pixel size and native mode changes. Useful messages include

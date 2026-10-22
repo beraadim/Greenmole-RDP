@@ -28,6 +28,7 @@ pub(crate) fn configuration_status(
         let running_values = serde_json::to_value(running).expect("UiConfig is serializable");
         for key in [
             "display_backend",
+            "reuse_virtual_display",
             "private_session",
             "bind_address",
             "port",
@@ -256,6 +257,36 @@ mod tests {
 
     fn status(saved: &UiConfig, running: Option<&UiConfig>) -> ConfigurationStatus {
         configuration_status(saved, running, &BTreeSet::new())
+    }
+
+    #[test]
+    fn retained_display_changes_require_restart_and_reverting_clears_pending_policy() {
+        let mut running = UiConfig::default();
+        running.display_backend = macrdp_core::DisplayBackend::Virtual;
+        for enabled in [true, false] {
+            running.reuse_virtual_display = !enabled;
+            let mut saved = running.clone();
+            saved
+                .set_field("reuse_virtual_display", &serde_json::json!(enabled))
+                .unwrap();
+            assert_eq!(
+                status(&saved, Some(&running)).pending_restart,
+                ["reuse_virtual_display"]
+            );
+            assert!(live_update(&saved, "reuse_virtual_display")
+                .unwrap()
+                .is_none());
+            saved.frame_rate = 30;
+            running.frame_rate = 30;
+            assert!(status(&saved, Some(&running)).restart_required);
+            saved
+                .set_field(
+                    "reuse_virtual_display",
+                    &serde_json::json!(running.reuse_virtual_display),
+                )
+                .unwrap();
+            assert!(!status(&saved, Some(&running)).restart_required);
+        }
     }
 
     #[test]

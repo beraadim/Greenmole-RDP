@@ -8,7 +8,7 @@ use core_foundation_sys::uuid::{CFUUIDGetUUIDBytes, CFUUIDRef};
 use core_graphics::display::CGDisplay;
 use std::time::{Duration, Instant};
 
-const PHASE_BUDGET: Duration = Duration::from_secs(3);
+pub(super) const PHASE_BUDGET: Duration = Duration::from_secs(3);
 
 #[link(name = "ColorSync", kind = "framework")]
 extern "C" {
@@ -146,6 +146,10 @@ impl SessionWindows {
         report
     }
 
+    pub(crate) fn evacuate_for_parking(virtual_id: u32) -> Result<PhaseReport> {
+        super::parking::evacuate_for_parking(virtual_id)
+    }
+
     pub(crate) fn take_reports(&mut self) -> Vec<PhaseReport> {
         std::mem::take(&mut self.reports)
     }
@@ -177,7 +181,7 @@ impl Window for accessibility::Element {
     }
 }
 
-fn physical_screens(virtual_id: u32, primary: u32) -> Result<Vec<Screen>> {
+pub(super) fn physical_screens(virtual_id: u32, primary: u32) -> Result<Vec<Screen>> {
     CGDisplay::active_displays()
         .map_err(|error| anyhow::anyhow!("Could not refresh session displays: {error}"))?;
     let mut screens = Vec::new();
@@ -235,7 +239,7 @@ fn display_key(id: u32) -> Option<DisplayKey> {
     ]))
 }
 
-fn finish_phase(phase: &str, report: &mut PhaseReport, started: Instant) {
+pub(super) fn finish_phase(phase: &str, report: &mut PhaseReport, started: Instant) {
     report.phase = phase.to_owned();
     report.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The early display helper has no tracing subscriber; its stderr is

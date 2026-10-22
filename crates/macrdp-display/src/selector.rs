@@ -29,7 +29,14 @@ pub(crate) fn validate_available(identity: &IdentityLease) -> Result<()> {
         expected_serial != 0,
         "Virtual display identity serial is invalid"
     );
-    for id in crate::macos::online_display_ids()? {
+    // Include retained disabled objects where the optional private API exists;
+    // a disabled owner is invisible to public online enumeration.
+    let ids = if crate::activation::available() {
+        crate::activation::all_display_ids()?
+    } else {
+        crate::macos::online_display_ids()?
+    };
+    for id in ids {
         let display = CGDisplay::new(id);
         ensure!(
             !identity_collision(display.vendor_number(), display.model_number(), display.serial_number(), expected_serial),
@@ -37,6 +44,15 @@ pub(crate) fn validate_available(identity: &IdentityLease) -> Result<()> {
         );
     }
     identity.validate_current()
+}
+
+pub(crate) fn set_display_enabled(
+    display_id: u32,
+    identity: &IdentityLease,
+    enabled: bool,
+) -> Result<()> {
+    let _finished = native_deadline()?;
+    crate::activation::configure_enabled(display_id, identity, enabled)
 }
 
 fn identity_collision(vendor: u32, product: u32, serial: u32, expected_serial: u32) -> bool {

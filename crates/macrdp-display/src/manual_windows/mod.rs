@@ -7,7 +7,7 @@ pub(crate) mod accessibility;
 pub(crate) mod discovery;
 mod frame_setter;
 pub(crate) mod geometry;
-mod process_filter;
+pub(crate) mod process_filter;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn move_windows(

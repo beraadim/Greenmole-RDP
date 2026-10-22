@@ -342,3 +342,110 @@ fn failure_before_gather_still_restores_primary_and_no_physical_display_never_mo
     assert_eq!(no_physical.restore(&[], &budget()).failed, 1);
     assert_eq!(main.0.borrow().writes, 1);
 }
+
+#[test]
+fn parking_evacuates_new_remote_windows_after_restoring_original_snapshots() {
+    let original = rect(-1500.0, 80.0, 1000.0, 700.0);
+    let existing = fake(1, original);
+    let mut session = snapshot(&[existing.clone()]);
+    let remote = rect(4480.0, 0.0, 1280.0, 720.0);
+    session.gather(remote, &budget());
+    let mut newly_created = fake(2, rect(4500.0, 50.0, 1000.0, 600.0));
+    assert_eq!(newly_created.0.borrow().writes, 0);
+    session.restore(&topology(), &budget());
+    assert_eq!(existing.0.borrow().frame, original);
+    let existing_writes = existing.0.borrow().writes;
+    let mut report = PhaseReport::default();
+    evacuate_window(
+        &mut existing.clone(),
+        remote,
+        &topology(),
+        &budget(),
+        &mut report,
+    );
+    evacuate_window(
+        &mut newly_created,
+        remote,
+        &topology(),
+        &budget(),
+        &mut report,
+    );
+    assert_eq!((report.moved, report.skipped, report.failed), (1, 1, 0));
+    assert_eq!(existing.0.borrow().writes, existing_writes);
+    assert_eq!(existing.0.borrow().frame, original);
+    assert!(newly_created
+        .0
+        .borrow()
+        .frame
+        .fits_inside(topology()[0].frame));
+    assert!(newly_created.0.borrow().frame.y >= 32.0);
+}
+
+#[test]
+fn parking_preserves_physical_spanning_other_display_and_nonmovable_windows() {
+    let remote = rect(4480.0, 0.0, 1280.0, 720.0);
+    let mut report = PhaseReport::default();
+    for frame in [
+        rect(-1500.0, 50.0, 1000.0, 700.0),
+        rect(4200.0, 50.0, 500.0, 600.0),
+        rect(-10000.0, 50.0, 1000.0, 700.0),
+    ] {
+        let mut window = fake(1, frame);
+        evacuate_window(&mut window, remote, &topology(), &budget(), &mut report);
+        assert_eq!(window.0.borrow().writes, 0);
+    }
+    let mut fullscreen_or_minimized = fake(2, rect(4500.0, 50.0, 1000.0, 600.0));
+    fullscreen_or_minimized.0.borrow_mut().movable = false;
+    evacuate_window(
+        &mut fullscreen_or_minimized,
+        remote,
+        &topology(),
+        &budget(),
+        &mut report,
+    );
+    assert_eq!(fullscreen_or_minimized.0.borrow().writes, 0);
+    assert_eq!((report.skipped, report.failed), (4, 0));
+}
+
+#[test]
+fn parking_bounds_work_and_reports_unverifiable_or_failed_moves_for_removal_fallback() {
+    let remote = rect(4480.0, 0.0, 1280.0, 720.0);
+    let mut window = fake(1, rect(4500.0, 50.0, 1000.0, 600.0));
+    let mut timed_out = PhaseReport::default();
+    evacuate_window(&mut window, remote, &topology(), &expired(), &mut timed_out);
+    assert!(timed_out.timed_out);
+    assert_eq!(timed_out.inspected, 0);
+    assert_eq!(window.0.borrow().writes, 0);
+    let mut limited = PhaseReport {
+        inspected: MAX_SAVED_WINDOWS,
+        ..PhaseReport::default()
+    };
+    evacuate_window(&mut window, remote, &topology(), &budget(), &mut limited);
+    assert!(limited.limit_reached);
+    assert_eq!(window.0.borrow().writes, 0);
+    window.0.borrow_mut().fail_write_after_resize = true;
+    let mut failed = PhaseReport::default();
+    evacuate_window(&mut window, remote, &topology(), &budget(), &mut failed);
+    assert_eq!(failed.failed, 1);
+    assert_eq!(failed.moved, 0);
+    let mut unavailable = PhaseReport::default();
+    window.0.borrow_mut().fail_write_after_resize = false;
+    evacuate_window(&mut window, remote, &[], &budget(), &mut unavailable);
+    assert_eq!(unavailable.failed, 1);
+}
+
+#[test]
+fn parking_keeps_fixed_window_size_and_uses_one_shared_phase_budget() {
+    let remote = rect(4480.0, 0.0, 1280.0, 720.0);
+    let mut fixed = fake(1, rect(4500.0, 50.0, 2200.0, 1200.0));
+    fixed.0.borrow_mut().resizable = false;
+    let shared = budget();
+    let mut report = PhaseReport::default();
+    evacuate_window(&mut fixed, remote, &topology(), &shared, &mut report);
+    assert_eq!(report.moved, 1);
+    let state = fixed.0.borrow();
+    assert_eq!(state.resize_writes, 0);
+    assert_eq!((state.frame.width, state.frame.height), (2200.0, 1200.0));
+    assert!(state.frame.has_accessible_titlebar(&[topology()[0].frame]));
+    assert_eq!(state.inspected_deadlines, vec![shared.deadline]);
+}

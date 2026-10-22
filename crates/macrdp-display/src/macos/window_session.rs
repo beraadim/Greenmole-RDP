@@ -40,6 +40,22 @@ impl SessionState {
         }
     }
 
+    pub(super) fn restore_for_parking(&mut self, virtual_id: u32) -> anyhow::Result<()> {
+        self.restore();
+        match SessionWindows::evacuate_for_parking(virtual_id) {
+            Ok(report) => {
+                self.completed.reports.push(report);
+                Ok(())
+            }
+            Err(error) => {
+                self.completed.warnings.push(format!(
+                    "Retained display parking will use removal fallback: {error:#}"
+                ));
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn pending(&self) -> bool {
         self.windows.is_some()
     }
