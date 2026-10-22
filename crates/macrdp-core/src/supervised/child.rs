@@ -80,8 +80,10 @@ pub(super) fn run() -> Result<()> {
             }
         })?;
     let level = initialization.config.log_level.as_deref().unwrap_or("info");
-    let filter = tracing_subscriber::EnvFilter::try_new(level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = crate::with_transition_diagnostics(
+        tracing_subscriber::EnvFilter::try_new(level)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
     let (filter, reload_filter) = tracing_subscriber::reload::Layer::new(filter);
     tracing_subscriber::registry()
         .with(filter)
@@ -195,7 +197,7 @@ async fn serve(
             command = commands.recv() => match command {
                 Some(Command::Update { request, update }) => {
                     let new_filter = match &update {
-                        crate::ConfigUpdate::LogLevel(level) => Some(tracing_subscriber::EnvFilter::try_new(level).map_err(|_| "Invalid log level".to_owned())),
+                        crate::ConfigUpdate::LogLevel(level) => Some(tracing_subscriber::EnvFilter::try_new(level).map(crate::with_transition_diagnostics).map_err(|_| "Invalid log level".to_owned())),
                         _ => None,
                     };
                     let result = if stopping { Err("Server is stopping".into()) }

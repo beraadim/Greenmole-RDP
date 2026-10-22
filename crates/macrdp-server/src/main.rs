@@ -51,8 +51,10 @@ async fn run() -> Result<()> {
     let cli = config::Cli::parse();
     let mut config = cli.load_config()?;
     let log_level = config.log_level.as_deref().unwrap_or("info");
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+    let filter = macrdp_core::with_transition_diagnostics(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+    );
     let log_path = macrdp_core::init_log_file();
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::registry()

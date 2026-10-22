@@ -1,0 +1,60 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "version": "0.1.27",
+  "status": "source checks passed; package pending",
+  "release_checks": {
+    "rust_passed": 825,
+    "rust_failed": 0,
+    "existing_opt_in_ignored": 6,
+    "rust_serial_mode": true,
+    "display_library_passed": 93,
+    "python_passed": 8,
+    "javascript_passed": 11,
+    "typescript_passed": true,
+    "frontend_production_build_passed": true,
+    "final_filter_directive_tests_passed": true
+  },
+  "behavior": {
+    "retention_default": false,
+    "current_identity_policy_unchanged": true,
+    "connect_disconnect_policy_unchanged": true,
+    "physical_display_modes_unchanged": true,
+    "resource_retirement_order_unchanged": true,
+    "watchdog_deadlines_unchanged": true
+  },
+  "diagnostics": {
+    "bounded_target": "macrdp_transition",
+    "available_with_warning_default": true,
+    "explicit_off_and_target_directives_respected": true,
+    "stderr_record_maximum_bytes": 4096,
+    "asynchronous_topology_worker_maximum": 1,
+    "topology_queue_capacity": 8,
+    "idle_polling_added": false,
+    "per_frame_logging_added": false,
+    "window_titles_and_input_content_logged": false
+  },
+  "maintenance": {
+    "one_time_explicitly_authorized": true,
+    "obsolete_registrations_archived": 165,
+    "preserved_registrations": 4,
+    "current_stable_identity_preserved": true,
+    "physical_color_and_identity_data_preserved": true,
+    "physical_topology_preserved": true,
+    "supported_rollback_rehearsal_passed": true,
+    "cache_manually_overwritten": false,
+    "windowserver_preferences_deleted": false,
+    "services_restarted": false,
+    "automatic_application_cleanup_added": false
+  },
+  "source_review": {
+    "independent_cleanup_review_passed": true,
+    "independent_display_and_capture_review_passed": true,
+    "external_dependency_versions_changed": false
+  },
+  "limitations": [
+    "No claim that cursor regression is fixed; matched consecutive-session user testing is required.",
+    "Topology observations may follow requested phases and CG mode data can be cached.",
+    "New diagnostic app is delivered for user installation; the running app is preserved."
+  ],
+  "device_test_instructions": "release-0.1.27.md"
+}

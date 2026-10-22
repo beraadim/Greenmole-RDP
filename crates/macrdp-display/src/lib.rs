@@ -35,6 +35,8 @@ mod selector;
 #[cfg(any(target_os = "macos", test))]
 mod session_windows;
 #[cfg(target_os = "macos")]
+mod transition;
+#[cfg(target_os = "macos")]
 mod virtual_display;
 mod window_move;
 pub use recovery::{

@@ -176,25 +176,50 @@ impl Drop for NativeSession {
             session: VTCompressionSessionRef,
             _callback_ctx: Arc<CallbackCtx>,
             _input: Option<OwnedPixelBuffer>,
+            retirement_id: u64,
         }
         unsafe impl Send for Retired {}
         impl Retired {
             fn cleanup(self) {
+                let started = std::time::Instant::now();
+                tracing::info!(target: "macrdp_transition",
+                    component = "video_encoder", worker_pid = std::process::id(),
+                    retirement_id = self.retirement_id, phase = "vt_invalidate", state = "begin",
+                    "Encoder lifecycle transition");
                 unsafe {
                     VTCompressionSessionInvalidate(self.session);
+                }
+                tracing::info!(target: "macrdp_transition",
+                    component = "video_encoder", worker_pid = std::process::id(),
+                    retirement_id = self.retirement_id, phase = "vt_invalidate", state = "end", outcome = "returned",
+                    elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    "Encoder lifecycle transition");
+                let started = std::time::Instant::now();
+                tracing::info!(target: "macrdp_transition",
+                    component = "video_encoder", worker_pid = std::process::id(),
+                    retirement_id = self.retirement_id, phase = "vt_release", state = "begin",
+                    "Encoder lifecycle transition");
+                unsafe {
                     CFRelease(self.session);
                 }
+                tracing::info!(target: "macrdp_transition",
+                    component = "video_encoder", worker_pid = std::process::id(),
+                    retirement_id = self.retirement_id, phase = "vt_release", state = "end", outcome = "returned",
+                    elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    "Encoder lifecycle transition");
                 // Retained buffers/context drop only after invalidation.
             }
         }
+        let retirement = self
+            .retirement
+            .take()
+            .expect("native session owns a retirement reservation");
         let retired = Retired {
             session: self.session,
             _callback_ctx: self.callback_ctx.clone(),
             _input: self.pending_input_buffer.take(),
+            retirement_id: retirement.diagnostic_id(),
         };
-        self.retirement
-            .take()
-            .expect("native session owns a retirement reservation")
-            .retire(move || retired.cleanup());
+        retirement.retire(move || retired.cleanup());
     }
 }

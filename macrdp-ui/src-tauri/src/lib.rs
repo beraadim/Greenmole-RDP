@@ -81,8 +81,9 @@ pub fn run() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::reload;
     use tracing_subscriber::util::SubscriberInitExt;
-    let (filter_layer, log_reload) =
-        reload::Layer::new(tracing_subscriber::EnvFilter::new(&filter));
+    let (filter_layer, log_reload) = reload::Layer::new(macrdp_core::with_transition_diagnostics(
+        tracing_subscriber::EnvFilter::new(&filter),
+    ));
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))

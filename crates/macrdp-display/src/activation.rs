@@ -105,6 +105,18 @@ pub(crate) fn configure_enabled(
     identity: &IdentityLease,
     enabled: bool,
 ) -> Result<()> {
+    crate::transition::native(
+        if enabled {
+            crate::transition::Phase::DisplayEnable
+        } else {
+            crate::transition::Phase::DisplayDisable
+        },
+        crate::transition::Details::display(display_id),
+        || configure_enabled_inner(display_id, identity, enabled),
+    )
+}
+
+fn configure_enabled_inner(display_id: u32, identity: &IdentityLease, enabled: bool) -> Result<()> {
     let api = api()?;
     validate_owned(display_id, identity)?;
     if !enabled {

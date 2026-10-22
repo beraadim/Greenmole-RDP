@@ -109,10 +109,14 @@ impl Drop for NativeCaptureLease {
             }
             (restore, requested)
         };
-        let _restoration = requested.then(|| self.0.watchdog.phase("restore_display"));
+        let mut restoration = requested.then(|| self.0.watchdog.phase("restore_display"));
         if let Some(restore) = restore {
             if requested {
-                if let Err(error) = restore() {
+                let result = restore();
+                if let Some(operation) = restoration.as_mut() {
+                    operation.set_outcome(if result.is_ok() { "ok" } else { "error" });
+                }
+                if let Err(error) = result {
                     *self.0.cleanup_error.lock().unwrap() =
                         Some(format!("Physical display restoration failed: {error:#}"));
                     tracing::warn!(%error, "Deferred physical display restoration failed");
@@ -139,8 +143,10 @@ impl Drop for NativeCaptureLease {
                 shutdown
             };
             if let Some(shutdown) = shutdown {
-                let _shutdown = self.0.watchdog.phase("shutdown_display");
-                if let Err(error) = shutdown() {
+                let mut operation = self.0.watchdog.phase("shutdown_display");
+                let result = shutdown();
+                operation.set_outcome(if result.is_ok() { "ok" } else { "error" });
+                if let Err(error) = result {
                     *self.0.cleanup_error.lock().unwrap() =
                         Some(format!("Display worker shutdown failed: {error:#}"));
                     tracing::warn!(%error, "Deferred display worker shutdown failed");
@@ -160,8 +166,18 @@ pub(crate) fn queue_restoration(display: &DisplayController) -> Result<()> {
     if Lifecycle::request_restore(&mut owner) {
         lifecycle().watchdog.set_cleanup_pending(true);
         lifecycle().watchdog.request_stop();
+        tracing::info!(target: "macrdp_transition",
+            component = "native_capture", worker_pid = std::process::id(),
+            owner_id = lifecycle().watchdog.diagnostic_id(),
+            phase = "restore_requested", state = "event", disposition = "deferred_until_capture_retired",
+            "Native lifecycle transition");
         return Ok(());
     }
+    tracing::info!(target: "macrdp_transition",
+        component = "native_capture", worker_pid = std::process::id(),
+        owner_id = lifecycle().watchdog.diagnostic_id(),
+        phase = "restore_requested", state = "event", disposition = "queued_no_native_capture",
+        "Native lifecycle transition");
     display.end_remote_session_async()
 }
 
@@ -198,14 +214,18 @@ pub(crate) fn restore_after_capture(display: DisplayController) -> Result<()> {
         NativeCaptureLease(lifecycle().clone())
     };
     let restore_result = {
-        let _restoration = lifecycle().watchdog.phase("restore_display");
-        display.end_remote_session_owned()
+        let operation = lifecycle().watchdog.phase("restore_display");
+        let result = display.end_remote_session_owned();
+        operation.finish(if result.is_ok() { "ok" } else { "error" });
+        result
     };
     // Attempt shutdown even after a completed restoration error. The worker's
     // native owner gets its final cleanup attempt before acknowledging exit.
     let shutdown_result = {
-        let _shutdown = lifecycle().watchdog.phase("shutdown_display");
-        display.shutdown_owned()
+        let operation = lifecycle().watchdog.phase("shutdown_display");
+        let result = display.shutdown_owned();
+        operation.finish(if result.is_ok() { "ok" } else { "error" });
+        result
     };
     let result = restore_result.and(shutdown_result);
     if let Err(error) = &result {

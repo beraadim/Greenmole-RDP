@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 use crate::identity::{IdentityLease, IdentityProof};
 use crate::macos::NativeDisplay;
 use crate::protocol::{read_message, write_message, Reply, Request};
+use crate::transition::{self, Details, Phase};
 use crate::{normalize_size, DisplayBackend, DisplayGeometry, HELPER_ARGUMENT};
 
 #[path = "helper_retained.rs"]
 mod retained;
+#[path = "helper_transitions.rs"]
+mod transitions;
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 // Allow bounded layout and window restoration before terminating an owner.
@@ -37,7 +40,7 @@ impl DisplayHelper {
         self.display_id.expect("initialized helper owns a display")
     }
 
-    pub(crate) fn new(width: u16, height: u16, identity_slot: &str) -> Result<Self> {
+    fn initialize(width: u16, height: u16, identity_slot: &str) -> Result<Self> {
         ensure!(
             !std::env::args_os().any(|arg| arg == HELPER_ARGUMENT),
             "Display helper entry hook was not called; refusing recursive helper launch"
@@ -72,13 +75,25 @@ impl DisplayHelper {
             .arg(HELPER_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         let proof = identity
             .map(|identity| identity.selector_proof(&mut command))
             .transpose()?;
         let mut child = command
             .spawn()
             .context("Could not launch display helper process")?;
+        let diagnostic_output = child.stderr.take().expect("piped child stderr");
+        let child_pid = child.id();
+        if let Err(error) = std::thread::Builder::new()
+            .name("macrdp-display-diagnostics".to_owned())
+            .spawn(move || transition::forward_stderr(BufReader::new(diagnostic_output), child_pid))
+        {
+            // No initialization request has been sent, so this child cannot
+            // own a display. Do not leave an undrained pipe or orphan helper.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("Could not start display diagnostic reader");
+        }
         let input = child.stdin.take().expect("piped child stdin");
         let output = child.stdout.take().expect("piped child stdout");
         let (sender, replies) = mpsc::sync_channel(1);
@@ -272,7 +287,7 @@ impl DisplayHelper {
         self.geometry_request(Request::Geometry {})
     }
 
-    pub(crate) fn begin_remote_session(&mut self) -> Result<DisplayGeometry> {
+    fn begin_remote_session_inner(&mut self) -> Result<DisplayGeometry> {
         let geometry = self.geometry_request_with_options(
             Request::BeginRemoteSession {},
             SESSION_TIMEOUT,
@@ -287,7 +302,7 @@ impl DisplayHelper {
         Ok(geometry)
     }
 
-    pub(crate) fn end_remote_session(&mut self) -> Result<DisplayGeometry> {
+    fn end_remote_session_inner(&mut self) -> Result<DisplayGeometry> {
         let geometry = self.geometry_request_with_options(
             Request::EndRemoteSession {},
             SESSION_TIMEOUT,
@@ -300,7 +315,7 @@ impl DisplayHelper {
         Ok(geometry)
     }
 
-    pub(crate) fn prepare_capture(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
+    fn prepare_capture_inner(&mut self, width: u16, height: u16) -> Result<DisplayGeometry> {
         ensure!(
             !self.parked,
             "Cannot capture a disabled retained virtual display"
@@ -410,6 +425,7 @@ fn validate_size(width: u16, height: u16) -> Result<()> {
 
 /// Called directly from the executable's main thread, before any CG query.
 pub(crate) fn run_child() -> Result<()> {
+    transition::install_helper_output();
     // EOF cannot wake a main thread blocked inside an Apple API. A separate
     // thread bounds orphan ownership even if both server and UI processes die.
     crate::parent_watchdog::start()?;
@@ -651,7 +667,13 @@ pub(crate) fn run_child() -> Result<()> {
             }
         }
     };
-    autoreleasepool(|_| drop(owner));
+    if let Some(owner) = owner {
+        let display_id = owner.id();
+        let _ = transition::native(Phase::OwnerDrop, Details::display(display_id), || {
+            autoreleasepool(|_| drop(owner));
+            Ok(())
+        });
+    }
     if acknowledge_shutdown {
         write_message(&mut output, &Reply::Stopped {})?;
     }

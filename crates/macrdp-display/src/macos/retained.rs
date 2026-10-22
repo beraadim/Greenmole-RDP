@@ -58,11 +58,17 @@ impl NativeDisplay {
         let snapshot = crate::layout::Snapshot { primary, displays };
         let promoted = snapshot.promoted(self.display_id)?;
         self.session_layout = Some(snapshot);
-        let geometry = crate::helper::DisplayHelper::configure_layout(
-            self.display_id,
-            virtual_display.identity(),
-            self.display_id,
-            promoted,
+        let geometry = transition::native(
+            Phase::PrimaryPromote,
+            Details::display(self.display_id).primary(self.display_id),
+            || {
+                crate::helper::DisplayHelper::configure_layout(
+                    self.display_id,
+                    virtual_display.identity(),
+                    self.display_id,
+                    promoted,
+                )
+            },
         )?;
         self.fresh_mode_required = true;
         eprintln!(

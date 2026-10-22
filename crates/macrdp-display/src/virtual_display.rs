@@ -13,6 +13,7 @@ use objc2::{msg_send, sel};
 use objc2_foundation::{NSArray, NSPoint, NSSize, NSString};
 use std::ffi::CStr;
 
+use crate::transition::{self, Details, Phase};
 use crate::{MAX_VIRTUAL_HEIGHT, MAX_VIRTUAL_WIDTH};
 pub(crate) const VENDOR_ID: u32 = 0x4D52;
 pub(crate) const PRODUCT_ID: u32 = 1;
@@ -134,6 +135,14 @@ pub(crate) struct VirtualDisplay {
 
 impl VirtualDisplay {
     pub(crate) fn new(width: u16, height: u16, slot: &str) -> Result<Self> {
+        transition::native(
+            Phase::VirtualCreate,
+            Details::default().size(width, height),
+            || Self::create(width, height, slot),
+        )
+    }
+
+    fn create(width: u16, height: u16, slot: &str) -> Result<Self> {
         let identity = crate::identity::IdentityLease::acquire(slot)?;
         // A disposable selector checks collisions without warming this owner's
         // CoreGraphics mode cache before the virtual display becomes active.
@@ -222,6 +231,14 @@ impl VirtualDisplay {
     }
 
     pub(crate) fn apply_mode(&mut self, width: u16, height: u16) -> Result<()> {
+        transition::native(
+            Phase::ModeApply,
+            Details::display(self.id).size(width, height),
+            || self.apply_mode_inner(width, height),
+        )
+    }
+
+    fn apply_mode_inner(&mut self, width: u16, height: u16) -> Result<()> {
         // No CoreGraphics display query may precede first activation: Tahoe can
         // otherwise cache the not-yet-active display's missing modes forever.
         if self.settings.is_some() {

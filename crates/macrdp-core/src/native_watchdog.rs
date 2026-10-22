@@ -66,38 +66,72 @@ fn registry() -> &'static Mutex<Vec<Weak<Mutex<State>>>> {
 /// A native owner has one short-held diagnostic lock. It never holds this
 /// lock while entering Apple APIs, waiting on workers, or restoring a display.
 #[derive(Clone)]
-pub(crate) struct Tracker(SharedState);
+pub(crate) struct Tracker(SharedState, u64);
 
 impl Default for Tracker {
     fn default() -> Self {
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
         let state = Arc::new(Mutex::new(State::default()));
         let mut registry = registry().lock().unwrap_or_else(|error| error.into_inner());
         registry.retain(|entry| entry.strong_count() != 0);
         registry.push(Arc::downgrade(&state));
-        Self(state)
+        Self(state, NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
     }
 }
 
 impl Tracker {
+    pub(crate) fn diagnostic_id(&self) -> u64 {
+        self.1
+    }
+
     pub(crate) fn phase(&self, name: &'static str) -> Operation {
+        self.operation(name, true)
+    }
+
+    /// Add detail inside an existing deadline without resetting its age.
+    pub(crate) fn diagnostic_phase(&self, name: &'static str) -> Operation {
+        self.operation(name, false)
+    }
+
+    fn operation(&self, name: &'static str, watchdog_tracked: bool) -> Operation {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let started_at = Instant::now();
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .phases
-            .push(Phase {
-                id,
-                name,
-                started_at,
-                thread_id: std::thread::current().id(),
-            });
+        let parent_operation_id = {
+            let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            let thread_id = std::thread::current().id();
+            let parent = state
+                .phases
+                .iter()
+                .rev()
+                .find(|phase| phase.thread_id == thread_id)
+                .map_or(0, |phase| phase.id);
+            if watchdog_tracked {
+                state.phases.push(Phase {
+                    id,
+                    name,
+                    started_at,
+                    thread_id,
+                });
+            }
+            parent
+        };
+        // Adaptive FPS configuration is deliberately excluded: diagnostics
+        // describe lifecycle transitions, never frame or steady-state work.
+        if logs_transition(name) {
+            tracing::info!(target: "macrdp_transition",
+                component = "native_capture", worker_pid = std::process::id(),
+                owner_id = self.1, operation_id = id, parent_operation_id,
+                phase = name, state = "begin", "Native lifecycle transition");
+        }
         Operation {
             tracker: self.clone(),
             id,
             name,
             started_at,
+            parent_operation_id,
+            outcome: "returned",
+            watchdog_tracked,
         }
     }
 
@@ -137,17 +171,69 @@ pub(crate) struct Operation {
     id: u64,
     name: &'static str,
     started_at: Instant,
+    parent_operation_id: u64,
+    outcome: &'static str,
+    watchdog_tracked: bool,
+}
+
+fn logs_transition(name: &str) -> bool {
+    matches!(
+        name,
+        "start"
+            | "start_failure_cleanup"
+            | "stop"
+            | "stream_drop"
+            | "replace"
+            | "replace_stop"
+            | "replace_start"
+            | "release_display_owner"
+            | "restore_display"
+            | "shutdown_display"
+            | "recovery_old_stop"
+            | "recovery_new_start"
+            | "recovery_probe"
+            | "recovery_cancel_cleanup"
+            | "recovery_probe_cleanup"
+            | "recovery_unclaimed_cleanup"
+    )
+}
+
+impl Operation {
+    pub(crate) fn set_outcome(&mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+
+    /// Record the call's actual result; plain scope exit only means it returned.
+    pub(crate) fn finish(mut self, outcome: &'static str) {
+        self.set_outcome(outcome);
+    }
 }
 
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.tracker
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .phases
-            .retain(|phase| phase.id != self.id);
+        if self.watchdog_tracked {
+            self.tracker
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phases
+                .retain(|phase| phase.id != self.id);
+        }
         let elapsed = self.started_at.elapsed();
+        if logs_transition(self.name) {
+            let outcome = if std::thread::panicking() {
+                "panicked"
+            } else {
+                self.outcome
+            };
+            tracing::info!(target: "macrdp_transition",
+                component = "native_capture", worker_pid = std::process::id(),
+                owner_id = self.tracker.1, operation_id = self.id,
+                parent_operation_id = self.parent_operation_id,
+                phase = self.name, state = "end", outcome,
+                elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64,
+                "Native lifecycle transition");
+        }
         if elapsed >= SLOW_OPERATION {
             tracing::warn!(
                 operation = self.name,
@@ -210,86 +296,5 @@ fn snapshot_states(states: impl IntoIterator<Item = SharedState>, now: Instant) 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_quiet_desktop_has_no_native_deadline() {
-        let tracker = Tracker::default();
-        let state = snapshot_states(
-            [tracker.0.clone()],
-            Instant::now() + Duration::from_secs(600),
-        );
-        assert!(!state.pending);
-        assert!(!state.is_stalled());
-    }
-
-    #[test]
-    fn nested_phase_returns_to_parent_then_clears_after_completion() {
-        let tracker = Tracker::default();
-        let parent = tracker.phase("replace");
-        let stop = tracker.phase("replace_stop");
-        assert_eq!(
-            tracker.snapshot().operation.as_deref(),
-            Some("replace_stop")
-        );
-        drop(stop);
-        let start = tracker.phase("replace_start");
-        assert_eq!(
-            tracker.snapshot().operation.as_deref(),
-            Some("replace_start")
-        );
-        drop(start);
-        assert_eq!(tracker.snapshot().operation.as_deref(), Some("replace"));
-        drop(parent);
-        assert!(!tracker.snapshot().pending);
-        tracker.request_stop();
-        tracker.set_cleanup_pending(true);
-        tracker.cleanup_finished();
-        let _reconnected = tracker.phase("start");
-        let reconnected = tracker.snapshot();
-        assert!(!reconnected.stop_requested && !reconnected.cleanup_pending);
-    }
-
-    #[test]
-    fn deadlines_use_monotonic_age_and_cannot_be_hidden_by_a_new_owner() {
-        let old = Tracker::default();
-        let operation = old.phase("set_frame_rate");
-        let later = Tracker::default();
-        let other_thread = later.clone();
-        let (entered, ready) = std::sync::mpsc::channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _later = other_thread.phase("start");
-            entered.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-        ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        old.request_stop();
-        old.set_cleanup_pending(true);
-        let state = snapshot_states(
-            [old.0.clone(), later.0.clone()],
-            operation.started_at + STALL_TIMEOUT,
-        );
-        assert!(state.is_stalled());
-        assert_eq!(state.operation.as_deref(), Some("set_frame_rate"));
-        assert!(state.stop_requested && state.cleanup_pending);
-        assert!(state.reason().unwrap().contains("30000 ms"));
-        let json = serde_json::to_string(&state).unwrap();
-        let decoded: Snapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.operation_id, state.operation_id);
-        assert!(decoded.is_stalled());
-        release.send(()).unwrap();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn nested_display_restoration_is_more_specific_than_owner_release() {
-        let capture = Tracker::default();
-        let _owner_release = capture.phase("release_display_owner");
-        let display = Tracker::default();
-        let _restoration = display.phase("restore_display");
-        let snapshot = snapshot_states([capture.0.clone(), display.0.clone()], Instant::now());
-        assert_eq!(snapshot.operation.as_deref(), Some("restore_display"));
-    }
-}
+#[path = "native_watchdog/tests.rs"]
+mod tests;

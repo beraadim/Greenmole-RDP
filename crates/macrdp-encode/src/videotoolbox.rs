@@ -575,6 +575,11 @@ impl VtEncoder {
             let h_num = OwnedCf::new(cf_i32(height as i32))?;
             let src_values = [fmt_num.as_ptr(), w_num.as_ptr(), h_num.as_ptr()];
             let src_attrs = OwnedCf::dictionary(&src_keys, &src_values)?;
+            let create_started = std::time::Instant::now();
+            tracing::info!(target: "macrdp_transition",
+                component = "video_encoder", worker_pid = std::process::id(),
+                retirement_id = retirement.diagnostic_id(), phase = "vt_create", state = "begin",
+                width, height, "Encoder lifecycle transition");
             let status = VTCompressionSessionCreate(
                 std::ptr::null(),
                 width as i32,
@@ -587,6 +592,12 @@ impl VtEncoder {
                 Arc::as_ptr(callback_ctx) as *mut c_void,
                 &mut session,
             );
+            tracing::info!(target: "macrdp_transition",
+                component = "video_encoder", worker_pid = std::process::id(),
+                retirement_id = retirement.diagnostic_id(), phase = "vt_create", state = "end",
+                outcome = if status == 0 && !session.is_null() { "ok" } else { "error" },
+                status, elapsed_ms = create_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                "Encoder lifecycle transition");
             anyhow::ensure!(
                 !session.is_null(),
                 "VTCompressionSessionCreate failed: {status}"

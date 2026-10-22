@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::transition::{self, Details, Phase};
 use crate::virtual_display::VirtualDisplay;
 use crate::{Command, DisplayBackend, DisplayGeometry};
 
@@ -227,11 +228,17 @@ impl NativeDisplay {
         // Retain the original before native mutation so teardown can restore it
         // even after a configuration timeout or a partially reported failure.
         self.session_layout = Some(snapshot);
-        let geometry = crate::helper::DisplayHelper::configure_layout(
-            self.display_id,
-            virtual_display.identity(),
-            self.display_id,
-            displays,
+        let geometry = transition::native(
+            Phase::PrimaryPromote,
+            Details::display(self.display_id).primary(self.display_id),
+            || {
+                crate::helper::DisplayHelper::configure_layout(
+                    self.display_id,
+                    virtual_display.identity(),
+                    self.display_id,
+                    displays,
+                )
+            },
         )?;
         tracing::info!(
             display_id = self.display_id,
@@ -258,11 +265,17 @@ impl NativeDisplay {
             .as_ref()
             .context("Missing owned virtual display")?
             .identity();
-        let geometry = crate::helper::DisplayHelper::configure_layout(
-            self.display_id,
-            identity,
-            primary,
-            displays,
+        let geometry = transition::native(
+            Phase::PrimaryRestore,
+            Details::display(self.display_id).primary(primary),
+            || {
+                crate::helper::DisplayHelper::configure_layout(
+                    self.display_id,
+                    identity,
+                    primary,
+                    displays,
+                )
+            },
         )?;
         // Restore frames in the original physical coordinate space while the
         // virtual screen still exists, so removal cannot strand these windows.
@@ -326,6 +339,14 @@ impl NativeDisplay {
     }
 
     fn wait_for_mode(&self, width: u16, height: u16) -> Result<DisplayGeometry> {
+        transition::native(
+            Phase::ModeSettle,
+            Details::display(self.display_id).size(width, height),
+            || self.wait_for_mode_inner(width, height),
+        )
+    }
+
+    fn wait_for_mode_inner(&self, width: u16, height: u16) -> Result<DisplayGeometry> {
         let deadline = Instant::now() + SETTLE_TIMEOUT;
         let mut selected_mode = false;
         tracing::debug!(

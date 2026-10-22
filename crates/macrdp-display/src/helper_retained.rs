@@ -40,6 +40,12 @@ impl DisplayHelper {
     }
 
     pub(crate) fn park_remote_session(&mut self) -> Result<()> {
+        transition::observed(Phase::RemoteEnd, Details::display(self.id()), || {
+            self.park_remote_session_inner()
+        })
+    }
+
+    fn park_remote_session_inner(&mut self) -> Result<()> {
         if self.parked {
             return Ok(());
         }

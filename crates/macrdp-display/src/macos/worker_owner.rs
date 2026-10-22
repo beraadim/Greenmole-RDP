@@ -177,17 +177,19 @@ fn retire(helper: &mut Option<crate::helper::DisplayHelper>, retained: bool) -> 
         return Ok(());
     };
     let display_id = owner.id();
-    retire_owned(
-        owner,
-        |owner| {
-            if owner.is_parked() {
-                Ok(())
-            } else {
-                owner.end_remote_session().map(|_| ())
-            }
-        },
-        || wait_for_display_removal(display_id, retained),
-    )
+    transition::observed(Phase::OwnerRetire, Details::display(display_id), || {
+        retire_owned(
+            owner,
+            |owner| {
+                if owner.is_parked() {
+                    Ok(())
+                } else {
+                    owner.end_remote_session().map(|_| ())
+                }
+            },
+            || wait_for_display_removal(display_id, retained),
+        )
+    })
 }
 
 fn retire_owned<T>(

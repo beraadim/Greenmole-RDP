@@ -69,12 +69,16 @@ impl NativeStream for ScreenCapturer {
         // Retire the old stream before starting its replacement. All callbacks
         // and the native lease remain owned here if either operation stalls.
         {
-            let _operation = tracker.phase("replace_stop");
-            self.stop().context(NativeRetirementFailed)?;
+            let operation = tracker.phase("replace_stop");
+            let result = self.stop().context(NativeRetirementFailed);
+            operation.finish(if result.is_ok() { "ok" } else { "error" });
+            result?;
         }
         {
-            let _operation = tracker.phase("replace_start");
-            *self = Self::new_blocking(config, audio)?;
+            let operation = tracker.phase("replace_start");
+            let result = Self::new_blocking(config, audio);
+            operation.finish(if result.is_ok() { "ok" } else { "error" });
+            *self = result?;
         }
         Ok(self.receiver())
     }
@@ -123,8 +127,18 @@ struct Commands<S: NativeStream> {
 impl<S: NativeStream> Commands<S> {
     fn request_stop(&self) {
         self.watchdog.request_stop();
-        self.pending.lock().unwrap().stop = true;
+        let mut pending = self.pending.lock().unwrap();
+        let first_request = !pending.stop;
+        pending.stop = true;
+        drop(pending);
         self.changed.notify_one();
+        if first_request {
+            tracing::info!(target: "macrdp_transition",
+                component = "native_capture", worker_pid = std::process::id(),
+                owner_id = self.watchdog.diagnostic_id(),
+                phase = "stop_requested", state = "event",
+                "Native lifecycle transition");
+        }
     }
 
     fn control_stream(&self, stream: &mut S) {
@@ -271,8 +285,10 @@ impl<S: NativeStream> CaptureWorker<S> {
                 // locals retire before their owner's lease is released.
                 let owner = owner;
                 let started = {
-                    let _operation = commands.watchdog.phase("start");
-                    start()
+                    let operation = commands.watchdog.phase("start");
+                    let result = start();
+                    operation.finish(if result.is_ok() { "ok" } else { "error" });
+                    result
                 };
                 let mut stream = match started {
                     Ok((stream, metadata)) => {
@@ -305,6 +321,7 @@ impl<S: NativeStream> CaptureWorker<S> {
 
                 let mut acknowledgement = Some(retired_tx);
                 let mut delay = Duration::from_millis(250);
+                let mut stop_failures = 0u64;
                 // One phase includes repeated failed stop attempts: an Apple
                 // callback that never confirms retirement is also a stalled
                 // owner, even when each failed attempt returns promptly.
@@ -315,6 +332,7 @@ impl<S: NativeStream> CaptureWorker<S> {
                     match result {
                         Ok(()) => break,
                         Err(error) => {
+                            stop_failures = stop_failures.saturating_add(1);
                             // Report the failure, but never release exclusive
                             // ownership while a live stream may still exist.
                             // One retiring worker retries; reconnects cannot
@@ -328,10 +346,14 @@ impl<S: NativeStream> CaptureWorker<S> {
                         }
                     }
                 }
+                let stream_drop = commands.watchdog.diagnostic_phase("stream_drop");
                 drop(stream);
-                drop(retirement);
+                stream_drop.finish("returned");
+                retirement.finish(if stop_failures == 0 { "ok" } else { "recovered" });
                 let _operation = commands.watchdog.phase("release_display_owner");
                 drop(owner);
+                // Drop may log a restoration failure internally; returning
+                // here proves ownership release, not successful restoration.
                 // A successful acknowledgement proves that old capture and its
                 // lease are gone before resize can mutate display mode.
                 if let Some(acknowledgement) = acknowledgement {

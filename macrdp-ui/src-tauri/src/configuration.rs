@@ -125,7 +125,9 @@ pub async fn set_config(
         let filter = format!("macrdp_ui={level},macrdp_core={level},{level}");
         state
             .log_reload
-            .reload(tracing_subscriber::EnvFilter::new(&filter))
+            .reload(macrdp_core::with_transition_diagnostics(
+                tracing_subscriber::EnvFilter::new(&filter),
+            ))
             .map_err(|e| format!("failed to reload log level: {e}"))?;
         tracing::info!(%level, "Reloaded tracing filter");
     }
