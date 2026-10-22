@@ -23,7 +23,7 @@ fn derive_transport_mode(gfx: &GfxState) -> String {
         return "bitmap".to_string();
     }
 
-    if gfx.bitmap_mode() {
+    if gfx.bitmap_mode() || gfx.encoder_bitmap_fallback {
         return "bitmap-fallback".to_string();
     }
 
@@ -357,6 +357,16 @@ mod tests {
         let metrics = MetricsSnapshot::default().sample(&gfx);
         assert_eq!(metrics.transport_mode, "gfx-uncompressed-fallback");
         assert_eq!(metrics.encoder_mode, "uncompressed");
+        gfx.encoder_bitmap_fallback = true;
+        let metrics = MetricsSnapshot::default().sample(&gfx);
+        assert_eq!(metrics.transport_mode, "bitmap-fallback");
+        assert_eq!(metrics.encoder_mode, "bitmap");
+        assert_eq!(
+            metrics.bitrate_mode,
+            "Wire throughput only (bitmap updates)"
+        );
+        assert!(gfx.avc420_supported && !gfx.bitmap_mode());
+        gfx.encoder_bitmap_fallback = false;
         gfx.bitmap_fallback_mode = true;
         assert_eq!(
             MetricsSnapshot::default().sample(&gfx).encoder_mode,

@@ -13,6 +13,7 @@ mod event_wait;
 mod idle_encode;
 mod idle_policy;
 mod live_controls;
+mod transport;
 mod uncompressed_pacing;
 mod video_encode;
 use damage::FrameDamage;
@@ -875,6 +876,7 @@ impl RdpServerDisplay for MacDisplay {
             capture_config,
             encoder: None,
             encoder_startup: None,
+            startup_mode_444: None,
             encoder_startup_attempted: false,
             encoder_failed: false,
             video_encode_recovery: video_encode::Recovery::default(),
@@ -974,6 +976,8 @@ struct MacDisplayUpdates {
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     encoder_startup: Option<encoder_startup::Initializer<Box<dyn VideoEncoder>>>,
+    /// Codec mode belonging to the pending initialization's original settings.
+    startup_mode_444: Option<bool>,
     encoder_startup_attempted: bool,
     /// A failed or stalled codec remains disabled for this capture. User
     /// toggles must not bypass the session's automatic recovery decision.
@@ -1231,7 +1235,7 @@ impl MacDisplayUpdates {
                     }
                     Ok(DisplayWake::Cursor | DisplayWake::Idle) => {}
                     Err(_) => {
-                        tracing::warn!("Async encoder did not complete within two seconds; recovering with uncompressed graphics");
+                        tracing::warn!("Async encoder did not complete within two seconds; recovering with compressed bitmap updates");
                         // The codec moves native invalidation to its bounded
                         // retirement worker, retaining callbacks and input there.
                         self.encoder = None;
@@ -1680,7 +1684,7 @@ impl MacDisplayUpdates {
             || gfx.last_ack_frame == 0
             || gfx.frame_acknowledgements_suspended
             || gfx.avc_fallback_to_uncompressed
-            || gfx.bitmap_mode()
+            || self.uses_bitmap_transport(&gfx)
     }
 
     fn mark_client_may_be_stale(&mut self, reason: &'static str) {
@@ -1785,9 +1789,10 @@ impl MacDisplayUpdates {
     }
 
     fn send_cached_full_frame_recovery(&mut self) -> Option<DisplayUpdate> {
+        self.sync_bitmap_transport();
         let (session_uses_gfx, gfx_channel_ready, gfx_avc_ready) = {
             let state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_mode();
+            let session_uses_gfx = state.session_uses_gfx && !self.uses_bitmap_transport(&state);
             let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
             let gfx_avc_ready =
                 gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
@@ -2035,6 +2040,7 @@ impl MacDisplayUpdates {
     }
 
     fn sync_bitmap_pacing(&mut self) {
+        self.sync_bitmap_transport();
         let costs = {
             let gfx = self.gfx_state.lock().unwrap();
             if gfx.bitmap_dispatches != self.bitmap_perf_dispatches {
@@ -2051,7 +2057,7 @@ impl MacDisplayUpdates {
                 self.bitmap_perf_dispatches = gfx.bitmap_dispatches;
                 self.bitmap_perf_bytes = gfx.bitmap_wire_bytes;
             }
-            if gfx.session_uses_gfx && !gfx.bitmap_mode() {
+            if gfx.session_uses_gfx && !self.uses_bitmap_transport(&gfx) {
                 return;
             }
             bitmap_pacing::BitmapCosts {
@@ -2405,6 +2411,7 @@ impl MacDisplayUpdates {
         frame: CapturedFrame,
         damage: FrameDamage,
     ) -> Result<Option<DisplayUpdate>> {
+        self.sync_bitmap_transport();
         self.coord_mapper.update_frame_content_rect(
             frame.width,
             frame.height,
@@ -2428,7 +2435,7 @@ impl MacDisplayUpdates {
             request_bitmap_fallback_full_frames,
         ) = {
             let mut state = self.gfx_state.lock().unwrap();
-            let session_uses_gfx = state.session_uses_gfx && !state.bitmap_mode();
+            let session_uses_gfx = state.session_uses_gfx && !self.uses_bitmap_transport(&state);
             let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
             let gfx_avc_ready =
                 gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
@@ -2478,6 +2485,12 @@ impl MacDisplayUpdates {
                     "GFX AVC negotiated but client never acknowledged a frame; abandoning GFX and falling back to classic bitmap updates for this session"
                 );
             }
+            // The no-ACK decision above changes the current dispatch, rather
+            // than leaking one final AVC/raw frame after selecting bitmaps.
+            let session_uses_gfx = state.session_uses_gfx && !self.uses_bitmap_transport(&state);
+            let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
+            let gfx_avc_ready =
+                gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
             let force_full_frame_uncompressed_gfx = state.gfx_validation_mode
                 || state.avc_fallback_to_uncompressed
                 || self.encoder.is_none()
@@ -2516,7 +2529,7 @@ impl MacDisplayUpdates {
             // The browser's first encoded frame is a self-contained IDR. A
             // raw seed or tiny RGB patch after video starts would require
             // terminating passthrough and re-encoding the surface as images.
-            // Keep raw seeds available during asynchronous encoder startup.
+            // Windows clients and explicit raw validation keep their raw seed.
             if self.needs_full_gfx_seed && !(browser_video && gfx_avc_ready) {
                 let full_rect = ClampedRect {
                     x: 0,

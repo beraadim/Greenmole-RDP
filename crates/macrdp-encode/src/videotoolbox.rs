@@ -14,6 +14,9 @@ mod callback;
 mod outcome;
 mod ownership;
 mod pair;
+mod startup;
+#[cfg(test)]
+mod startup_native_tests;
 use callback::encode_callback;
 use outcome::{CallbackDiagnostics, KeyframeRequests, NativeOutput};
 use ownership::{NativeSession, OwnedCf, OwnedPixelBuffer};
@@ -545,6 +548,7 @@ impl VtEncoder {
         let retirement = RETIREMENTS
             .get_or_init(|| crate::retirement::RetirementPool::new(2))
             .reserve()?;
+        let retirement_id = retirement.diagnostic_id();
         let mut session = std::ptr::null_mut();
         unsafe {
             let spec_keys = [
@@ -578,8 +582,10 @@ impl VtEncoder {
             let create_started = std::time::Instant::now();
             tracing::info!(target: "macrdp_transition",
                 component = "video_encoder", worker_pid = std::process::id(),
-                retirement_id = retirement.diagnostic_id(), phase = "vt_create", state = "begin",
-                width, height, "Encoder lifecycle transition");
+                retirement_id, phase = "vt_create", state = "begin",
+                width, height, fps, bitrate, pixel_format, mode_444, ?quality,
+                require_hardware = true, low_latency_rate_control = !mode_444,
+                "Encoder lifecycle transition");
             let status = VTCompressionSessionCreate(
                 std::ptr::null(),
                 width as i32,
@@ -594,7 +600,7 @@ impl VtEncoder {
             );
             tracing::info!(target: "macrdp_transition",
                 component = "video_encoder", worker_pid = std::process::id(),
-                retirement_id = retirement.diagnostic_id(), phase = "vt_create", state = "end",
+                retirement_id, phase = "vt_create", state = "end",
                 outcome = if status == 0 && !session.is_null() { "ok" } else { "error" },
                 status, elapsed_ms = create_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 "Encoder lifecycle transition");
@@ -611,6 +617,10 @@ impl VtEncoder {
                 retirement: Some(retirement),
             };
             check_status(status, "VTCompressionSessionCreate")?;
+            // Native service activation can dominate Create on the first use.
+            // Keep configuration and prepare timings separate so a future slow
+            // startup can be attributed without changing the worker's lifetime.
+            let properties = startup::Phase::begin(retirement_id, "vt_properties");
             set_required_property(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
@@ -747,10 +757,11 @@ impl VtEncoder {
                 },
                 "PrioritizeEncodingSpeedOverQuality",
             );
-            check_status(
-                VTCompressionSessionPrepareToEncodeFrames(session),
-                "VTCompressionSessionPrepareToEncodeFrames",
-            )?;
+            properties.finish(0);
+            let prepare = startup::Phase::begin(retirement_id, "vt_prepare");
+            let status = VTCompressionSessionPrepareToEncodeFrames(session);
+            prepare.finish(status);
+            check_status(status, "VTCompressionSessionPrepareToEncodeFrames")?;
             Ok(native)
         }
     }

@@ -1,0 +1,90 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "version": "0.1.28",
+  "status": "source validated; package verification pending",
+  "diagnosis": {
+    "observed_native_create_ms": 25921,
+    "native_create_status": 0,
+    "previous_adoption_timeout_seconds": 5,
+    "stage": "VTCompressionSessionCreate before property configuration or prepare",
+    "native_service_cold_launch_observed": true,
+    "exact_native_blocking_cause_established": false,
+    "portrait_dimensions_accepted_by_native_encoder": true,
+    "browser_decoder_rejection_observed": false,
+    "pending_and_failed_startup_previously_selected_raw_gfx": true
+  },
+  "startup_policy": {
+    "slow_notice_seconds": 5,
+    "hard_adoption_deadline_seconds": 30,
+    "completion_timestamp_controls_adoption": true,
+    "maximum_global_initializers": 1,
+    "abandoned_result_retired_on_worker": true,
+    "admission_held_through_abandoned_result_retirement": true,
+    "temporary_bitmap_fallback_preserves_avc_negotiation": true,
+    "handoff_discards_unsent_bitmap_tiles_and_preserves_latest_pixels": true,
+    "handoff_restores_video_fps_and_forces_keyframe": true,
+    "chroma_mismatch_cancels_pending_initializer": true,
+    "live_rebuild_budget_seconds_unchanged": 5,
+    "explicit_raw_validation_policy_unchanged": true,
+    "non_avc_policy_unchanged": true
+  },
+  "bitmap_codec_scope": {
+    "greenmole_browser_avc_advertises_remotefx": true,
+    "reported_session_compressed_codec_inferred_from_client_code": true,
+    "exact_reported_session_bitmap_codec_logged": false,
+    "client_without_supported_image_codec_may_retain_raw_surface_transport": true
+  },
+  "release_checks": {
+    "rust_passed": 837,
+    "rust_failed": 0,
+    "opt_in_ignored": 7,
+    "new_opt_in_generated_portrait_hardware_test": 1,
+    "rust_serial_mode": true,
+    "core_parallel_passed": 243,
+    "core_parallel_threads": 3,
+    "python_passed": 8,
+    "javascript_passed": 11,
+    "typescript_passed": true,
+    "frontend_production_build_passed": true
+  },
+  "generated_portrait_hardware_validation": {
+    "passed": true,
+    "dimensions": [1184, 1808],
+    "sequential_native_instances": 2,
+    "startup_ms": [1190, 2],
+    "valid_idr_and_exact_decoded_dimensions": true,
+    "external_timeout_seconds": 45,
+    "elapsed_seconds": 2.257482916,
+    "screen_capture_created": false,
+    "display_changes": false,
+    "network_connection_created": false,
+    "native_services_restarted": false
+  },
+  "preserved_behavior": {
+    "connect_disconnect_policy_unchanged": true,
+    "virtual_display_creation_promotion_restoration_removal_unchanged": true,
+    "current_monitor_identity_policy_unchanged": true,
+    "physical_display_modes_unchanged": true,
+    "retention_default": false,
+    "capture_stop_watchdog_unchanged": true,
+    "wake_assertion_policy_unchanged": true,
+    "native_retirement_order_unchanged": true,
+    "greenmole_changed_or_deployed": false,
+    "monitor_cleanup_performed": false
+  },
+  "source_review": {
+    "independent_startup_and_handoff_review_passed": true,
+    "native_diagnostics_and_lifetime_review_passed": true,
+    "external_dependency_versions_changed": false,
+    "scoped_formatting_and_diff_check_passed": true,
+    "staged_secret_scan_passed": true,
+    "version_and_lockfile_consistency_passed": true
+  },
+  "limitations": [
+    "The native macOS cold-service blocking cause is not established or eliminated.",
+    "Generated pixels do not reproduce the original cold-service delay or measure real remote-session bandwidth.",
+    "Browser image fallback after video has already started retains existing Greenmole behavior; the live rebuild budget remains five seconds.",
+    "AVC420 iPhone Safari acceptance remains a user device test after installation."
+  ],
+  "device_test_instructions": "release-0.1.28.md"
+}

@@ -178,6 +178,7 @@ fn replacing_a_codec_abandons_its_pending_output_without_collecting_it() {
 
 #[test]
 fn live_change_cancels_startup_without_adopting_late_codec_or_accumulating_workers() {
+    let _guard = encoder_startup::test_guard();
     let (resume, blocked) = std::sync::mpsc::channel();
     let (dropped, destruction) = std::sync::mpsc::channel();
     let drops = Arc::new(AtomicUsize::new(0));

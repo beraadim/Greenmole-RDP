@@ -412,6 +412,9 @@ pub struct GfxState {
     controls_changed: tokio::sync::watch::Sender<u64>,
     /// Backend instantiated by capture, rather than the configured preference.
     pub active_encoder: Option<&'static str>,
+    /// Current transport observation while an accepted AVC codec is unavailable.
+    /// This is not a negotiated capability or a permanent video-failure latch.
+    pub encoder_bitmap_fallback: bool,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
     pub chroma_mode: Option<String>,
     /// Whether to force negotiated GFX sessions into uncompressed validation mode.
@@ -495,6 +498,7 @@ impl GfxState {
             manual_bitmap_mode: false,
             controls_changed: tokio::sync::watch::channel(0).0,
             active_encoder: None,
+            encoder_bitmap_fallback: false,
             chroma_mode: None,
             gfx_validation_mode,
             avc_fallback_to_uncompressed: false,
@@ -698,6 +702,7 @@ impl GfxState {
         self.browser_avc444 = false;
         self.avc_fallback_to_uncompressed = false;
         self.bitmap_fallback_mode = false;
+        self.encoder_bitmap_fallback = false;
         self.frame_id = 0;
         self.pending_acks = 0;
         self.last_ack_frame = 0;
@@ -1533,6 +1538,7 @@ mod tests {
         state.start_time = Some(std::time::Instant::now());
         state.peer_addr = Some(std::net::IpAddr::from([192, 168, 86, 250]));
         state.avc_fallback_to_uncompressed = true;
+        state.encoder_bitmap_fallback = true;
         state.bitmap_fallback_mode = true;
 
         state.reset_connection_state(false);
@@ -1564,6 +1570,7 @@ mod tests {
         assert_eq!(state.negotiated_client_depth, None);
         assert_eq!(state.start_time, None);
         assert!(!state.avc_fallback_to_uncompressed);
+        assert!(!state.encoder_bitmap_fallback);
         assert!(!state.bitmap_fallback_mode);
         assert_eq!(
             state.peer_addr,

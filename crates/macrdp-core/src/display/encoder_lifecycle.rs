@@ -28,46 +28,74 @@ impl MacDisplayUpdates {
         };
         if !eligible {
             if self.encoder_startup.take().is_some() {
-                tracing::info!("AVC no longer selected; abandoning pending encoder initialization");
+                tracing::info!(target: "macrdp_transition",
+                    component = "encoder_startup", phase = "startup", state = "cancelled",
+                    "AVC no longer selected; abandoning pending encoder initialization");
             }
+            self.startup_mode_444 = None;
             if self.encoder.is_some() {
                 self.retire_current_encoder();
             }
             return;
         }
+        if self.encoder_startup.is_some() && self.startup_mode_444 != Some(mode_444) {
+            // A codec prepared for the old reference-chain format cannot be
+            // adopted after the negotiated AVC mode changes. The old worker
+            // retains its capacity until it has retired that result.
+            self.encoder_startup = None;
+            self.startup_mode_444 = None;
+            self.encoder_startup_attempted = false;
+            tracing::info!(target: "macrdp_transition",
+                component = "encoder_startup", phase = "startup", state = "cancelled",
+                reason = "negotiated_chroma_changed",
+                "Discarding encoder prepared for a previous AVC mode");
+        }
         if let Some(startup) = &mut self.encoder_startup {
             match startup.poll(Instant::now()) {
                 encoder_startup::Poll::Pending => return,
+                encoder_startup::Poll::SlowStart => {
+                    tracing::info!(target: "macrdp_transition",
+                        component = "encoder_startup", phase = "startup", state = "slow",
+                        notice_secs = encoder_startup::SLOW_START_NOTICE.as_secs(),
+                        timeout_secs = encoder_startup::STARTUP_TIMEOUT.as_secs(),
+                        "Encoder startup is slow; keeping compressed image updates while the bounded native worker continues");
+                    return;
+                }
                 encoder_startup::Poll::Ready(Ok(mut encoder)) => {
+                    self.prepare_video_handoff();
                     encoder.force_keyframe();
                     {
                         let mut gfx = self.gfx_state.lock().unwrap();
                         gfx.active_encoder = Some(encoder.backend_name());
                         gfx.applied_encoder_bitrate = encoder.applied_bitrate();
                     }
-                    tracing::info!(
+                    tracing::info!(target: "macrdp_transition",
+                        component = "encoder_startup", phase = "startup", state = "ready",
                         backend = encoder.backend_name(),
-                        "AVC encoder ready; switching from uncompressed graphics"
+                        "AVC encoder ready; replacing compressed image fallback with a fresh video baseline"
                     );
                     self.encoder = Some(encoder);
+                    self.sync_bitmap_transport();
                     // Configuration/adaptation may have changed while startup
                     // was pending; do not silently retain its older target.
                     self.apply_encoder_bitrate(self.bitrate_ctrl.current_bitrate());
+                    self.apply_capture_fps(self.bitrate_ctrl.current_fps(), "video-startup-ready");
                     self.needs_full_gfx_seed = true;
                     self.client_may_be_stale = true;
                     self.settings_refresh_pending = true;
                 }
                 encoder_startup::Poll::Ready(Err(error)) => {
                     self.encoder_failed = true;
-                    tracing::warn!(%error, "Encoder initialization failed; continuing uncompressed graphics");
+                    tracing::warn!(%error, "Encoder initialization failed; continuing compressed image fallback");
                 }
                 encoder_startup::Poll::TimedOut => {
                     self.encoder_failed = true;
-                    tracing::warn!(timeout_secs = 5,
-                        "Encoder initialization timed out; continuing uncompressed graphics while native cleanup remains owned");
+                    tracing::warn!(timeout_secs = encoder_startup::STARTUP_TIMEOUT.as_secs(),
+                        "Encoder initialization timed out; continuing compressed image fallback while native cleanup remains owned");
                 }
             }
             self.encoder_startup = None;
+            self.startup_mode_444 = None;
             return;
         }
         if self.encoder.is_some() || self.encoder_startup_attempted {
@@ -75,7 +103,7 @@ impl MacDisplayUpdates {
         }
         // A resized/reconnected capture can arrive before the previous worker
         // finishes retiring. Admission denial is not a failed native attempt:
-        // stay uncompressed and retry only after the one global slot is free.
+        // keep compressed images and retry only after the global slot is free.
         if encoder_startup::pending() || macrdp_encode::native_cleanup_pending() {
             return;
         }
@@ -84,7 +112,7 @@ impl MacDisplayUpdates {
         self.encoder_startup_attempted = true;
         let width = self.capture_config.width;
         let height = self.capture_config.height;
-        // Raw fallback may temporarily pace capture below the intended video
+        // Image fallback may temporarily pace capture below the intended video
         // rate while a previous initializer retires. Initialize AVC for the
         // video controller's rate, which is restored when it becomes ready.
         let fps = self.bitrate_ctrl.current_fps() as f32;
@@ -99,7 +127,9 @@ impl MacDisplayUpdates {
             Ok(encoder)
         }) {
             Ok(startup) => {
-                tracing::info!(
+                tracing::info!(target: "macrdp_transition",
+                    component = "encoder_startup", phase = "startup", state = "begin",
+                    timeout_secs = encoder_startup::STARTUP_TIMEOUT.as_secs(),
                     width,
                     height,
                     fps,
@@ -111,12 +141,51 @@ impl MacDisplayUpdates {
                 );
                 self.gfx_state.lock().unwrap().requested_encoder_bitrate = Some(bitrate);
                 self.encoder_startup = Some(startup);
+                self.startup_mode_444 = Some(mode_444);
             }
             Err(error) => {
                 self.encoder_failed = true;
-                tracing::warn!(%error, "Encoder startup unavailable; continuing uncompressed graphics")
+                tracing::warn!(%error, "Encoder startup unavailable; continuing compressed image fallback")
             }
         }
+    }
+
+    fn prepare_video_handoff(&mut self) {
+        // A compressed bitmap can be split over multiple writes. Preserve its
+        // newest source, then discard every unsent tile before an AVC baseline
+        // supersedes it. Otherwise old RGB tiles could repaint after video.
+        if let Some(frame) = super::live_controls::discard_bitmap_batch(
+            &mut self.pending_bitmap_updates,
+            &mut self.pending_bitmap_frame,
+            &mut self.deferred_bitmap_frame,
+        ) {
+            self.cache_latest_frame(&frame);
+        }
+        if let Some(frame) = self
+            .capturer
+            .as_mut()
+            .and_then(super::NativeCapture::try_latest_image)
+        {
+            self.record_capture_delivery();
+            self.cache_latest_frame(&frame);
+        }
+        let gfx = self.gfx_state.lock().unwrap();
+        self.bitmap_pacing.reset(super::bitmap_pacing::BitmapCosts {
+            dispatches: gfx.bitmap_dispatches,
+            encode_ms: gfx.bitmap_encode_ms_total,
+            write_ms: gfx.bitmap_write_ms_total,
+        });
+        self.uncompressed_pacing
+            .reset(super::uncompressed_pacing::UncompressedCosts {
+                dispatches: gfx.uncompressed_dispatches,
+                prepare_ms: gfx.uncompressed_prepare_ms_total,
+                write_ms: gfx.uncompressed_write_ms_total,
+            });
+        drop(gfx);
+        self.needs_full_bitmap_seed = false;
+        self.forced_full_bitmap_updates_remaining = 0;
+        self.logged_bitmap_mode = false;
+        self.logged_gfx_avc_mode = false;
     }
 
     pub(super) fn encoder_control_timeout(&self) -> Option<Duration> {

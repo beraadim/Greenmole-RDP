@@ -122,7 +122,7 @@ fn successful_adoption_transfers_exactly_once_and_releases_startup_capacity() {
     let resource = loop {
         match init.poll(Instant::now()) {
             Poll::Ready(result) => break result.unwrap(),
-            Poll::Pending => {
+            Poll::Pending | Poll::SlowStart => {
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
             }
@@ -135,4 +135,61 @@ fn successful_adoption_transfers_exactly_once_and_releases_startup_capacity() {
     drop(resource);
     assert_eq!(destruction.recv().unwrap(), std::thread::current().id());
     assert!(destruction.try_recv().is_err());
+}
+
+#[test]
+fn slow_success_is_adopted_once_without_a_second_worker() {
+    let capacity = Capacity::default();
+    let (resume, blocked) = mpsc::channel();
+    let (dropped, destruction) = mpsc::channel();
+    let mut init = Initializer::start_in(capacity.clone(), Duration::from_secs(30), move || {
+        blocked.recv().unwrap();
+        Ok(Resource {
+            dropped,
+            release_drop: None,
+        })
+    })
+    .unwrap();
+    init.slow_deadline = Instant::now();
+    assert!(matches!(init.poll(Instant::now()), Poll::SlowStart));
+    assert!(matches!(init.poll(Instant::now()), Poll::Pending));
+    assert!(Initializer::start_in(capacity.clone(), Duration::from_secs(1), || Ok(())).is_err());
+    resume.send(()).unwrap();
+    let wait_until = Instant::now() + Duration::from_secs(2);
+    while init.result.lock().unwrap().is_none() {
+        assert!(Instant::now() < wait_until);
+        std::thread::yield_now();
+    }
+    // Completion before the hard cutoff remains usable even if a busy socket
+    // or frame queue delays the next poll until after that cutoff.
+    let resource = match init.poll(init.deadline + Duration::from_secs(1)) {
+        Poll::Ready(result) => result.unwrap(),
+        _ => panic!("usable slow initialization was discarded"),
+    };
+    assert!(init.result.lock().unwrap().is_none());
+    drop(init);
+    wait_released(&capacity);
+    assert!(destruction.try_recv().is_err());
+    drop(resource);
+    assert_eq!(destruction.recv().unwrap(), std::thread::current().id());
+    assert!(destruction.try_recv().is_err());
+}
+
+#[test]
+fn soft_notice_never_extends_the_hard_deadline() {
+    let capacity = Capacity::default();
+    let (resume, blocked) = mpsc::channel();
+    let mut init = Initializer::start_in(capacity.clone(), Duration::from_secs(30), move || {
+        blocked.recv().unwrap();
+        Ok(())
+    })
+    .unwrap();
+    let hard = init.deadline;
+    assert!(matches!(init.poll(init.slow_deadline), Poll::SlowStart));
+    assert!(matches!(init.poll(hard), Poll::TimedOut));
+    assert_eq!(init.deadline, hard);
+    drop(init);
+    assert!(Initializer::start_in(capacity.clone(), Duration::from_secs(1), || Ok(())).is_err());
+    resume.send(()).unwrap();
+    wait_released(&capacity);
 }

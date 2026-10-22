@@ -37,7 +37,7 @@ fn abandon_video(
 
 /// A new complete baseline supersedes every unsent descriptor. Preserve the
 /// newest source pixels, including updates beyond an older batch's geometry.
-fn discard_bitmap_batch(
+pub(super) fn discard_bitmap_batch(
     regions: &mut std::collections::VecDeque<super::bitmap_updates::Region>,
     source: &mut Option<macrdp_capture::CapturedFrame>,
     deferred: &mut Option<macrdp_capture::CapturedFrame>,
@@ -152,6 +152,7 @@ impl MacDisplayUpdates {
 
     pub(super) fn retire_current_encoder(&mut self) {
         self.video_encode_recovery = Default::default();
+        self.startup_mode_444 = None;
         // VideoToolbox Drop transfers its native session, input buffers and
         // callbacks to its bounded retirement owner. Never collect this old
         // submission using the newly configured codec.
@@ -189,6 +190,7 @@ impl MacDisplayUpdates {
             || Instant::now() >= deadline
         {
             self.encoder_startup = None;
+            self.startup_mode_444 = None;
             self.encoder_startup_attempted = true;
             self.encoder_failed |= eligible;
             self.encoder_rebuild_deadline = None;

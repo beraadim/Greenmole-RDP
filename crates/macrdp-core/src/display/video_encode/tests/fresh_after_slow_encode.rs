@@ -4,7 +4,7 @@
 use crate::display::*;
 use macrdp_encode::{Avc444EncodedFrame, EncodedFrame};
 
-struct RecordingEncoder;
+pub(super) struct RecordingEncoder;
 
 fn encoded(pixels: &[u8]) -> EncodedFrame {
     EncodedFrame {
@@ -43,7 +43,7 @@ impl VideoEncoder for RecordingEncoder {
     }
 }
 
-fn fixture(avc444: bool) -> MacDisplayUpdates {
+pub(super) fn fixture(avc444: bool) -> MacDisplayUpdates {
     let mut state = GfxState::new(16, 16, avc444, false);
     state.session_uses_gfx = true;
     state.channel_id = Some(1);
@@ -75,6 +75,7 @@ fn fixture(avc444: bool) -> MacDisplayUpdates {
         },
         encoder: Some(Box::new(RecordingEncoder)),
         encoder_startup: None,
+        startup_mode_444: None,
         encoder_startup_attempted: true,
         encoder_failed: false,
         video_encode_recovery: super::super::Recovery::default(),
@@ -132,7 +133,7 @@ fn fixture(avc444: bool) -> MacDisplayUpdates {
     }
 }
 
-fn capture(value: u8) -> CapturedFrame {
+pub(super) fn capture(value: u8) -> CapturedFrame {
     CapturedFrame {
         data: FrameData::Raw(Bytes::from(vec![value; 16 * 16 * 4])),
         width: 16,

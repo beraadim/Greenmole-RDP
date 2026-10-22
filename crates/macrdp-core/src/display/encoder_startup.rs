@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+// Cold VideoToolbox service activation can succeed well after five seconds.
+// These are asynchronous admission bounds, never a wait on the RDP thread.
+pub(super) const SLOW_START_NOTICE: Duration = Duration::from_secs(5);
+pub(super) const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 struct Capacity(Arc<AtomicUsize>);
@@ -28,6 +31,16 @@ pub(crate) fn pending() -> bool {
     capacity().0.load(Ordering::Acquire) != 0
 }
 
+/// Tests exercising the real admission slot must not compete with each other.
+/// Tests of independent capacity instances need no serialization.
+#[cfg(test)]
+pub(super) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    TEST_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Completed<T> {
     at: Instant,
     result: Result<T>,
@@ -35,6 +48,7 @@ struct Completed<T> {
 
 pub(super) enum Poll<T> {
     Pending,
+    SlowStart,
     Ready(Result<T>),
     TimedOut,
 }
@@ -42,6 +56,8 @@ pub(super) enum Poll<T> {
 pub(super) struct Initializer<T> {
     result: Arc<Mutex<Option<Completed<T>>>>,
     release: Option<mpsc::Sender<()>>,
+    slow_deadline: Instant,
+    slow_reported: bool,
     deadline: Instant,
 }
 
@@ -63,7 +79,8 @@ impl<T: Send + 'static> Initializer<T> {
         let result = Arc::new(Mutex::new(None));
         let completed = result.clone();
         let (release, released) = mpsc::channel();
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         std::thread::Builder::new()
             .name("encoder-startup".into())
             .spawn(move || {
@@ -84,6 +101,8 @@ impl<T: Send + 'static> Initializer<T> {
         Ok(Self {
             result,
             release: Some(release),
+            slow_deadline: started + SLOW_START_NOTICE.min(timeout),
+            slow_reported: false,
             deadline,
         })
     }
@@ -99,6 +118,9 @@ impl<T: Send + 'static> Initializer<T> {
             Poll::Ready(result)
         } else if now >= self.deadline {
             Poll::TimedOut
+        } else if !self.slow_reported && now >= self.slow_deadline {
+            self.slow_reported = true;
+            Poll::SlowStart
         } else {
             Poll::Pending
         }

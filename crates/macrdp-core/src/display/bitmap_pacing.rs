@@ -20,6 +20,13 @@ pub(super) struct BitmapPacing {
 }
 
 impl BitmapPacing {
+    pub(super) fn reset(&mut self, costs: BitmapCosts) {
+        *self = Self {
+            seen: costs,
+            ..Self::default()
+        };
+    }
+
     pub fn observe(
         &mut self,
         costs: BitmapCosts,
