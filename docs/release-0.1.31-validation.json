@@ -2,7 +2,7 @@
   "schema": "macrdp-release-validation-v1",
   "product_name": "Greenmole RDP",
   "version": "0.1.31",
-  "status": "source and frontend validated; release package pending",
+  "status": "built, verified and delivered for user testing",
   "attribution": {
     "original_project": "https://github.com/x6nux/macrdp",
     "original_author": "x6nux",
@@ -28,7 +28,12 @@
     ],
     "mocked_ui_light_and_dark_themes_checked": true,
     "mocked_page_errors": [],
-    "runtime_rust_tests": "not repeated; no runtime Rust source or dependency changes"
+    "runtime_rust_tests": "not repeated; no runtime Rust source or dependency changes",
+    "optimized_cli_and_app_build_passed": true,
+    "deep_strict_ad_hoc_signature_verified": true,
+    "dmg_checksum_verified": true,
+    "installed_application_and_config_hashes_preserved": true,
+    "actual_app_or_rdp_session_started": false
   },
   "compatibility": {
     "bundle_identifier": "com.macrdp.app",
@@ -36,5 +41,40 @@
     "connect_disconnect_behavior_unchanged": true,
     "existing_storage_and_monitor_identity_unchanged": true
   },
-  "device_test_instructions": "release-0.1.31.md"
+  "device_test_instructions": "release-0.1.31.md",
+  "source_revision": "4d6781c0ff5872df904ecd7b4065f460e1f2ae03",
+  "verified_at_utc": "2026-10-23T15:48:48.549886+00:00",
+  "package_verification": {
+    "version": "0.1.31",
+    "source_revision": "4d6781c0ff5872df904ecd7b4065f460e1f2ae03",
+    "package": "Greenmole_RDP_0.1.31_aarch64_4d6781c0ff58.dmg",
+    "sha256": "5fd138e552e0667cc98ab16cc693fa5aa985894c96662406b20723fe63634ed1",
+    "bytes": 14653309,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "product_name": "Greenmole RDP",
+    "bundle_identifier": "com.macrdp.app",
+    "mascot_icon_verified": true,
+    "licenses_and_artwork_attribution_bundled": true,
+    "binary_architecture_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "original_macrdp_notice_bundled": true,
+    "verification_mount_removed": true,
+    "standalone_cli_version_verified": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "Greenmole_RDP_0.1.30_aarch64_e4209df5146a.dmg",
+      "Greenmole_RDP_0.1.30_aarch64_e4209df5146a.dmg.sha256",
+      "Greenmole_RDP_0.1.30_aarch64_e4209df5146a.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "installed_app_metadata_and_config_unchanged": true,
+    "live_remote_session_started": false
+  }
 }

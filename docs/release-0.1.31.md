@@ -29,3 +29,21 @@ page errors were checked. This does not start the server or a real RDP session.
 The new DMG is for manual installation and testing. After installing it, open
 About and verify the MacRDP/x6nux acknowledgment and links. Package and delivery
 evidence is recorded in [the validation record](release-0.1.31-validation.json).
+
+## Verified package
+
+Desktop test package: `Greenmole_RDP_0.1.31_aarch64_4d6781c0ff58.dmg`, with SHA-256 and build metadata
+sidecars.
+
+- Source: `4d6781c0ff5872df904ecd7b4065f460e1f2ae03`.
+- SHA-256: `5fd138e552e0667cc98ab16cc693fa5aa985894c96662406b20723fe63634ed1`.
+- Size: 14,653,309 bytes; aarch64, ad-hoc signed.
+- The read-only mounted app passes deep strict signature verification. Its
+  version, architecture and build metadata match the committed release.
+- The packaged original-project NOTICE, GPLv3 license, artwork license, original
+  artwork notice and provenance match their source files.
+- The verified package and sidecars are on the Mac mini Desktop. The previous
+  0.1.30 installer and its two sidecars were removed after delivery succeeded.
+- Installed app/config and existing login/monitor-identity file hashes remain
+  unchanged. The app was not installed or launched, and no live RDP session or
+  desktop/display recovery action was performed.
