@@ -41,6 +41,8 @@ pub struct AppState {
     pub status: Mutex<ServerStatus>,
     pub metrics: Mutex<Metrics>,
     pub(crate) diagnostic_history: Mutex<crate::diagnostics::DiagnosticHistory>,
+    /// Pure lifecycle evidence reducer; held briefly at synchronous callback ingress.
+    pub(crate) session_status: std::sync::Mutex<crate::session_status::SessionStatusObserver>,
     pub connections: Mutex<Vec<Connection>>,
     pub logs: Mutex<VecDeque<LogEntry>>,
     pub server_handle: SharedServerHandle,
@@ -66,6 +68,9 @@ impl AppState {
             status: Mutex::new(ServerStatus::default()),
             metrics: Mutex::new(Metrics::default()),
             diagnostic_history: Mutex::new(crate::diagnostics::DiagnosticHistory::default()),
+            session_status: std::sync::Mutex::new(
+                crate::session_status::SessionStatusObserver::default(),
+            ),
             connections: Mutex::new(Vec::new()),
             logs: Mutex::new(VecDeque::new()),
             server_handle: Arc::new(Mutex::new(None)),

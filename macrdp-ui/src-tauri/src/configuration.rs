@@ -49,8 +49,13 @@ pub(crate) fn configuration_status(
                 pending_restart.push(key);
             }
         }
+        if unconfirmed.contains("graphics_profile") {
+            pending_live.push("graphics_profile");
+        }
         for key in ["quality", "encoder"] {
-            if saved_values[key] != running_values[key] || unconfirmed.contains(key) {
+            if !unconfirmed.contains("graphics_profile")
+                && (saved_values[key] != running_values[key] || unconfirmed.contains(key))
+            {
                 pending_live.push(key);
             }
         }

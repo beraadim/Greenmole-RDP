@@ -29,6 +29,7 @@ pub(super) fn update_status(
 }
 
 pub(super) fn diagnostic(record: String, handler: &dyn ServerEventHandler) {
+    handler.on_operational_record(&record);
     if let Ok(entry) = serde_json::from_str::<LogEntry>(&record) {
         handler.on_log(entry);
     }

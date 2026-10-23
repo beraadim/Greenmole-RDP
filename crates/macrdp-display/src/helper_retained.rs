@@ -41,7 +41,11 @@ impl DisplayHelper {
 
     pub(crate) fn park_remote_session(&mut self) -> Result<()> {
         transition::observed(Phase::RemoteEnd, Details::display(self.id()), || {
-            self.park_remote_session_inner()
+            // Parent-owned evidence covers the exact Parked acknowledgment. The
+            // native wrapper adds no topology query or display operation.
+            transition::native(Phase::DisplayDisable, Details::display(self.id()), || {
+                self.park_remote_session_inner()
+            })
         })
     }
 

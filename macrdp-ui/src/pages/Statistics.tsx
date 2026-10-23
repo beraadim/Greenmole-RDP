@@ -5,6 +5,7 @@ import { formatBytes, formatDuration } from "../lib/format";
 import MetricCard from "@/components/MetricCard";
 import { ChartPanel } from "@/components/ChartPanel";
 import { BarChart } from "@/components/BarChart";
+import SessionStatusPanel from "../components/SessionStatusPanel";
 import EmptyState from "@/components/EmptyState";
 import type { ConnectionHistory, TrafficStats } from "../lib/types";
 
@@ -112,6 +113,8 @@ function Statistics() {
           </button>
         </div>
       </div>
+
+      <SessionStatusPanel showHistory />
 
       {/* 2. Summary cards */}
       <div className="flex gap-2">

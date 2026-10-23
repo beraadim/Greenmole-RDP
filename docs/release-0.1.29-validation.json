@@ -1,0 +1,74 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "version": "0.1.29",
+  "status": "source checks passed; package pending",
+  "changes": {
+    "saved_graphics_profiles": true,
+    "session_status_and_cleanup_evidence": true,
+    "opt_in_repeated_session_acceptance": true
+  },
+  "preserved_behavior": {
+    "connect_disconnect_policy_unchanged": true,
+    "virtual_display_creation_promotion_restoration_removal_unchanged": true,
+    "monitor_identity_policy_unchanged": true,
+    "physical_display_modes_unchanged": true,
+    "retention_default": false,
+    "guarded_session_policy_unchanged": true,
+    "native_retirement_order_and_timeouts_unchanged": true,
+    "no_automatic_profile_selection": true,
+    "greenmole_changed_or_deployed": false,
+    "real_remote_sessions_run_by_release_checks": false,
+    "native_service_or_monitor_cleanup_performed": false
+  },
+  "limits": [
+    "Actual client acceptance and repeated real sessions remain user tests after installation.",
+    "Overall cleanup confirmation targets virtual-display sessions; physical-main-display capture remains unconfirmed without virtual disposition evidence.",
+    "Diagnostic loss or bounded observation overflow prevents complete cleanup confirmation.",
+    "The soak harness requires an explicitly configured local client driver for automatic real sessions; synthetic tests do not connect to RDP.",
+    "ColorSync CPU snapshots are informational; resource differences alone do not establish a leak."
+  ],
+  "device_test_instructions": "release-0.1.29.md",
+  "soak_instructions": "session-soak.md",
+  "release_checks": {
+    "rust_passed": 866,
+    "rust_failed": 0,
+    "rust_opt_in_ignored": 7,
+    "rust_serial_mode": true,
+    "python_passed": 39,
+    "python_benchmark_passed": 8,
+    "python_soak_passed": 31,
+    "soak_resource_warnings_treated_as_errors": true,
+    "javascript_passed": 11,
+    "typescript_passed": true,
+    "frontend_production_build_passed": true,
+    "standalone_debug_build_passed": true,
+    "mocked_react_profile_checks_passed": 6,
+    "mocked_react_status_checks_passed": 6,
+    "mocked_ui_native_app_or_rdp_sessions_started": false,
+    "status_ui_sizes_tested": [
+      [
+        960,
+        620
+      ],
+      [
+        800,
+        500
+      ]
+    ],
+    "scoped_new_rust_module_formatting_passed": true,
+    "diff_check_passed": true,
+    "locked_version_consistency_passed": true,
+    "targeted_source_secret_pattern_scan_passed": true
+  },
+  "source_review": {
+    "independent_profile_and_session_evidence_review_passed": true,
+    "independent_soak_safety_review_passed": true,
+    "overlapping_and_late_operations_tested": true,
+    "unrelated_workers_and_old_generations_rejected": true,
+    "observation_capacity_and_worker_event_loss_invalidate_confirmation": true,
+    "logging_capacity_and_nonblocking_producer_policy_unchanged": true,
+    "failed_driver_descendants_and_inherited_probe_cleanup_tested": true,
+    "installed_application_and_configuration_hashes_unchanged_before_packaging": true,
+    "external_dependency_versions_changed": false
+  }
+}

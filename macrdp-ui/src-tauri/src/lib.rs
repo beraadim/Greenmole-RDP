@@ -4,11 +4,13 @@ mod configuration;
 mod database;
 mod diagnostics;
 mod event_bridge;
+mod graphics_profiles;
 #[cfg(target_os = "macos")]
 mod own_windows;
 mod permissions;
 mod recovery;
 mod server_lifecycle;
+mod session_status;
 mod state;
 mod tray;
 mod ui_config;
@@ -166,6 +168,7 @@ pub fn run() {
             commands::get_server_status,
             commands::get_metrics,
             commands::get_connections,
+            session_status::get_session_status,
             commands::get_permissions,
             commands::request_permissions,
             commands::get_input_debug_state,
@@ -173,6 +176,10 @@ pub fn run() {
             configuration::get_configuration_status,
             commands::get_tls_status,
             configuration::set_config,
+            graphics_profiles::get_graphics_profiles,
+            graphics_profiles::save_graphics_profile,
+            graphics_profiles::delete_graphics_profile,
+            graphics_profiles::apply_graphics_profile,
             commands::get_logs,
             diagnostics::export_diagnostics,
             commands::get_connection_history,

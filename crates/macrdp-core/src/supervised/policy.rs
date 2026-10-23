@@ -10,6 +10,13 @@ use std::time::Instant;
 
 pub(super) fn apply_update(config: &mut ServerConfig, update: &ConfigUpdate) {
     match update {
+        ConfigUpdate::Graphics(settings) => {
+            config.frame_rate = settings.frame_rate;
+            config.bitrate_mbps = Some(settings.bitrate_mbps);
+            config.quality = Some(settings.quality.clone());
+            config.encoder = Some(settings.encoder.clone());
+            config.chroma_mode = Some(settings.chroma_mode.clone());
+        }
         ConfigUpdate::FrameRate(value) => config.frame_rate = *value,
         ConfigUpdate::BitrateKbps(value) => config.bitrate_mbps = Some(value.div_ceil(1000)),
         ConfigUpdate::LogLevel(value) => config.log_level = Some(value.clone()),
@@ -74,6 +81,36 @@ mod tests {
         assert_eq!(config.bitrate_mbps, Some(123));
         assert_eq!(config.quality.as_deref(), Some("lossless"));
         assert_eq!(config.encoder.as_deref(), Some("bitmap"));
+    }
+
+    #[test]
+    fn grouped_graphics_recovery_replay_preserves_every_unrelated_preference() {
+        let mut config = ServerConfig::default();
+        config.port = 3395;
+        config.reuse_virtual_display = true;
+        config.private_session = true;
+        config.display_backend = crate::DisplayBackend::Virtual;
+        config.username = Some("fixture-user".into());
+        config.password = Some("fixture-secret".into());
+        let mut expected = serde_json::to_value(&config).unwrap();
+        let settings = crate::GraphicsSettings {
+            frame_rate: 30,
+            bitrate_mbps: 8,
+            quality: "balanced".into(),
+            encoder: "auto".into(),
+            chroma_mode: "avc444".into(),
+        };
+        for (key, value) in [
+            ("frame_rate", serde_json::json!(30)),
+            ("bitrate_mbps", serde_json::json!(8)),
+            ("quality", serde_json::json!("balanced")),
+            ("encoder", serde_json::json!("auto")),
+            ("chroma_mode", serde_json::json!("avc444")),
+        ] {
+            expected[key] = value;
+        }
+        apply_update(&mut config, &ConfigUpdate::Graphics(settings));
+        assert_eq!(serde_json::to_value(&config).unwrap(), expected);
     }
 
     #[test]

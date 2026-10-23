@@ -38,6 +38,11 @@ pub async fn export_diagnostics(
     let lifecycle = state.lifecycle_lock.lock().await;
     let config = state.ui_config.lock().await.clone();
     let history = state.diagnostic_history.lock().await.snapshot();
+    let session_status = state
+        .session_status
+        .lock()
+        .map(|observer| observer.snapshot())
+        .ok();
     let (status, metrics, connection_count, supervision) = {
         let handles = state.server_handle.lock().await;
         match handles.as_ref() {
@@ -80,7 +85,7 @@ pub async fn export_diagnostics(
             },
         );
         let report = json!({
-            "schema_version": 4,
+            "schema_version": 5,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -99,6 +104,7 @@ pub async fn export_diagnostics(
             "metrics": safe_metrics(&metrics),
             "supervision": supervision,
             "history": history,
+            "session_status": session_status,
             "recent_events": logs,
             "privacy": "Only selected operational fields are included. Credentials, input text, clipboard contents, addresses, client names, paths, raw log messages and free-form error details are excluded."
         });

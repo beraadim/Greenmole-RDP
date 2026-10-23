@@ -30,6 +30,11 @@ pub struct TauriEventBridge {
 
 impl TauriEventBridge {
     pub fn new(app: AppHandle, generation: u64) -> Self {
+        if let Some(state) = app.try_state::<Arc<AppState>>() {
+            if let Ok(mut observer) = state.session_status.lock() {
+                observer.begin_generation(generation);
+            }
+        }
         let (connection_tx, mut receiver) = tokio::sync::mpsc::channel(256);
         let worker_app = app.clone();
         let running = Arc::new(AtomicBool::new(false));
@@ -53,6 +58,11 @@ impl TauriEventBridge {
 
 impl ServerEventHandler for TauriEventBridge {
     fn on_status_change(&self, status: ServerStatus) {
+        if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+            if let Ok(mut observer) = state.session_status.lock() {
+                observer.status(self.generation, &status);
+            }
+        }
         // Stop accepting metrics immediately, before the async UI status task runs.
         // Polling a handle during thread cleanup must not revive a failed server's tray.
         self.running.store(status.running, Ordering::Release);
@@ -87,6 +97,15 @@ impl ServerEventHandler for TauriEventBridge {
     }
 
     fn on_metrics(&self, metrics: Metrics) {
+        if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+            if state.server_generation.load(Ordering::Acquire) == self.generation
+                && self.running.load(Ordering::Acquire)
+            {
+                if let Ok(mut observer) = state.session_status.lock() {
+                    observer.metrics(self.generation, &metrics);
+                }
+            }
+        }
         let app = self.app.clone();
         let generation = self.generation;
         let running = self.running.clone();
@@ -130,6 +149,17 @@ impl ServerEventHandler for TauriEventBridge {
     }
 
     fn on_connection(&self, event: ConnectionEvent) {
+        if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+            // Stop increments the service generation before real cleanup completes.
+            // Retain that bridge's disconnect evidence until a new bridge replaces it.
+            if matches!(&event, ConnectionEvent::Disconnected(_))
+                || state.server_generation.load(Ordering::Acquire) == self.generation
+            {
+                if let Ok(mut observer) = state.session_status.lock() {
+                    observer.connection(self.generation, &event);
+                }
+            }
+        }
         if let Err(error) = self.connection_tx.try_send(event) {
             tracing::error!(%error, "Connection history queue unavailable; event not persisted");
             let _ = self.app.emit(
@@ -152,6 +182,14 @@ impl ServerEventHandler for TauriEventBridge {
             }
             let _ = app.emit("log", &entry_clone);
         });
+    }
+
+    fn on_operational_record(&self, record: &str) {
+        if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+            if let Ok(mut observer) = state.session_status.lock() {
+                observer.record(self.generation, record);
+            }
+        }
     }
 }
 

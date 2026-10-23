@@ -1,3 +1,4 @@
+import { GraphicsProfilesControl } from "./GraphicsProfilesControl";
 import { useRef, useState } from "react";
 import type { UiConfig } from "../lib/types";
 import { SettingRow } from "./SettingRow";
@@ -7,12 +8,13 @@ const bitratePresets = [2, 4, 8, 16, 32, 50];
 const frameRatePresets = [15, 30, 60, 120];
 type GraphicsKey = "quality" | "encoder" | "bitrate_mbps" | "frame_rate" | "chroma_mode";
 
-export function GraphicsSettings({ config, running, pendingLive, save, loadSaved }: {
+export function GraphicsSettings({ config, running, pendingLive, save, loadSaved, refresh }: {
   config: UiConfig;
   running: boolean;
   pendingLive: string[];
   save: (key: keyof UiConfig, value: unknown) => Promise<boolean>;
   loadSaved: () => Promise<UiConfig>;
+  refresh: () => Promise<void>;
 }) {
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -65,8 +67,21 @@ export function GraphicsSettings({ config, running, pendingLive, save, loadSaved
     }
   };
 
+  const profileOperation = async (operation: () => Promise<void>) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setSaving(true);
+    setFeedback(null);
+    setRetryError(null);
+    try { await operation(); }
+    finally { inFlight.current = false; setSaving(false); }
+  };
+  const individualPending = pendingLive.filter(key => key !== "graphics_profile");
+
   return <>
-    {pendingLive.length > 0 && <div role="status" className="mb-3 rounded-md border border-yellow-400/60 p-2 text-xs text-text-secondary">
+    <GraphicsProfilesControl config={config} busy={saving} pending={pendingLive.includes("graphics_profile")}
+      run={profileOperation} refresh={refresh} />
+    {individualPending.length > 0 && <div role="status" className="mb-3 rounded-md border border-yellow-400/60 p-2 text-xs text-text-secondary">
       <p>Saved graphics changes have not been confirmed by the server.</p>
       <button type="button" disabled={saving} onClick={() => void retry()}
         className="mt-1 text-accent underline disabled:opacity-50">Retry pending changes</button>

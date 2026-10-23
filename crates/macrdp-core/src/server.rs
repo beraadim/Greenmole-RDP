@@ -79,6 +79,7 @@ use crate::permissions;
 use crate::tls;
 
 mod audio_metrics;
+mod graphics_controls;
 mod lifecycle;
 mod metrics;
 mod startup;
@@ -892,6 +893,18 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
         tokio::task::spawn_local(async move {
             while let Some(update) = config_rx.recv().await {
                 match update {
+                    ConfigUpdate::Graphics(settings) => {
+                        tracing::info!("Hot-update: graphics profile");
+                        let bitmap_quality = {
+                            let mut state = gfx_for_config.lock().unwrap();
+                            graphics_controls::apply(&mut state, &settings)
+                        };
+                        if let Some(quality) = bitmap_quality {
+                            if let Err(error) = ev_sender.send(ironrdp_server::ServerEvent::SetBitmapQuality(quality)) {
+                                tracing::error!(%error, "Graphics control channel unavailable");
+                            }
+                        }
+                    }
                     ConfigUpdate::FrameRate(fps) => {
                         tracing::info!(fps, "Hot-update: frame_rate");
                         let mut state = gfx_for_config.lock().unwrap();

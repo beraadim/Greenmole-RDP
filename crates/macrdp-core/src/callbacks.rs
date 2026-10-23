@@ -185,9 +185,39 @@ pub struct InputDebugState {
     pub last_translation: Option<String>,
 }
 
+/// A graphics-only update accepted as one control message. Chroma is still
+/// negotiated on the next connection; no display or connection ownership lives here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GraphicsSettings {
+    pub frame_rate: u32,
+    pub bitrate_mbps: u32,
+    pub quality: String,
+    pub encoder: String,
+    pub chroma_mode: String,
+}
+
+impl GraphicsSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ConfigUpdate::FrameRate(self.frame_rate).validate()?;
+        anyhow::ensure!(
+            (1..=1000).contains(&self.bitrate_mbps),
+            "bitrate_mbps must be between 1 and 1000"
+        );
+        ConfigUpdate::Quality(self.quality.clone()).validate()?;
+        ConfigUpdate::Encoder(self.encoder.clone()).validate()?;
+        anyhow::ensure!(
+            matches!(self.chroma_mode.as_str(), "avc420" | "avc444"),
+            "Unknown video color detail selection"
+        );
+        Ok(())
+    }
+}
+
 /// Hot-updatable configuration
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ConfigUpdate {
+    Graphics(GraphicsSettings),
     FrameRate(u32),
     BitrateKbps(u32),
     LogLevel(String),
@@ -203,6 +233,7 @@ pub enum ConfigUpdate {
 impl std::fmt::Debug for ConfigUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Graphics(value) => f.debug_tuple("Graphics").field(value).finish(),
             Self::FrameRate(value) => f.debug_tuple("FrameRate").field(value).finish(),
             Self::BitrateKbps(value) => f.debug_tuple("BitrateKbps").field(value).finish(),
             Self::LogLevel(value) => f.debug_tuple("LogLevel").field(value).finish(),
@@ -247,6 +278,7 @@ impl ConfigUpdate {
     /// Validate public runtime updates before they reach the session worker.
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
+            Self::Graphics(settings) => settings.validate()?,
             Self::FrameRate(fps) => anyhow::ensure!(
                 (1..=240).contains(fps),
                 "frame_rate must be between 1 and 240"
@@ -285,6 +317,39 @@ impl ConfigUpdate {
 #[cfg(test)]
 mod config_update_tests {
     use super::ConfigUpdate;
+
+    #[test]
+    fn grouped_graphics_update_validates_all_fields_and_round_trips_as_one_message() {
+        let good = super::GraphicsSettings {
+            frame_rate: 30,
+            bitrate_mbps: 8,
+            quality: "balanced".into(),
+            encoder: "auto".into(),
+            chroma_mode: "avc420".into(),
+        };
+        let update = ConfigUpdate::Graphics(good.clone());
+        update.validate().unwrap();
+        let decoded: ConfigUpdate =
+            serde_json::from_slice(&serde_json::to_vec(&update).unwrap()).unwrap();
+        assert!(matches!(decoded, ConfigUpdate::Graphics(value) if value == good));
+        for field in [
+            "frame_rate",
+            "bitrate_mbps",
+            "quality",
+            "encoder",
+            "chroma_mode",
+        ] {
+            let mut bad = good.clone();
+            match field {
+                "frame_rate" => bad.frame_rate = 0,
+                "bitrate_mbps" => bad.bitrate_mbps = u32::MAX,
+                "quality" => bad.quality = "unknown".into(),
+                "encoder" => bad.encoder = "unknown".into(),
+                _ => bad.chroma_mode = "unknown".into(),
+            }
+            assert!(ConfigUpdate::Graphics(bad).validate().is_err());
+        }
+    }
 
     #[test]
     fn hot_encoder_updates_reject_zero_and_overflowing_values() {
@@ -348,6 +413,8 @@ pub trait ServerEventHandler: Send + Sync + 'static {
     fn on_metrics(&self, _metrics: Metrics) {}
     fn on_connection(&self, _event: ConnectionEvent) {}
     fn on_log(&self, _entry: LogEntry) {}
+    /// Observe existing bounded operational JSON without changing lifecycle policy.
+    fn on_operational_record(&self, _record: &str) {}
     /// Benchmark text is produced in the capture worker, printed only by the
     /// CLI parent; stdout in a worker is reserved for the private protocol.
     fn on_performance_summary(&self, _report: String) {}

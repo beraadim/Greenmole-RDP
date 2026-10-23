@@ -26,6 +26,12 @@ impl WakeLease {
             "user_activity",
             &mut release,
         );
+        // Report the real ownership result, never a disconnect's intention.
+        tracing::info!(target: "macrdp_transition", component = "wake_lease",
+            worker_pid = std::process::id(), phase = "cleanup",
+            state = if self.display_sleep_assertion_id.is_none()
+                && self.user_activity_assertion_id.is_none() { "complete" } else { "pending" },
+            "Remote wake assertion cleanup observed");
     }
 }
 

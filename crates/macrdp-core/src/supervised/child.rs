@@ -3,50 +3,31 @@
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use super::protocol::{self, Command, Event, Initialization, Snapshot};
 use crate::{ConnectionEvent, ServerEventHandler};
 
+#[path = "child_diagnostics.rs"]
+mod diagnostics;
+use diagnostics::{record_loss, write_event_with_diagnostic_loss, DiagnosticLayer};
+
 #[derive(Clone)]
-struct Events(mpsc::SyncSender<Event>);
+struct Events {
+    events: mpsc::SyncSender<Event>,
+    dropped: Arc<AtomicU64>,
+}
 
 impl ServerEventHandler for Events {
     fn on_connection(&self, value: ConnectionEvent) {
-        let _ = self.0.try_send(Event::Connection { value });
-    }
-}
-
-struct DiagnosticLayer {
-    events: mpsc::SyncSender<Event>,
-    queued: Arc<AtomicUsize>,
-}
-impl<S: tracing::Subscriber> Layer<S> for DiagnosticLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if let Ok(bytes) = crate::log_bridge::serialize_event(event) {
-            if bytes.len() <= 32 * 1024 {
-                if let Ok(record) = String::from_utf8(bytes) {
-                    // Leave most pipe capacity for health, settings replies and
-                    // terminal events even when debug logging is very busy.
-                    if self
-                        .queued
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                            (count < 64).then_some(count + 1)
-                        })
-                        .is_ok()
-                    {
-                        if self.events.try_send(Event::Diagnostic { record }).is_err() {
-                            self.queued.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                }
-            }
+        if self.events.try_send(Event::Connection { value }).is_err() {
+            record_loss(&self.dropped);
         }
     }
 }
@@ -62,16 +43,26 @@ pub(super) fn run() -> Result<()> {
     let written = terminal_written.clone();
     let diagnostic_count = Arc::new(AtomicUsize::new(0));
     let pending_diagnostics = diagnostic_count.clone();
+    let dropped_diagnostics = Arc::new(AtomicU64::new(0));
+    let writer_drops = dropped_diagnostics.clone();
     let writer = std::thread::Builder::new()
         .name("server-worker-output".into())
         .spawn(move || {
             let mut output = BufWriter::new(std::io::stdout());
+            let mut reported_drops = 0;
             while let Ok(event) = events.recv() {
                 if matches!(&event, Event::Diagnostic { .. }) {
                     pending_diagnostics.fetch_sub(1, Ordering::AcqRel);
                 }
                 let terminal = matches!(&event, Event::Stopped | Event::Failed { .. });
-                if protocol::write(&event, &mut output).is_err() {
+                if write_event_with_diagnostic_loss(
+                    &event,
+                    &mut output,
+                    &writer_drops,
+                    &mut reported_drops,
+                )
+                .is_err()
+                {
                     break;
                 }
                 if terminal {
@@ -91,6 +82,7 @@ pub(super) fn run() -> Result<()> {
         .with(DiagnosticLayer {
             events: sender.clone(),
             queued: diagnostic_count,
+            dropped: dropped_diagnostics.clone(),
         })
         .try_init()?;
     let (commands, command_receiver) = tokio::sync::mpsc::channel(32);
@@ -125,6 +117,7 @@ pub(super) fn run() -> Result<()> {
     let result = runtime.block_on(serve(
         initialization,
         sender.clone(),
+        dropped_diagnostics,
         command_receiver,
         parent_gone,
         reload_filter,
@@ -166,6 +159,7 @@ type OwnReplies = Arc<Mutex<HashMap<u64, mpsc::SyncSender<std::result::Result<us
 async fn serve(
     initialization: Initialization,
     events: mpsc::SyncSender<Event>,
+    dropped: Arc<AtomicU64>,
     mut commands: tokio::sync::mpsc::Receiver<Command>,
     parent_gone: Arc<AtomicBool>,
     reload_filter: tracing_subscriber::reload::Handle<
@@ -173,7 +167,10 @@ async fn serve(
         tracing_subscriber::Registry,
     >,
 ) -> Result<()> {
-    let callback = Events(events.clone());
+    let callback = Events {
+        events: events.clone(),
+        dropped,
+    };
     // Keep reading parent EOF while native startup is in flight. The dedicated
     // input thread's process deadline does not depend on this future yielding.
     let perf = initialization
@@ -269,50 +266,5 @@ async fn serve(
                 if stop_task.as_ref().is_some_and(|task| task.is_finished()) { stop_task.take(); }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn diagnostic_saturation_reserves_capacity_for_health_and_control_replies() {
-        let (events, received) = mpsc::sync_channel(256);
-        let queued = Arc::new(AtomicUsize::new(0));
-        let subscriber = tracing_subscriber::registry().with(DiagnosticLayer {
-            events: events.clone(),
-            queued: queued.clone(),
-        });
-        tracing::subscriber::with_default(subscriber, || {
-            for _ in 0..1_000 {
-                tracing::info!("Diagnostic saturation fixture");
-            }
-        });
-        assert_eq!(queued.load(Ordering::Acquire), 64);
-        assert!(events
-            .try_send(Event::Snapshot {
-                snapshot: Box::default()
-            })
-            .is_ok());
-        for request in 0..191 {
-            assert!(events
-                .try_send(Event::Updated {
-                    request,
-                    result: Ok(())
-                })
-                .is_ok());
-        }
-        let mut diagnostics = 0;
-        let mut health = 0;
-        for event in received.try_iter() {
-            match event {
-                Event::Diagnostic { .. } => diagnostics += 1,
-                Event::Snapshot { .. } => health += 1,
-                _ => {}
-            }
-        }
-        assert_eq!(diagnostics, 64);
-        assert_eq!(health, 1);
     }
 }

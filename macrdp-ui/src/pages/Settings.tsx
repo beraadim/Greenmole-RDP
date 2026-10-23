@@ -147,7 +147,11 @@ function Settings() {
         {activeCategory === "rdp" && (
           <CategorySection title="RDP Service">
             <GraphicsSettings config={config} running={configurationState?.running ?? false}
-              pendingLive={configurationState?.pending_live ?? []} save={updateConfig} loadSaved={api.getConfig} />
+              pendingLive={configurationState?.pending_live ?? []} save={updateConfig} loadSaved={api.getConfig}
+              refresh={async () => {
+                const [saved, status] = await Promise.all([api.getConfig(), api.getConfigurationStatus()]);
+                setConfig(saved); setConfigurationState(status);
+              }} />
           </CategorySection>
         )}
 

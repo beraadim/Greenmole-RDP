@@ -441,14 +441,19 @@ impl RdpServerInputHandler for MacInputHandler {
                 tracing::warn!("Failed to wake display for new remote session: {e}");
             }
         }
+        let connected_at = chrono::Utc::now();
         let info = crate::callbacks::ConnectionInfo {
             client_ip: peer_addr.unwrap_or_else(|| "unknown".to_string()),
             client_name: context.client_name,
-            connected_at: chrono::Utc::now().to_rfc3339(),
+            connected_at: connected_at.to_rfc3339(),
         };
         *self.active_connection.lock().unwrap() = Some(info.clone());
         if let Some(events) = &mut self.session_events {
             events.started_at = Some(std::time::Instant::now());
+            tracing::info!(target: "macrdp_transition", component = "session",
+                worker_pid = std::process::id(), session_started_unix_ms = connected_at.timestamp_millis(),
+                phase = "connection", state = "connected",
+                "Authenticated session boundary observed");
             events
                 .handler
                 .on_connection(crate::callbacks::ConnectionEvent::Connected(info));
@@ -457,6 +462,15 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn on_disconnect(&mut self) {
+        let observed_session = self
+            .session_events
+            .as_ref()
+            .is_some_and(|events| events.started_at.is_some());
+        if observed_session {
+            tracing::info!(target: "macrdp_transition", component = "session",
+                worker_pid = std::process::id(), phase = "connection", state = "disconnecting",
+                "Authenticated session boundary observed");
+        }
         // End all held input before virtual-display teardown changes geometry.
         self.reset_session_input("on disconnect");
         let outcome = self
@@ -514,6 +528,11 @@ impl RdpServerInputHandler for MacInputHandler {
         }
         if let Some(wake) = &mut self.wake {
             wake.deactivate_display_sleep_assertion();
+        }
+        if observed_session {
+            tracing::info!(target: "macrdp_transition", component = "session",
+                worker_pid = std::process::id(), phase = "connection", state = "disconnected",
+                "Authenticated session boundary observed");
         }
         self.refresh_debug_state(Some("connection:disconnected".to_string()));
     }

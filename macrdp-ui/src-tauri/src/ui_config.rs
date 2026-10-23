@@ -18,6 +18,9 @@ pub struct UiConfig {
     pub encoder: String,
     pub chroma_mode: String,
     pub gfx_validation_mode: bool,
+    /// Optional named graphics preferences; never applied automatically.
+    pub graphics_profiles: Vec<crate::graphics_profiles::SavedGraphicsProfile>,
+    pub graphics_profile: Option<String>,
     pub bind_address: String,
     pub idle_timeout_secs: u64,
 
@@ -67,6 +70,8 @@ impl Default for UiConfig {
             encoder: "auto".to_string(),
             chroma_mode: "avc420".to_string(),
             gfx_validation_mode: false,
+            graphics_profiles: Vec::new(),
+            graphics_profile: None,
             bind_address: "0.0.0.0".to_string(),
             idle_timeout_secs: 1800,
             username: "macrdp".to_string(),
@@ -142,6 +147,7 @@ impl UiConfig {
         } else {
             Self::default()
         };
+        crate::graphics_profiles::validate_saved(&config.graphics_profiles)?;
         let previous_password = load_password()?;
         if config.password.is_empty() {
             config.password = match previous_password.clone() {
@@ -179,6 +185,7 @@ impl UiConfig {
         save_password: impl Fn(&str) -> Result<(), String>,
         delete_password: impl Fn() -> Result<(), String>,
     ) -> Result<(), String> {
+        crate::graphics_profiles::validate_saved(&self.graphics_profiles)?;
         if self.private_session && self.display_backend != DisplayBackend::Virtual {
             return Err("Guarded private sessions require the virtual display backend".into());
         }
@@ -229,6 +236,7 @@ impl UiConfig {
     /// to avoid creating overlapping display owners. Other settings use their live update
     /// paths; these flags never restart a display during an ordinary client resize.
     pub fn set_field(&mut self, key: &str, value: &serde_json::Value) -> Result<bool, String> {
+        let previous_graphics = crate::graphics_profiles::settings(self);
         match key {
             "port" => {
                 self.port = integer_in_range(value, key, 1, u16::MAX as u64)? as u16;
@@ -401,6 +409,9 @@ impl UiConfig {
             _ => return Err(format!("unknown config key: {key}")),
         }
 
+        if crate::graphics_profiles::settings(self) != previous_graphics {
+            self.graphics_profile = None;
+        }
         Ok(self.requires_restart(key, None))
     }
 

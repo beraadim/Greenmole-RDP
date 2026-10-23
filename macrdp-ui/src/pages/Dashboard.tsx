@@ -15,6 +15,7 @@ import MetricCard from "../components/MetricCard";
 import { ChartPanel } from "../components/ChartPanel";
 import { AreaChart } from "../components/AreaChart";
 import ConnItem from "../components/ConnItem";
+import SessionStatusPanel from "../components/SessionStatusPanel";
 import EmptyState from "../components/EmptyState";
 import type { InputDebugState, UiConfig } from "../lib/types";
 
@@ -139,6 +140,7 @@ function Dashboard() {
 
       <MoveWindowsControl />
       <RecoveryControl />
+      <SessionStatusPanel />
 
       <div className="flex gap-3">
         <ChartPanel

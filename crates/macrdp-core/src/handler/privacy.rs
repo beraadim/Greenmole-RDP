@@ -48,6 +48,7 @@ impl PrivateSession {
 
     fn prepare_with(&mut self, start: impl FnOnce(i64) -> Result<Box<dyn Guard>>) -> Result<()> {
         if !self.enabled {
+            protection_observed("not_required");
             return Ok(());
         }
         ensure!(
@@ -66,6 +67,7 @@ impl PrivateSession {
         );
         self.guard = Some(guard);
         macrdp_input::set_remote_event_tag(tag);
+        protection_observed("ready");
         tracing::info!("Private session guard admitted remote control");
         Ok(())
     }
@@ -83,15 +85,25 @@ impl PrivateSession {
     /// cancellation, Stop and unknown outcomes always require a verified lock.
     pub(super) fn finish(&mut self, outcome: Option<ConnectionOutcome>) -> Result<()> {
         if let Some(guard) = &mut self.guard {
-            guard.finish(outcome != Some(ConnectionOutcome::ClientDisconnect))?;
+            if let Err(error) = guard.finish(outcome != Some(ConnectionOutcome::ClientDisconnect)) {
+                protection_observed("pending");
+                return Err(error);
+            }
             // Do not take/drop the guard or clear routing state on failure: its
             // barriers must remain alive and subsequent admission must fail.
             self.guard.take();
             macrdp_input::set_remote_event_tag(0);
+            protection_observed("complete");
             tracing::info!("Private session protection completed before local desktop restoration");
         }
         Ok(())
     }
+}
+
+fn protection_observed(state: &'static str) {
+    tracing::info!(target: "macrdp_transition", component = "private_guard",
+        worker_pid = std::process::id(), phase = "protection", state,
+        "Private session protection observed");
 }
 
 impl Drop for PrivateSession {
