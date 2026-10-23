@@ -1,0 +1,80 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.30",
+  "status": "source checks passed; package pending",
+  "branding": {
+    "original_greenmole_logo_sha256": "5c1cb410e7f474ad971f29cfd09895d1413a58abbe9cb038c1afd1e38a6729a7",
+    "frontend_derivative_copied_unchanged": true,
+    "application_and_color_tray_icons_derived": true,
+    "artwork_apache_license_and_original_notice_retained": true,
+    "project_gpl_license_preserved_and_stale_mit_labels_corrected": true
+  },
+  "compatibility": {
+    "bundle_identifier": "com.macrdp.app",
+    "internal_crate_binary_names_unchanged": true,
+    "settings_keychain_tls_and_database_paths_unchanged": true,
+    "default_credentials_and_profile_selection_unchanged": true,
+    "stable_monitor_identity_and_descriptor_unchanged": true,
+    "helper_flags_and_diagnostic_schema_targets_unchanged": true,
+    "connect_disconnect_and_native_retirement_policy_unchanged": true,
+    "legacy_autostart_label_pinned": true,
+    "autostart_refresh_requires_saved_opt_in_and_existing_registration": true,
+    "autostart_refresh_rejects_development_temporary_and_unsafe_paths": true,
+    "greenmole_client_or_oberon_changed": false
+  },
+  "translation": {
+    "remaining_tracked_cjk_text_lines": 0,
+    "unicode_clipboard_fixture_bytes_preserved": true,
+    "english_primary_readme_and_help": true,
+    "historical_design_notes_translated_without_executing_them": true,
+    "historical_release_evidence_preserved": true
+  },
+  "release_checks": {
+    "rust_passed": 875,
+    "rust_failed": 0,
+    "opt_in_ignored": 7,
+    "rust_serial_mode": true,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "typescript_and_production_frontend_build_passed": true,
+    "standalone_debug_build_passed": true,
+    "mocked_actual_ui_checks_passed": 7,
+    "mocked_ui_sizes": [
+      [
+        960,
+        620
+      ],
+      [
+        800,
+        500
+      ],
+      [
+        300,
+        280
+      ]
+    ],
+    "mocked_ui_light_and_dark_themes_checked": true,
+    "startup_identity_pure_tests_passed": 9,
+    "shell_syntax_and_make_help_release_dry_runs_passed": true,
+    "source_audit": {
+      "utf8_files_scanned": 459,
+      "binary_files_skipped": 10,
+      "remaining_cjk_text_lines": 0,
+      "example_active_assignments_unchanged": true,
+      "monitor_identity_and_tls_source_unchanged": true,
+      "settings_storage_source_unchanged": true,
+      "third_party_locked_dependencies_unchanged": true,
+      "project_license_metadata_matches_gpl": true,
+      "artwork_license_and_notice_match_greenmole": true,
+      "original_logo_sha256_verified": true
+    },
+    "installed_application_config_login_registration_and_monitor_identity_hashes_preserved": true,
+    "actual_app_or_rdp_session_started": false
+  },
+  "limitations": [
+    "Installation, renewed macOS privacy grants if requested, login-startup and actual RDP acceptance remain user device checks.",
+    "Internal macrdp identifiers remain deliberately compatible; they are not untranslated Chinese text."
+  ],
+  "device_test_instructions": "release-0.1.30.md"
+}

@@ -124,7 +124,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         for name in [
             "plain.txt",
-            "Blåbær 東京 😀.txt",
+            "Blåbær \u{6771}\u{4EAC} 😀.txt",
             "a #1? 100%+done.txt",
             "literal%20name.txt",
             "literal%00name.txt",
@@ -183,7 +183,7 @@ mod tests {
         let board = NSPasteboard::pasteboardWithUniqueName();
         let directory = tempfile::tempdir().unwrap();
         let paths = vec![
-            directory.path().join("Blåbær 東京.txt"),
+            directory.path().join("Blåbær \u{6771}\u{4EAC}.txt"),
             directory.path().join("a #1? 100%.txt"),
         ];
         for (index, path) in paths.iter().enumerate() {

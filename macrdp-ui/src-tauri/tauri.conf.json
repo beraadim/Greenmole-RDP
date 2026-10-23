@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/refs/heads/dev/crates/tauri-schema-generator/schemas/config.schema.json",
-  "productName": "macrdp",
-  "version": "0.1.29",
+  "productName": "Greenmole RDP",
+  "version": "0.1.30",
   "identifier": "com.macrdp.app",
   "build": {
     "frontendDist": "../dist",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "macrdp",
+        "title": "Greenmole RDP",
         "width": 960,
         "height": 620,
         "minWidth": 800,
@@ -40,8 +40,8 @@
     ],
     "trayIcon": {
       "id": "main-tray",
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": false
     },
     "security": {
       "csp": null
@@ -60,6 +60,13 @@
     ],
     "macOS": {
       "infoPlist": "Info.plist"
+    },
+    "license": "GPL-3.0-only",
+    "resources": {
+      "../../LICENSE": "licenses/GPL-3.0.txt",
+      "../../branding/LICENSE": "licenses/Greenmole-artwork/LICENSE",
+      "../../branding/NOTICE": "licenses/Greenmole-artwork/NOTICE",
+      "../../branding/README.md": "licenses/Greenmole-artwork/README.md"
     }
   }
 }

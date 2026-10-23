@@ -62,7 +62,7 @@ impl LogWorker {
                     LogCommand::Flush(reply) => { let _ = reply.send(log.flush()); continue; }
                 };
                 if let Err(error) = result {
-                    if !reported_error { eprintln!("Unable to write macrdp diagnostics: {error}"); }
+                    if !reported_error { eprintln!("Unable to write Greenmole RDP diagnostics: {error}"); }
                     reported_error = true;
                 } else { reported_error = false; }
             }

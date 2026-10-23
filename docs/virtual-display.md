@@ -1,19 +1,20 @@
 # Virtual display and Guacamole resizing
 
 The optional virtual display backend creates an extended macOS display named
-**macRDP Remote Display**. The RDP session captures that display, and Display
-Control requests change its actual macOS mode to match the client viewport.
+**macRDP Remote Display**. This legacy descriptor name is retained to preserve
+the existing monitor identity across the Greenmole RDP rebrand. The RDP session
+captures that display, and Display Control requests change its actual macOS mode to match the client viewport.
 The physical display backend remains the default.
 
 This is experimental. Creation uses the undocumented `CGVirtualDisplay` API.
-macrdp checks the available classes and method signatures at runtime and rejects
+Greenmole RDP checks the available classes and method signatures at runtime and rejects
 unsupported APIs or modes with a diagnostic. macOS updates can change this API;
 native build and client testing are required on the target Mac. A failure does
 not silently capture a different display.
 
 ## Enable it
 
-In the macrdp app, open Settings > Display, select the virtual display backend
+In the Greenmole RDP app, open Settings > Display, select the virtual display backend
 and automatic resolution, then stop/start the server. Settings save
 automatically; backend changes require a restart. The corresponding TOML
 settings are:
@@ -36,7 +37,7 @@ display while a remote client is connected, bringing the Dock and menu bar to th
 remote desktop. The previous display arrangement and captured window positions
 are restored on disconnect. It
 is an additional screen in the same user session, with shared keyboard, pointer,
-applications and audio. macrdp does not mirror displays or create a separate
+applications and audio. Greenmole RDP does not mirror displays or create a separate
 user login session.
 
 Starting the server does not create a virtual display. By default, a background helper
@@ -82,7 +83,7 @@ to preserve monitor identity.
 An exclusive identity lease prevents two helpers from creating the same monitor.
 Configuration selectors inherit that lease and validate a separate session
 generation, so a late selector cannot act on a subsequent session's reused
-identity. A busy or invalid identity slot rejects display creation; macrdp does
+identity. A busy or invalid identity slot rejects display creation; Greenmole RDP does
 not work around it by inventing another monitor serial. Concurrent same-user
 servers using the same port also share this slot, even on different bind IPs.
 With reuse off, normal disconnect releases ownership. With reuse on, ownership
@@ -103,7 +104,7 @@ initialized. Its global origin is read back from macOS after the change. Resizin
 the browser changes the same display's mode without replacing the saved physical
 display arrangement. RDP resize reactivation remains part of the same connection.
 
-Before changing the main display, macrdp snapshots normal, movable windows on
+Before changing the main display, Greenmole RDP snapshots normal, movable windows on
 the connected physical displays. It records each window's original display,
 position and size, including windows on the original main display. It then
 gathers windows from the original **non-main physical displays** onto the
@@ -111,7 +112,7 @@ virtual display automatically. Windows on the original main display are left
 to macOS's normal primary-display transition, rather than moved a second time.
 The snapshot belongs to that connection; browser resizes do not replace it.
 
-On disconnect, macrdp restores the physical display arrangement and returns
+On disconnect, Greenmole RDP restores the physical display arrangement and returns
 captured windows to their original displays, positions and sizes. If an original
 display has been disconnected, the window is fitted visibly onto a surviving
 physical display. Closed windows are ignored, and an application can constrain
@@ -127,7 +128,7 @@ the session, rather than matched using titles. Window titles and contents are
 not read for identity or logged. Automatic window handling runs on the isolated
 display helper's main thread and queries GUI applications out of process; it
 never queries its own PID. The manual Dashboard action still uses main-thread
-AppKit for macrdp itself, avoiding the earlier in-process WebKit crash. Saved
+AppKit for Greenmole RDP itself, avoiding the earlier in-process WebKit crash. Saved
 window state remains in memory and is discarded when the session ends.
 
 The Dashboard's **Move windows to remote display** button remains available
@@ -267,7 +268,7 @@ button against real application windows after installing the DMG.
    display and click **Move windows to remote display** on the Dashboard.
    Confirm they become usable remotely, existing remote windows stay put, and
    minimized/full-screen windows are handled without forcing their state.
-   Repeat with macrdp's own window on the physical display and verify it moves
+   Repeat with Greenmole RDP's own window on the physical display and verify it moves
    without crashing. Disconnect while gathering and confirm cleanup still runs;
    the button must be disabled while disconnected or using the physical backend.
 9. Repeat the connect, resize and disconnect cycle with three physical displays,

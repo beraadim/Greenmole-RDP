@@ -47,7 +47,7 @@ fn reveal_main_window(app: &tauri::AppHandle, target: RevealTarget) -> Result<us
             let _ = sender.send(reveal_on_main_thread(&main_app, target));
         }
     })
-    .context("Could not schedule the macrdp window reveal")?;
+    .context("Could not schedule the Greenmole RDP window reveal")?;
     match receiver.recv_timeout(Duration::from_secs(2)) {
         Ok(result) => result,
         Err(_) => {
@@ -55,7 +55,7 @@ fn reveal_main_window(app: &tauri::AppHandle, target: RevealTarget) -> Result<us
             // native AppKit call already in progress may finish later; do not
             // make the independent recovery command wait for a hung UI thread.
             claimed_or_cancelled.store(true, Ordering::Release);
-            bail!("The macrdp window is not responding. Controls could not be shown.")
+            bail!("The Greenmole RDP window is not responding. Controls could not be shown.")
         }
     }
 }
@@ -64,17 +64,17 @@ fn reveal_on_main_thread(app: &tauri::AppHandle, target: RevealTarget) -> Result
     let mtm = MainThreadMarker::new().context("Window reveal requires the main thread")?;
     let window = app
         .get_webview_window("main")
-        .context("The macrdp main window is unavailable")?;
+        .context("The Greenmole RDP main window is unavailable")?;
     // Fullscreen has a separate Space. Leaving it and fitting the window are
     // best effort; failed geometry must never leave a hidden window hidden.
     let placement = (|| {
         window
             .set_fullscreen(false)
-            .context("Could not leave fullscreen while opening macrdp")?;
+            .context("Could not leave fullscreen while opening Greenmole RDP")?;
         let pointer = window
             .ns_window()
-            .context("Could not access the macrdp window")?;
-        ensure!(!pointer.is_null(), "The macrdp window is unavailable");
+            .context("Could not access the Greenmole RDP window")?;
+        ensure!(!pointer.is_null(), "The Greenmole RDP window is unavailable");
         // SAFETY: Tauri retains this NSWindow through `window`; all access is
         // confined to its AppKit main thread. Never use Accessibility on self.
         let native = unsafe { &*pointer.cast::<NSWindow>() };
@@ -102,7 +102,7 @@ fn reveal_on_main_thread(app: &tauri::AppHandle, target: RevealTarget) -> Result
                 })
             }
         }
-        .context("The selected display is no longer available to macrdp")?;
+        .context("The selected display is no longer available to Greenmole RDP")?;
         let frame = fitted_frame(native.frame(), screen.visibleFrame())?;
         if let Some(frame) = frame {
             native.setFrame_display(frame, true);
@@ -114,19 +114,19 @@ fn reveal_on_main_thread(app: &tauri::AppHandle, target: RevealTarget) -> Result
         // unminimize or app-unhide must not prevent show/focus from being tried.
         let operations = [
             app.show()
-                .context("Could not unhide the macrdp application"),
+                .context("Could not unhide the Greenmole RDP application"),
             window
                 .unminimize()
-                .context("Could not restore the macrdp window"),
-            window.show().context("Could not show the macrdp window"),
+                .context("Could not restore the Greenmole RDP window"),
+            window.show().context("Could not show the Greenmole RDP window"),
             window
                 .set_focus()
-                .context("Could not focus the macrdp window"),
+                .context("Could not focus the Greenmole RDP window"),
         ];
         for operation in operations {
             operation?;
         }
-        tracing::info!("Revealed macrdp main window");
+        tracing::info!("Revealed Greenmole RDP main window");
         Ok(())
     })
 }
@@ -136,7 +136,7 @@ fn reveal_after_placement(
     reveal: impl FnOnce() -> Result<()>,
 ) -> Result<usize> {
     let moved = placement.unwrap_or_else(|error| {
-        tracing::warn!(%error, "Could not position macrdp; revealing its existing window");
+        tracing::warn!(%error, "Could not position Greenmole RDP; revealing its existing window");
         0
     });
     reveal()?;

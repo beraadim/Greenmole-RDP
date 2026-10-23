@@ -121,7 +121,7 @@ impl PerfStats {
 
         writeln!(report).unwrap();
         writeln!(report, "═══════════════════════════════════════════").unwrap();
-        writeln!(report, "  macrdp Performance Report").unwrap();
+        writeln!(report, "  Greenmole RDP Performance Report").unwrap();
         writeln!(report, "═══════════════════════════════════════════").unwrap();
         writeln!(report, "  Duration:      {:.1}s", duration).unwrap();
         writeln!(report, "  Total frames:  {}", self.total_frames).unwrap();
@@ -284,7 +284,7 @@ mod tests {
         stats.record_capture(3.0, 2);
         let report = stats.summary_for_duration(10.0);
         assert!(report.starts_with(
-            "\n═══════════════════════════════════════════\n  macrdp Performance Report\n"
+            "\n═══════════════════════════════════════════\n  Greenmole RDP Performance Report\n"
         ));
         assert!(report.contains("  Duration:      10.0s\n  Total frames:  2\n  Avg FPS:       0.2\n  Keyframes:     1 (50.0%)\n"));
         assert!(report.contains("  Encode Latency (ms, latest 2 samples):\n    Mean:   3.0     Stddev: 1.0\n    P50:    4.0     P95:    4.0     P99:   4.0\n"));

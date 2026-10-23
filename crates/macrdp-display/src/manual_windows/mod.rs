@@ -39,7 +39,7 @@ fn move_windows_with_policy(
     budget.check()?;
     ensure!(
         accessibility::trusted(),
-        "Enable Accessibility access for macrdp in System Settings > Privacy & Security > Accessibility to move application windows"
+        "Enable Accessibility access for Greenmole RDP in System Settings > Privacy & Security > Accessibility to move application windows"
     );
     let bounds = geometry::Frame::from(target);
     ensure!(
@@ -54,7 +54,7 @@ fn move_windows_with_policy(
     let (moved, own_failed) = match own_windows(target) {
         Ok(moved) => (moved, 0),
         Err(error) => {
-            tracing::warn!(%error, "Could not move macrdp's own windows; continuing with other applications");
+            tracing::warn!(%error, "Could not move Greenmole RDP's own windows; continuing with other applications");
             (0, 1)
         }
     };

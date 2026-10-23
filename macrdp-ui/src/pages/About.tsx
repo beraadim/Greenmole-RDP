@@ -1,16 +1,14 @@
-import { Monitor } from "lucide-react";
+import BrandLogo from "../components/BrandLogo";
 
 function About() {
   return (
     <div className="flex h-full flex-col items-center justify-center p-4">
       <div className="w-full max-w-sm rounded-[10px] bg-card p-6 text-center">
         {/* App icon */}
-        <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent/10">
-          <Monitor size={32} className="text-accent" />
-        </div>
+        <BrandLogo className="mx-auto mb-3 h-20 w-20" alt="Greenmole mole mascot" />
 
         {/* App name */}
-        <div className="text-lg font-semibold text-text">MacRDP</div>
+        <div className="text-lg font-semibold text-text">Greenmole RDP</div>
 
         {/* Version */}
         <div className="mt-0.5 text-xs text-text-muted">Version {import.meta.env.VITE_APP_VERSION}</div>
@@ -34,7 +32,7 @@ function About() {
           >
             GitHub
           </a>
-          <span className="text-xs text-text-muted">MIT License</span>
+          <span className="text-xs text-text-muted">GPLv3 License</span>
           <a
             href="https://github.com/beraadim/macronrdp/releases"
             target="_blank"

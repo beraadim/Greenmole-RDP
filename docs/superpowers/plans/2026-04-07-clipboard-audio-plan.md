@@ -1046,17 +1046,17 @@ mod tests {
 
     #[test]
     fn utf8_to_utf16le_chinese() {
-        let result = utf8_to_utf16le("你好");
+        let result = utf8_to_utf16le("\u{4F60}\u{597D}");
         // 2 chars + null = 3 code units = 6 bytes
         assert_eq!(result.len(), 6);
-        // '你' = U+4F60 → LE [0x60, 0x4F]
+        // U+4F60 uses little-endian bytes [0x60, 0x4F]
         assert_eq!(result[0], 0x60);
         assert_eq!(result[1], 0x4F);
     }
 
     #[test]
     fn utf16le_to_utf8_roundtrip() {
-        let original = "Hello 世界! 🎉";
+        let original = "Hello \u{4E16}\u{754C}! 🎉";
         let encoded = utf8_to_utf16le(original);
         let decoded = utf16le_to_utf8(&encoded).unwrap();
         assert_eq!(decoded, original);
@@ -1777,12 +1777,12 @@ mod tests {
     #[test]
     fn file_descriptor_unicode_name() {
         let desc = FileDescriptor {
-            name: "文档.pdf".to_string(),
+            name: "\u{6587}\u{6863}.pdf".to_string(),
             size: 0,
         };
         let bytes = serialize_file_group_descriptor(&[desc]);
         let parsed = parse_file_group_descriptor(&bytes).unwrap();
-        assert_eq!(parsed[0].name, "文档.pdf");
+        assert_eq!(parsed[0].name, "\u{6587}\u{6863}.pdf");
     }
 
     #[test]

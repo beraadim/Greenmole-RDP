@@ -1,6 +1,6 @@
 # macrdp-display
 
-Owns the display selected for a macRDP server. `Main` pins the display ID that
+Owns the display selected for a Greenmole RDP server. `Main` pins the display ID that
 was primary at startup and only reads its geometry. `Virtual` creates one extended
 display in the existing macOS login session when a connection activates and
 changes that display's mode as the RDP viewport changes. It becomes the primary

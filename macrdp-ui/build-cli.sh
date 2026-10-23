@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
 
-# 优先用环境变量 MACRDP_CLI_PROFILE，其次用参数，默认 debug
+# Prefer MACRDP_CLI_PROFILE, then the first argument; default to debug.
 PROFILE="${MACRDP_CLI_PROFILE:-${1:-debug}}"
 
 echo "Building macrdp-server (profile: $PROFILE, target: $TARGET_TRIPLE)..."

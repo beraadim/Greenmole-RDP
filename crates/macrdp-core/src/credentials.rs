@@ -68,7 +68,7 @@ pub fn load_desktop_password() -> Result<Option<String>> {
             )),
             // errSecItemNotFound is the only error that permits first-run initialization.
             Err(error) if error.code() == -25300 => Ok(None),
-            Err(error) => Err(error).context("Unable to read macrdp password from Keychain"),
+            Err(error) => Err(error).context("Unable to read Greenmole RDP password from Keychain"),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -88,7 +88,7 @@ pub fn save_desktop_password(password: &str) -> Result<()> {
             KEYCHAIN_ACCOUNT,
             password.as_bytes(),
         )
-        .context("Unable to store macrdp password in Keychain")
+        .context("Unable to store Greenmole RDP password in Keychain")
     }
     #[cfg(not(target_os = "macos"))]
     anyhow::bail!("Desktop credential storage requires macOS Keychain")
@@ -104,7 +104,7 @@ pub fn delete_desktop_password() -> Result<()> {
         ) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == -25300 => Ok(()),
-            Err(error) => Err(error).context("Unable to remove macrdp password from Keychain"),
+            Err(error) => Err(error).context("Unable to remove Greenmole RDP password from Keychain"),
         }
     }
     #[cfg(not(target_os = "macos"))]

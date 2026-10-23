@@ -11,6 +11,7 @@ import {
 import { api } from "../lib/ipc";
 import type { PermissionStatus } from "../lib/types";
 import ThemeToggle from "./ThemeToggle";
+import BrandLogo from "./BrandLogo";
 
 const navGroups = [
   {
@@ -58,6 +59,11 @@ function Sidebar() {
         data-tauri-drag-region
         style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
       />
+
+      <div className="flex shrink-0 items-center gap-2 px-5 pb-4">
+        <BrandLogo className="h-7 w-7" />
+        <span className="whitespace-nowrap text-xs font-semibold text-text">Greenmole RDP</span>
+      </div>
 
       {/* Navigation */}
       <nav role="navigation" className="flex-1 overflow-y-auto px-3">

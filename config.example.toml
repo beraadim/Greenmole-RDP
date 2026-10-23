@@ -1,4 +1,4 @@
-# macrdp server configuration
+# Greenmole RDP server configuration
 # Copy this file to config.toml and modify as needed.
 # Config search order: ./config.toml → ~/.config/macrdp/ → ~/Library/Application Support/macrdp/
 

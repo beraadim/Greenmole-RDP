@@ -109,7 +109,7 @@ impl Endpoint {
         // never unlink the lock file or replace another live owner's endpoint.
         ensure!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "Another macrdp instance owns desktop recovery"
+            "Another Greenmole RDP instance owns desktop recovery"
         );
         let socket_path = path.join("control.sock");
         if owned_socket(&socket_path)? {
@@ -196,10 +196,10 @@ fn request_at(path: &Path) -> Result<()> {
     let socket = path.join("control.sock");
     ensure!(
         owned_socket(&socket)?,
-        "macrdp is not running, or its recovery control is unavailable"
+        "Greenmole RDP is not running, or its recovery control is unavailable"
     );
     let mut stream =
-        UnixStream::connect(socket).context("Could not contact the running macrdp application")?;
+        UnixStream::connect(socket).context("Could not contact the running Greenmole RDP application")?;
     ensure!(
         same_user(&stream),
         "Recovery endpoint belongs to another user"

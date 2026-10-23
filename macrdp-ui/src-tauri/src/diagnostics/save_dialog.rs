@@ -18,9 +18,9 @@ fn select_on_main_thread() -> Result<Option<PathBuf>, String> {
     use objc2_foundation::NSString;
     let mtm = MainThreadMarker::new().ok_or("Save dialog requires the main thread")?;
     let panel = NSSavePanel::savePanel(mtm);
-    panel.setTitle(Some(&NSString::from_str("Export macrdp diagnostics")));
+    panel.setTitle(Some(&NSString::from_str("Export Greenmole RDP diagnostics")));
     panel.setNameFieldStringValue(&NSString::from_str(&format!(
-        "macrdp-diagnostics-{}.json",
+        "greenmole-rdp-diagnostics-{}.json",
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     )));
     panel.setCanCreateDirectories(true);

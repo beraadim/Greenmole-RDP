@@ -1,13 +1,13 @@
 # Guarded private sessions
 
-macrdp 0.1.24 adds an opt-in **Settings > Security > Guarded private session**
+Greenmole RDP includes the opt-in **Settings > Security > Guarded private session**
 option. Select the virtual display backend first. Restart the service after
 changing this option; an active connection's policy never changes underneath it.
 The CLI configuration uses `private_session = true` and
 `display_backend = "virtual"` in its protected TOML file.
 
 The mode covers the local screens and filters local keyboard, pointer, scroll
-and tablet input while accepting macrdp's marked remote input. Remote modifiers
+and tablet input while accepting Greenmole RDP's marked remote input. Remote modifiers
 must come from the remote session, not from keys held at the physical keyboard.
 Black covering does not turn a monitor's backlight off.
 

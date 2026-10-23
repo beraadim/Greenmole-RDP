@@ -62,7 +62,7 @@ Set the RDP connection's **Resize method** to **Display update**, equivalent to
 `resize-method=display-update`. Guacamole then sends Display Control requests
 when the browser viewport changes size. Leave the connection's width and height
 unset to use the initial client viewport, and use `resolution = "auto"` in
-macrdp to allow live resizing. Guacamole's `reconnect` method instead ends and
+Greenmole RDP to allow live resizing. Guacamole's `reconnect` method instead ends and
 reopens the RDP session; an unset resize method does not send live resize requests.
 
 A connection that already resizes a Windows host may already have this setting.

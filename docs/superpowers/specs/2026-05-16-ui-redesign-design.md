@@ -1,286 +1,286 @@
-# MacRDP UI 重设计方案
+# MacRDP UI Redesign Specification
 
-## 概述
+## Overview
 
-对 macrdp-ui (Tauri 桌面应用) 进行全面视觉重设计，升级为 **Xcode/Instruments 专业工具风格**，提升信息密度、视觉质感和专业感。
+Completely redesign the visual appearance of macrdp-ui (the Tauri desktop application) in the style of **Xcode/Instruments professional tools**, improving information density, visual polish and usability.
 
-**当前状态**: 现有 UI 使用 Tailwind w-52 (208px) 宽侧边栏，带图标和文字标签，基础 macOS 浅灰风格。本次重设计将重新调整侧边栏结构（增加分组标题），全面更新配色体系和所有页面布局。
+**Current state**: The existing UI has a Tailwind w-52 (208px) sidebar with icons and text labels and a basic light-gray macOS appearance. This redesign reorganizes the sidebar with section headings and updates the color system and all page layouts.
 
-**范围**: 主窗口的全部 6 个页面 (Dashboard, Settings, Permissions, Logs, Statistics, About)。Popover 弹出窗口（tray icon 菜单，300×280px）不在本次范围内，保持现有样式。
+**Scope**: All six main-window pages (Dashboard, Settings, Permissions, Logs, Statistics, About). The Popover window (the tray-icon menu, 300×280px) is outside this scope and retains its existing styling.
 
-## 设计方向
+## Design Direction
 
-- **风格**: Xcode/Instruments 专业暗色工具风格
-- **导航**: 180px 宽侧边栏 + 分组标题（类似 Xcode Navigator）
-- **主题**: 保持现有三态切换（浅色 / 深色 / 跟随系统），侧边栏底部保留快捷切换按钮，设置页"通用"分类也提供切换
-- **Dashboard**: 数据图表 + 连接列表并重
+- **Style**: Xcode/Instruments professional dark-tool appearance
+- **Navigation**: 180px sidebar with section headings, similar to the Xcode Navigator
+- **Theme**: Preserve the existing three-way selection (Light / Dark / System), with a quick toggle at the bottom of the sidebar and another selector in Settings → General
+- **Dashboard**: Give charts and the connection list equal prominence
 
-## 设计系统
+## Design System
 
-### 色彩体系
+### Colors
 
-**暗色模式 (Dark)**:
-| 用途 | 色值 |
-|------|------|
-| 背景 | `#1a1a1a` |
-| 侧边栏 | `#202020` |
-| 卡片/面板 | `#252525` |
-| 边框 | `#2d2d2d` / `#3a3a3a` |
-| 标题文字 | `#ffffff` |
-| 正文文字 | `#cccccc` |
-| 次要文字 | `#8e8e93` (提升对比度，满足 WCAG AA 4.5:1) |
-| 蓝色强调 | `#0a84ff` |
-| 绿色 (成功/运行) | `#30d158` |
-| 橙色 (警告/中等) | `#ff9f0a` |
-| 红色 (错误/停止) | `#ff453a` |
-| 紫色 (辅助) | `#bf5af2` |
+**Dark mode**:
+| Purpose | Value |
+|---------|-------|
+| Background | `#1a1a1a` |
+| Sidebar | `#202020` |
+| Cards/panels | `#252525` |
+| Borders | `#2d2d2d` / `#3a3a3a` |
+| Heading text | `#ffffff` |
+| Body text | `#cccccc` |
+| Secondary text | `#8e8e93` (increase contrast to meet WCAG AA 4.5:1) |
+| Blue accent | `#0a84ff` |
+| Green (success/running) | `#30d158` |
+| Orange (warning/moderate) | `#ff9f0a` |
+| Red (error/stopped) | `#ff453a` |
+| Purple (secondary accent) | `#bf5af2` |
 
-**浅色模式 (Light)**:
-| 用途 | 色值 |
-|------|------|
-| 背景 | `#f5f5f7` |
-| 侧边栏 | `#ebebed` |
-| 卡片/面板 | `#ffffff` + 边框 `#e8e8e8` |
-| 标题文字 | `#1d1d1f` |
-| 正文文字 | `#333333` |
-| 次要文字 | `#86868b` |
-| 蓝色强调 | `#007aff` |
-| 绿色 | `#34c759` |
-| 橙色 | `#ff9500` |
-| 红色 | `#ff3b30` |
-| 紫色 | `#af52de` |
+**Light mode**:
+| Purpose | Value |
+|---------|-------|
+| Background | `#f5f5f7` |
+| Sidebar | `#ebebed` |
+| Cards/panels | `#ffffff` with border `#e8e8e8` |
+| Heading text | `#1d1d1f` |
+| Body text | `#333333` |
+| Secondary text | `#86868b` |
+| Blue accent | `#007aff` |
+| Green | `#34c759` |
+| Orange | `#ff9500` |
+| Red | `#ff3b30` |
+| Purple | `#af52de` |
 
-**半透明变体约定**:
-- 选中背景: 强调色 15% 不透明度 (如 `rgba(10,132,255,0.15)`)
-- Hover 背景: 强调色 8% 不透明度
-- Disabled: 前景色 40% 不透明度
+**Translucent variants**:
+- Selected background: accent color at 15% opacity, such as `rgba(10,132,255,0.15)`
+- Hover background: accent color at 8% opacity
+- Disabled: foreground color at 40% opacity
 
-**CSS 变量迁移策略**: 统一使用 HEX 值替换现有 `--color-macos-*` 变量。移除 shadcn oklch 语义变量（当前未深度使用），全面切换到新色彩体系。移除 Geist Variable 字体依赖，统一使用系统字体栈。
+**CSS variable migration**: Replace the existing `--color-macos-*` variables with consistent HEX values. Remove the shadcn oklch semantic variables, which are not heavily used, and switch fully to the new color system. Remove the Geist Variable font dependency and use the system font stack throughout.
 
-### 字体排版
+### Typography
 
-| 用途 | 字体 | 字重 | 大小 |
-|------|------|------|------|
-| 页面标题 | SF Pro Display | 600 | 16px |
-| 分组标题 | SF Pro Text | 600 | 10px (大写) |
-| 正文/标签 | SF Pro Text | 500 | 12px |
-| 次要信息 | SF Pro Text | 400 | 11px |
-| 数据/指标 | SF Pro Display | 700 | 16-20px |
-| 日志/代码 | SF Mono | 400 | 11px |
+| Purpose | Font | Weight | Size |
+|---------|------|--------|------|
+| Page titles | SF Pro Display | 600 | 16px |
+| Section headings | SF Pro Text | 600 | 10px (uppercase) |
+| Body text/labels | SF Pro Text | 500 | 12px |
+| Secondary information | SF Pro Text | 400 | 11px |
+| Data/metrics | SF Pro Display | 700 | 16-20px |
+| Logs/code | SF Mono | 400 | 11px |
 
-字体栈: `-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', system-ui, sans-serif`
-等宽字体栈: `'SF Mono', SFMono-Regular, ui-monospace, Menlo, monospace`
+Font stack: `-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', system-ui, sans-serif`
+Monospace font stack: `'SF Mono', SFMono-Regular, ui-monospace, Menlo, monospace`
 
-### 间距与圆角
+### Spacing and Corner Radii
 
-- **圆角**: 5px (控件/按钮) / 8px (卡片/面板) / 10px (大容器)
-- **间距**: 8px (紧凑, Tailwind p-2) / 12px (标准, p-3) / 16px (宽松, p-4)
-- **侧边栏宽度**: 180px
-- **最小窗口尺寸**: 800 × 500
+- **Corner radii**: 5px (controls/buttons) / 8px (cards/panels) / 10px (large containers)
+- **Spacing**: 8px (compact, Tailwind p-2) / 12px (standard, p-3) / 16px (comfortable, p-4)
+- **Sidebar width**: 180px
+- **Minimum window size**: 800 × 500
 
-> 间距值对齐 Tailwind 默认 4px 基准 scale，无需自定义 spacing 配置。
+> Spacing follows Tailwind's default 4px scale; no custom spacing configuration is needed.
 
-### 过渡动画
+### Transitions
 
-| 场景 | 时长 | 缓动 |
-|------|------|------|
-| 颜色/背景变化 | 150ms | ease-out |
-| 页面切换 | 0ms (立即) |  |
-| 图表数据更新 | 300ms | ease-in-out |
-| Hover 效果 | 100ms | ease-out |
+| Scenario | Duration | Easing |
+|----------|----------|--------|
+| Color/background changes | 150ms | ease-out |
+| Page navigation | 0ms (immediate) |  |
+| Chart updates | 300ms | ease-in-out |
+| Hover effects | 100ms | ease-out |
 
-全局默认: `transition-colors duration-150 ease-out`
+Global default: `transition-colors duration-150 ease-out`
 
-### 组件规范
+### Component Specifications
 
-**StatusBar (状态栏)**:
-- 紧凑单行，高度 ~36px
-- 左侧: 状态圆点(8px, 带 glow) + 状态文字 + 辅助信息(端口/运行时间)
-- 右侧: 操作按钮(启动/停止)
-- 背景色比内容区稍深一级
-- **状态映射**: running=绿 / starting=黄 / stopped=灰 / error=红(闪烁)
-- **Error 态**: 红色背景(10%不透明度) + 红色边框 + 错误信息文字
+**StatusBar**:
+- Compact single row, approximately 36px high
+- Left: status dot (8px, with glow), status text and supporting information (port/uptime)
+- Right: action button (Start/Stop)
+- Background one shade darker than the content area
+- **Status mapping**: running=green / starting=yellow / stopped=gray / error=red (flashing)
+- **Error state**: red background at 10% opacity, red border and error text
 
-**MetricCard (指标卡片)**:
-- 等宽排列 (flex: 1)
-- 居中布局: 大数字(16-20px, 彩色) + 底部标签(10px, 次要色)
-- 各指标用不同颜色区分: FPS=蓝, 带宽=绿, 延迟=橙, 连接=紫
-- **无数据态**: 显示 `--` 替代数字，标签保留，颜色变为次要色
+**MetricCard**:
+- Equal widths (flex: 1)
+- Centered layout: large colored value (16-20px) above a secondary-color label (10px)
+- Distinguish metrics by color: FPS=blue, bandwidth=green, latency=orange, connections=purple
+- **No-data state**: show `--` instead of a value, retain the label and use the secondary color
 
-**ChartPanel (图表面板)**:
-- 顶部: 标题(左) + 当前值(右, 彩色)
-- 主体: SVG 面积图或柱状图
-- 面积图使用渐变填充(从强调色 30% 到 0%)
-- **无数据态**: 灰色虚线基准线 + 居中文字"等待数据..."
-- **加载态**: 低不透明度脉冲动画占位
+**ChartPanel**:
+- Header: title on the left and current colored value on the right
+- Body: SVG area or bar chart
+- Area charts use a gradient from 30% accent opacity to 0%
+- **No-data state**: gray dashed baseline with centered "Waiting for data..." text
+- **Loading state**: low-opacity pulsing placeholder
 
-**ConnItem (连接列表项)**:
-- 左侧彩色指示条(3px 宽, 圆角): 绿=良好 / 橙=一般 / 红=差
-- 主信息: 用户名@IP (12px, 白色)
-- 副信息: 连接时长 (10px, 次要色)
-- 右侧: FPS + 带宽 (对齐)
-- **空列表态**: 居中图标 + "暂无活跃连接" 提示文字
+**ConnItem**:
+- Left colored indicator (3px wide, rounded): green=good / orange=fair / red=poor
+- Primary information: username@IP (12px, white)
+- Secondary information: connection duration (10px, secondary color)
+- Right: aligned FPS and bandwidth
+- **Empty-list state**: centered icon and "No active connections" text
 
-**SettingRow (设置行)**:
-- 左右分布: label(左) + control(右)
-- 背景色比内容区稍深一级
-- 圆角 6px, 行间距 4px
-- 控件类型: Toggle 开关 / Select 下拉 / Input 输入框
+**SettingRow**:
+- Label on the left, control on the right
+- Background one shade darker than the content area
+- 6px corner radius, 4px spacing between rows
+- Control types: Toggle / Select / Input
 
-**LogEntry (日志条目)**:
-- 等宽字体 (SF Mono)
-- 三栏: 时间戳(70px, 灰) | 级别(40px, 彩色加粗) | 消息(flex, 浅灰)
-- 级别颜色: INFO=蓝 / WARN=橙 / ERROR=红 / DEBUG=暗灰
-- 紧凑行高, 底部细边框分隔
+**LogEntry**:
+- Monospace font (SF Mono)
+- Three columns: timestamp (70px, gray) | level (40px, bold and colored) | message (flex, light gray)
+- Level colors: INFO=blue / WARN=orange / ERROR=red / DEBUG=dark gray
+- Compact line height, with a thin bottom border between entries
 
-### 无障碍 (Accessibility)
+### Accessibility
 
-- **色彩对比度**: 所有文字/背景组合满足 WCAG AA (4.5:1)。次要文字暗色模式使用 `#8e8e93`(对比度 5.2:1)
-- **键盘导航**: 侧边栏项支持 Tab 切换 + Enter 激活；设置页分类导航支持 Arrow 键
-- **ARIA**: 侧边栏使用 `role="navigation"` + `aria-current="page"`；状态栏使用 `role="status"` + `aria-live="polite"`
-- **焦点指示**: 蓝色 2px outline offset 2px
+- **Color contrast**: All text/background combinations meet WCAG AA (4.5:1). Secondary text uses `#8e8e93` in dark mode (contrast ratio 5.2:1).
+- **Keyboard navigation**: Sidebar entries support Tab and Enter; Settings categories support arrow keys.
+- **ARIA**: Use `role="navigation"` and `aria-current="page"` for the sidebar, and `role="status"` and `aria-live="polite"` for the status bar.
+- **Focus indication**: 2px blue outline with 2px offset.
 
-## 页面设计
+## Page Designs
 
-### 1. 控制台 (Dashboard) — 主页面
+### 1. Dashboard — Main Page
 
-**布局从上到下**:
-1. **状态栏**: 运行状态 + 端口 + 运行时间 + 启停按钮
-2. **FPS 实时曲线**: Instruments 风格面积图，展示最近 60 秒帧率趋势
-3. **指标卡片行**: FPS / 带宽 / 延迟 / 连接数 (四等分)
-4. **活跃连接列表**: 带质量指示的连接卡片，显示用户、时长、实时指标
+**Layout from top to bottom**:
+1. **Status bar**: running state, port, uptime and Start/Stop button
+2. **Live FPS chart**: Instruments-style area chart showing the last 60 seconds
+3. **Metric-card row**: FPS / bandwidth / latency / connections, in four equal columns
+4. **Active connections**: connection cards showing quality, user, duration and live metrics
 
-**数据策略**:
-- **FPS 历史曲线**: 前端使用 `useRef` 维护 60 元素环形缓冲区，每秒从 `useMetrics` 推入新数据点。页面切换后缓冲区重置，重新积累（可接受，非关键历史数据）
-- 指标卡片: 实时随 Tauri 事件更新
-- 连接列表: 事件驱动(连接/断开/指标变化)
+**Data strategy**:
+- **FPS history**: Maintain a 60-element ring buffer with `useRef`, adding a new sample from `useMetrics` each second. Reset and rebuild the buffer after navigating away; this is acceptable for noncritical historical data.
+- Metric cards update live from Tauri events.
+- Connection list updates are event-driven (connect/disconnect/metric changes).
 
-**状态处理**:
-- **服务未启动**: 状态栏显示灰色"已停止" + "启动"按钮；图表区显示"等待数据..."；连接列表显示空态
-- **启动中**: 状态栏黄色"启动中..." + 按钮 disabled
-- **运行中无连接**: 图表正常显示；连接列表显示"暂无活跃连接"
+**State handling**:
+- **Service stopped**: gray "Stopped" status and "Start" button; "Waiting for data..." in the chart; empty connection list
+- **Starting**: yellow "Starting..." status and disabled button
+- **Running without connections**: show the chart normally and "No active connections" in the list
 
-### 2. 设置 (Settings)
+### 2. Settings
 
-**布局**: 内容区二级分栏
-- 左侧分类导航(140px): RDP 服务 / 网络 / 安全 / 显示 / 音频 / 通用
-- 右侧选项面板: 分组标题 + SettingRow 列表
+**Layout**: Two columns within the content area
+- Left category navigation (140px): RDP Service / Network / Security / Display / Audio / General
+- Right options panel: section heading and a list of SettingRow components
 
-**分类内容** (对齐 UiConfig 字段):
-- **RDP 服务**: 编码器 (`encoder`)、码率 (`bitrate_mbps`)、帧率 (`frame_rate`)、色度模式 (`chroma_mode`)
-- **网络**: 监听端口 (`port`)、绑定地址 (`bind_address`)、最大连接数 (`max_connections`)、超时 (`idle_timeout_secs`)
-- **安全**: 用户名/密码 (`username`/`password`)。TLS 证书/密钥路径当前由 UiConfig 硬编码为 None，后续如需 UI 配置需先扩展 UiConfig 字段
-- **显示**: HiDPI 模式 (`hidpi_mode`)、光标捕获 (`capture_cursor`)、显示光标 (`show_cursor`)
-- **音频**: 当前 UiConfig 未暴露音频配置字段。此分类作为占位，待后端将 `AudioConfig.enabled` 等字段接入 UiConfig 后启用
-- **通用**: 日志级别 (`log_level`)、自动启动 (`auto_start`)、主题切换 (前端 ThemeContext)
+**Category contents** (aligned with UiConfig fields):
+- **RDP Service**: encoder (`encoder`), bitrate (`bitrate_mbps`), frame rate (`frame_rate`), chroma mode (`chroma_mode`)
+- **Network**: listening port (`port`), bind address (`bind_address`), maximum connections (`max_connections`), timeout (`idle_timeout_secs`)
+- **Security**: username/password (`username`/`password`). UiConfig currently hardcodes TLS certificate/key paths to None; UI configuration requires extending UiConfig first.
+- **Display**: HiDPI mode (`hidpi_mode`), cursor capture (`capture_cursor`), cursor visibility (`show_cursor`)
+- **Audio**: UiConfig does not yet expose audio configuration. This category is a placeholder until the backend connects fields such as `AudioConfig.enabled` to UiConfig.
+- **General**: log level (`log_level`), automatic startup (`auto_start`), theme selection (frontend ThemeContext)
 
-> 音频分类当前为占位。安全分类中 TLS 配置也暂不可用。这些将随后端 UiConfig 字段扩展逐步启用。
+> Audio is currently a placeholder, and TLS settings under Security are also unavailable. Enable these progressively as the backend UiConfig fields expand.
 
-### 3. 日志 (Logs)
+### 3. Logs
 
-**布局**:
-1. **工具栏**: 级别筛选标签(全部/Error/Warn/Info/Debug) + 搜索框 + 实时指示
-2. **日志列表**: Console.app 风格，等宽字体，颜色分级，紧凑行
+**Layout**:
+1. **Toolbar**: level filters (All/Error/Warn/Info/Debug), search and live indicator
+2. **Log list**: Console.app style, monospace, colored levels and compact rows
 
-**交互**:
-- 筛选标签高亮当前选中
-- 搜索实时过滤
-- 自动滚动(可暂停)
-- 右上角显示实时/暂停状态
+**Interaction**:
+- Highlight the selected filter
+- Filter immediately as the search changes
+- Automatic scrolling, with a pause option
+- Show Live/Paused status in the upper-right corner
 
-**状态处理**:
-- **无日志**: 居中显示"暂无日志记录"
-- **搜索无结果**: "未找到匹配的日志"
+**State handling**:
+- **No logs**: centered "No log entries" text
+- **No search results**: "No matching logs"
 
-### 4. 统计 (Statistics)
+### 4. Statistics
 
-**布局**:
-1. **顶部**: 标题 + 时间范围切换(7天 / 30天)
-2. **汇总卡片行**: 总连接数 / 总流量 / 平均会话时长
-3. **流量趋势图**: 柱状图，按天聚合
-4. **连接历史表**: 用户 / 时间 / 时长 / 流量 四列
+**Layout**:
+1. **Header**: title and time-range selector (7 days / 30 days)
+2. **Summary cards**: total connections / total traffic / average session duration
+3. **Traffic chart**: bar chart aggregated by day
+4. **Connection history**: four columns for user / time / duration / traffic
 
-> 时间范围仅提供 7 天和 30 天（对齐现有 `getTrafficStats(days)` API 的按天聚合能力）。24 小时按小时聚合视图作为后续功能，待后端 API 支持后再加入。
+> Offer only 7-day and 30-day ranges, matching the existing daily aggregation in `getTrafficStats(days)`. A 24-hour view with hourly aggregation is a future feature, pending backend support.
 
-**状态处理**:
-- **无统计数据**: 图表区显示"暂无统计数据"；汇总卡片显示 `--`
-- **加载中**: 骨架屏(skeleton)占位
+**State handling**:
+- **No statistics**: "No statistics available" in the chart and `--` in summary cards
+- **Loading**: skeleton placeholders
 
-### 5. 权限 (Permissions)
+### 5. Permissions
 
-**布局**: 权限列表卡片
-- 每个权限一张卡片: 图标 + 名称 + 状态(已授权/未授权) + 请求按钮
-- 权限类型: 屏幕录制、辅助功能、麦克风
-- 未授权状态: 橙色警告 + "前往系统设置"按钮
-- 全部已授权: 顶部显示绿色"所有权限已就绪"提示
+**Layout**: Permission cards
+- One card per permission: icon, name, status (Granted/Not granted) and request button
+- Permission types: Screen Recording, Accessibility and Microphone
+- Not granted: orange warning and "Open System Settings" button
+- All granted: green "All permissions are ready" message at the top
 
-### 6. 关于 (About)
+### 6. About
 
-**布局**: 居中信息卡片
-- App 图标 + 名称 + 版本号
-- 技术栈信息(IronRDP, OpenH264, ScreenCaptureKit)
-- 链接: GitHub / License / 检查更新
+**Layout**: Centered information card
+- App icon, name and version
+- Technology details (IronRDP, OpenH264, ScreenCaptureKit)
+- Links: GitHub / License / Check for updates
 
-## 导航结构
+## Navigation Structure
 
-**侧边栏分组**:
+**Sidebar sections**:
 ```
-服务
-  └── 控制台 (Dashboard)
-配置
-  ├── 设置 (Settings)
-  └── 权限 (Permissions)
-诊断
-  ├── 日志 (Logs)
-  └── 统计 (Statistics)
+Service
+  └── Dashboard
+Configuration
+  ├── Settings
+  └── Permissions
+Diagnostics
+  ├── Logs
+  └── Statistics
 ──────
-  关于 (About) ← 底部固定
+  About ← pinned to the bottom
 ```
 
-**侧边栏交互**:
-- 选中项: 蓝色半透明背景(15%) + 蓝色文字
-- Hover: 微弱背景色变化(8%)
-- 分组标题: 大写、10px、灰色，不可点击
-- 底部"关于"用分隔线与主导航分开
-- 主题切换按钮位于"关于"下方，图标形式(☀/🌙/Auto)
+**Sidebar interaction**:
+- Selected entry: translucent blue background (15%) and blue text
+- Hover: subtle background-color change (8%)
+- Section headings: uppercase, 10px, gray and noninteractive
+- Separate the bottom About entry from main navigation with a divider
+- Place an icon-based theme selector (☀/🌙/Auto) below About
 
-## 窗口配置变更
+## Window Configuration Changes
 
-| 属性 | 当前值 | 新值 |
-|------|--------|------|
-| 默认宽度 | 900px | 960px |
-| 默认高度 | 600px | 620px |
-| 最小宽度 | 720px | 800px |
-| 最小高度 | 480px | 500px |
+| Property | Current | New |
+|----------|---------|-----|
+| Default width | 900px | 960px |
+| Default height | 600px | 620px |
+| Minimum width | 720px | 800px |
+| Minimum height | 480px | 500px |
 
-## 技术实现要点
+## Implementation Notes
 
-### 保留不变
+### Preserve
 - React 19 + TypeScript + Vite 6 + Tauri 2
 - Tailwind CSS v4 (utility-first)
-- Radix UI 基础组件 (Select, Switch, Tooltip)
-- lucide-react 图标库
-- ThemeContext 三态主题切换
-- Tauri IPC 数据通信
+- Radix UI primitives (Select, Switch, Tooltip)
+- lucide-react icons
+- Three-way ThemeContext theme selection
+- Tauri IPC communication
 
-### 需要变更
-- **globals.css**: 全面替换 CSS 变量为新色彩体系(HEX)，移除 oklch 和 `--color-macos-*` 前缀
-- **字体**: 移除 `@fontsource-variable/geist` 依赖，统一系统字体栈
-- **布局结构**: 侧边栏改为 180px 宽 + 分组标题
-- **组件重构**: 提取 StatusBar, MetricCard, ChartPanel, ConnItem, SettingRow, LogEntry 为独立组件
-- **图表**: 手写轻量 SVG 面积图/柱状图组件（避免引入 recharts 重依赖），使用 `useRef` 环形缓冲区管理历史数据
-- **设置页**: 从 6 卡片平铺改为左右分栏
-- **日志页**: 改用等宽字体 + 颜色分级样式
-- **tauri.conf.json**: 更新窗口尺寸
+### Change
+- **globals.css**: replace CSS variables with the new HEX color system; remove oklch and the `--color-macos-*` prefix
+- **Fonts**: remove `@fontsource-variable/geist` and use the system font stack
+- **Layout**: 180px sidebar with section headings
+- **Components**: extract StatusBar, MetricCard, ChartPanel, ConnItem, SettingRow and LogEntry
+- **Charts**: lightweight hand-written SVG area/bar charts, avoiding the heavy recharts dependency; manage history with a `useRef` ring buffer
+- **Settings**: replace six tiled cards with a two-column layout
+- **Logs**: monospace text and colored severity levels
+- **tauri.conf.json**: update window dimensions
 
-### 不新增外部依赖
-纯手写 SVG 图表组件，保持包体轻量。
+### No New External Dependencies
+Use hand-written SVG chart components to keep the bundle small.
 
-## 设计原则
+## Design Principles
 
-1. **信息密度适中**: 专业但不拥挤，保证可读性
-2. **一致性**: 所有页面共享同一套组件和间距系统
-3. **性能优先**: 图表更新平滑，避免不必要的 re-render
-4. **macOS 原生感**: SF 字体栈、系统配色、圆角风格
-5. **渐进增强**: 核心功能先行，动画效果后续优化
-6. **无障碍**: 满足 WCAG AA 对比度标准，支持键盘导航
+1. **Appropriate information density**: professional and readable, without crowding
+2. **Consistency**: shared components and spacing across pages
+3. **Performance first**: smooth chart updates and no unnecessary re-renders
+4. **Native macOS appearance**: SF fonts, system colors and rounded corners
+5. **Progressive enhancement**: core functionality first, animation refinements later
+6. **Accessibility**: WCAG AA contrast and keyboard navigation

@@ -36,7 +36,7 @@ fn move_main_window_blocking(app: &tauri::AppHandle, target: DisplayGeometry) ->
         let result = move_on_main_thread(&main_app, target);
         let _ = sender.send(result);
     })
-    .context("Could not schedule the macrdp window move")?;
+    .context("Could not schedule the Greenmole RDP window move")?;
     match receiver.recv_timeout(Duration::from_secs(1)) {
         Ok(result) => result,
         Err(_) => {
@@ -48,7 +48,7 @@ fn move_main_window_blocking(app: &tauri::AppHandle, target: DisplayGeometry) ->
             if let Ok(result) = receiver.try_recv() {
                 return result;
             }
-            bail!("The macrdp window is busy. Please try again.")
+            bail!("The Greenmole RDP window is busy. Please try again.")
         }
     }
 }
@@ -70,14 +70,14 @@ fn move_on_main_thread(app: &tauri::AppHandle, target: DisplayGeometry) -> Resul
                 })
                 == Some(target.display_id)
         })
-        .context("The selected display is no longer available to macrdp")?;
+        .context("The selected display is no longer available to Greenmole RDP")?;
     let Some(window) = app.get_webview_window("main") else {
         return Ok(0);
     };
     let pointer = window
         .ns_window()
-        .context("Could not access the macrdp window")?;
-    ensure!(!pointer.is_null(), "The macrdp window is unavailable");
+        .context("Could not access the Greenmole RDP window")?;
+    ensure!(!pointer.is_null(), "The Greenmole RDP window is unavailable");
     // SAFETY: Tauri owns this NSWindow and the retained webview handle above
     // stays alive for this callback. All access occurs on AppKit's main thread.
     let native = unsafe { &*pointer.cast::<NSWindow>() };
@@ -93,7 +93,7 @@ fn move_on_main_thread(app: &tauri::AppHandle, target: DisplayGeometry) -> Resul
     }
     tracing::info!(
         display_id = target.display_id,
-        "Moved macrdp window through AppKit"
+        "Moved Greenmole RDP window through AppKit"
     );
     Ok(usize::from(frame.is_some()))
 }

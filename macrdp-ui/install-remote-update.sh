@@ -1,16 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_NAME="macrdp.app"
+APP_NAME="Greenmole RDP.app"
 BUNDLE_ID="com.macrdp.app"
-DEFAULT_DMG="$(find "$HOME/Desktop" -maxdepth 1 -type f -name 'macrdp*.dmg' -print0 | xargs -0 ls -t 2>/dev/null | head -n1 || true)"
+DEFAULT_DMG="$(find "$HOME/Desktop" -maxdepth 1 -type f \( -name 'Greenmole_RDP*.dmg' -o -name 'macrdp*.dmg' \) -print0 | xargs -0 ls -t 2>/dev/null | head -n1 || true)"
 DMG_PATH="${1:-$DEFAULT_DMG}"
 EXISTING_APP="$(osascript -e "POSIX path of (path to application id \"$BUNDLE_ID\")" 2>/dev/null | tr -d '\n' || true)"
 APP_DEST="${EXISTING_APP:-$HOME/Applications/$APP_NAME}"
 
 if [[ -z "${DMG_PATH:-}" || ! -f "$DMG_PATH" ]]; then
-  echo "Usage: $0 /path/to/macrdp.dmg" >&2
-  echo "No macrdp DMG found on the Desktop." >&2
+  echo "Usage: $0 /path/to/Greenmole_RDP.dmg" >&2
+  echo "No Greenmole RDP DMG found on the Desktop." >&2
   exit 1
 fi
 
@@ -25,7 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Quitting running macrdp instances"
+echo "==> Quitting running Greenmole RDP instances"
 osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
 pkill -x macrdp-ui >/dev/null 2>&1 || true
 sleep 2
@@ -50,11 +50,11 @@ open -a "$APP_DEST"
 
 for _ in {1..20}; do
   if pgrep -x macrdp-ui >/dev/null 2>&1; then
-    echo "==> macrdp-ui is running"
+    echo "==> Greenmole RDP is running"
     exit 0
   fi
   sleep 1
 done
 
-echo "macrdp-ui did not appear to start cleanly" >&2
+echo "Greenmole RDP did not appear to start cleanly" >&2
 exit 1

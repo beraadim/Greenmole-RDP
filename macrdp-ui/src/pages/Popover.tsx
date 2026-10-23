@@ -12,6 +12,7 @@ import { useMetrics } from "../hooks/useMetrics";
 import { useConnections } from "../hooks/useConnections";
 import { api } from "../lib/ipc";
 import ServerError from "../components/ServerError";
+import BrandLogo from "../components/BrandLogo";
 import { formatBytes, formatDuration } from "../lib/format";
 import { hasLiveSessionMetrics } from "../lib/metricPresentation";
 import { Button } from "@/components/ui/button";
@@ -73,18 +74,19 @@ function Popover() {
   const extraCount = connections.length - 3;
 
   return (
-    <div className="min-h-screen bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
+    <div className="min-h-screen bg-bg/95 backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
       <div className="flex flex-col p-3.5 gap-3">
         <ServerError message={!status.running ? actionError ?? status.error_details : null} />
         {metricsAvailable && connections.length > 0 && metrics.clipboard_disabled && <p role="status" className="text-xs text-orange">Clipboard unavailable. Reconnect to restore sharing.</p>}
         {/* Header row */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
+            <BrandLogo className="h-5 w-5" />
             <div
               className={`h-2 w-2 rounded-full ${statusDotColor[status.state.startsWith("error") ? "error" : status.state] ?? "bg-muted-foreground"}`}
             />
             <span className="text-sm font-semibold text-foreground">
-              macrdp
+              Greenmole RDP
             </span>
             {status.running && status.uptime_secs > 0 && (
               <span className="text-xs text-muted-foreground">
@@ -105,7 +107,7 @@ function Popover() {
               variant="destructive"
               size="icon-xs"
               onClick={handleQuit}
-              title="Quit macrdp and stop server"
+              title="Quit Greenmole RDP and stop server"
             >
               <LogOut className="h-3.5 w-3.5" />
             </Button>

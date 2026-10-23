@@ -20,7 +20,7 @@ ironrdp-acceptor = { path = "crates/ironrdp-acceptor-patched" }
 [workspace.package]
 edition = "2021"
 rust-version = "1.75"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

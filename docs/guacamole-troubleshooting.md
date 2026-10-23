@@ -8,13 +8,13 @@ creation and sent no monitor layouts.
 
 ## Check the Mac connection's settings
 
-In Guacamole administration, edit the specific RDP connection used for macrdp:
+In Guacamole administration, edit the specific RDP connection used for Greenmole RDP:
 
 1. Set **Resize method** to **Display update** (`resize-method=display-update`).
 2. Leave **Width** and **Height** unset so the initial size follows the browser.
 3. Save, fully disconnect that connection, and connect again before testing.
 
-Keep macrdp's resolution set to **Auto**. Its fixed-resolution mode intentionally
+Keep Greenmole RDP's resolution set to **Auto**. Its fixed-resolution mode intentionally
 ignores client resize requests.
 
 These are per-connection settings, so check the Mac connection even if a Windows
@@ -25,14 +25,14 @@ See the [official RDP display settings](https://guacamole.apache.org/doc/gug/con
 ## Identify where resizing stops
 
 After changing the setting and reconnecting, resize the browser without
-disconnecting. Check macrdp's logs:
+disconnecting. Check Greenmole RDP's logs:
 
 | Log evidence | Meaning and next step |
 | --- | --- |
 | `DisplayControl (CreationFailed(3221225473))` | Client rejected channel creation with `0xC0000001`; live resize is unavailable. |
 | `Display Control channel opened` | Channel creation succeeded. Resize the browser and look for a layout message. |
 | `Received client Display Control layout` | The server received new dimensions. Check the following resolution and capture logs if the desktop remains unchanged. |
-| `Applying resolution change` and `Activated capture and pointer desktop size` | Correlate requested, normalized, and activated sizes to diagnose the macrdp display/capture path. |
+| `Applying resolution change` and `Activated capture and pointer desktop size` | Correlate requested, normalized, and activated sizes to diagnose the Greenmole RDP display/capture path. |
 
 Success requires a received layout and an activated desktop size matching it
 after normalization. Initial dimensions or an open graphics channel alone do

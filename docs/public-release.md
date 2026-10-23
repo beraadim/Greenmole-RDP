@@ -34,7 +34,9 @@ notarization is possible for internal testing, but public mode requires both.
 
 ## Installation and upgrade acceptance
 
-Copy macrdp.app into `/Applications` and launch that installed copy consistently.
+Copy **Greenmole RDP.app** into `/Applications` and launch that installed copy
+consistently. The `com.macrdp.app` bundle identity and existing storage names
+remain unchanged for upgrade compatibility.
 Complete required Screen Recording and Accessibility setup on the physical
 display before starting the service. Enable clipboard file sharing only when
 needed; protected folders can require separate consent. System audio capture

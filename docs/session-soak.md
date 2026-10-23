@@ -14,7 +14,7 @@ There are two modes:
   actions and verifies each cycle from the server's structured lifecycle logs.
   A driver exiting successfully does not prove a connection or cleanup worked.
 
-The tool itself does not start/restart macrdp, lock the screen, inject input,
+The tool itself does not start/restart Greenmole RDP, lock the screen, inject input,
 change networking, invoke recovery, remove monitor registrations/profiles,
 restart ColorSync, change physical displays, or request administrator access.
 Native probes use read-only CoreGraphics/ColorSync queries, `ps`, and
@@ -22,17 +22,17 @@ Native probes use read-only CoreGraphics/ColorSync queries, `ps`, and
 
 ## Prepare the Mac after installing the test build
 
-1. Start the installed macrdp normally. Use a build with the fixed
+1. Start the installed Greenmole RDP normally. Use a build with the fixed
    `macrdp_transition` session, wake and private-guard markers (0.1.29 or later).
    Keep your existing connection/display/privacy settings.
 2. Make one normal warm-up connection and disconnect. Wait until the dashboard
    reports idle/cleanup complete. This avoids treating first-use native service
    activation or an initially created display identity as gradual accumulation.
-3. Leave only one macrdp server running and no client connected. Keep physical
+3. Leave only one Greenmole RDP server running and no client connected. Keep physical
    display connections, arrangement, resolution and the selected graphics mode
    unchanged for the test. Avoid unrelated profile/system updates during it.
-4. Find the root macrdp UI/server process PID in Activity Monitor. The root process
-   must be named `macrdp`, `macrdp-ui` or `macrdp-server`; its descendants are
+4. Find the root Greenmole RDP UI/server process PID in Activity Monitor. The root process
+   still uses a legacy name: `macrdp`, `macrdp-ui` or `macrdp-server`; its descendants are
    included in the process/RSS observations. Do not select a transient worker.
 5. Run the observer on this Mac as the same user, with a fresh report filename.
    Reports are created exclusively with mode `0600`; existing files are never
@@ -97,7 +97,7 @@ Driver requirements:
   is issued, and lets the established client remain alive for `disconnect`.
 - `disconnect` closes only that driver-owned connection, is safe to request if
   connection establishment failed, and returns zero promptly. It must not kill
-  macrdp, alter displays/settings, lock/restart the Mac, or close other sessions.
+  Greenmole RDP, alter displays/settings, lock/restart the Mac, or close other sessions.
 - Both actions run without interactive input and finish within `--action-timeout`
   (30 seconds by default). Stdout and stderr are discarded, not captured.
 - Abnormal action cleanup can terminate only the subprocess group created for
@@ -144,13 +144,13 @@ Every cycle is compared with the **original idle baseline**, including:
 - ColorSync display-device registration count, profile-entry count, and a
   fingerprint of registered display identities. The enumeration covers display
   devices in the user ColorSync registry; it does not delete obsolete entries.
-- The persisted macrdp virtual-monitor identity for `--port` (3389 by default).
+- The persisted Greenmole RDP virtual-monitor identity for `--port` (3389 by default).
   Missing/unreadable identity is unconfirmed; the tool never creates one.
 - Physical display count/topology, including arrangement, main-display status,
   dimensions and rotation, reduced to a fingerprint before reporting.
-- Online macrdp virtual-display count, compared with the idle baseline. A retained
+- Online Greenmole RDP virtual-display count, compared with the idle baseline. A retained
   disabled display is supported; the test does not require zero by assumption.
-- macrdp's named wake assertion count, which must return to zero.
+- Greenmole RDP's named wake assertion count, which must return to zero.
 - Root process generation, process-tree count, root/tree RSS, and process liveness.
   RSS growth has a configurable allowance (64 MiB by default) against the first
   baseline, so a gradual increase cannot be hidden by resetting the baseline.
@@ -170,7 +170,7 @@ Exit status is `0` for all requested cycles verified, `1` for an observed failur
 or driver failure, `2` for incomplete/unavailable evidence, and `3` for user
 interruption. The final JSONL record has the result and verified cycle count.
 Monitor/profile/process differences and RSS threshold breaches are acceptance
-signals to investigate, not proof by themselves that macrdp leaked a resource.
+signals to investigate, not proof by themselves that Greenmole RDP leaked a resource.
 The observer cannot measure physical cursor smoothness or prove that a remote
 image was presented; check both during the hardware test and correlate with the
 report and existing transition diagnostics.
@@ -186,5 +186,5 @@ evidence, failed restoration, multiple encoder owners, crashes, interruption,
 original-baseline resource growth, log loss, secret filtering and private report
 limits. Tiny temporary local executables verify the action protocol and abnormal
 owned-group cleanup, including a descendant that ignores TERM after its leader
-exits. These tests never run an RDP client, macrdp app, native display mutation,
+exits. These tests never run an RDP client, Greenmole RDP app, native display mutation,
 power assertion, recovery action or real network connection.

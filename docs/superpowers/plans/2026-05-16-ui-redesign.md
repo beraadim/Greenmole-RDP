@@ -1,12 +1,12 @@
-# MacRDP UI 重设计实施计划
+# MacRDP UI Redesign Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将 macrdp-ui 从基础 macOS 风格全面升级为 Xcode/Instruments 专业工具风格，包括新配色体系、分组侧边栏、实时图表仪表盘、Console.app 风格日志等。
+**Goal:** Upgrade macrdp-ui from a basic macOS appearance to the style of Xcode/Instruments professional tools, including a new color system, grouped sidebar, live dashboard charts and Console.app-style logs.
 
-**Architecture:** 自底向上实施——先建立设计系统基础(CSS 变量/字体)，然后构建可复用组件(StatusBar/MetricCard/ChartPanel 等)，最后逐页重写。每个 Task 产出可独立验证的工作成果。
+**Architecture:** Implement from the bottom up: establish the design-system foundation (CSS variables/fonts), build reusable components (StatusBar/MetricCard/ChartPanel and others), then rewrite each page. Each task produces independently verifiable work.
 
-**Tech Stack:** React 19, TypeScript, Tailwind CSS v4, Radix UI, lucide-react, Tauri 2, 手写 SVG 图表
+**Tech Stack:** React 19, TypeScript, Tailwind CSS v4, Radix UI, lucide-react, Tauri 2, hand-written SVG charts
 
 **Spec:** `docs/superpowers/specs/2026-05-16-ui-redesign-design.md`
 
@@ -14,74 +14,74 @@
 
 ## File Map
 
-### 新建文件
-| 文件 | 职责 |
+### New Files
+| File | Responsibility |
 |------|------|
-| `src/components/StatusBar.tsx` | 紧凑服务状态栏(运行状态/端口/运行时长/启停按钮) |
-| `src/components/MetricCard.tsx` | 单指标展示卡片(数字+标签+颜色) |
-| `src/components/ChartPanel.tsx` | SVG 图表容器(面积图/柱状图) |
-| `src/components/AreaChart.tsx` | SVG 面积图(60 点环形缓冲区) |
-| `src/components/BarChart.tsx` | SVG 柱状图(流量趋势) |
-| `src/components/ConnItem.tsx` | 连接列表项(质量指示条+用户信息+指标) |
-| `src/components/LogEntry.tsx` | 日志条目(等宽字体+颜色分级) |
-| `src/components/SettingRow.tsx` | 设置行(label+control 布局) |
-| `src/components/EmptyState.tsx` | 通用空状态组件(图标+文字) |
-| `src/hooks/useFpsHistory.ts` | FPS 环形缓冲区 hook(60 数据点) |
+| `src/components/StatusBar.tsx` | Compact service status bar (state/port/uptime/Start and Stop) |
+| `src/components/MetricCard.tsx` | Single-metric card (value, label and color) |
+| `src/components/ChartPanel.tsx` | SVG chart container (area/bar charts) |
+| `src/components/AreaChart.tsx` | SVG area chart (60-point ring buffer) |
+| `src/components/BarChart.tsx` | SVG bar chart (traffic trend) |
+| `src/components/ConnItem.tsx` | Connection item (quality indicator, user information and metrics) |
+| `src/components/LogEntry.tsx` | Log entry (monospace text and colored levels) |
+| `src/components/SettingRow.tsx` | Settings row (label and control layout) |
+| `src/components/EmptyState.tsx` | Shared empty-state component (icon and text) |
+| `src/hooks/useFpsHistory.ts` | FPS ring-buffer hook (60 samples) |
 
-### 重写文件
-| 文件 | 行数 | 变更内容 |
+### Files to Rewrite
+| File | Lines | Changes |
 |------|------|----------|
-| `src/styles/globals.css` | 222→~120 | 全面替换 CSS 变量，移除 oklch，新色彩体系 |
-| `src/components/Sidebar.tsx` | 94→~130 | 180px 宽 + 分组标题 + 底部主题切换 |
-| `src/pages/Dashboard.tsx` | 177→~180 | 状态栏+FPS图表+指标行+连接列表 |
-| `src/pages/Settings.tsx` | 369→~280 | 左右分栏(分类导航+选项面板) |
-| `src/pages/Logs.tsx` | 170→~150 | Console.app 风格，等宽字体+颜色分级 |
-| `src/pages/Statistics.tsx` | 256→~200 | 时间范围切换+柱状图+历史表 |
-| `src/pages/Permissions.tsx` | 104→~110 | 新样式权限卡片 |
-| `src/pages/About.tsx` | 154→~120 | 居中信息卡片，精简布局 |
+| `src/styles/globals.css` | 222→~120 | Replace all CSS variables, remove oklch and introduce the new colors |
+| `src/components/Sidebar.tsx` | 94→~130 | 180px width, section headings and bottom theme selector |
+| `src/pages/Dashboard.tsx` | 177→~180 | Status bar, FPS chart, metric row and connection list |
+| `src/pages/Settings.tsx` | 369→~280 | Two-column category navigation and options panel |
+| `src/pages/Logs.tsx` | 170→~150 | Console.app appearance, monospace text and colored levels |
+| `src/pages/Statistics.tsx` | 256→~200 | Time-range selector, bar chart and history table |
+| `src/pages/Permissions.tsx` | 104→~110 | Restyled permission cards |
+| `src/pages/About.tsx` | 154→~120 | Centered information card and simpler layout |
 
-### 修改文件
-| 文件 | 变更内容 |
+### Files to Modify
+| File | Changes |
 |------|----------|
-| `src/App.tsx` | 宽度 class, 替换 macos-* 引用, 移除 PermissionBanner |
-| `src/components/ThemeToggle.tsx` | 适配新位置(侧边栏底部)，图标形式 |
-| `src/pages/Popover.tsx` | 替换 macos-* class 引用为新变量名 |
-| `src-tauri/tauri.conf.json` | 窗口尺寸 960×620, 最小 800×500 |
-| `package.json` | 移除 `@fontsource-variable/geist` |
+| `src/App.tsx` | Width classes, replacement of macos-* references and removal of PermissionBanner |
+| `src/components/ThemeToggle.tsx` | Adapt to the sidebar bottom with an icon-based selector |
+| `src/pages/Popover.tsx` | Replace macos-* classes with the new variable names |
+| `src-tauri/tauri.conf.json` | Window size 960×620, minimum 800×500 |
+| `package.json` | Remove `@fontsource-variable/geist` |
 
-### 可删除文件
-| 文件 | 原因 |
+### Files That Can Be Deleted
+| File | Reason |
 |------|------|
-| `src/components/MetricsStrip.tsx` | 被 MetricCard 行替代 |
-| `src/components/StatusBadge.tsx` | 被 StatusBar 内状态圆点替代 |
-| `src/components/ServerInfoTags.tsx` | 信息合并到 StatusBar |
-| `src/components/PermissionCard.tsx` | 内联到 Permissions 页面 |
-| `src/components/PermissionBanner.tsx` | 功能由 Sidebar 红点 + Permissions 页覆盖 |
+| `src/components/MetricsStrip.tsx` | Replaced by the MetricCard row |
+| `src/components/StatusBadge.tsx` | Replaced by the StatusBar status dot |
+| `src/components/ServerInfoTags.tsx` | Information merged into StatusBar |
+| `src/components/PermissionCard.tsx` | Inlined into the Permissions page |
+| `src/components/PermissionBanner.tsx` | Covered by the Sidebar permission dot and Permissions page |
 
 ---
 
-## Task 1: 设计系统基础 — CSS 变量 + 字体 + 窗口配置
+## Task 1: Design-System Foundation — CSS Variables, Fonts and Window Configuration
 
 **Files:**
 - Rewrite: `macrdp-ui/src/styles/globals.css`
 - Modify: `macrdp-ui/src-tauri/tauri.conf.json`
 - Modify: `macrdp-ui/package.json`
-- Modify: `macrdp-ui/src/main.tsx` (如有 Geist 字体 import 则移除)
-- Modify: `macrdp-ui/src/App.tsx` (替换 `bg-macos-bg` 等旧 class)
-- Modify: `macrdp-ui/src/pages/Popover.tsx` (替换 `macos-*` 引用为新变量名)
+- Modify: `macrdp-ui/src/main.tsx` (remove any Geist font import)
+- Modify: `macrdp-ui/src/App.tsx` (replace old classes such as `bg-macos-bg`)
+- Modify: `macrdp-ui/src/pages/Popover.tsx` (replace `macos-*` references with the new names)
 
-> **迁移策略**: globals.css 重写时，在底部保留 `--color-macos-*` 作为新变量的别名（临时兼容层），确保未重写的文件（Popover 等）在过渡期间仍能构建。Task 11 清理时移除别名。或者，在本 Task 中同步将 App.tsx 和 Popover.tsx 中的 `macos-*` 引用替换为新变量名。推荐后者，一步到位。
+> **Migration strategy**: When rewriting globals.css, retain `--color-macos-*` aliases to the new variables at the bottom as a temporary compatibility layer, so files not yet rewritten (such as Popover) still build. Remove the aliases during Task 11. Alternatively, replace `macos-*` references in App.tsx and Popover.tsx in this task. The second approach is recommended because it completes the migration immediately.
 
-- [ ] **Step 1: 重写 globals.css**
+- [ ] **Step 1: Rewrite globals.css**
 
-替换全部 CSS 变量为新色彩体系。移除 oklch 语义变量和 `--color-macos-*` 前缀。保留 shadcn/ui 组件所需的基础变量映射（`--background`, `--foreground`, `--primary` 等），将它们指向新色值，确保 `src/components/ui/` 下的 shadcn 组件继续正常渲染。
+Replace all CSS variables with the new color system. Remove oklch semantic variables and the `--color-macos-*` prefix. Retain the base variable mappings required by shadcn/ui (`--background`, `--foreground`, `--primary` and others), pointing them to the new colors so components under `src/components/ui/` continue rendering correctly.
 
-关键内容结构:
+Key structure:
 ```css
 @import "tailwindcss";
 
 @theme {
-  /* 浅色模式（默认） */
+  /* Light mode (default) */
   --color-bg: #f5f5f7;
   --color-sidebar: #ebebed;
   --color-card: #ffffff;
@@ -97,11 +97,11 @@
   --color-purple: #af52de;
   --color-yellow: #ffcc00;
 
-  /* 字体 */
+  /* Fonts */
   --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', system-ui, sans-serif;
   --font-mono: 'SF Mono', SFMono-Regular, ui-monospace, Menlo, monospace;
 
-  /* 圆角 */
+  /* Corner radii */
   --radius-sm: 5px;
   --radius-md: 8px;
   --radius-lg: 10px;
@@ -124,7 +124,7 @@
   --color-yellow: #ffd60a;
 }
 
-/* 全局基础样式 */
+/* Global base styles */
 body {
   font-family: var(--font-sans);
   background: var(--color-bg);
@@ -132,22 +132,22 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* 全局过渡 */
+/* Global transitions */
 * { transition: color 150ms ease-out, background-color 150ms ease-out, border-color 150ms ease-out; }
 ```
 
-> 注意: Tailwind v4 的 `@theme` 指令自动生成对应的 utility class (如 `bg-card`, `text-muted`, `border-border`)。
+> Note: Tailwind v4's `@theme` directive generates the corresponding utility classes automatically, such as `bg-card`, `text-muted` and `border-border`.
 
-- [ ] **Step 2: 移除 Geist 字体 + 替换旧 class 引用**
+- [ ] **Step 2: Remove Geist and Replace Old Class References**
 
-Geist 字体 import 在 `globals.css` 中（已在 Step 1 中移除）。检查 `main.tsx` 是否也有，如有则移除。
+The Geist font import is in `globals.css` and was removed in Step 1. Check `main.tsx` as well and remove it there if present.
 
-移除 npm 依赖（如存在）:
+Remove the npm dependency if present:
 ```bash
 cd macrdp-ui && npm uninstall @fontsource-variable/geist 2>/dev/null || true
 ```
 
-替换 `App.tsx` 和 `Popover.tsx` 中的旧 `macos-*` class 引用为新变量:
+Replace old `macos-*` classes in `App.tsx` and `Popover.tsx` with the new variables:
 - `bg-macos-bg` → `bg-bg`
 - `bg-macos-card` → `bg-card`
 - `text-macos-text` → `text-text`
@@ -157,11 +157,11 @@ cd macrdp-ui && npm uninstall @fontsource-variable/geist 2>/dev/null || true
 - `bg-macos-blue` → `bg-accent`
 - `bg-macos-red` → `bg-red`
 - `text-macos-green` → `text-green`
-- 以此类推，全局搜索 `macos-` 并逐一替换
+- Continue similarly: search for `macos-` throughout the project and replace each occurrence.
 
-- [ ] **Step 3: 更新窗口尺寸**
+- [ ] **Step 3: Update Window Dimensions**
 
-修改 `macrdp-ui/src-tauri/tauri.conf.json` 中 main 窗口配置:
+Update the main-window configuration in `macrdp-ui/src-tauri/tauri.conf.json`:
 ```json
 {
   "width": 960,
@@ -171,12 +171,12 @@ cd macrdp-ui && npm uninstall @fontsource-variable/geist 2>/dev/null || true
 }
 ```
 
-- [ ] **Step 4: 验证基础构建**
+- [ ] **Step 4: Verify the Foundation Build**
 
 ```bash
 cd macrdp-ui && npm run build
 ```
-Expected: 构建成功，无错误。页面可正常加载（配色变化但布局未变）。
+Expected: The build succeeds without errors. Pages load normally, with updated colors and unchanged layout.
 
 - [ ] **Step 5: Commit**
 
@@ -187,82 +187,82 @@ git commit -m "refactor(ui): replace design system — new color tokens, system 
 
 ---
 
-## Task 2: 侧边栏重写 — 分组导航 + 底部主题切换
+## Task 2: Sidebar Rewrite — Grouped Navigation and Bottom Theme Selector
 
 **Files:**
 - Rewrite: `macrdp-ui/src/components/Sidebar.tsx`
 - Modify: `macrdp-ui/src/components/ThemeToggle.tsx`
-- Modify: `macrdp-ui/src/App.tsx` (sidebar 宽度 class)
+- Modify: `macrdp-ui/src/App.tsx` (sidebar width class)
 
-- [ ] **Step 1: 重写 Sidebar.tsx**
+- [ ] **Step 1: Rewrite Sidebar.tsx**
 
-新侧边栏结构:
-- 宽度 180px (`w-[180px]`)
-- 顶部 28px drag region
-- 三个分组: 服务(控制台) / 配置(设置, 权限) / 诊断(日志, 统计)
-- 分组标题: `text-[10px] font-semibold uppercase tracking-wider text-muted`
-- 导航项: lucide-react 图标(16px) + 文字标签(12px)
-- 选中态: `bg-accent/15 text-accent`
+New sidebar structure:
+- Width 180px (`w-[180px]`)
+- 28px drag region at the top
+- Three sections: Service (Dashboard) / Configuration (Settings, Permissions) / Diagnostics (Logs, Statistics)
+- Section headings: `text-[10px] font-semibold uppercase tracking-wider text-muted`
+- Navigation entries: lucide-react icon (16px) and text label (12px)
+- Selected state: `bg-accent/15 text-accent`
 - Hover: `hover:bg-accent/8`
-- 底部固定: 分隔线 + "关于"链接 + ThemeToggle
+- Pinned bottom area: divider, About link and ThemeToggle
 
 ```tsx
-// 导航项数据结构
+// Navigation-entry data structure
 const navGroups = [
   {
-    label: "服务",
-    items: [{ path: "/", icon: Monitor, label: "控制台" }],
+    label: "Service",
+    items: [{ path: "/", icon: Monitor, label: "Dashboard" }],
   },
   {
-    label: "配置",
+    label: "Configuration",
     items: [
-      { path: "/settings", icon: Settings, label: "设置" },
-      { path: "/permissions", icon: Shield, label: "权限" },
+      { path: "/settings", icon: Settings, label: "Settings" },
+      { path: "/permissions", icon: Shield, label: "Permissions" },
     ],
   },
   {
-    label: "诊断",
+    label: "Diagnostics",
     items: [
-      { path: "/logs", icon: FileText, label: "日志" },
-      { path: "/statistics", icon: Activity, label: "统计" },
+      { path: "/logs", icon: FileText, label: "Logs" },
+      { path: "/statistics", icon: Activity, label: "Statistics" },
     ],
   },
 ];
 ```
 
-ARIA: `<nav role="navigation">`, 当前项 `aria-current="page"`
+ARIA: `<nav role="navigation">`, with `aria-current="page"` on the current entry
 
-- [ ] **Step 2: 改造 ThemeToggle.tsx**
+- [ ] **Step 2: Refactor ThemeToggle.tsx**
 
-从独立悬浮按钮改为内联侧边栏底部元素:
-- 移除 fixed 定位和 z-50
-- 三态图标按钮: Sun / Moon / Monitor (lucide-react)
-- 点击循环: light → dark → system → light
-- 小尺寸: 28×28px 圆角按钮
-- 显示当前模式 tooltip
+Replace the standalone floating button with an inline element at the sidebar bottom:
+- Remove fixed positioning and z-50
+- Three-state icon button: Sun / Moon / Monitor (lucide-react)
+- Click cycle: light → dark → system → light
+- Small 28×28px rounded button
+- Tooltip showing the current mode
 
-- [ ] **Step 3: 更新 App.tsx 布局**
+- [ ] **Step 3: Update the App.tsx Layout**
 
-修改主布局中侧边栏宽度 class:
+Change the sidebar width class in the main layout:
 ```diff
 - <div className="w-52 ...">
 + <div className="w-[180px] flex-shrink-0 ...">
 ```
 
-确保内容区 `flex-1 overflow-y-auto` 正确填充剩余空间。
+Ensure the `flex-1 overflow-y-auto` content area fills the remaining space correctly.
 
-- [ ] **Step 4: 验证导航功能**
+- [ ] **Step 4: Verify Navigation**
 
 ```bash
 cd macrdp-ui && npm run dev
 ```
 
-手动验证:
-- 侧边栏 180px 宽，分组标题正确显示
-- 所有 6 个路由点击可切换
-- 选中态蓝色高亮
-- 主题切换在底部可用，三态循环正常
-- 权限红点指示器保留
+Verify manually:
+- The sidebar is 180px wide and section headings display correctly.
+- All six routes can be opened by clicking.
+- The selected entry is highlighted in blue.
+- The bottom theme control cycles through all three modes correctly.
+- The permission warning dot is retained.
 
 - [ ] **Step 5: Commit**
 
@@ -273,14 +273,14 @@ git commit -m "refactor(ui): rewrite sidebar — grouped navigation, 180px width
 
 ---
 
-## Task 3: 共享组件 — StatusBar + MetricCard + EmptyState
+## Task 3: Shared Components — StatusBar, MetricCard and EmptyState
 
 **Files:**
 - Create: `macrdp-ui/src/components/StatusBar.tsx`
 - Create: `macrdp-ui/src/components/MetricCard.tsx`
 - Create: `macrdp-ui/src/components/EmptyState.tsx`
 
-- [ ] **Step 1: 实现 StatusBar**
+- [ ] **Step 1: Implement StatusBar**
 
 Props:
 ```tsx
@@ -294,16 +294,16 @@ interface StatusBarProps {
 }
 ```
 
-布局: 单行 flex, 高 36px, `bg-card rounded-[8px] px-3`
-- 左侧: 状态圆点 (8px, glow via box-shadow) + 文字 + 辅助信息
-- 右侧: 启动/停止按钮
-- 状态色: running=green, starting=yellow, stopped=gray (`text-muted`), error=red
-- Error 态: `bg-red/10 border border-red/20` + 错误消息
+Layout: single flex row, 36px high, `bg-card rounded-[8px] px-3`
+- Left: status dot (8px, glow via box-shadow), text and supporting information
+- Right: Start/Stop button
+- Status colors: running=green, starting=yellow, stopped=gray (`text-muted`), error=red
+- Error state: `bg-red/10 border border-red/20` and error message
 - `role="status" aria-live="polite"`
 
-运行时间格式: `formatUptime(seconds)` → "2h 34m" / "5m" / "< 1m"
+Uptime format: `formatUptime(seconds)` → "2h 34m" / "5m" / "< 1m"
 
-- [ ] **Step 2: 实现 MetricCard**
+- [ ] **Step 2: Implement MetricCard**
 
 Props:
 ```tsx
@@ -316,12 +316,12 @@ interface MetricCardProps {
 }
 ```
 
-布局: `flex-1 bg-card rounded-[8px] p-2 text-center`
-- 数字: `text-xl font-bold` + 颜色映射
-- 无数据: `--` + `text-muted`
-- 标签: `text-[10px] text-muted mt-0.5`
+Layout: `flex-1 bg-card rounded-[8px] p-2 text-center`
+- Value: `text-xl font-bold` and mapped color
+- No data: `--` and `text-muted`
+- Label: `text-[10px] text-muted mt-0.5`
 
-颜色映射 (Tailwind class):
+Color mapping (Tailwind classes):
 ```tsx
 const colorMap = {
   blue: "text-accent",
@@ -331,7 +331,7 @@ const colorMap = {
 };
 ```
 
-- [ ] **Step 3: 实现 EmptyState**
+- [ ] **Step 3: Implement EmptyState**
 
 Props:
 ```tsx
@@ -341,12 +341,12 @@ interface EmptyStateProps {
 }
 ```
 
-布局: `flex flex-col items-center justify-center py-8 text-muted`
-- 图标 32px + 文字 12px
+Layout: `flex flex-col items-center justify-center py-8 text-muted`
+- 32px icon and 12px text
 
-- [ ] **Step 4: 验证组件渲染**
+- [ ] **Step 4: Verify Component Rendering**
 
-临时在 Dashboard 中 import 并渲染 StatusBar 和 MetricCard，确认样式正确。
+Temporarily import and render StatusBar and MetricCard in Dashboard to verify the styling.
 
 - [ ] **Step 5: Commit**
 
@@ -357,7 +357,7 @@ git commit -m "feat(ui): add StatusBar, MetricCard, EmptyState components"
 
 ---
 
-## Task 4: 图表组件 — AreaChart + BarChart + ChartPanel + useFpsHistory
+## Task 4: Chart Components — AreaChart, BarChart, ChartPanel and useFpsHistory
 
 **Files:**
 - Create: `macrdp-ui/src/components/AreaChart.tsx`
@@ -365,9 +365,9 @@ git commit -m "feat(ui): add StatusBar, MetricCard, EmptyState components"
 - Create: `macrdp-ui/src/components/ChartPanel.tsx`
 - Create: `macrdp-ui/src/hooks/useFpsHistory.ts`
 
-- [ ] **Step 1: 实现 useFpsHistory hook**
+- [ ] **Step 1: Implement the useFpsHistory Hook**
 
-60 元素环形缓冲区，每秒从 metrics 推入新数据点。使用 `useState` 触发重渲染:
+Use a 60-element ring buffer and push a metrics sample each second. Use `useState` to trigger rendering:
 ```tsx
 export function useFpsHistory(currentFps: number | null, maxPoints = 60): number[] {
   const bufferRef = useRef<number[]>([]);
@@ -378,18 +378,18 @@ export function useFpsHistory(currentFps: number | null, maxPoints = 60): number
     const buf = bufferRef.current;
     buf.push(currentFps);
     if (buf.length > maxPoints) buf.shift();
-    setTick(t => t + 1); // 触发重渲染使 AreaChart 更新
+    setTick(t => t + 1); // Trigger a render so AreaChart updates
   }, [currentFps, maxPoints]);
 
   return bufferRef.current;
 }
 ```
 
-> 注意: 仅用 `useRef` 不会触发 React 重渲染。`setTick` 是轻量的 forceUpdate 机制。
+> Note: `useRef` alone does not trigger React rendering. `setTick` provides a lightweight forceUpdate mechanism.
 
-- [ ] **Step 2: 实现 AreaChart**
+- [ ] **Step 2: Implement AreaChart**
 
-纯 SVG 面积图:
+Pure SVG area chart:
 ```tsx
 interface AreaChartProps {
   data: number[];
@@ -400,14 +400,14 @@ interface AreaChartProps {
 ```
 
 - SVG `viewBox="0 0 {width} {height}"`, `preserveAspectRatio="none"`
-- 数据点 → SVG path (polyline smoothed with simple interpolation)
-- 渐变填充: `<linearGradient>` 从 `{color}/30%` 到 `transparent`
-- 线条: `stroke={color} stroke-width="1.5" fill="none"`
-- 空数据: 不渲染 (ChartPanel 负责空态)
+- Data points → SVG path (polyline smoothed with simple interpolation)
+- Gradient fill: `<linearGradient>` from `{color}/30%` to `transparent`
+- Line: `stroke={color} stroke-width="1.5" fill="none"`
+- Empty data: render nothing; ChartPanel handles the empty state.
 
-- [ ] **Step 3: 实现 BarChart**
+- [ ] **Step 3: Implement BarChart**
 
-纯 SVG 柱状图:
+Pure SVG bar chart:
 ```tsx
 interface BarChartProps {
   data: { label: string; value: number }[];
@@ -416,32 +416,32 @@ interface BarChartProps {
 }
 ```
 
-- 等宽柱子, 间距 2px, 圆角顶部 (`rx="2"`)
-- 柱子高度按 maxValue 归一化
-- hover 时不透明度增加到 1.0 (默认 0.7)
+- Equal-width bars with 2px spacing and rounded tops (`rx="2"`)
+- Normalize bar heights by maxValue
+- Increase opacity to 1.0 on hover (default 0.7)
 
-- [ ] **Step 4: 实现 ChartPanel**
+- [ ] **Step 4: Implement ChartPanel**
 
-包装容器:
+Container component:
 ```tsx
 interface ChartPanelProps {
   title: string;
-  value?: string;         // 右侧显示的当前值
-  valueColor?: string;    // 当前值颜色
-  empty?: boolean;        // 是否无数据
-  emptyText?: string;     // 无数据提示 (default "等待数据...")
+  value?: string;         // Current value shown on the right
+  valueColor?: string;    // Current-value color
+  empty?: boolean;        // Whether data is unavailable
+  emptyText?: string;     // Empty-state message (default "Waiting for data...")
   children: React.ReactNode;
 }
 ```
 
-布局: `bg-card rounded-[8px] p-3`
-- Header: title(左, `text-[11px] text-muted`) + value(右, `text-[11px] font-medium`)
-- Body: children (图表)
-- 空态: 灰色虚线 + 居中文字
+Layout: `bg-card rounded-[8px] p-3`
+- Header: title on the left (`text-[11px] text-muted`) and value on the right (`text-[11px] font-medium`)
+- Body: children (the chart)
+- Empty state: gray dashed line and centered text
 
-- [ ] **Step 5: 验证图表渲染**
+- [ ] **Step 5: Verify Chart Rendering**
 
-临时在 Dashboard 中用静态数据渲染 AreaChart 和 BarChart，确认 SVG 正确绘制。
+Temporarily render AreaChart and BarChart in Dashboard using static data, and verify the SVG output.
 
 - [ ] **Step 6: Commit**
 
@@ -452,31 +452,31 @@ git commit -m "feat(ui): add SVG chart components (AreaChart, BarChart, ChartPan
 
 ---
 
-## Task 5: 连接组件 — ConnItem
+## Task 5: Connection Component — ConnItem
 
 **Files:**
 - Create: `macrdp-ui/src/components/ConnItem.tsx`
 
-- [ ] **Step 1: 实现 ConnItem**
+- [ ] **Step 1: Implement ConnItem**
 
-Props (复用现有 `Connection` 类型):
+Props (reuse the existing `Connection` type):
 ```tsx
 interface ConnItemProps {
   connection: Connection;
 }
 ```
 
-布局: `flex items-center justify-between bg-card rounded-[8px] p-2`
-- 左侧 3px 彩色指示条 (基于连接时长/流量的简单指示):
-  - 连接时间 > 10min → green (稳定连接)
-  - 连接时间 > 1min → orange (新连接)
-  - 否则 → accent (刚连上)
-- 主区: `client_name`@`client_ip` (`text-xs font-medium text-text`) + 连接时长 (`text-[10px] text-muted`)
-- 右侧: 流量 (`text-[11px] font-medium`, 格式化为 MB/GB) (`text-[10px] text-muted`)
+Layout: `flex items-center justify-between bg-card rounded-[8px] p-2`
+- Left 3px colored indicator, based on a simple connection-duration/traffic heuristic:
+  - Connected > 10min → green (stable connection)
+  - Connected > 1min → orange (new connection)
+  - Otherwise → accent (just connected)
+- Main area: `client_name`@`client_ip` (`text-xs font-medium text-text`) and connection duration (`text-[10px] text-muted`)
+- Right: traffic (`text-[11px] font-medium`, formatted as MB/GB) (`text-[10px] text-muted`)
 
-> 注意: `Connection` 类型只有 `client_ip`, `client_name`, `connected_at`, `bytes_total`。没有 per-connection FPS 数据。质量指示条基于连接时长而非 FPS。
+> Note: `Connection` contains only `client_ip`, `client_name`, `connected_at` and `bytes_total`. It has no per-connection FPS data. Base the quality indicator on connection duration instead of FPS.
 
-连接时长: 用 `connected_at` 与 `Date.now()` 差值计算，复用/新建 `formatDuration()` helper
+Connection duration: calculate the difference between `connected_at` and `Date.now()`; reuse or add a `formatDuration()` helper.
 
 - [ ] **Step 2: Commit**
 
@@ -487,7 +487,7 @@ git commit -m "feat(ui): add ConnItem component with quality indicator"
 
 ---
 
-## Task 6: Dashboard 页面重写
+## Task 6: Dashboard Page Rewrite
 
 **Files:**
 - Rewrite: `macrdp-ui/src/pages/Dashboard.tsx`
@@ -495,46 +495,46 @@ git commit -m "feat(ui): add ConnItem component with quality indicator"
 - Delete: `macrdp-ui/src/components/StatusBadge.tsx`
 - Delete: `macrdp-ui/src/components/ServerInfoTags.tsx`
 
-- [ ] **Step 1: 重写 Dashboard.tsx**
+- [ ] **Step 1: Rewrite Dashboard.tsx**
 
-Import 新组件: StatusBar, MetricCard, ChartPanel, AreaChart, ConnItem, EmptyState
+Import the new components: StatusBar, MetricCard, ChartPanel, AreaChart, ConnItem, EmptyState
 Import hooks: useServerStatus, useMetrics, useConnections, useFpsHistory
 
-布局 (从上到下, `flex flex-col gap-3 p-4 overflow-y-auto`):
+Layout (top to bottom, `flex flex-col gap-3 p-4 overflow-y-auto`):
 ```
 1. StatusBar — state/port/uptime/onStart/onStop
-2. ChartPanel("帧率 (FPS)") → AreaChart(fpsHistory, accent color)
+2. ChartPanel("Frame rate (FPS)") → AreaChart(fpsHistory, accent color)
 3. div.flex.gap-2 →
    MetricCard(fps, "FPS", "blue")
    MetricCard(bitrate, "Mbps", "green", v => (v/1000).toFixed(1))
-   MetricCard(latency, "ms 延迟", "orange")
-   MetricCard(connectionCount, "连接", "purple")
+   MetricCard(latency, "ms latency", "orange")
+   MetricCard(connectionCount, "Connections", "purple")
 4. ConnPanel (bg-card rounded-[8px] p-3):
-   Header: "活跃连接" + count badge
+   Header: "Active connections" and count badge
    connections.map(c => <ConnItem key={c.id} connection={c} />)
-   或 EmptyState("暂无活跃连接")
+   Or EmptyState("No active connections")
 ```
 
-数据流:
+Data flow:
 - `const { status, start, stop } = useServerStatus()`
 - `const metrics = useMetrics()`
 - `const connections = useConnections()`
 - `const fpsHistory = useFpsHistory(metrics?.fps ?? null)`
 
-- [ ] **Step 2: 删除废弃组件**
+- [ ] **Step 2: Delete Obsolete Components**
 
-删除 `MetricsStrip.tsx`、`StatusBadge.tsx`、`ServerInfoTags.tsx`。在项目中 grep 确认无其他引用。
+Delete `MetricsStrip.tsx`, `StatusBadge.tsx` and `ServerInfoTags.tsx`. Search the project to confirm that no references remain.
 
-- [ ] **Step 3: 验证 Dashboard**
+- [ ] **Step 3: Verify Dashboard**
 
 ```bash
 cd macrdp-ui && npm run dev
 ```
 
-手动验证:
-- 服务停止时: 灰色状态栏 + 图表空态 + 连接空态
-- 服务启动后: 绿色状态栏 + FPS 曲线逐步填充 + 指标卡片实时更新
-- 有连接时: 连接列表显示，彩色指示条正确
+Verify manually:
+- Service stopped: gray status bar, empty chart and empty connection list
+- Service running: green status bar, FPS curve fills progressively and metric cards update live
+- Connected: connection list displays with the correct colored indicators
 
 - [ ] **Step 4: Commit**
 
@@ -546,13 +546,13 @@ git commit -m "feat(ui): rewrite Dashboard — status bar, FPS chart, metrics ca
 
 ---
 
-## Task 7: 设置页重写 — 左右分栏
+## Task 7: Settings Page Rewrite — Two-Column Layout
 
 **Files:**
 - Create: `macrdp-ui/src/components/SettingRow.tsx`
 - Rewrite: `macrdp-ui/src/pages/Settings.tsx`
 
-- [ ] **Step 1: 实现 SettingRow**
+- [ ] **Step 1: Implement SettingRow**
 
 Props:
 ```tsx
@@ -563,45 +563,45 @@ interface SettingRowProps {
 }
 ```
 
-布局: `flex items-center justify-between bg-card rounded-[6px] px-3 py-2`
-- 左侧: label (`text-xs text-text-secondary`) + optional description (`text-[10px] text-muted`)
-- 右侧: children (control slot)
+Layout: `flex items-center justify-between bg-card rounded-[6px] px-3 py-2`
+- Left: label (`text-xs text-text-secondary`) and optional description (`text-[10px] text-muted`)
+- Right: children (control slot)
 
-- [ ] **Step 2: 重写 Settings.tsx**
+- [ ] **Step 2: Rewrite Settings.tsx**
 
-左右分栏结构:
+Two-column structure:
 ```tsx
 const categories = [
-  { id: "rdp", label: "RDP 服务" },
-  { id: "network", label: "网络" },
-  { id: "security", label: "安全" },
-  { id: "display", label: "显示" },
-  { id: "audio", label: "音频" },
-  { id: "general", label: "通用" },
+  { id: "rdp", label: "RDP Service" },
+  { id: "network", label: "Network" },
+  { id: "security", label: "Security" },
+  { id: "display", label: "Display" },
+  { id: "audio", label: "Audio" },
+  { id: "general", label: "General" },
 ];
 ```
 
-布局: `flex h-full`
-- 左侧导航 (140px, `border-r border-border`): 分类列表，选中态 `bg-accent/12 text-accent`
-- 右侧面板 (`flex-1 overflow-y-auto p-4`): 分组标题 + SettingRow 列表
+Layout: `flex h-full`
+- Left navigation (140px, `border-r border-border`): category list with `bg-accent/12 text-accent` for the selected item
+- Right panel (`flex-1 overflow-y-auto p-4`): section heading and SettingRow list
 
-每个分类的字段直接映射 UiConfig:
-- RDP 服务: encoder (Select), bitrate_mbps (Select: 2/4/8/16/32), frame_rate (Select: 30/60/120), chroma_mode (Select)
-- 网络: port (Input), bind_address (Input), max_connections (Input), idle_timeout_secs (Input)
-- 安全: username (Input), password (Input type=password)
-- 显示: hidpi_scale (Select: 1/2/3/4), show_cursor (Switch)
-- 音频: 显示"音频配置尚未开放"提示
-- 通用: log_level (Select), auto_start (Switch), 主题 (三态 Select)
+Map each category directly to UiConfig fields:
+- RDP Service: encoder (Select), bitrate_mbps (Select: 2/4/8/16/32), frame_rate (Select: 30/60/120), chroma_mode (Select)
+- Network: port (Input), bind_address (Input), max_connections (Input), idle_timeout_secs (Input)
+- Security: username (Input), password (Input type=password)
+- Display: hidpi_scale (Select: 1/2/3/4), show_cursor (Switch)
+- Audio: show an "Audio configuration is not yet available" notice
+- General: log_level (Select), auto_start (Switch), theme (three-way Select)
 
-保持现有 `setConfig(key, value)` 调用模式和 `restart_required` 提示。
+Preserve the existing `setConfig(key, value)` calling pattern and `restart_required` notice.
 
-- [ ] **Step 3: 验证设置页**
+- [ ] **Step 3: Verify Settings**
 
-手动验证:
-- 左侧分类点击切换
-- 右侧选项正确显示
-- 修改设置值能正确调用 `setConfig`
-- restart_required 提示正常弹出
+Verify manually:
+- Clicking left-side categories changes the selection.
+- The right-side options display correctly.
+- Editing values calls `setConfig` correctly.
+- The restart_required notice appears correctly.
 
 - [ ] **Step 4: Commit**
 
@@ -612,51 +612,51 @@ git commit -m "feat(ui): rewrite Settings — split panel layout with category n
 
 ---
 
-## Task 8: 日志页重写 — Console.app 风格
+## Task 8: Logs Page Rewrite — Console.app Style
 
 **Files:**
 - Create: `macrdp-ui/src/components/LogEntry.tsx`
 - Rewrite: `macrdp-ui/src/pages/Logs.tsx`
 
-- [ ] **Step 1: 实现 LogEntry**
+- [ ] **Step 1: Implement LogEntry**
 
-Props (复用现有 `LogEntry` 类型):
+Props (reuse the existing `LogEntry` type):
 ```tsx
 interface LogEntryRowProps {
   entry: LogEntry;
 }
 ```
 
-布局: `flex gap-2 px-2.5 py-1 border-b border-border font-mono text-[11px]`
-- 时间戳: `min-w-[70px] text-muted` (format: "HH:mm:ss")
-- 级别: `min-w-[40px] font-semibold` + 颜色映射
+Layout: `flex gap-2 px-2.5 py-1 border-b border-border font-mono text-[11px]`
+- Timestamp: `min-w-[70px] text-muted` (format: "HH:mm:ss")
+- Level: `min-w-[40px] font-semibold` and mapped color
   - "info" → `text-accent`, "warn" → `text-orange`, "error" → `text-red`, "debug" → `text-muted`, "trace" → `text-muted`
-- 消息: `flex-1 text-text-secondary truncate`
+- Message: `flex-1 text-text-secondary truncate`
 
-- [ ] **Step 2: 重写 Logs.tsx**
+- [ ] **Step 2: Rewrite Logs.tsx**
 
-布局 (`flex flex-col gap-3 p-4 h-full`):
+Layout (`flex flex-col gap-3 p-4 h-full`):
 ```
-1. Header: 标题 "日志" + 实时指示 (● 绿色 "实时" / ⏸ 灰色 "已暂停")
-2. Toolbar: 级别筛选标签 + 搜索框 (flex gap-1.5)
-   - 筛选: "全部" | "Error" | "Warn" | "Info" | "Debug"
-   - 选中态: bg-accent/15 border-accent text-accent
-   - 默认态: bg-card border-border-subtle text-muted
-   - 搜索: flex-1, bg-card, border, rounded-[5px], placeholder "搜索日志..."
+1. Header: "Logs" and live indicator (green ● "Live" / gray ⏸ "Paused")
+2. Toolbar: level filters and search input (flex gap-1.5)
+   - Filters: "All" | "Error" | "Warn" | "Info" | "Debug"
+   - Selected state: bg-accent/15 border-accent text-accent
+   - Default state: bg-card border-border-subtle text-muted
+   - Search: flex-1, bg-card, border, rounded-[5px], placeholder "Search logs..."
 3. LogList: flex-1 overflow-y-auto, bg-[#1a1a1a] dark:bg-[#111] rounded-[6px] border
    - logs.filter(levelFilter).filter(searchFilter).map(log => <LogEntry />)
-   - 空态: EmptyState("暂无日志记录") 或 "未找到匹配的日志"
+   - Empty state: EmptyState("No log entries") or "No matching logs"
 ```
 
-保持现有 useLogs hook 的 polling 机制和 auto-scroll 逻辑。
+Preserve the existing useLogs polling mechanism and automatic-scrolling logic.
 
-- [ ] **Step 3: 验证日志页**
+- [ ] **Step 3: Verify Logs**
 
-手动验证:
-- 等宽字体正确显示
-- 级别颜色编码正确 (INFO=蓝, WARN=橙, ERROR=红)
-- 筛选和搜索功能正常
-- 自动滚动/暂停切换正常
+Verify manually:
+- Monospace text renders correctly.
+- Severity colors are correct (INFO=blue, WARN=orange, ERROR=red).
+- Filtering and search work.
+- Automatic scrolling and pause/resume work.
 
 - [ ] **Step 4: Commit**
 
@@ -667,40 +667,40 @@ git commit -m "feat(ui): rewrite Logs — Console.app style with monospace font 
 
 ---
 
-## Task 9: 统计页重写
+## Task 9: Statistics Page Rewrite
 
 **Files:**
 - Rewrite: `macrdp-ui/src/pages/Statistics.tsx`
 
-- [ ] **Step 1: 重写 Statistics.tsx**
+- [ ] **Step 1: Rewrite Statistics.tsx**
 
-布局 (`flex flex-col gap-3 p-4 overflow-y-auto`):
+Layout (`flex flex-col gap-3 p-4 overflow-y-auto`):
 ```
-1. Header: "统计" + 时间范围切换 (7天 | 30天, pill 按钮组)
-2. 汇总卡片行: 3× MetricCard
-   - 总连接数 (blue)
-   - 总流量 (green, 格式化 GB/MB)
-   - 平均会话时长 (orange, 格式化 h m)
-3. ChartPanel("流量趋势") → BarChart(trafficStats)
-4. 连接历史表:
+1. Header: "Statistics" and time-range selector (7 days | 30 days, pill-button group)
+2. Summary-card row: 3× MetricCard
+   - Total connections (blue)
+   - Total traffic (green, formatted as GB/MB)
+   - Average session duration (orange, formatted as h m)
+3. ChartPanel("Traffic trend") → BarChart(trafficStats)
+4. Connection-history table:
    bg-card rounded-[8px] p-3
-   Header: 用户 | 时间 | 时长 | 流量 (text-[10px] text-muted font-medium)
+   Header: User | Time | Duration | Traffic (text-[10px] text-muted font-medium)
    Rows: text-[11px], border-b border-border
-   分页保持现有逻辑 (PAGE_SIZE=20)
+   Preserve the existing pagination logic (PAGE_SIZE=20).
 ```
 
-数据: 复用现有 `getTrafficStats(days)` 和 `getConnectionHistory(limit, offset)`。
-`days` 根据选中的时间范围切换 (7 or 30)。
+Data: reuse `getTrafficStats(days)` and `getConnectionHistory(limit, offset)`.
+Set `days` from the selected time range (7 or 30).
 
-空态: MetricCard 显示 `--`，ChartPanel 显示"暂无统计数据"，表格显示 EmptyState。
+Empty state: MetricCard shows `--`, ChartPanel shows "No statistics available", and the table shows EmptyState.
 
-- [ ] **Step 2: 验证统计页**
+- [ ] **Step 2: Verify Statistics**
 
-手动验证:
-- 7天/30天切换正确请求数据
-- 柱状图正确渲染
-- 分页功能正常
-- 无数据时空态显示
+Verify manually:
+- The 7-day/30-day selector requests the correct data.
+- The bar chart renders correctly.
+- Pagination works.
+- The empty state appears when no data is available.
 
 - [ ] **Step 3: Commit**
 
@@ -711,55 +711,55 @@ git commit -m "feat(ui): rewrite Statistics — time range selector, bar chart, 
 
 ---
 
-## Task 10: 权限页 + 关于页重写
+## Task 10: Permissions and About Page Rewrites
 
 **Files:**
 - Rewrite: `macrdp-ui/src/pages/Permissions.tsx`
 - Rewrite: `macrdp-ui/src/pages/About.tsx`
-- Modify: `macrdp-ui/src/App.tsx` (移除 PermissionBanner import 和渲染)
-- Delete: `macrdp-ui/src/components/PermissionCard.tsx` (内联到页面)
-- Delete: `macrdp-ui/src/components/PermissionBanner.tsx` (替换为 inline 提示)
+- Modify: `macrdp-ui/src/App.tsx` (remove the PermissionBanner import and rendering)
+- Delete: `macrdp-ui/src/components/PermissionCard.tsx` (inline into the page)
+- Delete: `macrdp-ui/src/components/PermissionBanner.tsx` (replace with an inline notice)
 
-- [ ] **Step 1: 重写 Permissions.tsx**
+- [ ] **Step 1: Rewrite Permissions.tsx**
 
-布局 (`flex flex-col gap-3 p-4`):
+Layout (`flex flex-col gap-3 p-4`):
 ```
-1. Header: "权限"
-2. 全部已授权时: 绿色提示条 (bg-green/10 border-green/20 text-green)
-3. 权限卡片列表 (gap-2):
-   每个卡片: bg-card rounded-[8px] p-3
-   - 左侧: 图标 (Monitor/Hand/Mic) + 名称 + 状态文字
-   - 右侧: 已授权 → 绿色 ✓ / 未授权 → "前往系统设置" 按钮 (橙色)
+1. Header: "Permissions"
+2. When all permissions are granted: green notice (bg-green/10 border-green/20 text-green)
+3. Permission-card list (gap-2):
+   Each card: bg-card rounded-[8px] p-3
+   - Left: icon (Monitor/Hand/Mic), name and status text
+   - Right: granted → green ✓ / not granted → "Open System Settings" button (orange)
 ```
 
-权限: screen_capture (屏幕录制), accessibility (辅助功能), microphone (麦克风)
+Permissions: screen_capture (Screen Recording), accessibility (Accessibility), microphone (Microphone)
 
-- [ ] **Step 2: 重写 About.tsx**
+- [ ] **Step 2: Rewrite About.tsx**
 
-布局 (`flex flex-col items-center justify-center h-full p-4`):
+Layout (`flex flex-col items-center justify-center h-full p-4`):
 ```
-居中卡片 (bg-card rounded-[10px] p-6 max-w-sm text-center):
-1. App 图标 (64px)
+Centered card (bg-card rounded-[10px] p-6 max-w-sm text-center):
+1. App icon (64px)
 2. "MacRDP" (text-lg font-semibold)
-3. 版本号 (text-xs text-muted)
-4. 分隔线
-5. 技术栈: IronRDP · OpenH264 · ScreenCaptureKit (text-[11px] text-muted)
-6. 链接行: GitHub | License | 检查更新 (text-xs text-accent)
+3. Version (text-xs text-muted)
+4. Divider
+5. Technology: IronRDP · OpenH264 · ScreenCaptureKit (text-[11px] text-muted)
+6. Links: GitHub | License | Check for updates (text-xs text-accent)
 ```
 
-- [ ] **Step 3: 删除废弃组件 + 更新 App.tsx**
+- [ ] **Step 3: Delete Obsolete Components and Update App.tsx**
 
-删除 `PermissionCard.tsx` 和 `PermissionBanner.tsx`。
-同步修改 `App.tsx`: 移除 `import PermissionBanner` 和对应的 `<PermissionBanner />` 渲染（当前在 Sidebar 和 main content 之间）。权限警告功能已由新 Sidebar 的 permission 红点和 Permissions 页面覆盖。
+Delete `PermissionCard.tsx` and `PermissionBanner.tsx`.
+Update `App.tsx` at the same time: remove `import PermissionBanner` and the `<PermissionBanner />` rendering currently between Sidebar and the main content. The new Sidebar permission dot and Permissions page cover the warning functionality.
 
-Grep 确认无其他引用:
+Search to confirm that no other references remain:
 ```bash
 cd macrdp-ui && grep -r "PermissionBanner\|PermissionCard" src/ --include="*.tsx"
 ```
 
-- [ ] **Step 4: 验证两个页面**
+- [ ] **Step 4: Verify Both Pages**
 
-手动验证权限页和关于页显示正确。
+Verify manually that Permissions and About display correctly.
 
 - [ ] **Step 5: Commit**
 
@@ -771,47 +771,47 @@ git commit -m "feat(ui): rewrite Permissions and About pages, remove PermissionB
 
 ---
 
-## Task 11: 清理 + 全面验证
+## Task 11: Cleanup and Complete Verification
 
 **Files:**
 - Modify: Various (cleanup unused imports, dead code)
 
-- [ ] **Step 1: 清理未使用的 shadcn 变量**
+- [ ] **Step 1: Remove Unused shadcn Variables**
 
-检查 `globals.css` 是否还有残留的旧变量引用。Grep 整个 `src/` 目录:
+Check globals.css for remaining references to old variables. Search the entire `src/` directory:
 ```bash
 cd macrdp-ui && grep -r "macos-" src/ --include="*.tsx" --include="*.ts" --include="*.css"
 ```
 
-清除所有对旧 `macos-*` 变量的引用，替换为新变量名。
+Replace all old `macos-*` variable references with the new names.
 
-- [ ] **Step 2: 检查未使用的 imports**
+- [ ] **Step 2: Check for Unused Imports**
 
 ```bash
 cd macrdp-ui && npx tsc --noEmit
 ```
 
-修复所有 TypeScript 编译错误和未使用的 imports。
+Fix all TypeScript compilation errors and unused imports.
 
-- [ ] **Step 3: 构建验证**
+- [ ] **Step 3: Verify the Build**
 
 ```bash
 cd macrdp-ui && npm run build
 ```
 
-Expected: 构建成功，无错误，无警告。
+Expected: The build succeeds without errors or warnings.
 
-- [ ] **Step 4: 全面功能验证**
+- [ ] **Step 4: Complete Functional Verification**
 
-逐页手动测试:
-- [ ] Dashboard: 启停服务、图表渲染、连接列表
-- [ ] Settings: 所有分类、所有控件、配置保存
-- [ ] Permissions: 权限状态检测、跳转系统设置
-- [ ] Logs: 筛选、搜索、自动滚动
-- [ ] Statistics: 时间范围切换、分页
-- [ ] About: 版本信息、链接
-- [ ] 主题切换: 浅色/深色/跟随系统 三态正常
-- [ ] Popover: 不受影响，仍然可用
+Test each page manually:
+- [ ] Dashboard: service Start/Stop, chart rendering and connection list
+- [ ] Settings: all categories, controls and configuration persistence
+- [ ] Permissions: permission-state checks and links to System Settings
+- [ ] Logs: filters, search and automatic scrolling
+- [ ] Statistics: time-range selection and pagination
+- [ ] About: version information and links
+- [ ] Theme: Light/Dark/System modes work correctly
+- [ ] Popover: unaffected and still functional
 
 - [ ] **Step 5: Final Commit**
 

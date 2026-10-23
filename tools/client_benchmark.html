@@ -2,12 +2,12 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MacRDP repeatable client workload</title>
+<title>Greenmole RDP repeatable client workload</title>
 <style>
 body{font:16px system-ui,sans-serif;background:#132232;color:#e6eff6;margin:20px}header{max-width:1100px;display:flex;gap:20px;align-items:center}button{padding:12px 24px;font:inherit}h1{font-size:22px;margin:0}#cue{background:#22445f;padding:12px;min-height:40px}#content{display:grid;grid-template-columns:1fr 1fr;gap:16px}#text,#scroll{background:#f2f4f6;color:#14283b;padding:16px;height:260px;overflow:hidden;white-space:pre-wrap;font:16px/24px monospace}#scroll{white-space:normal}.row{height:40px;border-bottom:1px solid #abc;display:flex;align-items:center}.row:nth-child(odd){background:#d9e5ec}canvas{width:100%;height:260px;background:#173047}textarea{width:95%;height:60px;font:16px monospace}small{color:#b9ccd9}#status{color:#ffd27c}#phase{font-weight:bold}
 </style>
 <body data-token="BENCHMARK_TOKEN">
-<header><button id="start">Start 170-second suite</button><div><h1>MacRDP repeatable rendering workload</h1><small>Open this page on the streamed Mac. Keep it foreground. No passwords or typed text are recorded.</small></div></header>
+<header><button id="start">Start 170-second suite</button><div><h1>Greenmole RDP repeatable rendering workload</h1><small>Open this page on the streamed Mac. Keep it foreground. No passwords or typed text are recorded.</small></div></header>
 <p id="phase">Ready • fixed seed 12345678 • repeat the same viewport and client settings</p>
 <p id="cue">Source rendering, server samples and manual checks are recorded separately. This does not measure input-to-display latency.</p>
 <div id="content"><div><div id="text">Deterministic typing and short pauses</div><p>Optional real RDP keyboard check (records event count only):</p><textarea id="input" aria-label="Manual RDP keyboard check" placeholder="Type the same sentence in each run"></textarea></div><div><div id="scroll"></div><canvas id="video" width="960" height="520" aria-label="Synthetic video-like moving scene"></canvas></div></div>

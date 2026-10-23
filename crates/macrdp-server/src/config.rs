@@ -3,7 +3,7 @@ use macrdp_core::{DisplayBackend, ServerConfig};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "macrdp", about = "macOS RDP Server", version)]
+#[command(name = "Greenmole RDP", bin_name = "macrdp-server", about = "Greenmole RDP — macOS Remote Desktop Server", version)]
 pub struct Cli {
     /// TCP port to listen on (defaults to the configuration file, or 3389).
     #[arg(short, long)]

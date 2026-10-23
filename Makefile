@@ -1,28 +1,28 @@
 .PHONY: help build build-cli build-ui build-ui-rust build-ui-frontend \
        dev dev-cli dev-ui clean clean-cli clean-ui \
-       install run-cli run-ui check release release-fast link-cli
+       install run-cli run-cli-ipc run-ui check release release-fast link-cli
 
 # Default target
 help:
-	@echo "macrdp Makefile"
+	@echo "Greenmole RDP Makefile"
 	@echo ""
-	@echo "  开发:"
-	@echo "    make install          安装前端依赖"
-	@echo "    make build-cli        编译 CLI"
-	@echo "    make dev-ui           启动 UI 开发模式 (Tauri)"
-	@echo "    make dev-front        仅启动前端 dev server"
-	@echo "    make run-cli          运行 CLI (端口 3389)"
-	@echo "    make run-cli-ipc      运行 CLI + IPC socket"
-	@echo "    make check            检查所有编译"
+	@echo "  Development:"
+	@echo "    make install          Install frontend dependencies"
+	@echo "    make build-cli        Build CLI"
+	@echo "    make dev-ui           Start UI development mode (Tauri)"
+	@echo "    make dev-front        Start only the frontend dev server"
+	@echo "    make run-cli          Run CLI (port 3389)"
+	@echo "    make run-cli-ipc      Legacy CLI alias (private IPC is automatic)"
+	@echo "    make check            Run all checks"
 	@echo ""
-	@echo "  发布:"
-	@echo "    make release          完整发布构建 (CLI+UI, 优化, dmg)"
-	@echo "    make release-fast     快速发布构建 (无优化, dmg)"
+	@echo "  Release:"
+	@echo "    make release          Full release build (optimized CLI+UI, DMG)"
+	@echo "    make release-fast     Fast release build (unoptimized, DMG)"
 	@echo ""
-	@echo "  清理:"
-	@echo "    make clean            清理所有构建产物"
-	@echo "    make clean-cli        仅清理 CLI"
-	@echo "    make clean-ui         仅清理 UI"
+	@echo "  Clean:"
+	@echo "    make clean            Remove all build artifacts"
+	@echo "    make clean-cli        Clean only CLI artifacts"
+	@echo "    make clean-ui         Clean only UI artifacts"
 
 # === CLI ===
 
@@ -37,8 +37,9 @@ build-cli: link-cli
 run-cli:
 	cargo run -p macrdp-server
 
-run-cli-ipc:
-	cargo run -p macrdp-server -- --ipc-socket /tmp/macrdp.sock
+
+# The supervised server now owns private IPC automatically.
+run-cli-ipc: run-cli
 
 clean-cli:
 	cargo clean
@@ -63,32 +64,32 @@ dev-front:
 clean-ui:
 	rm -rf macrdp-ui/dist macrdp-ui/src-tauri/target
 
-# === 发布 ===
+# === Release ===
 
 BUNDLE_ID := com.macrdp.app
-SIGN_IDENTITY := macrdp-dev
-APP_BUNDLE := macrdp-ui/src-tauri/target/release/bundle/macos/macrdp.app
+SIGN_IDENTITY ?= -
+APP_BUNDLE := macrdp-ui/src-tauri/target/release/bundle/macos/Greenmole RDP.app
 
-# Tauri 自动签名：设置此环境变量后 tauri build 会自动 codesign
-export APPLE_SIGNING_IDENTITY := $(SIGN_IDENTITY)
+# Tauri signing environment for certificate-based builds
+export MACRDP_SIGNING_IDENTITY ?= $(SIGN_IDENTITY)
 
-# 完整发布：全优化编译 + 自动签名 + 打包 dmg
+# Full release: optimized build, signing and DMG packaging
 release:
-	@echo "=== 完整发布构建 (签名: $(SIGN_IDENTITY)) ==="
+	@echo "=== Full release build (signing: $(MACRDP_SIGNING_IDENTITY)) ==="
 	cd macrdp-ui && BUNDLE_ID=$(BUNDLE_ID) MACRDP_CLI_PROFILE=release ./build.sh
 	@echo ""
-	@echo "=== 构建完成 ==="
+	@echo "=== Build complete ==="
 	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
 
-# 快速发布：关闭优化 + 自动签名 + 打包 dmg
+# Fast release: unoptimized build, signing and DMG packaging
 release-fast:
-	@echo "=== 快速发布构建 (签名: $(SIGN_IDENTITY)) ==="
+	@echo "=== Fast release build (signing: $(MACRDP_SIGNING_IDENTITY)) ==="
 	cd macrdp-ui && BUNDLE_ID=$(BUNDLE_ID) MACRDP_CLI_PROFILE=debug ./build.sh
 	@echo ""
-	@echo "=== 构建完成 ==="
+	@echo "=== Build complete ==="
 	@ls -lh macrdp-ui/src-tauri/target/debug/bundle/dmg/*.dmg
 
-# === 全局 ===
+# === Global ===
 
 build: build-cli build-ui-front build-ui-rust
 

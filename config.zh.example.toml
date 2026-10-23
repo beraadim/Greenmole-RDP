@@ -1,102 +1,106 @@
-# macrdp 服务端配置文件
-# 将此文件复制为 config.toml 并根据需要修改
-# 配置文件搜索顺序: ./config.toml → ~/.config/macrdp/ → ~/Library/Application Support/macrdp/
+# Greenmole RDP server configuration (legacy example filename)
+# Copy this file to config.toml and modify as needed.
+# Config search order: ./config.toml → ~/.config/macrdp/ → ~/Library/Application Support/macrdp/
 
-# ─── 网络 ─────────────────────────────────────────────────────────────────────
+# ─── Network ───────────────────────────────────────────────────────────────────
 
-# 监听端口
-# 默认值: 3389 (RDP 标准端口, 1024 以下需要 sudo 权限)
-# 可选值: 任意有效端口号 (建议 1024-65535)
+# TCP port to listen on
+# Default: 3389 (standard RDP port; ports below 1024 require elevated privileges)
+# Options: any valid port number (1024-65535 recommended)
 port = 13389
 
-# ─── 认证 ─────────────────────────────────────────────────────────────────────
+# ─── Authentication ────────────────────────────────────────────────────────────
 
-# RDP 登录凭据 (NLA/Hybrid/CredSSP 认证)
-# 无人值守启动前请同时设置用户名和唯一密码，并保护此配置文件。
-# 交互式终端中可省略两者以生成一次性凭据；空密码或缺少一项会被拒绝。
+# RDP login credentials (NLA/Hybrid/CredSSP authentication)
+# Set both fields for unattended startup; use a unique password and protect this file.
+# Omit both only in an interactive terminal to generate one-time credentials.
+# Empty or partial credentials are rejected.
 username = "admin"
-password = "" # 使用前请替换；不提供可用的默认密码。
+password = "" # Replace before use. No working default password is shipped.
 
-# ─── 显示 ─────────────────────────────────────────────────────────────────────
+# ─── Display ───────────────────────────────────────────────────────────────────
 
-# "main" 共享主显示器；"virtual" 在当前 macOS 会话中创建实验性扩展显示器。
-# 连接时汇集已有窗口；断开时恢复物理显示器布局并移除虚拟显示器。
-# 修改此设置需要重启服务；客户端正常调整分辨率时不需要重启。
+# "main" shares the main display; "virtual" creates an experimental extended
+# display in the current macOS session.
+# Connection gathers existing windows. Disconnect restores the physical display
+# arrangement and removes the virtual display.
+# Changes require a server restart; ordinary client resizing does not.
 display_backend = "main"
 
-# 实验性选项：在远程会话之间保留虚拟显示器对象，但将显示器禁用。
-# 需要 display_backend="virtual"，修改后需要重启服务；默认关闭。
-# 首次连接时创建，断开时停止捕获和编码，服务停止时彻底移除。
+# Experimental: keep the display allocated but disabled between remote sessions.
+# Requires display_backend="virtual" and a service restart. Default: false.
+# Created on the first connection; capture and encoding stop while disconnected.
+# The owning helper and display are removed when the server stops.
 reuse_virtual_display = false
 
-# 分辨率宽度 (像素)
-# 默认值: 0 (自动检测 macOS 显示器分辨率, 并跟随客户端请求)
-# 设置具体值 (如 1920) 则强制使用固定分辨率, 忽略客户端请求
+# Resolution width in pixels
+# Default: 0 (auto-detect from the macOS display and follow client requests)
+# Set a specific value (e.g. 1920) to force a fixed resolution and ignore client requests.
 width = 0
 
-# 分辨率高度 (像素)
-# 默认值: 0 (自动检测 macOS 显示器分辨率, 并跟随客户端请求)
-# 设置具体值 (如 1080) 则强制使用固定分辨率, 忽略客户端请求
+# Resolution height in pixels
+# Default: 0 (auto-detect from the macOS display and follow client requests)
+# Set a specific value (e.g. 1080) to force a fixed resolution and ignore client requests.
 height = 0
 
-# 目标帧率
-# 默认值: 60
-# 可选值: 30, 60, 120
+# Target frame rate
+# Default: 60
+# Options: 30, 60, 120
 frame_rate = 60
 
-# 目标码率 (Mbps, 默认: 根据分辨率/帧率/质量自动计算)
-# 手动设置后, 自适应质量仍会根据网络状况在此上限内调整
+# Target bitrate in Mbps (default: auto-calculated from resolution, frame rate and quality)
+# When overridden, adaptive quality still adjusts within this ceiling for network conditions.
 # bitrate_mbps = 50
 
-# 远程帧缓冲区分辨率："auto" 或以像素表示的 "宽x高"。
-# "auto" 跟随所选显示器和客户端请求。虚拟显示器最高支持 3840x2160，
-# 修改虚拟显示器的此设置需要重启服务。
+# Remote framebuffer resolution: "auto" or "WIDTHxHEIGHT" in pixels.
+# "auto" follows the selected display and client request. Virtual displays support
+# up to 3840x2160. Changing this setting for a virtual display requires a server restart.
 # resolution = "3840x2160"
 
-# ─── 编码 ─────────────────────────────────────────────────────────────────────
+# ─── Encoding ──────────────────────────────────────────────────────────────────
 
-# 视频质量预设
-# 默认值: high_quality
-# 可选值:
-#   "low_latency"  — 低码率, 最快编码 (1080p30 约 16 Mbps)
-#   "balanced"     — 平衡画质与码率 (1080p30 约 33 Mbps)
-#   "high_quality" — 最佳画质, 较高码率 (1080p30 约 50 Mbps)
+# Video quality preset
+# Default: high_quality
+# Options:
+#   "low_latency"  — low bitrate, fastest encoding (about 16 Mbps at 1080p30)
+#   "balanced"     — balances detail and bitrate (about 33 Mbps at 1080p30)
+#   "high_quality" — highest detail, higher bitrate (about 50 Mbps at 1080p30)
 quality = "high_quality"
 
-# H.264 编码器选择
-# 默认值: software
-# 可选值:
-#   "software"  — OpenH264 软件编码 (CPU), 支持 P 帧, 编码延迟约 40ms
-#   "hardware"  — VideoToolbox 硬件编码 (GPU), 编码延迟约 6ms, 仅 macOS
-#   "auto"      — 等同于 software
+# H.264 encoder selection
+# Default: software
+# Options:
+#   "software"  — OpenH264 software encoding (CPU), supports P-frames
+#   "hardware"  — VideoToolbox hardware encoding (GPU), macOS only
+#   "auto"      — same as software
 encoder = "hardware"
 
-# 色度采样模式
-# 默认值: avc420
-# 可选值:
-#   "avc420" — 标准 YUV 4:2:0 色度采样 (兼容所有 RDP 客户端)
-#   "avc444" — 完整 YUV 4:4:4 色度, 通过双流 AVC444 传输 (需要 V10+ 客户端, 画质最佳)
+# Chroma subsampling mode
+# Default: avc420
+# Options:
+#   "avc420" — standard YUV 4:2:0 chroma subsampling
+#   "avc444" — full YUV 4:4:4 via dual-stream AVC444 (requires a V10+ client)
 # chroma_mode = "avc420"
 
-# ─── TLS 证书 ──────────────────────────────────────────────────────────────────
+# ─── TLS certificates ───────────────────────────────────────────────────────────
 
-# TLS 证书文件路径 (PEM 格式)
-# 默认值: 自动生成自签名证书
+# Path to the TLS certificate file (PEM format)
+# Default: automatically generate a self-signed certificate
 # cert_path = "/path/to/cert.pem"
 
-# TLS 私钥文件路径 (PEM 格式)
-# 默认值: 随证书一起自动生成
+# Path to the TLS private key file (PEM format)
+# Default: generate the private key together with the certificate
 # key_path = "/path/to/key.pem"
 
-# ─── 日志 ─────────────────────────────────────────────────────────────────────
+# ─── Logging ───────────────────────────────────────────────────────────────────
 
-# 日志级别
-# 默认值: info
-# 可选值: trace, debug, info, warn, error
+# Log level
+# Default: info
+# Options: trace, debug, info, warn, error
 log_level = "info"
 
-# ─── 会话 ─────────────────────────────────────────────────────────────────────
+# ─── Session ───────────────────────────────────────────────────────────────────
 
-# 空闲超时时间 (秒), 无输入操作后自动断开连接
-# 默认值: 1800 (30 分钟)
+# Idle timeout in seconds; disconnect after this period without input
+# Default: 1800 (30 minutes)
 idle_timeout_secs = 1800

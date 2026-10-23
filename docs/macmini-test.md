@@ -1,18 +1,20 @@
 # Mac mini Test Bring-Up
 
-This is the shortest path to getting `macrdp` running on a spare Mac mini with
+This is the shortest path to getting Greenmole RDP running on a spare Mac mini with
 stable credentials and the right macOS permissions.
 
 ## 1. Build
 
 ```bash
-cd /Users/milo/code/macronrdp
+cd /path/to/macronrdp
 cargo build --release --bin macrdp-server
 ```
 
 ## 2. Create a local config
 
-Use a fixed config file instead of relying on generated credentials:
+Use a fixed config file instead of relying on generated credentials. The legacy
+`macrdp-server` binary and `macrdp` configuration paths are retained for upgrade
+compatibility:
 
 ```bash
 mkdir -p ~/.config/macrdp
@@ -20,7 +22,7 @@ cat > ~/.config/macrdp/config.toml <<'EOF'
 port = 13389
 
 username = "macrdp"
-password = "change-this-now"
+password = "" # Set a unique password before starting; empty passwords are rejected.
 
 width = 0
 height = 0
@@ -42,7 +44,7 @@ Suggested first edits:
 ## 3. Start it once manually
 
 ```bash
-cd /Users/milo/code/macronrdp
+cd /path/to/macronrdp
 cargo run --release --bin macrdp-server
 ```
 
@@ -64,7 +66,7 @@ Grant them to the exact binary identity you are running.
 For a release run from this repo, that is typically:
 
 ```text
-/Users/milo/code/macronrdp/target/release/macrdp-server
+/path/to/macronrdp/target/release/macrdp-server
 ```
 
 Important:
@@ -95,7 +97,7 @@ Use the username/password from `~/.config/macrdp/config.toml`.
 Watch the server log:
 
 ```bash
-tail -f /Users/milo/code/macronrdp/macrdp.log
+tail -f "$HOME/Library/Application Support/macrdp/macrdp-logs.jsonl"
 ```
 
 Common causes:

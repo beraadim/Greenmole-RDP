@@ -40,7 +40,7 @@ pub(super) fn evacuate_for_parking(virtual_id: u32) -> Result<PhaseReport> {
         ensure!(
             display.vendor_number() == crate::virtual_display::VENDOR_ID
                 && display.model_number() == crate::virtual_display::PRODUCT_ID,
-            "Window evacuation target is not a macrdp virtual display"
+            "Window evacuation target is not a Greenmole RDP virtual display"
         );
         ensure!(
             !display.is_in_mirror_set(),

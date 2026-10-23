@@ -46,7 +46,7 @@ pub(crate) fn install_control_endpoint(app: &tauri::AppHandle) -> anyhow::Result
             result
                 .recv_timeout(Duration::from_secs(80))
                 .unwrap_or_else(|_| {
-                    Err("Recovery is still pending. Check macrdp's local controls and logs.".into())
+                    Err("Recovery is still pending. Check Greenmole RDP's local controls and logs.".into())
                 })
         })?;
         app.manage(endpoint);
@@ -76,7 +76,7 @@ pub(crate) async fn recover_local_desktop(app: &tauri::AppHandle) -> Result<(), 
 async fn recover_local_desktop_inner(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app
         .try_state::<Arc<AppState>>()
-        .ok_or("macrdp is still initializing. Try recovery again shortly.")?;
+        .ok_or("Greenmole RDP is still initializing. Try recovery again shortly.")?;
     state
         .stop_requests
         .send_modify(|epoch| *epoch = epoch.wrapping_add(1));

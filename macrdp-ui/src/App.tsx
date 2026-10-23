@@ -16,17 +16,17 @@ function MainLayout() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // 先检查服务是否在运行，只有运行中才检查权限
-    // CLI 未运行时权限状态不可用，直接放行进入仪表盘
+    // Check permissions only while the service is running.
+    // When the CLI is stopped, permission status is unavailable; open the dashboard.
     api
       .getServerStatus()
       .then((status) => {
         if (!status.running) {
-          // 服务未运行，跳过权限检查
+          // The service is stopped; skip the permission check.
           setInitialized(true);
           return;
         }
-        // 服务运行中，检查权限
+        // The service is running; check its permissions.
         return api.getPermissions().then((perms) => {
           if (!perms.screen_capture || !perms.accessibility) {
             navigate("/permissions", { state: { firstLaunch: true } });

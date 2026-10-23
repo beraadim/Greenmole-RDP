@@ -10,7 +10,7 @@ pub fn setup_tray(handle: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     let tray = handle
         .tray_by_id("main-tray")
         .ok_or("tray icon 'main-tray' not found")?;
-    tray.set_tooltip(Some("macrdp"))?;
+    tray.set_tooltip(Some("Greenmole RDP"))?;
     let recover = MenuItem::with_id(
         handle,
         "recover-local-desktop",
@@ -18,11 +18,11 @@ pub fn setup_tray(handle: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
         true,
         None::<&str>,
     )?;
-    let show = MenuItem::with_id(handle, "show-main", "Open macrdp", true, None::<&str>)?;
+    let show = MenuItem::with_id(handle, "show-main", "Open Greenmole RDP", true, None::<&str>)?;
     let quit = MenuItem::with_id(
         handle,
         "quit-macrdp",
-        "Quit macrdp and stop server",
+        "Quit Greenmole RDP and stop server",
         true,
         None::<&str>,
     )?;
@@ -42,7 +42,7 @@ pub fn setup_tray(handle: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
             "show-main" => {
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) = show_main_window(&app).await {
-                        tracing::warn!(%error, "Could not open macrdp controls");
+                        tracing::warn!(%error, "Could not open Greenmole RDP controls");
                     }
                 });
             }
@@ -108,7 +108,7 @@ pub async fn show_main_on_physical_display(handle: &AppHandle) -> Result<(), Str
 fn reveal_main_window(app: &AppHandle) -> anyhow::Result<()> {
     let window = app
         .get_webview_window("main")
-        .ok_or_else(|| anyhow::anyhow!("The macrdp main window is unavailable"))?;
+        .ok_or_else(|| anyhow::anyhow!("The Greenmole RDP main window is unavailable"))?;
     let results = [window.unminimize(), window.show(), window.set_focus()];
     for result in results {
         result?;

@@ -1,6 +1,6 @@
 {
   "name": "macrdp-ui",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:build": "./build.sh",
-    "tauri:install": "npm run tauri:build && cp -R src-tauri/target/release/bundle/macos/macrdp.app /Applications/macrdp.app"
+    "tauri:install": "npm run tauri:build && cp -R \"src-tauri/target/release/bundle/macos/Greenmole RDP.app\" \"/Applications/Greenmole RDP.app\""
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",

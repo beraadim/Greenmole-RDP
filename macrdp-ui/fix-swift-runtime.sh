@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_BUNDLE="${1:-$SCRIPT_DIR/src-tauri/target/release/bundle/macos/macrdp.app}"
+APP_BUNDLE="${1:-$SCRIPT_DIR/src-tauri/target/release/bundle/macos/Greenmole RDP.app}"
 APP_BIN="$APP_BUNDLE/Contents/MacOS/macrdp-ui"
 FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
 TARGET_LIB="libswift_Concurrency.dylib"

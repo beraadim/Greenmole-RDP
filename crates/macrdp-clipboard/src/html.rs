@@ -199,7 +199,7 @@ mod tests {
     fn accepts_all_header_line_endings_with_and_without_context() {
         for separator in ["\r", "\n", "\r\n"] {
             for context in [false, true] {
-                let html = "<b>Blåbær 東京 😀</b>";
+                let html = "<b>Blåbær \u{6771}\u{4EAC} 😀</b>";
                 let extra = format!("SourceURL:https://example.test/{separator}");
                 assert_eq!(
                     unwrap_html_format(&envelope(html, separator, context, &extra)).as_deref(),
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn roundtrip_unicode() {
-        let html = "<p>你好世界 🎉</p>";
+        let html = "<p>\u{4F60}\u{597D}\u{4E16}\u{754C} 🎉</p>";
         let wrapped = wrap_html_format(html).unwrap();
         let unwrapped = unwrap_html_format(&wrapped).unwrap();
         assert_eq!(unwrapped, html);

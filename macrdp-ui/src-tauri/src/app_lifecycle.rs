@@ -41,11 +41,11 @@ pub(crate) fn request_show_main(app: &tauri::AppHandle, source: &'static str) {
     {
         return;
     }
-    tracing::info!(source, "Requested reopening macrdp controls");
+    tracing::info!(source, "Requested reopening Greenmole RDP controls");
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = crate::tray::show_main_window(&app).await {
-            tracing::warn!(%error, source, "Could not reveal macrdp controls");
+            tracing::warn!(%error, source, "Could not reveal Greenmole RDP controls");
         }
     });
 }
@@ -80,7 +80,7 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
 pub(crate) fn request_quit(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app
         .try_state::<Arc<AppState>>()
-        .ok_or("macrdp is still initializing. Please try Quit again shortly.")?;
+        .ok_or("Greenmole RDP is still initializing. Please try Quit again shortly.")?;
     if !state.exit.begin() {
         return Ok(());
     }

@@ -11,6 +11,7 @@ mod permissions;
 mod recovery;
 mod server_lifecycle;
 mod session_status;
+mod startup_identity;
 mod state;
 mod tray;
 mod ui_config;
@@ -19,7 +20,6 @@ mod window_commands;
 use std::sync::Arc;
 
 use tauri::Manager;
-use tauri_plugin_autostart::MacosLauncher;
 
 use database::Database;
 
@@ -69,7 +69,7 @@ pub fn run() {
     let ui_config = match ui_config::UiConfig::load() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("Cannot load macrdp configuration securely: {error}");
+            eprintln!("Cannot load Greenmole RDP configuration securely: {error}");
             return;
         }
     };
@@ -96,22 +96,20 @@ pub fn run() {
         process_id = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
         revision = option_env!("MACRDP_BUILD_REVISION").unwrap_or("development"),
-        "macrdp-ui starting..."
+        "Greenmole RDP starting..."
     );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             app_lifecycle::request_show_main(app, "second_instance");
         }))
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec![]),
-        ))
+        .plugin(startup_identity::plugin())
         .setup(move |app| {
             let handle = app.handle().clone();
 
             // Initialize application state
             state::init_app_state(&handle, log_reload.clone(), ui_config.clone())?;
+            startup_identity::refresh_existing_registration(&handle, ui_config.autostart);
             recovery::install_control_endpoint(&handle)?;
 
             // Setup is explicit and only allowed while no remote owner exists.
@@ -193,6 +191,6 @@ pub fn run() {
             window_commands::move_windows_to_remote,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building macrdp-ui")
+        .expect("error while building Greenmole RDP")
         .run(app_lifecycle::handle_run_event);
 }
