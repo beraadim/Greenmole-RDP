@@ -107,3 +107,24 @@ frontend production build and standalone CLI build also passed. Mocked React
 checks exercise profile operations and expanded cleanup states, including the
 minimum application window size. No real RDP session or installed app launch
 was used for these checks.
+
+## Verified package
+
+Test package: `macrdp_0.1.29_aarch64_9af2c4dcbced.dmg`, delivered on the Mac mini Desktop with
+SHA-256 and build metadata sidecars.
+
+- Source: `9af2c4dcbced9f1fee08bc34cc88429b352ad732`.
+- SHA-256: `24ea2a0aea327940eaa3db989584b1e6b5f740bca0583826a15c858ddf463809`.
+- Size: 15,784,701 bytes; aarch64, ad-hoc signed.
+- Image checksum, mounted application deep strict signature, binary architecture,
+  version and embedded source metadata passed. The read-only mount was removed.
+- Packaged helper/recovery extra-argument rejection and standalone CLI checks
+  passed without launching the app or running valid helper/recovery actions.
+- Desktop copies were verified before removing the previous 0.1.28 installer
+  and its two matching sidecars. The installed application metadata/binary and
+  saved configuration hashes remained unchanged.
+
+The implementation is committed and the installer is ready for user installation
+and real-client acceptance. No actual RDP connection, physical-display mutation,
+monitor/profile cleanup or native-service restart was performed during release
+verification.

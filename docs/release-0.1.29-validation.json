@@ -1,7 +1,7 @@
 {
   "schema": "macrdp-release-validation-v1",
   "version": "0.1.29",
-  "status": "source checks passed; package pending",
+  "status": "built, verified and delivered for user testing",
   "changes": {
     "saved_graphics_profiles": true,
     "session_status_and_cleanup_evidence": true,
@@ -58,7 +58,8 @@
     "scoped_new_rust_module_formatting_passed": true,
     "diff_check_passed": true,
     "locked_version_consistency_passed": true,
-    "targeted_source_secret_pattern_scan_passed": true
+    "targeted_source_secret_pattern_scan_passed": true,
+    "optimized_cli_and_app_build_passed": true
   },
   "source_review": {
     "independent_profile_and_session_evidence_review_passed": true,
@@ -69,6 +70,44 @@
     "logging_capacity_and_nonblocking_producer_policy_unchanged": true,
     "failed_driver_descendants_and_inherited_probe_cleanup_tested": true,
     "installed_application_and_configuration_hashes_unchanged_before_packaging": true,
-    "external_dependency_versions_changed": false
+    "external_dependency_versions_changed": false,
+    "independent_package_and_delivery_safety_review_passed": true
+  },
+  "source_revision": "9af2c4dcbced9f1fee08bc34cc88429b352ad732",
+  "verified_at_utc": "2026-10-23T10:23:56.137241+00:00",
+  "package_verification": {
+    "version": "0.1.29",
+    "source_revision": "9af2c4dcbced9f1fee08bc34cc88429b352ad732",
+    "package": "macrdp_0.1.29_aarch64_9af2c4dcbced.dmg",
+    "sha256": "24ea2a0aea327940eaa3db989584b1e6b5f740bca0583826a15c858ddf463809",
+    "bytes": 15784701,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "binary_architecture_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-private-session-helper": true,
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--recover-local-desktop": true
+    },
+    "verification_mount_removed": true,
+    "standalone_cli_version_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "macrdp_0.1.28_aarch64_ac0350c852bd.dmg",
+      "macrdp_0.1.28_aarch64_ac0350c852bd.dmg.sha256",
+      "macrdp_0.1.28_aarch64_ac0350c852bd.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "installed_app_metadata_and_config_unchanged": true,
+    "live_remote_session_started": false
   }
 }
