@@ -1,0 +1,40 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.31",
+  "status": "source and frontend validated; release package pending",
+  "attribution": {
+    "original_project": "https://github.com/x6nux/macrdp",
+    "original_author": "x6nux",
+    "upstream_commit": "6f01a66170f30efe9bb067fde1faaf19f0c0c08f",
+    "readme_intro_and_acknowledgments": true,
+    "about_visible_credit_and_safe_upstream_links": true,
+    "notice_bundled_as": "licenses/NOTICE.txt",
+    "existing_license_texts_and_attribution_preserved": true
+  },
+  "release_checks": {
+    "locked_cargo_metadata_valid": true,
+    "typescript_and_production_frontend_build_passed": true,
+    "mocked_actual_about_page_passed": true,
+    "mocked_ui_sizes": [
+      [
+        960,
+        620
+      ],
+      [
+        800,
+        500
+      ]
+    ],
+    "mocked_ui_light_and_dark_themes_checked": true,
+    "mocked_page_errors": [],
+    "runtime_rust_tests": "not repeated; no runtime Rust source or dependency changes"
+  },
+  "compatibility": {
+    "bundle_identifier": "com.macrdp.app",
+    "runtime_source_unchanged": true,
+    "connect_disconnect_behavior_unchanged": true,
+    "existing_storage_and_monitor_identity_unchanged": true
+  },
+  "device_test_instructions": "release-0.1.31.md"
+}

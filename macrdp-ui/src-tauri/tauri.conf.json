@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/refs/heads/dev/crates/tauri-schema-generator/schemas/config.schema.json",
   "productName": "Greenmole RDP",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "identifier": "com.macrdp.app",
   "build": {
     "frontendDist": "../dist",
@@ -64,6 +64,7 @@
     "license": "GPL-3.0-only",
     "resources": {
       "../../LICENSE": "licenses/GPL-3.0.txt",
+      "../../NOTICE": "licenses/NOTICE.txt",
       "../../branding/LICENSE": "licenses/Greenmole-artwork/LICENSE",
       "../../branding/NOTICE": "licenses/Greenmole-artwork/NOTICE",
       "../../branding/README.md": "licenses/Greenmole-artwork/README.md"

@@ -16,6 +16,11 @@ Android using a compatible RDP client, including Windows Remote Desktop
 Greenmole RDP is the macOS server companion to the Greenmole browser client. It
 also supports Windows Remote Desktop Connection and other compatible RDP clients.
 
+Greenmole RDP is an independently maintained fork of
+[MacRDP](https://github.com/x6nux/macrdp), originally created by
+[x6nux](https://github.com/x6nux). We gratefully acknowledge the original project
+and its contributors. See [NOTICE](NOTICE) for source attribution.
+
 ---
 
 ## Features
@@ -124,6 +129,7 @@ crates/
 
 The project builds on the following open-source work:
 
+- **[MacRDP](https://github.com/x6nux/macrdp)** — The original macOS RDP server by [x6nux](https://github.com/x6nux) and its contributors, which provides the foundation for Greenmole RDP.
 - **[IronRDP](https://github.com/Devolutions/IronRDP)** — Pure Rust RDP protocol implementation. Greenmole RDP's protocol stack is built on a fork of ironrdp-server with GFX/AVC444 extensions.
 - **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — The reference open-source RDP implementation. Its AVC444 dual-stream encoding approach and YUV444 B-area split algorithm were essential references.
 - **[RustDesk](https://github.com/rustdesk/rustdesk)** — Open-source remote desktop software written in Rust. Its architecture for cross-platform screen capture and input injection was a great source of inspiration.

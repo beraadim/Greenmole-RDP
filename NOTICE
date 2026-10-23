@@ -1,0 +1,17 @@
+Greenmole RDP
+
+Greenmole RDP is an independently maintained fork of MacRDP, originally created
+by x6nux. We acknowledge the original project and its contributors.
+
+Original project: https://github.com/x6nux/macrdp
+Original author: https://github.com/x6nux
+Downstream project: https://github.com/beraadim/Greenmole-RDP
+
+The original MacRDP source and this downstream work are distributed under the
+GNU General Public License, version 3. See the accompanying GPLv3 license. Original authorship is
+preserved in the Git history; this fork does not imply upstream endorsement.
+
+Third-party code and the shared Greenmole mascot artwork retain their respective
+licenses, copyright notices, and attribution. In the source tree, see the license
+files in crates/ironrdp-server-gfx/ and crates/ironrdp-acceptor-patched/, and the
+artwork license, notice, and provenance in branding/.
