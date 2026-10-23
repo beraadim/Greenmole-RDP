@@ -61,3 +61,22 @@ guards; seven mocked UI checks cover branding, light/dark themes, minimum window
 size and the popover. Source audits found no remaining tracked Chinese/CJK text,
 verified unchanged Unicode fixture bytes, confirmed exact example configuration
 values and checked that third-party locked dependencies were unchanged.
+
+## Verified package
+
+Desktop test package: `Greenmole_RDP_0.1.30_aarch64_e4209df5146a.dmg`, with SHA-256 and build metadata
+sidecars.
+
+- Source: `e4209df5146aa8efd1469e74e20ca15157d1259a`.
+- SHA-256: `192966e6511b5bbaf0b2a8dfdb6d9aa3d3096afccf12568a72adae76752adeb8`.
+- Size: 14,651,702 bytes; aarch64, ad-hoc signed.
+- Mounted bundle name, stable identifier, version/build metadata and actual arm64
+  executable match. Deep strict signature and image checksum verification pass.
+- Application icon bytes match the committed mascot icon. Bundled GPLv3 and
+  artwork Apache license/NOTICE/provenance match their source files.
+- Invalid helper/recovery arguments exit before UI/native actions. Standalone CLI
+  branding and legacy command usage are verified. The read-only mount is removed.
+- Desktop copies are verified before deleting the previous macrdp 0.1.29 DMG
+  and its two matching sidecars. Installed app/config, existing login entries and
+  stable monitor-identity hashes remain unchanged. The app is not installed or
+  launched by the delivery process.

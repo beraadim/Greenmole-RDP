@@ -2,7 +2,7 @@
   "schema": "macrdp-release-validation-v1",
   "product_name": "Greenmole RDP",
   "version": "0.1.30",
-  "status": "source checks passed; package pending",
+  "status": "built, verified and delivered for user testing",
   "branding": {
     "original_greenmole_logo_sha256": "5c1cb410e7f474ad971f29cfd09895d1413a58abbe9cb038c1afd1e38a6729a7",
     "frontend_derivative_copied_unchanged": true,
@@ -70,11 +70,56 @@
       "original_logo_sha256_verified": true
     },
     "installed_application_config_login_registration_and_monitor_identity_hashes_preserved": true,
-    "actual_app_or_rdp_session_started": false
+    "actual_app_or_rdp_session_started": false,
+    "optimized_cli_and_app_build_passed": true,
+    "independent_package_delivery_review_passed": true
   },
   "limitations": [
     "Installation, renewed macOS privacy grants if requested, login-startup and actual RDP acceptance remain user device checks.",
     "Internal macrdp identifiers remain deliberately compatible; they are not untranslated Chinese text."
   ],
-  "device_test_instructions": "release-0.1.30.md"
+  "device_test_instructions": "release-0.1.30.md",
+  "source_revision": "e4209df5146aa8efd1469e74e20ca15157d1259a",
+  "verified_at_utc": "2026-10-23T11:09:28.965336+00:00",
+  "package_verification": {
+    "version": "0.1.30",
+    "source_revision": "e4209df5146aa8efd1469e74e20ca15157d1259a",
+    "package": "Greenmole_RDP_0.1.30_aarch64_e4209df5146a.dmg",
+    "sha256": "192966e6511b5bbaf0b2a8dfdb6d9aa3d3096afccf12568a72adae76752adeb8",
+    "bytes": 14651702,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "product_name": "Greenmole RDP",
+    "bundle_identifier": "com.macrdp.app",
+    "mascot_icon_verified": true,
+    "licenses_and_artwork_attribution_bundled": true,
+    "binary_architecture_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "packaged_helper_argument_rejection": {
+      "--macrdp-private-session-helper": true,
+      "--macrdp-display-helper": true,
+      "--macrdp-server-helper": true,
+      "--recover-local-desktop": true
+    },
+    "verification_mount_removed": true,
+    "standalone_cli_version_verified": true,
+    "standalone_private_helper_argument_rejection": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "macrdp_0.1.29_aarch64_9af2c4dcbced.dmg",
+      "macrdp_0.1.29_aarch64_9af2c4dcbced.dmg.sha256",
+      "macrdp_0.1.29_aarch64_9af2c4dcbced.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "installed_app_metadata_and_config_unchanged": true,
+    "live_remote_session_started": false,
+    "standalone_cli_help_brand_and_legacy_usage_verified": true,
+    "login_registration_and_stable_monitor_identity_preserved": true
+  }
 }
