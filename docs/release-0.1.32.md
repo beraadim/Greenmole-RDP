@@ -87,3 +87,10 @@ Option/navigation handling and reserved shortcuts are not changed. Non-BMP
 Unicode, including many emoji, and complete IME composition remain outside this
 release's fixes and end-to-end validation. Supported layouts are not a universal
 typing guarantee for every application or input method.
+
+The optimized ARM64 DMG was built, its ad-hoc signature, checksum and bundled
+licenses verified, and the package delivered to the Mac mini Desktop with its
+checksum and build metadata. Older recognized Desktop installer files were
+removed after delivery. The installed application and configuration hashes were
+unchanged. See [release validation](release-0.1.32-validation.json) for recorded
+automated checks and package provenance.

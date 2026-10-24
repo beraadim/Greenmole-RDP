@@ -1,0 +1,135 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.32",
+  "status": "built, verified and delivered for user testing",
+  "source_revision": "2eed338b3d3b876ed1fc054d4cc8a0d2f34c22ba",
+  "verified_at_utc": "2026-10-24T09:51:06.744240+00:00",
+  "tests": {
+    "handler_passed": 55,
+    "norwegian_frozen_chords": 124,
+    "configuration_passed": 12,
+    "input_passed": 54,
+    "acceptor_passed": 10,
+    "server_passed": 167,
+    "server_existing_ignored": 3,
+    "desktop_configuration_passed": 24,
+    "sanitized_diagnostics_passed": 9,
+    "native_events_posted": false,
+    "host_layout_threading": {
+      "status": "passed",
+      "pure_policy_tests": 3,
+      "native_probe": {
+        "main_thread_snapshot": true,
+        "background_setup_rejected": true,
+        "unique_letters": 26,
+        "serialized_parallel_lookups": 2080,
+        "duration_ms": 7.524125,
+        "nsapplication_initialized": false,
+        "native_input_posted": false,
+        "display_actions": false
+      },
+      "initialization": "Explicit headless opt-in once on process main thread; no global test ordering dependency"
+    },
+    "settings_ui": {
+      "status": "passed",
+      "checks": [
+        "automatic defaults",
+        "all nine layout choices",
+        "native Mac shortcut description",
+        "persisted exact settings",
+        "restart banner and revert",
+        "failed save retained previous selection",
+        "minimum/normal window and light/dark themes"
+      ],
+      "layouts": [
+        {
+          "viewport": 960,
+          "body": 960,
+          "main": 780,
+          "mainWidth": 780,
+          "asideCount": 1,
+          "mainCount": 1,
+          "colorScheme": "light"
+        },
+        {
+          "viewport": 960,
+          "body": 960,
+          "main": 780,
+          "mainWidth": 780,
+          "asideCount": 1,
+          "mainCount": 1,
+          "colorScheme": "dark"
+        },
+        {
+          "viewport": 800,
+          "body": 800,
+          "main": 620,
+          "mainWidth": 620,
+          "asideCount": 1,
+          "mainCount": 1,
+          "colorScheme": "light"
+        },
+        {
+          "viewport": 800,
+          "body": 800,
+          "main": 620,
+          "mainWidth": 620,
+          "asideCount": 1,
+          "mainCount": 1,
+          "colorScheme": "dark"
+        }
+      ],
+      "pageErrors": [],
+      "nativeApiMocked": true,
+      "remoteConnected": false
+    }
+  },
+  "release_checks": {
+    "optimized_cli_and_app_build_passed": true,
+    "frontend_production_build_passed": true,
+    "changed_files_secret_scan": "Gitleaks: zero findings",
+    "existing_license_and_original_attribution_preserved": true,
+    "derived_keyboard_tables_license_and_notice_bundled": true
+  },
+  "compatibility": {
+    "bundle_identifier": "com.macrdp.app",
+    "connect_disconnect_behavior_unchanged": true,
+    "existing_storage_and_monitor_identity_unchanged": true,
+    "existing_config_files_unchanged": true
+  },
+  "package_verification": {
+    "version": "0.1.32",
+    "source_revision": "2eed338b3d3b876ed1fc054d4cc8a0d2f34c22ba",
+    "package": "Greenmole_RDP_0.1.32_aarch64_2eed338b3d3b.dmg",
+    "sha256": "233c70af7255a7edb7e716d0e3112744f84d57ce435c170858b9e80380bb1c76",
+    "bytes": 14670788,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "product_name": "Greenmole RDP",
+    "bundle_identifier": "com.macrdp.app",
+    "mascot_icon_verified": true,
+    "licenses_and_artwork_attribution_bundled": true,
+    "binary_architecture_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "original_macrdp_notice_bundled": true,
+    "verification_mount_removed": true,
+    "standalone_cli_version_verified": true,
+    "valid_helpers_or_recovery_invoked": false,
+    "live_security_actions_run": false,
+    "desktop_copy_verified": true,
+    "checksum_and_build_info_copied": true,
+    "removed_previous_installers": [
+      "Greenmole_RDP_0.1.31_aarch64_4d6781c0ff58.dmg",
+      "Greenmole_RDP_0.1.31_aarch64_4d6781c0ff58.dmg.sha256",
+      "Greenmole_RDP_0.1.31_aarch64_4d6781c0ff58.dmg.build-info.json"
+    ],
+    "installed_application_replaced": false,
+    "installed_app_metadata_and_config_unchanged": true,
+    "live_remote_session_started": false
+  },
+  "manual_acceptance": "Physical client/browser typing and shortcuts still require user testing; see keyboard-layouts.md for supported layouts and existing limitations."
+}
