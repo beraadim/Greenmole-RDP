@@ -3,6 +3,7 @@
 mod event_tag;
 pub mod keyboard;
 pub mod keymap;
+pub mod host_layout;
 pub mod mouse;
 pub mod power;
 

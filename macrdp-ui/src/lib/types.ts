@@ -150,6 +150,8 @@ export interface UiConfig {
   display_backend: "main" | "virtual";
   reuse_virtual_display: boolean;
   private_session: boolean;
+  keyboard_layout: "auto" | "us" | "uk" | "no" | "se" | "dk" | "de" | "fr" | "physical";
+  keyboard_shortcuts: "auto" | "windows" | "mac" | "physical";
   resolution: string;
   show_cursor: boolean;
   audio_enabled: boolean;

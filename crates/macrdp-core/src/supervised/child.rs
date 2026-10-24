@@ -33,6 +33,9 @@ impl ServerEventHandler for Events {
 }
 
 pub(super) fn run() -> Result<()> {
+    // This helper is dispatched before AppKit/Tauri startup and never starts a
+    // UI event loop. Carbon layout reads may therefore be serialized on workers.
+    macrdp_input::host_layout::configure_for_headless_process()?;
     let mut input = BufReader::new(std::io::stdin());
     let mut initialization: Initialization =
         protocol::read(&mut input)?.context("Server worker initialization missing")?;

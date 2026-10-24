@@ -44,6 +44,7 @@ pub struct Acceptor {
     reactivation: bool,
     client_name: String,
     keyboard_layout: u32,
+    keyboard_subtype: u32,
     client_desktop_size: Option<DesktopSize>,
     deferred_channel_pdus: Vec<Vec<u8>>,
 }
@@ -58,6 +59,7 @@ pub struct AcceptorResult {
     pub reactivation: bool,
     pub client_name: String,
     pub keyboard_layout: u32,
+    pub keyboard_subtype: u32,
     /// Original size from Client Core Data. Confirm Active may already echo
     /// the server's Demand Active size, especially with FreeRDP clients.
     pub client_desktop_size: Option<DesktopSize>,
@@ -83,6 +85,7 @@ impl Acceptor {
             reactivation: false,
             client_name: String::new(),
             keyboard_layout: 0,
+            keyboard_subtype: 0,
             client_desktop_size: None,
             deferred_channel_pdus: Vec::new(),
         }
@@ -128,6 +131,7 @@ impl Acceptor {
             reactivation: true,
             client_name: consumed.client_name,
             keyboard_layout: consumed.keyboard_layout,
+            keyboard_subtype: consumed.keyboard_subtype,
             client_desktop_size: consumed.client_desktop_size,
             deferred_channel_pdus: Vec::new(),
         })
@@ -189,6 +193,7 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 client_name: self.client_name.clone(),
                 keyboard_layout: self.keyboard_layout,
+                keyboard_subtype: self.keyboard_subtype,
                 client_desktop_size: self.client_desktop_size,
             }),
             previous_state => {
@@ -421,6 +426,7 @@ impl Sequence for Acceptor {
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 self.client_name = gcc_blocks.core.client_name.clone();
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
+                self.keyboard_subtype = gcc_blocks.core.keyboard_subtype;
                 self.client_desktop_size = Some(DesktopSize {
                     width: gcc_blocks.core.desktop_width,
                     height: gcc_blocks.core.desktop_height,
@@ -886,7 +892,7 @@ mod tests {
                 client_build: 1,
                 client_name: "viewport-test".into(),
                 keyboard_type: gcc::KeyboardType::IbmEnhanced,
-                keyboard_subtype: 0,
+                keyboard_subtype: 0x474D_0102,
                 keyboard_functional_keys_count: 12,
                 ime_file_name: String::new(),
                 optional_data: gcc::ClientCoreOptionalData::default(),
@@ -917,6 +923,8 @@ mod tests {
         };
         let result = acceptor.get_result().unwrap();
         assert_eq!(result.client_desktop_size, Some(requested));
+        assert_eq!(result.keyboard_layout, 0x0409);
+        assert_eq!(result.keyboard_subtype, 0x474D_0102);
         let reactivated = Acceptor::new_deactivation_reactivation(
             acceptor,
             result.static_channels,
@@ -927,6 +935,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reactivated.client_desktop_size, Some(requested));
+        assert_eq!(reactivated.keyboard_subtype, 0x474D_0102);
         assert!(reactivated.reactivation);
     }
 

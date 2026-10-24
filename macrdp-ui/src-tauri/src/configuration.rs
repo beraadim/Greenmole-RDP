@@ -30,6 +30,8 @@ pub(crate) fn configuration_status(
             "display_backend",
             "reuse_virtual_display",
             "private_session",
+            "keyboard_layout",
+            "keyboard_shortcuts",
             "bind_address",
             "port",
             "idle_timeout_secs",
@@ -261,6 +263,23 @@ pub(crate) fn accepts_live_updates(status: &macrdp_core::ServerStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_preferences_remain_pending_until_restart_or_reverted() {
+        let mut running = UiConfig::default();
+        for (key, value) in [("keyboard_layout", "no"), ("keyboard_shortcuts", "mac")] {
+            let mut saved = running.clone();
+            saved.set_field(key, &serde_json::json!(value)).unwrap();
+            assert_eq!(status(&saved, Some(&running)).pending_restart, [key]);
+            assert!(live_update(&saved, key).unwrap().is_none());
+            saved.frame_rate = 30;
+            running.frame_rate = 30;
+            assert_eq!(status(&saved, Some(&running)).pending_restart, [key]);
+            assert!(!status(&saved, None).restart_required);
+            saved.set_field(key, &serde_json::json!("auto")).unwrap();
+            assert!(!status(&saved, Some(&running)).restart_required);
+        }
+    }
 
     fn status(saved: &UiConfig, running: Option<&UiConfig>) -> ConfigurationStatus {
         configuration_status(saved, running, &BTreeSet::new())

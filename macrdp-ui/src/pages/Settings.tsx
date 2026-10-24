@@ -1,6 +1,7 @@
 import { CertificateSettings } from "../components/CertificateSettings";
 import { ClipboardSettings } from "../components/ClipboardSettings";
 import { GraphicsSettings } from "../components/GraphicsSettings";
+import { KeyboardSettings } from "../components/KeyboardSettings";
 import { useState, useEffect } from "react";
 import { AlertTriangle } from "lucide-react";
 import { api } from "../lib/ipc";
@@ -23,6 +24,7 @@ const categories = [
   { id: "network", label: "Network" },
   { id: "security", label: "Security" },
   { id: "display", label: "Display" },
+  { id: "keyboard", label: "Keyboard" },
   { id: "audio", label: "Audio" },
   { id: "clipboard", label: "Clipboard" },
   { id: "general", label: "General" },
@@ -34,6 +36,7 @@ const restartLabels: Record<string, string> = {
   display_backend: "display", bind_address: "bind address", port: "port",
   reuse_virtual_display: "virtual display reuse",
   private_session: "guarded private session",
+  keyboard_layout: "keyboard layout", keyboard_shortcuts: "keyboard shortcuts",
   idle_timeout_secs: "idle timeout", tls_cert_path: "certificate", tls_key_path: "certificate key",
   tls_server_names: "certificate names", audio_enabled: "system audio",
   clipboard_enabled: "clipboard synchronization", clipboard_file_transfer: "file transfers",
@@ -329,6 +332,12 @@ function Settings() {
                 onCheckedChange={(checked) => updateConfig("show_cursor", checked)}
               />
             </SettingRow>
+          </CategorySection>
+        )}
+
+        {activeCategory === "keyboard" && (
+          <CategorySection title="Keyboard">
+            <KeyboardSettings config={config} save={updateConfig} />
           </CategorySection>
         )}
 

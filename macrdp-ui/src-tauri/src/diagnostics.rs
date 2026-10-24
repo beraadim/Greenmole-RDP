@@ -204,6 +204,8 @@ fn safe_configuration(config: &UiConfig) -> Value {
         "chroma": selection(&config.chroma_mode, &["avc420", "avc444"]),
         "display_backend": config.display_backend, "resolution": resolution,
         "reuse_virtual_display": config.reuse_virtual_display,
+        "keyboard_layout": selection(&config.keyboard_layout, macrdp_core::config::keyboard::LAYOUTS),
+        "keyboard_shortcuts": selection(&config.keyboard_shortcuts, macrdp_core::config::keyboard::SHORTCUT_POLICIES),
         "automatic_resolution": config.resolution == "auto", "show_cursor": config.show_cursor,
         "idle_timeout_secs": config.idle_timeout_secs,
         "audio_enabled": config.audio_enabled,

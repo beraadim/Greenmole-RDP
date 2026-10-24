@@ -3,7 +3,7 @@ use super::*;
 fn recording_handler(name: &str, layout: u32) -> (MacInputHandler, Arc<Mutex<Vec<KeyAction>>>) {
     let mut handler = handler_for(name, layout);
     let events = Arc::new(Mutex::new(Vec::new()));
-    handler.keyboard = Some(Box::new(RecordingKeyboard(Arc::clone(&events))));
+    handler.keyboard = Some(Box::new(RecordingKeyboard::new(Arc::clone(&events))));
     (handler, events)
 }
 
@@ -238,6 +238,7 @@ fn synchronize_disconnect_and_reconnect_clear_held_shortcuts() {
                     ClientInputContext {
                         client_name: "Guacamole RDP".into(),
                         keyboard_layout: 0x0409,
+                        keyboard_subtype: 0,
                     },
                     None,
                 ),
@@ -289,6 +290,9 @@ struct FailingKeyboard {
 }
 
 impl KeyboardDevice for FailingKeyboard {
+    fn ensure_keycode_pressed(&self, key: u16) -> anyhow::Result<()> {
+        self.recording.ensure_keycode_pressed(key)
+    }
     fn inject_command_keycode(&self, key: u16, pressed: bool, shifted: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             !*self.fail_command.lock().unwrap(),
@@ -318,7 +322,7 @@ fn failed_shortcut_press_never_falls_back_to_text_and_failed_release_can_retry()
     let (mut handler, events) = recording_handler("Windows Remote Desktop", 0x0414);
     let fail_command = Arc::new(Mutex::new(true));
     handler.keyboard = Some(Box::new(FailingKeyboard {
-        recording: RecordingKeyboard(Arc::clone(&events)),
+        recording: RecordingKeyboard::new(Arc::clone(&events)),
         fail_command: Arc::clone(&fail_command),
     }));
     key(&mut handler, 0x1D, false, true);

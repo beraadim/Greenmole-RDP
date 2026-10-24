@@ -35,6 +35,8 @@ pub struct UiConfig {
     pub display_backend: DisplayBackend,
     pub reuse_virtual_display: bool,
     pub private_session: bool,
+    pub keyboard_layout: String,
+    pub keyboard_shortcuts: String,
     #[serde(alias = "hidpi_scale")]
     pub resolution: String,
     pub show_cursor: bool,
@@ -82,6 +84,8 @@ impl Default for UiConfig {
             display_backend: DisplayBackend::Main,
             reuse_virtual_display: false,
             private_session: false,
+            keyboard_layout: "auto".into(),
+            keyboard_shortcuts: "auto".into(),
             resolution: "auto".to_string(),
             show_cursor: false,
             audio_enabled: true,
@@ -119,6 +123,14 @@ fn integer_in_range(
 }
 
 impl UiConfig {
+    fn validate_keyboard_preferences(&self) -> Result<(), String> {
+        macrdp_core::config::keyboard::validate_layout(&self.keyboard_layout)
+            .and_then(|_| {
+                macrdp_core::config::keyboard::validate_shortcuts(&self.keyboard_shortcuts)
+            })
+            .map_err(|error| error.to_string())
+    }
+
     /// Load configuration and migrate legacy plaintext passwords to Keychain.
     /// A locked or unavailable Keychain is an error, never permission to replace credentials.
     pub fn load() -> Result<Self, String> {
@@ -147,6 +159,7 @@ impl UiConfig {
         } else {
             Self::default()
         };
+        config.validate_keyboard_preferences()?;
         crate::graphics_profiles::validate_saved(&config.graphics_profiles)?;
         let previous_password = load_password()?;
         if config.password.is_empty() {
@@ -185,6 +198,7 @@ impl UiConfig {
         save_password: impl Fn(&str) -> Result<(), String>,
         delete_password: impl Fn() -> Result<(), String>,
     ) -> Result<(), String> {
+        self.validate_keyboard_preferences()?;
         crate::graphics_profiles::validate_saved(&self.graphics_profiles)?;
         if self.private_session && self.display_backend != DisplayBackend::Virtual {
             return Err("Guarded private sessions require the virtual display backend".into());
@@ -238,6 +252,20 @@ impl UiConfig {
     pub fn set_field(&mut self, key: &str, value: &serde_json::Value) -> Result<bool, String> {
         let previous_graphics = crate::graphics_profiles::settings(self);
         match key {
+            "keyboard_layout" => {
+                let layout = value.as_str().ok_or("keyboard_layout must be a string")?;
+                macrdp_core::config::keyboard::validate_layout(layout)
+                    .map_err(|error| error.to_string())?;
+                self.keyboard_layout = layout.into();
+            }
+            "keyboard_shortcuts" => {
+                let shortcuts = value
+                    .as_str()
+                    .ok_or("keyboard_shortcuts must be a string")?;
+                macrdp_core::config::keyboard::validate_shortcuts(shortcuts)
+                    .map_err(|error| error.to_string())?;
+                self.keyboard_shortcuts = shortcuts.into();
+            }
             "port" => {
                 self.port = integer_in_range(value, key, 1, u16::MAX as u64)? as u16;
             }
@@ -423,6 +451,8 @@ impl UiConfig {
             "display_backend"
                 | "reuse_virtual_display"
                 | "private_session"
+                | "keyboard_layout"
+                | "keyboard_shortcuts"
                 | "bind_address"
                 | "port"
                 | "idle_timeout_secs"
@@ -447,6 +477,8 @@ impl UiConfig {
             display_backend: self.display_backend,
             reuse_virtual_display: self.reuse_virtual_display,
             private_session: self.private_session,
+            keyboard_layout: self.keyboard_layout.clone(),
+            keyboard_shortcuts: self.keyboard_shortcuts.clone(),
             width: 0,  // auto-detect
             height: 0, // auto-detect
             username: Some(self.username.clone()),
@@ -480,6 +512,9 @@ impl UiConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod keyboard_tests;
 
 #[cfg(test)]
 mod tests {

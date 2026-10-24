@@ -1514,6 +1514,7 @@ impl RdpServer {
             let context = ClientInputContext {
                 client_name: result.client_name.clone(),
                 keyboard_layout: result.keyboard_layout,
+                keyboard_subtype: result.keyboard_subtype,
             };
             if !result.reactivation {
                 handler

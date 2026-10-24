@@ -739,6 +739,7 @@ async fn resize_reactivation_refreshes_context_without_starting_a_new_session() 
             reactivation,
             client_name: client_name.to_owned(),
             keyboard_layout: 0x0409,
+            keyboard_subtype: 0x474D_0102,
             client_desktop_size: None,
         };
         let error = server
@@ -802,6 +803,7 @@ async fn protection_rejection_precedes_context_capture_and_channel_startup() {
                 reactivation: false,
                 client_name: "fixture".into(),
                 keyboard_layout: 0x0409,
+                keyboard_subtype: 0x474D_0102,
                 client_desktop_size: None,
             },
             DesktopSize {
@@ -821,6 +823,7 @@ struct InputGraphicsObservation {
     callback: &'static str,
     client_name: String,
     keyboard_layout: u32,
+    keyboard_subtype: u32,
     peer_addr: Option<String>,
     bytes_sent: u64,
     updates_sent: u64,
@@ -854,6 +857,7 @@ impl GraphicsInspectingInput {
                 callback,
                 client_name: context.client_name,
                 keyboard_layout: context.keyboard_layout,
+                keyboard_subtype: context.keyboard_subtype,
                 peer_addr,
                 bytes_sent: gfx.total_bytes_sent,
                 updates_sent: gfx.total_frames_sent,
@@ -914,6 +918,7 @@ async fn activation_publishes_fresh_graphics_outside_the_lock_and_preserves_reac
             reactivation,
             client_name: client_name.to_owned(),
             keyboard_layout: 0x0409,
+            keyboard_subtype: 0x474D_0102,
             client_desktop_size: None,
         };
         let error = server
@@ -941,6 +946,7 @@ async fn activation_publishes_fresh_graphics_outside_the_lock_and_preserves_reac
         assert_eq!(observation.callback, callback);
         assert_eq!(observation.client_name, client_name);
         assert_eq!(observation.keyboard_layout, 0x0409);
+        assert_eq!(observation.keyboard_subtype, 0x474D_0102);
         assert_eq!(observation.pending_acks, 0);
     }
     for observation in &observations[..2] {
@@ -1024,6 +1030,7 @@ async fn freerdp_confirm_active_echo_does_not_replace_the_initial_viewport() {
             reactivation,
             client_name: "Guacamole RDP".into(),
             keyboard_layout: 0x0409,
+            keyboard_subtype: 0x474D_0102,
             client_desktop_size: Some(requested),
         };
         let error = server

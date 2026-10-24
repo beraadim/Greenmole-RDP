@@ -50,6 +50,12 @@ impl KeyboardInjector {
         self.with_state(|state| state.inject(InjectedKey::Physical(keycode), pressed, Self::post))
     }
 
+    /// Reassert a remotely held modifier only when text injection has released
+    /// it. Normal key repeats must continue using `inject_keycode` instead.
+    pub fn ensure_keycode_pressed(&self, keycode: u16) -> Result<()> {
+        self.with_state(|state| state.ensure_pressed(InjectedKey::Physical(keycode), Self::post))
+    }
+
     /// Apply Command only to this shortcut, then explicitly restore modifiers.
     pub fn inject_command_keycode(&self, keycode: u16, pressed: bool, shifted: bool) -> Result<()> {
         self.with_state(|state| {

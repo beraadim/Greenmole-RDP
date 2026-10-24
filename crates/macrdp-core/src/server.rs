@@ -791,6 +791,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             Some(display_controller.clone()),
         )
         .with_private_session(args.config.private_session)
+        .with_keyboard_preferences(&args.config.keyboard_layout, &args.config.keyboard_shortcuts)
         .with_events(
             Arc::clone(&args.handler),
             Arc::clone(&args.gfx_state),

@@ -110,6 +110,7 @@ static SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
         (0x37, 0x43), // Numpad * (multiply)
         (0x4A, 0x4E), // Numpad - (subtract)
         (0x4E, 0x45), // Numpad + (add)
+        (0x56, 0x0A), // ISO extra key (kVK_ISO_Section)
         // Misc
         (0x45, 0x47), // Num Lock → Clear (macOS equivalent)
         (0x46, 0x6B), // Scroll Lock → F14

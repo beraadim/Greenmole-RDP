@@ -1,4 +1,4 @@
-use super::{KeyboardTranslationProfile, MacInputHandler, ModifierState, SuppressedCtrlState};
+use super::{MacInputHandler, ModifierState, SuppressedCtrlState};
 use ironrdp_server::KeyboardEvent;
 
 impl MacInputHandler {
@@ -20,7 +20,15 @@ impl MacInputHandler {
                     code == 0x3A && !extended && self.modifier_state.caps_lock_pressed;
                 self.update_modifier_state(code, extended, true);
 
-                if let Some(result) = self.handle_command_shortcut(code, extended, true) {
+                if self.mapped_key_releases.contains_key(&(code, extended)) {
+                    self.inject_physical_key(code, extended, true)
+                } else if let Some(chars) = self.translated_key_releases.get(&(code, extended)) {
+                    Self::inject_unicode_sequence(
+                        self.keyboard.as_deref().expect("keyboard checked above"),
+                        chars,
+                        true,
+                    )
+                } else if let Some(result) = self.handle_command_shortcut(code, extended, true) {
                     result
                 } else if caps_repeat
                     || (code == 0x3A && !extended && self.translation_profile().is_some())
@@ -28,34 +36,23 @@ impl MacInputHandler {
                     // Unicode translation owns the remote lock state; toggling
                     // the host's global lock would double-apply it to text.
                     Ok(())
-                } else if extended
-                    && code == 0x38
-                    && matches!(
-                        self.translation_profile(),
-                        Some(KeyboardTranslationProfile::NorwegianPhysical)
-                    )
-                {
+                } else if extended && code == 0x38 && self.translates_altgr() {
                     self.handle_norwegian_altgr_press()
-                } else if code == 0x1D
-                    && matches!(
-                        self.translation_profile(),
-                        Some(KeyboardTranslationProfile::NorwegianPhysical)
-                    )
-                    && self.modifier_state.right_alt
-                {
+                } else if code == 0x1D && self.translates_altgr() && self.modifier_state.right_alt {
                     self.release_ctrl_companion_if_needed(extended)
                 } else if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
                     Ok(())
-                } else if extended && code == 0x38 && self.translation_profile().is_some() {
+                } else if extended
+                    && code == 0x38
+                    && (self.translates_altgr()
+                        || (self.shortcut_policy() == "windows"
+                            && self.translation_profile().is_some()))
+                {
                     Ok(())
                 } else if let Some(result) = self.handle_translated_key_press(code, extended) {
                     result
-                } else if extended && code == 0x38 && self.map_right_alt_to_option() {
-                    let kb = self.keyboard.as_deref().expect("keyboard checked above");
-                    kb.inject_keycode(0x3D, true)
                 } else {
-                    let kb = self.keyboard.as_deref().expect("keyboard checked above");
-                    kb.inject_key(code, extended, true)
+                    self.inject_physical_key(code, extended, true)
                 }
             }
             KeyboardEvent::Released { code, extended } => {
@@ -65,6 +62,10 @@ impl MacInputHandler {
 
                 if let Some(result) = shortcut_result {
                     result
+                } else if self.mapped_key_releases.contains_key(&(code, extended)) {
+                    self.inject_physical_key(code, extended, false)
+                } else if let Some(chars) = self.translated_key_releases.remove(&(code, extended)) {
+                    Self::inject_unicode_sequence(kb, &chars, false)
                 } else if code == 0x3A && !extended && self.translation_profile().is_some() {
                     Ok(())
                 } else if code == 0x1D
@@ -77,17 +78,18 @@ impl MacInputHandler {
                         self.suppressed_ctrl_for_altgr.left = false;
                     }
                     Ok(())
-                } else if let Some(chars) = self.translated_key_releases.remove(&(code, extended)) {
-                    Self::inject_unicode_sequence(kb, &chars, false)
                 } else if extended && code == 0x1D && self.treat_right_ctrl_as_altgr_companion() {
                     Ok(())
-                } else if extended && code == 0x38 && self.translation_profile().is_some() {
+                } else if extended
+                    && code == 0x38
+                    && (self.translates_altgr()
+                        || (self.shortcut_policy() == "windows"
+                            && self.translation_profile().is_some()))
+                {
                     self.clear_suppressed_altgr_ctrls();
                     Ok(())
-                } else if extended && code == 0x38 && self.map_right_alt_to_option() {
-                    kb.inject_keycode(0x3D, false)
                 } else {
-                    kb.inject_key(code, extended, false)
+                    self.inject_physical_key(code, extended, false)
                 }
             }
             KeyboardEvent::UnicodePressed(ch) => self
@@ -151,6 +153,7 @@ impl MacInputHandler {
                 self.pending_dead_key = None;
                 self.translated_key_releases.clear();
                 self.command_shortcuts.clear();
+                self.mapped_key_releases.clear();
                 result
             }
         };

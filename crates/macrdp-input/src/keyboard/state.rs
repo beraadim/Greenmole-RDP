@@ -61,6 +61,17 @@ impl KeyboardState {
         )
     }
 
+    pub(super) fn ensure_pressed(
+        &mut self,
+        key: InjectedKey,
+        post: impl FnMut(InjectedKey, bool, RemoteModifiers) -> Result<()>,
+    ) -> Result<()> {
+        if self.held.contains(&key) {
+            return Ok(());
+        }
+        self.inject(key, true, post)
+    }
+
     pub(super) fn inject(
         &mut self,
         key: InjectedKey,

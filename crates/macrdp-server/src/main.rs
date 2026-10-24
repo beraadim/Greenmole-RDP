@@ -43,6 +43,9 @@ fn main() -> Result<()> {
     if let Some(result) = macrdp_core::run_server_helper_if_requested() {
         return result;
     }
+    // This executable remains a command-line process; configure before Tokio
+    // starts any workers. The isolated server child opts in independently.
+    macrdp_core::host_layout::configure_for_headless_process()?;
     run()
 }
 

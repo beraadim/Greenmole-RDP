@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn restoring_held_modifiers_does_not_duplicate_presses_but_reasserts_after_text_cleanup() {
+    let mut state = KeyboardState::default();
+    let shift = InjectedKey::Physical(0x38);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        state
+            .ensure_pressed(shift, |key, pressed, _| {
+                events.push((key, pressed));
+                Ok(())
+            })
+            .unwrap();
+    }
+    state
+        .release_matching(InjectedKey::is_modifier, |key, pressed, _| {
+            events.push((key, pressed));
+            Ok(())
+        })
+        .unwrap();
+    state
+        .ensure_pressed(shift, |key, pressed, flags| {
+            assert!(flags.flags.contains(CGEventFlags::CGEventFlagShift));
+            events.push((key, pressed));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(events, [(shift, true), (shift, false), (shift, true)]);
+}
+
+#[test]
+fn failed_modifier_restore_is_retryable_and_successful_restore_is_released() {
+    let mut state = KeyboardState::default();
+    let shift = InjectedKey::Physical(0x3C);
+    assert!(state
+        .ensure_pressed(shift, |_, _, _| anyhow::bail!("simulated post failure"))
+        .is_err());
+    assert!(!state.held.contains(&shift));
+    state.ensure_pressed(shift, |_, _, _| Ok(())).unwrap();
+    let mut releases = Vec::new();
+    state
+        .release_matching(
+            |_| true,
+            |key, pressed, _| {
+                releases.push((key, pressed));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(releases, [(shift, false)]);
+}
+
+#[test]
 fn private_flags_follow_only_remote_owned_modifier_transitions() {
     let mut state = KeyboardState::default();
     assert_eq!(state.modifiers().flags, CGEventFlags::empty());

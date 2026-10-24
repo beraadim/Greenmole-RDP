@@ -63,6 +63,22 @@ frame_rate = 60
 # up to 3840x2160; changing this setting for a virtual display requires a restart.
 # resolution = "3840x2160"
 
+# ─── Keyboard ──────────────────────────────────────────────────────────────────
+
+# Text layout uses the RDP client's negotiated layout, independently of shortcuts.
+# Options: auto, us, uk, no, se, dk, de, fr, physical. Restart required.
+# The existing Norwegian Windows mapping is preserved. Greenmole browser sessions
+# normally use a US transport layout even with a Norwegian local keyboard.
+# Unsupported layouts and "physical" use the Mac's selected input source.
+keyboard_layout = "auto"
+
+# Shortcut policy. Restart required.
+# auto: honor a supported Greenmole client preference, otherwise Windows-friendly.
+# windows: preserve Ctrl+A/X/C/V/Enter -> Command and Alt -> Command, Win -> Option.
+# mac: preserve native Command/Option/Control, including Control+C in Terminal.
+# physical: keep Control; map Win/Super to Command and Alt to Option.
+keyboard_shortcuts = "auto"
+
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 
 # Image quality preset (CLI default: high_quality; desktop default: balanced).

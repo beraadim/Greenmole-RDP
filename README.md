@@ -28,7 +28,7 @@ and its contributors. See [NOTICE](NOTICE) for source attribution.
 - **Standard RDP protocol** — supports Windows Remote Desktop and Greenmole/Guacamole clients
 - **Hardware-accelerated encoding** — GPU-powered H.264 via Apple VideoToolbox, low latency on Apple Silicon
 - **High fidelity color** — AVC420 and AVC444 video, with negotiated image fallback
-- **Full keyboard & mouse** — complete input injection with 104-key mapping, numpad, modifiers, scroll
+- **Localized keyboard & mouse** — seven text layouts, independent Windows/Mac shortcut preferences, numpad and scroll; see [keyboard configuration](docs/keyboard-layouts.md)
 - **HiDPI / Retina support** — capture at 2x/3x resolution for sharp 4K remote display
 - **Experimental virtual display** — an extended macOS desktop that follows the Guacamole viewport; see [setup and testing](docs/virtual-display.md)
 - **Configurable** — resolution, frame rate, bitrate, encoder, quality presets, all via simple TOML config
@@ -86,6 +86,10 @@ encoder = "hardware"        # hardware (GPU) / software (CPU)
 chroma_mode = "avc420"      # avc420 (compatible) / avc444 (best quality)
 bitrate_mbps = 50           # target bitrate (Mbps)
 
+# Keyboard
+keyboard_layout = "auto"    # negotiated layout; us / uk / no / se / dk / de / fr / physical
+keyboard_shortcuts = "auto" # Greenmole preference, otherwise Windows-friendly
+
 # Logging
 log_level = "info"          # trace / debug / info / warn / error
 ```
@@ -94,6 +98,13 @@ With `width = 0`, `height = 0`, and `resolution = "auto"`, client requests can
 resize the remote desktop. A fixed value such as `resolution = "1920x1080"`
 disables client-driven resizing. Legacy scale values remain supported as strings
 (for example, `resolution = "2"`); these values must be quoted in TOML.
+
+Keyboard preferences are available in **Settings → Keyboard** and take effect
+after restarting the service. Keep both at `auto` to preserve the existing
+Norwegian Windows experience. A Greenmole browser connection normally uses a US
+transport layout even with a Norwegian local keyboard; do not change it just to
+match the browser's language. See [layout selection, shortcut modes and testing
+limits](docs/keyboard-layouts.md).
 
 The desktop app is **Greenmole RDP.app**. Internal crate/binary names, the
 `com.macrdp.app` application identifier and existing configuration, Keychain, TLS
@@ -133,6 +144,7 @@ The project builds on the following open-source work:
 - **[IronRDP](https://github.com/Devolutions/IronRDP)** — Pure Rust RDP protocol implementation. Greenmole RDP's protocol stack is built on a fork of ironrdp-server with GFX/AVC444 extensions.
 - **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — The reference open-source RDP implementation. Its AVC444 dual-stream encoding approach and YUV444 B-area split algorithm were essential references.
 - **[RustDesk](https://github.com/rustdesk/rustdesk)** — Open-source remote desktop software written in Rust. Its architecture for cross-platform screen capture and input injection was a great source of inspiration.
+- **[Apache Guacamole](https://guacamole.apache.org/)** — Source of additional keyboard layout tables, with the Apache License 2.0 and notices retained in [the layout module](crates/macrdp-core/src/handler/layouts/).
 
 ---
 

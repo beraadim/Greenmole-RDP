@@ -56,6 +56,21 @@ fn native_timeouts_and_keepalive_policy_preserve_only_operational_evidence() {
 }
 
 #[test]
+fn keyboard_diagnostics_include_only_supported_preference_names() {
+    let mut config = UiConfig::default();
+    config.keyboard_layout = "no".into();
+    config.keyboard_shortcuts = "windows".into();
+    let value = safe_configuration(&config);
+    assert_eq!(value["keyboard_layout"], "no");
+    assert_eq!(value["keyboard_shortcuts"], "windows");
+    config.keyboard_layout = "unsupported-private-value".into();
+    config.keyboard_shortcuts = "unsupported-private-value".into();
+    assert!(!safe_configuration(&config)
+        .to_string()
+        .contains("unsupported-private-value"));
+}
+
+#[test]
 fn exports_selected_operational_fields_without_credentials_or_input_text() {
     let secret = "private-canary-value";
     let mut config = UiConfig::default();
@@ -66,6 +81,8 @@ fn exports_selected_operational_fields_without_credentials_or_input_text() {
     config.bind_address = secret.into();
     config.tls_server_names = vec![secret.into()];
     config.encoder = secret.into();
+    config.keyboard_layout = secret.into();
+    config.keyboard_shortcuts = secret.into();
     config.resolution = secret.into();
     let config_json = safe_configuration(&config).to_string();
     assert!(!config_json.contains(secret));

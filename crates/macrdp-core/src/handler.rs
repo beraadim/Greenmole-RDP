@@ -8,10 +8,13 @@ use crate::callbacks::InputDebugState;
 
 mod keyboard_device;
 mod keyboard_events;
+mod keyboard_policy;
+mod layouts;
 mod privacy;
 mod shortcuts;
 mod translation;
 use keyboard_device::KeyboardDevice;
+use layouts::KeyboardTranslationProfile;
 use shortcuts::CommandShortcut;
 
 /// Bridges RDP input events to macOS CGEvent injection
@@ -24,11 +27,14 @@ pub struct MacInputHandler {
     last_sync_lock_bits: Option<u8>,
     coord_mapper: MouseCoordMapper,
     client_context: ClientInputContext,
+    keyboard_layout: String,
+    keyboard_shortcuts: String,
     modifier_state: ModifierState,
     suppressed_ctrl_for_altgr: SuppressedCtrlState,
     pending_dead_key: Option<char>,
     translated_key_releases: HashMap<(u8, bool), Vec<u16>>,
     command_shortcuts: HashMap<(u8, bool), CommandShortcut>,
+    mapped_key_releases: HashMap<(u8, bool), u16>,
     debug_state: Arc<Mutex<InputDebugState>>,
     active_connection: Arc<Mutex<Option<crate::callbacks::ConnectionInfo>>>,
     display_controller: Option<macrdp_display::DisplayController>,
@@ -76,12 +82,6 @@ enum TextTranslation {
     Dead(char),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyboardTranslationProfile {
-    GuacamoleUs,
-    NorwegianPhysical,
-}
-
 impl MacInputHandler {
     pub fn new(
         coord_mapper: MouseCoordMapper,
@@ -114,11 +114,14 @@ impl MacInputHandler {
             last_sync_lock_bits: None,
             coord_mapper,
             client_context: ClientInputContext::default(),
+            keyboard_layout: "auto".into(),
+            keyboard_shortcuts: "auto".into(),
             modifier_state: ModifierState::default(),
             suppressed_ctrl_for_altgr: SuppressedCtrlState::default(),
             pending_dead_key: None,
             translated_key_releases: HashMap::new(),
             command_shortcuts: HashMap::new(),
+            mapped_key_releases: HashMap::new(),
             debug_state,
             active_connection,
             display_controller,
@@ -147,6 +150,12 @@ impl MacInputHandler {
         self
     }
 
+    pub fn with_keyboard_preferences(mut self, layout: &str, shortcuts: &str) -> Self {
+        self.keyboard_layout = layout.to_string();
+        self.keyboard_shortcuts = shortcuts.to_string();
+        self
+    }
+
     fn reset_session_input(&mut self, reason: &str) {
         if let Some(keyboard) = &self.keyboard {
             if let Err(error) = keyboard.release_all() {
@@ -163,16 +172,14 @@ impl MacInputHandler {
         self.pending_dead_key = None;
         self.translated_key_releases.clear();
         self.command_shortcuts.clear();
+        self.mapped_key_releases.clear();
         self.last_sync_lock_bits = None;
         self.set_last_translation(None);
     }
 
     fn translation_profile_name(&self) -> &'static str {
-        match self.translation_profile() {
-            Some(KeyboardTranslationProfile::GuacamoleUs) => "guacamole_us",
-            Some(KeyboardTranslationProfile::NorwegianPhysical) => "norwegian_physical",
-            None => "none",
-        }
+        self.translation_profile()
+            .map_or("physical", |profile| profile.name())
     }
 
     fn map_right_alt_to_option(&self) -> bool {
@@ -183,20 +190,18 @@ impl MacInputHandler {
     }
 
     fn treat_right_ctrl_as_altgr_companion(&self) -> bool {
-        matches!(
-            self.translation_profile(),
-            Some(KeyboardTranslationProfile::NorwegianPhysical)
-        )
+        self.shortcut_policy() == "windows"
+            && matches!(
+                self.translation_profile(),
+                Some(KeyboardTranslationProfile::Norwegian)
+            )
     }
 
     fn translation_profile(&self) -> Option<KeyboardTranslationProfile> {
-        if self.client_context.client_name.contains("Guacamole") {
-            Some(KeyboardTranslationProfile::GuacamoleUs)
-        } else if self.client_context.keyboard_layout == 0x0414 {
-            Some(KeyboardTranslationProfile::NorwegianPhysical)
-        } else {
-            None
-        }
+        KeyboardTranslationProfile::from_setting(
+            &self.keyboard_layout,
+            self.client_context.keyboard_layout,
+        )
     }
 
     fn inject_unicode_sequence(
@@ -224,7 +229,16 @@ impl MacInputHandler {
         code: u8,
         extended: bool,
     ) -> Option<anyhow::Result<()>> {
-        let translation = self.translate_text_key(code, extended)?;
+        let translation = match self.translate_text_key(code, extended) {
+            Some(translation) => translation,
+            None if self.is_unmapped_text_chord(code, extended) => {
+                self.translated_key_releases
+                    .entry((code, extended))
+                    .or_default();
+                return Some(Ok(()));
+            }
+            None => return None,
+        };
         let kb = self.keyboard.as_deref().expect("keyboard checked above");
 
         let mut emitted = Vec::new();
@@ -274,6 +288,12 @@ impl MacInputHandler {
         if !emitted.is_empty() {
             self.translated_key_releases
                 .insert((code, extended), emitted);
+        } else {
+            // Dead keys are handled entirely in this session. Their key-up
+            // must not become an unmatched native physical release.
+            self.translated_key_releases
+                .entry((code, extended))
+                .or_default();
         }
 
         self.set_last_translation(match translation {
@@ -407,6 +427,7 @@ impl MacInputHandler {
         // including when accessibility is unavailable or tests use no device.
         if let Some(kb) = &self.keyboard {
             kb.inject_key(0x1D, extended, false)?;
+            self.mapped_key_releases.remove(&(0x1D, extended));
         }
         Ok(())
     }
@@ -538,12 +559,18 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn update_client_context(&mut self, context: ClientInputContext) {
-        tracing::info!(
-            client_name = context.client_name,
-            keyboard_layout = format_args!("{:#06x}", context.keyboard_layout),
-            "Updated client input context"
-        );
         self.client_context = context;
+        tracing::info!(
+            keyboard_layout = format_args!("{:#010x}", self.client_context.keyboard_layout),
+            keyboard_subtype = format_args!("{:#010x}", self.client_context.keyboard_subtype),
+            text_profile = self.translation_profile_name(),
+            shortcut_profile = self.shortcut_policy(),
+            "Selected session keyboard profiles"
+        );
+        if self.keyboard_layout == "auto" && self.translation_profile().is_none() {
+            tracing::warn!(keyboard_layout = format_args!("{:#010x}", self.client_context.keyboard_layout),
+                "No text profile for advertised layout; using host physical layout. Select a keyboard layout override if characters differ");
+        }
         self.refresh_debug_state(Some(format!(
             "context:{}:{:#06x}",
             self.client_context.client_name, self.client_context.keyboard_layout

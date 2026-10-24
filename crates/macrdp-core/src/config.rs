@@ -1,5 +1,7 @@
 //! Server configuration
 
+pub mod keyboard;
+
 use macrdp_display::DisplayBackend;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -60,6 +62,10 @@ pub struct ServerConfig {
     pub reuse_virtual_display: bool,
     /// Guard local screens/input during a virtual-display connection. Requires restart.
     pub private_session: bool,
+    /// Remote text layout: auto follows the negotiated RDP layout. Requires restart.
+    pub keyboard_layout: String,
+    /// Shortcut policy: auto accepts a supported client hint, otherwise Windows compatibility.
+    pub keyboard_shortcuts: String,
     /// Resolution width (0 = auto-detect from display)
     pub width: u32,
     /// Resolution height (0 = auto-detect from display)
@@ -112,6 +118,8 @@ impl Default for ServerConfig {
             display_backend: DisplayBackend::Main,
             reuse_virtual_display: false,
             private_session: false,
+            keyboard_layout: "auto".into(),
+            keyboard_shortcuts: "auto".into(),
             width: 0,
             height: 0,
             username: None,
@@ -138,6 +146,8 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Reject unsafe/inconsistent settings before initializing the desktop or listener.
     pub fn validate(&self) -> anyhow::Result<()> {
+        keyboard::validate_layout(&self.keyboard_layout)?;
+        keyboard::validate_shortcuts(&self.keyboard_shortcuts)?;
         anyhow::ensure!(self.port > 0, "port must be between 1 and 65535");
         anyhow::ensure!(
             !self.reuse_virtual_display || self.display_backend == DisplayBackend::Virtual,

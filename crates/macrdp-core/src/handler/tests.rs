@@ -7,6 +7,8 @@ use ironrdp_server::{KeyboardEvent, RdpServerInputHandler};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod keyboard_policy_tests;
+mod modifier_reconciliation_tests;
 mod shortcut_tests;
 
 #[test]
@@ -54,7 +56,11 @@ fn handler_for(client_name: &str, keyboard_layout: u32) -> MacInputHandler {
         client_context: ClientInputContext {
             client_name: client_name.to_string(),
             keyboard_layout,
+            keyboard_subtype: 0,
         },
+        keyboard_layout: "auto".into(),
+        keyboard_shortcuts: "auto".into(),
+        mapped_key_releases: HashMap::new(),
         modifier_state: ModifierState::default(),
         suppressed_ctrl_for_altgr: SuppressedCtrlState::default(),
         pending_dead_key: None,
@@ -86,11 +92,11 @@ fn private_session_input_inspector_does_not_export_typed_content_or_modifiers() 
 }
 
 #[test]
-fn guacamole_uses_norwegian_text_translation_for_comma_key() {
+fn guacamole_us_transport_translates_comma_independently_of_host_layout() {
     let mut handler = handler_for("Guacamole RDP", 0x0409);
     assert_eq!(
         handler.translation_profile(),
-        Some(KeyboardTranslationProfile::GuacamoleUs)
+        Some(KeyboardTranslationProfile::Us)
     );
     assert_eq!(
         handler.translate_text_key(0x33, false),
@@ -104,11 +110,60 @@ fn guacamole_uses_norwegian_text_translation_for_comma_key() {
 }
 
 #[test]
+fn native_and_browser_clients_use_the_negotiated_layout_not_their_name() {
+    for client in [
+        "Windows Remote Desktop",
+        "MacBook",
+        "Guacamole RDP",
+        "GuacamoleAVC420",
+        "custom-name",
+    ] {
+        for (layout, code, expected) in [
+            (0x0409, 0x1A, '['),
+            (0x0809, 0x2B, '#'),
+            (0x0414, 0x1A, 'å'),
+            (0x041D, 0x27, 'ö'),
+            (0x0406, 0x27, 'æ'),
+            (0x0407, 0x15, 'z'),
+            (0x040C, 0x10, 'a'),
+        ] {
+            let handler = handler_for(client, layout);
+            assert_eq!(
+                handler.translate_text_key(code, false),
+                Some(TextTranslation::Unicode(expected)),
+                "{client} layout={layout:#x}"
+            );
+            assert_eq!(handler.translate_text_key(code, true), None);
+        }
+        assert_eq!(handler_for(client, 0x10409).translation_profile(), None);
+        assert_eq!(handler_for(client, 0).translation_profile(), None);
+    }
+}
+
+#[test]
+fn layout_override_is_explicit_and_does_not_mutate_negotiated_identity() {
+    let mut handler = handler_for("Windows Remote Desktop", 0x0414);
+    handler.keyboard_layout = "us".into();
+    assert_eq!(
+        handler.translate_text_key(0x1A, false),
+        Some(TextTranslation::Unicode('['))
+    );
+    assert_eq!(handler.client_context.keyboard_layout, 0x0414);
+    handler.keyboard_layout = "physical".into();
+    assert_eq!(handler.translate_text_key(0x1A, false), None);
+    handler.keyboard_layout = "auto".into();
+    assert_eq!(
+        handler.translate_text_key(0x1A, false),
+        Some(TextTranslation::Unicode('å'))
+    );
+}
+
+#[test]
 fn norwegian_star_key_translates_to_expected_characters() {
     let mut handler = handler_for("Windows App", 0x0414);
     assert_eq!(
         handler.translation_profile(),
-        Some(KeyboardTranslationProfile::NorwegianPhysical)
+        Some(KeyboardTranslationProfile::Norwegian)
     );
     assert_eq!(
         handler.translate_text_key(0x2B, false),
@@ -298,29 +353,66 @@ enum KeyAction {
     ReleaseAll,
 }
 
-struct RecordingKeyboard(Arc<Mutex<Vec<KeyAction>>>);
+struct RecordingKeyboard {
+    actions: Arc<Mutex<Vec<KeyAction>>>,
+    held: std::cell::RefCell<std::collections::BTreeSet<u16>>,
+}
+
+impl RecordingKeyboard {
+    fn new(actions: Arc<Mutex<Vec<KeyAction>>>) -> Self {
+        Self {
+            actions,
+            held: Default::default(),
+        }
+    }
+}
+
 impl KeyboardDevice for RecordingKeyboard {
     fn inject_command_keycode(&self, key: u16, pressed: bool, shifted: bool) -> anyhow::Result<()> {
-        self.0
+        self.actions
             .lock()
             .unwrap()
             .push(KeyAction::Command(key, pressed, shifted));
         Ok(())
     }
     fn inject_keycode(&self, key: u16, pressed: bool) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push(KeyAction::Key(key, pressed));
+        self.actions
+            .lock()
+            .unwrap()
+            .push(KeyAction::Key(key, pressed));
+        if pressed {
+            self.held.borrow_mut().insert(key);
+        } else {
+            self.held.borrow_mut().remove(&key);
+        }
+        Ok(())
+    }
+    fn ensure_keycode_pressed(&self, key: u16) -> anyhow::Result<()> {
+        if !self.held.borrow().contains(&key) {
+            self.inject_keycode(key, true)?;
+        }
         Ok(())
     }
     fn inject_unicode(&self, ch: u16, pressed: bool) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push(KeyAction::Unicode(ch, pressed));
+        self.actions
+            .lock()
+            .unwrap()
+            .push(KeyAction::Unicode(ch, pressed));
         Ok(())
     }
     fn release_transient_modifiers(&self) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push(KeyAction::ReleaseModifiers);
+        self.actions
+            .lock()
+            .unwrap()
+            .push(KeyAction::ReleaseModifiers);
+        self.held
+            .borrow_mut()
+            .retain(|code| !matches!(code, 0x36..=0x38 | 0x3A..=0x3F));
         Ok(())
     }
     fn release_all(&self) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push(KeyAction::ReleaseAll);
+        self.actions.lock().unwrap().push(KeyAction::ReleaseAll);
+        self.held.borrow_mut().clear();
         Ok(())
     }
     fn current_modifier_flags(&self) -> (Vec<String>, u64) {
@@ -332,7 +424,7 @@ impl KeyboardDevice for RecordingKeyboard {
 fn caps_lock_sync_repeat_and_reconnect_follow_remote_state_without_host_toggles() {
     let mut handler = handler_for("Guacamole RDP", 0x0409);
     let actions = Arc::new(Mutex::new(Vec::new()));
-    handler.keyboard = Some(Box::new(RecordingKeyboard(actions.clone())));
+    handler.keyboard = Some(Box::new(RecordingKeyboard::new(actions.clone())));
     handler.keyboard(KeyboardEvent::Synchronize(
         ironrdp_server::SynchronizeFlags::from_bits_truncate(4),
     ));
@@ -381,6 +473,7 @@ fn caps_lock_sync_repeat_and_reconnect_follow_remote_state_without_host_toggles(
         ClientInputContext {
             client_name: "Guacamole RDP".into(),
             keyboard_layout: 0x0409,
+            keyboard_subtype: 0,
         },
         None,
     );
@@ -458,7 +551,7 @@ fn caps_lock_xor_shift_applies_to_letters_not_symbols_or_altgr() {
 fn caps_lock_composes_uppercase_dead_keys_and_releases_the_original_character() {
     let mut handler = handler_for("Windows App", 0x0414);
     let actions = Arc::new(Mutex::new(Vec::new()));
-    handler.keyboard = Some(Box::new(RecordingKeyboard(actions.clone())));
+    handler.keyboard = Some(Box::new(RecordingKeyboard::new(actions.clone())));
     handler.keyboard(KeyboardEvent::Synchronize(
         ironrdp_server::SynchronizeFlags::from_bits_truncate(4),
     ));
@@ -504,8 +597,9 @@ fn caps_lock_composes_uppercase_dead_keys_and_releases_the_original_character() 
 #[test]
 fn initial_physical_caps_sync_reconciles_host_lock_once() {
     let mut handler = handler_for("Windows App", 0x0409);
+    handler.keyboard_layout = "physical".into();
     let actions = Arc::new(Mutex::new(Vec::new()));
-    handler.keyboard = Some(Box::new(RecordingKeyboard(actions.clone())));
+    handler.keyboard = Some(Box::new(RecordingKeyboard::new(actions.clone())));
     let caps = ironrdp_server::SynchronizeFlags::from_bits_truncate(4);
     handler.keyboard(KeyboardEvent::Synchronize(caps));
     handler.keyboard(KeyboardEvent::Synchronize(caps));
@@ -526,7 +620,7 @@ fn initial_physical_caps_sync_reconciles_host_lock_once() {
 fn disconnect_releases_keyboard_before_reconnect_and_clears_translation_state() {
     let mut handler = handler_for("Windows App", 0x0414);
     let events = Arc::new(Mutex::new(Vec::new()));
-    handler.keyboard = Some(Box::new(RecordingKeyboard(Arc::clone(&events))));
+    handler.keyboard = Some(Box::new(RecordingKeyboard::new(Arc::clone(&events))));
     handler.keyboard(KeyboardEvent::Pressed {
         code: 0x2A,
         extended: false,
@@ -553,6 +647,7 @@ fn disconnect_releases_keyboard_before_reconnect_and_clears_translation_state() 
         ClientInputContext {
             client_name: "Guacamole RDP".into(),
             keyboard_layout: 0x0409,
+            keyboard_subtype: 0,
         },
         None,
     );
@@ -583,7 +678,7 @@ fn disconnect_releases_keyboard_before_reconnect_and_clears_translation_state() 
 fn reconnect_without_disconnect_and_synchronize_release_all_remote_keys() {
     let mut handler = handler_for("Windows App", 0x0409);
     let events = Arc::new(Mutex::new(Vec::new()));
-    handler.keyboard = Some(Box::new(RecordingKeyboard(Arc::clone(&events))));
+    handler.keyboard = Some(Box::new(RecordingKeyboard::new(Arc::clone(&events))));
     handler.keyboard(KeyboardEvent::Pressed {
         code: 0x38,
         extended: false,

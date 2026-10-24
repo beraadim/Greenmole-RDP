@@ -62,6 +62,9 @@ pub enum MouseEvent {
 pub struct ClientInputContext {
     pub client_name: String,
     pub keyboard_layout: u32,
+    /// OEM keyboard subtype. Exact Greenmole virtual-keyboard values may carry
+    /// a shortcut preference; other values retain the server's configured policy.
+    pub keyboard_subtype: u32,
 }
 
 /// Input Event Handler for an RDP server
