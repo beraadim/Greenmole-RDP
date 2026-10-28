@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Copyright 2026 Greenmole contributors.
+SPDX-License-Identifier: Apache-2.0
+Original Greenmole deployment artwork, shared with Greenmole RDP.
+Licensed under the Apache License, Version 2.0; see LICENSE in this directory.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title description">
+  <title id="title">Greenmole — browser to Mac through a private WireGuard tunnel</title>
+  <desc id="description">A browser connects over HTTPS and secure WebSocket on TCP 443 to a public edge VPS reverse proxy. Browser TLS terminates at the VPS. A WireGuard tunnel carries HTTP and WebSocket to a Linux Docker host behind a home or office router. The host publishes Greenmole's Java and Tomcat web container port 8080 as port 18080 on its WireGuard address. The web container connects to guacd on unpublished port 4822 over a trusted private Docker bridge. guacd reaches the native Greenmole RDP macOS server over RDP TLS on the LAN. The configured RDP port defaults to 3389; the example configuration uses 13389. The home host initiates the WireGuard tunnel; the browser needs no VPN client. RDP and guacd are not exposed to the internet.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f5faf8"/>
+      <stop offset="1" stop-color="#eef4fa"/>
+    </linearGradient>
+    <linearGradient id="privateArea" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e9f6ec"/>
+      <stop offset="1" stop-color="#f2f9f3"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#163a2c" flood-opacity="0.06"/>
+    </filter>
+    <marker id="blueArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9 Z" fill="#3b6db2"/>
+    </marker>
+    <marker id="greenArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9 Z" fill="#2a8453"/>
+    </marker>
+    <marker id="grayArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9 Z" fill="#698174"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+      .ink { fill: #173c2b; }
+      .muted { fill: #52665d; }
+      .label { font-size: 16px; font-weight: 700; letter-spacing: 1.8px; }
+      .heading { font-size: 27px; font-weight: 700; }
+      .body { font-size: 21px; }
+      .small { font-size: 18px; }
+      .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 18px; }
+      .icon { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+      .flow { fill: none; stroke-width: 3; stroke-linecap: round; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" rx="28" fill="url(#background)"/>
+  <rect x="48" y="48" width="7" height="66" rx="3.5" fill="#3d995b"/>
+  <text x="76" y="79" class="ink" font-size="38" font-weight="750">Greenmole, from anywhere</text>
+  <text x="76" y="113" class="muted body">A public front door. A private path to your Mac.</text>
+  <rect x="1262" y="55" width="290" height="42" rx="21" fill="#dfede3"/>
+  <text x="1407" y="82" text-anchor="middle" fill="#27673e" class="label">REFERENCE ARCHITECTURE</text>
+
+  <!-- Home/office boundary includes the WireGuard peer, Docker bridge and Mac. -->
+  <rect x="724" y="162" width="828" height="586" rx="25" fill="url(#privateArea)" stroke="#b9d9c2" stroke-width="1.5" stroke-dasharray="7 7"/>
+  <text x="752" y="194" class="label" fill="#34714b">HOME / OFFICE NETWORK</text>
+  <text x="752" y="222" class="small muted">Behind NAT · no inbound router port forwarding</text>
+
+  <text x="48" y="194" class="label muted">YOUR DEVICE</text>
+  <text x="374" y="194" class="label muted">PUBLIC INTERNET</text>
+
+  <!-- Browser. -->
+  <rect x="48" y="250" width="246" height="350" rx="22" fill="#fff" stroke="#d8e3de" filter="url(#shadow)"/>
+  <rect x="76" y="278" width="66" height="66" rx="17" fill="#edf3fb"/>
+  <g class="icon" color="#3b6db2" transform="translate(89 292)">
+    <rect x="0" y="0" width="40" height="29" rx="3"/>
+    <path d="M0 8H40 M15 29V35 M25 29V35 M9 36H31"/>
+    <path d="M5 4H6 M10 4H11"/>
+  </g>
+  <text x="76" y="389" class="heading ink">Your browser</text>
+  <text x="76" y="428" class="body muted">Laptop, tablet</text>
+  <text x="76" y="457" class="body muted">or phone</text>
+  <path d="M76 484H266" stroke="#e5ece8"/>
+  <text x="76" y="519" class="body ink">HTTPS / WSS</text>
+  <text x="76" y="558" class="small muted">No VPN client needed</text>
+
+  <!-- TLS termination at the edge, not at the private application. -->
+  <rect x="374" y="250" width="270" height="350" rx="22" fill="#fff" stroke="#d8e3de" filter="url(#shadow)"/>
+  <rect x="402" y="278" width="66" height="66" rx="17" fill="#edf3fb"/>
+  <g class="icon" color="#3b6db2" transform="translate(416 291)">
+    <path d="M19 0L36 7V20C36 29 29 36 19 40C9 36 2 29 2 20V7Z"/>
+    <rect x="12" y="17" width="14" height="12" rx="2"/>
+    <path d="M15 17V13A4 4 0 0 1 23 13V17"/>
+  </g>
+  <text x="402" y="389" class="heading ink">Edge VPS</text>
+  <text x="402" y="428" class="body muted">HTTPS reverse proxy</text>
+  <text x="402" y="457" class="body muted">Public DNS + certificate</text>
+  <path d="M402 484H616" stroke="#e5ece8"/>
+  <text x="402" y="519" class="body ink">Browser TLS ends here</text>
+  <text x="402" y="558" class="small muted">WireGuard peer</text>
+
+  <!-- Bidirectional session traffic; initiation direction is described below. -->
+  <path d="M303 392H365" class="flow" stroke="#3b6db2" marker-start="url(#blueArrow)" marker-end="url(#blueArrow)"/>
+  <text x="334" y="370" text-anchor="middle" class="small" fill="#3b6db2">443</text>
+  <path d="M654 392H743" class="flow" stroke="#2a8453" marker-start="url(#greenArrow)" marker-end="url(#greenArrow)"/>
+  <text x="698" y="349" text-anchor="middle" font-size="17" font-weight="700" fill="#27673e">WireGuard</text>
+  <text x="698" y="373" text-anchor="middle" font-size="16" fill="#34714b">HTTP / WS</text>
+  <text x="698" y="424" text-anchor="middle" font-size="16" fill="#34714b">encrypted</text>
+
+  <!-- Docker host: only the web port is published, on the tunnel address. -->
+  <rect x="752" y="250" width="424" height="458" rx="22" fill="#fff" stroke="#b9d9c2" filter="url(#shadow)"/>
+  <text x="780" y="290" class="heading ink">Linux Docker host</text>
+  <rect x="776" y="308" width="376" height="36" rx="8" fill="#edf6ef"/>
+  <text x="964" y="332" text-anchor="middle" class="mono" fill="#34714b">WireGuard IP :18080 → :8080</text>
+
+  <rect x="780" y="362" width="368" height="110" rx="14" fill="#f3f9f4" stroke="#c4dfcd"/>
+  <g class="icon" color="#2a8453" transform="translate(801 387)">
+    <rect width="36" height="32" rx="4"/>
+    <path d="M0 10H36 M6 5H7 M12 5H13 M10 18L6 22L10 26 M26 18L30 22L26 26"/>
+  </g>
+  <text x="854" y="402" class="heading ink">Greenmole web</text>
+  <text x="854" y="436" class="body muted">Java / Tomcat · 8080</text>
+
+  <path d="M816 484V546" class="flow" stroke="#698174" marker-start="url(#grayArrow)" marker-end="url(#grayArrow)"/>
+  <text x="854" y="504" class="small muted">Private Docker bridge</text>
+  <text x="854" y="531" class="small muted">Guacamole protocol · 4822</text>
+
+  <rect x="780" y="558" width="368" height="100" rx="14" fill="#f3f9f4" stroke="#c4dfcd"/>
+  <g class="icon" color="#2a8453" transform="translate(801 582)">
+    <rect width="36" height="15" rx="3"/>
+    <rect y="21" width="36" height="15" rx="3"/>
+    <path d="M7 7H8 M7 28H8 M16 7H28 M16 28H28"/>
+  </g>
+  <text x="854" y="598" class="heading ink">guacd</text>
+  <text x="854" y="632" class="body muted">RDP gateway · 4822</text>
+  <text x="780" y="686" class="small muted">4822 stays unpublished · LAN egress allowed</text>
+
+  <!-- The Mac remains a native application outside Docker. -->
+  <rect x="1252" y="434" width="272" height="274" rx="22" fill="#fff" stroke="#b9d9c2" filter="url(#shadow)"/>
+  <g class="icon" color="#2a8453" transform="translate(1278 461)">
+    <rect width="46" height="31" rx="3"/>
+    <path d="M18 31V38 M28 31V38 M11 39H35"/>
+    <path d="M7 24H39"/>
+  </g>
+  <text x="1278" y="541" font-size="26" font-weight="700" class="ink">Greenmole RDP</text>
+  <text x="1278" y="577" class="body muted">Native macOS server</text>
+  <text x="1278" y="608" class="body muted">Capture + encode</text>
+  <path d="M1278 628H1498" stroke="#e5ece8"/>
+  <text x="1278" y="657" class="small ink">RDP port: 3389 by default</text>
+  <text x="1278" y="684" class="small muted">13389 in example config</text>
+  <path d="M1186 608H1243" class="flow" stroke="#2a8453" marker-start="url(#greenArrow)" marker-end="url(#greenArrow)"/>
+  <text x="1214" y="566" text-anchor="middle" class="small" fill="#34714b">RDP</text>
+  <text x="1214" y="589" text-anchor="middle" class="small" fill="#34714b">TLS</text>
+
+  <!-- Initiation and exposure are separate from the bidirectional data arrows. -->
+  <text x="48" y="664" class="label muted">THE HOME HOST INITIATES THE TUNNEL</text>
+  <text x="48" y="696" class="body muted">Keep it available through NAT with WireGuard keepalives.</text>
+
+  <!-- Explicit trust boundaries, including the unencrypted local container hop. -->
+  <path d="M48 781H1552" stroke="#d4e2d9"/>
+  <circle cx="58" cy="818" r="6" fill="#3b6db2"/>
+  <text x="76" y="825" class="body ink">Browser ↔ VPS: TLS</text>
+  <circle cx="478" cy="818" r="6" fill="#2a8453"/>
+  <text x="496" y="825" class="body ink">VPS ↔ home: WireGuard</text>
+  <circle cx="1000" cy="818" r="6" fill="#2a8453"/>
+  <text x="1018" y="825" class="body ink">guacd ↔ Mac: RDP TLS</text>
+  <text x="48" y="865" class="small muted">Local web ↔ guacd traffic is trusted and unencrypted by default. Authenticate users and validate the Mac’s certificate.</text>
+  <text x="1552" y="865" text-anchor="end" class="small" fill="#34714b">No public RDP or guacd</text>
+</svg>

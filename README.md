@@ -62,6 +62,50 @@ cargo run --release --bin macrdp-server
 
 ---
 
+## Suggested deployment architecture
+
+For browser access to a home or office LAN behind NAT, pair this native macOS
+server with [Greenmole](https://github.com/beraadim/Greenmole) on a Linux Docker
+host and a public edge VPS. The browser needs no WireGuard client. This is a
+reference pattern; adapt the suggested ports to your installation.
+
+![Browser access through an edge VPS, WireGuard, Greenmole containers, and a native macOS RDP server](docs/images/deployment-architecture.svg)
+
+[Open the deployment diagram at full size](docs/images/deployment-architecture.svg).
+
+1. **Public edge VPS:** serve HTTPS and secure WebSocket (WSS) on TCP **443**
+   with a valid certificate. Browser TLS terminates here. Configure the reverse
+   proxy for WebSocket upgrades and an unbuffered HTTP tunnel fallback; follow
+   the [Guacamole reverse-proxy guide](https://guacamole.apache.org/doc/gug/reverse-proxy.html).
+2. **WireGuard tunnel:** have the Linux host initiate and maintain the tunnel to
+   the VPS, with persistent keepalives for NAT traversal as described in the
+   [WireGuard quick start](https://www.wireguard.com/quickstart/). The VPS forwards
+   HTTP/WS through this encrypted tunnel; allow its configured WireGuard UDP
+   port on the VPS.
+3. **Greenmole web container:** run the Java application in Tomcat on TCP
+   **8080**, published as `WIREGUARD_IP:18080:8080` on the Linux host. Restrict
+   access to the VPS peer using firewall rules that cover Docker-published
+   traffic; binding to a private address alone is insufficient. See
+   [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/).
+4. **guacd container:** connect the web application to `guacd:4822` on a private
+   Docker bridge, without publishing that port. This trusted local hop is
+   unencrypted by default. Preserve outbound LAN access so guacd can reach the
+   Mac; an isolated Docker `internal` network alone cannot provide that route.
+5. **Greenmole RDP on the Mac:** grant Screen Recording and Accessibility
+   permissions, configure credentials, and use RDP TLS with NLA and certificate
+   validation. The default certificate is self-signed: establish guacd's trust
+   in the Mac's certificate, or supply a certificate from a trusted CA, matching
+   its hostname. Match the connection's TCP port to the Mac configuration:
+   default **3389**, or **13389** in `config.example.toml`. Restrict RDP ingress
+   to authorized LAN sources, including the Docker host's actual egress
+   address. Keep RDP and guacd off the public internet.
+
+Keep credentials and runtime configuration outside Git. HTTPS provides the
+secure context required for experimental AVC WebCodecs decoding; compatible
+browser/decoder support and explicit feature opt-in are also required.
+
+---
+
 ## Configuration
 
 Copy `config.example.toml` to `config.toml` and edit as needed:
