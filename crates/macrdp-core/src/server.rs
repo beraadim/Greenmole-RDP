@@ -820,6 +820,13 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
                 None
             };
 
+        // Microphone input is independent of desktop sound forwarding.
+        let microphone_factory: Option<Box<dyn ironrdp_server::MicrophoneServerFactory>> =
+            args.config.microphone.enabled.then(|| {
+                Box::new(macrdp_microphone::MacMicrophoneFactory)
+                    as Box<dyn ironrdp_server::MicrophoneServerFactory>
+            });
+
         // Clipboard factory
         let cliprdr_factory: Option<Box<dyn ironrdp_server::CliprdrServerFactory>> =
             if args.config.clipboard.enabled {
@@ -865,6 +872,7 @@ fn run_server_thread(args: ServerThreadArgs, ready: &mut StartupSignal) -> Resul
             .with_input_handler(input_handler)
             .with_display_handler(display)
             .with_sound_factory(sound_factory)
+            .with_microphone_factory(microphone_factory)
             .with_cliprdr_factory(cliprdr_factory)
             .with_bitmap_quality(match args.quality {
                 macrdp_encode::Quality::LowLatency => ironrdp_server::BitmapQuality::Performance,

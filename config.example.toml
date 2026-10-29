@@ -140,11 +140,17 @@ log_level = "info"
 # Default: 1800 (30 minutes)
 idle_timeout_secs = 1800
 
-# Audio and clipboard policies take effect after restarting the service.
+# Audio, microphone and clipboard policies take effect after restarting the service.
 [audio]
 enabled = true
 sample_rate = 48000
 channels = 2
+
+# Requires the bundled Greenmole Remote Microphone driver (Settings > Microphone).
+# A consenting client may stream its mic throughout the active RDP connection.
+# Guacamole: enable-audio-input=true over HTTPS. mstsc: Record from this computer.
+[microphone]
+enabled = false
 
 [clipboard]
 enabled = true

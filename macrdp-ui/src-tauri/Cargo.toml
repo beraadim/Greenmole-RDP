@@ -6,7 +6,7 @@ ironrdp-acceptor = { path = "../../crates/ironrdp-acceptor-patched" }
 
 [package]
 name = "macrdp-ui"
-version = "0.1.32"
+version = "0.1.33"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Greenmole RDP GUI — Tauri v2 desktop application"
@@ -16,6 +16,7 @@ tauri-build = { version = "=2.5.6", features = [] }
 
 [dependencies]
 macrdp-core = { path = "../../crates/macrdp-core" }
+macrdp-microphone = { path = "../../crates/macrdp-microphone" }
 tauri = { version = "=2.10.1", features = ["tray-icon", "macos-private-api"] }
 # Tauri 2.10.1's runtime traits and menu macros must come from its release set.
 # Newer 2.x internals can introduce APIs that this pinned Tauri version lacks.

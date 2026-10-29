@@ -11,6 +11,7 @@ import type {
   UiConfig,
   ConfigurationStatus,
   TlsStatus,
+  MicrophoneDriverStatus,
   WindowMoveStatus,
   WindowMoveResult,
 } from "./types";
@@ -30,6 +31,9 @@ export const api = {
   getConfig: () => invoke<UiConfig>("get_config"),
   getConfigurationStatus: () => invoke<ConfigurationStatus>("get_configuration_status"),
   getTlsStatus: () => invoke<TlsStatus>("get_tls_status"),
+  getMicrophoneDriverStatus: () => invoke<MicrophoneDriverStatus>("get_microphone_driver_status"),
+  installMicrophoneDriver: () => invoke<MicrophoneDriverStatus>("install_microphone_driver"),
+  removeMicrophoneDriver: () => invoke<MicrophoneDriverStatus>("remove_microphone_driver"),
   setConfig: (key: string, value: unknown) =>
     invoke<ConfigurationStatus>("set_config", { key, value }),
   exportDiagnostics: () => invoke<{ path: string | null }>("export_diagnostics"),

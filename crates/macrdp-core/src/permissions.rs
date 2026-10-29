@@ -8,7 +8,8 @@ pub fn check_permissions() -> PermissionStatus {
         screen_capture: macrdp_capture::check_screen_recording_permission(),
         accessibility: macrdp_input::check_accessibility_permission(),
         input_monitoring: macrdp_input::check_input_monitoring_permission(),
-        microphone: false, // Phase 3
+        // Redirected audio uses the virtual driver, not the Mac's hardware mic.
+        microphone: false,
     }
 }
 

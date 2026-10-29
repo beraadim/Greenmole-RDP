@@ -5,6 +5,7 @@ mod database;
 mod diagnostics;
 mod event_bridge;
 mod graphics_profiles;
+mod microphone_driver;
 #[cfg(target_os = "macos")]
 mod own_windows;
 mod permissions;
@@ -173,6 +174,9 @@ pub fn run() {
             configuration::get_config,
             configuration::get_configuration_status,
             commands::get_tls_status,
+            microphone_driver::get_microphone_driver_status,
+            microphone_driver::install_microphone_driver,
+            microphone_driver::remove_microphone_driver,
             configuration::set_config,
             graphics_profiles::get_graphics_profiles,
             graphics_profiles::save_graphics_profile,

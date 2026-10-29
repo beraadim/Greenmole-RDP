@@ -36,6 +36,7 @@ and its contributors. See [NOTICE](NOTICE) for source attribution.
 - **Session diagnostics** — current phases, recent outcomes and evidence-based cleanup status
 - **Graphics profiles** — saved Mobile, Desktop, Limited bandwidth and custom settings
 - **Guarded private sessions** — opt-in local input protection and lock restoration; see [limits and testing](docs/private-sessions.md)
+- **Experimental client microphone** — redirect microphone audio from Windows RDP or Greenmole/Guacamole into a virtual Mac input device; see [setup and testing](docs/microphone.md)
 
 ---
 

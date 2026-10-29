@@ -1,0 +1,13 @@
+[package]
+name = "macrdp-microphone"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+getrandom = "0.2"
+ironrdp-server = "0.10"
+rubato = { version = "0.16.2", default-features = false }

@@ -10,6 +10,7 @@ members = [
     "crates/macrdp-privacy",
     "crates/macrdp-encode",
     "crates/macrdp-audio",
+    "crates/macrdp-microphone",
     "crates/macrdp-clipboard",
 ]
 

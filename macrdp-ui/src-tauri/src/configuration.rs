@@ -39,6 +39,7 @@ pub(crate) fn configuration_status(
             "tls_key_path",
             "tls_server_names",
             "audio_enabled",
+            "microphone_enabled",
             "clipboard_enabled",
             "clipboard_file_transfer",
             "clipboard_max_file_size_mb",
@@ -439,10 +440,14 @@ mod tests {
         let mut running = UiConfig::default();
         let mut saved = running.clone();
         saved.set_field("audio_enabled", &json!(false)).unwrap();
+        saved.set_field("microphone_enabled", &json!(true)).unwrap();
         saved.set_field("port", &json!(13389)).unwrap();
         for _ in 0..2 {
             let status = status(&saved, Some(&running));
-            assert_eq!(status.pending_restart, ["port", "audio_enabled"]);
+            assert_eq!(
+                status.pending_restart,
+                ["port", "audio_enabled", "microphone_enabled"]
+            );
         }
         saved.set_field("frame_rate", &json!(30)).unwrap();
         running.set_field("frame_rate", &json!(30)).unwrap();
@@ -450,11 +455,16 @@ mod tests {
         saved.set_field("port", &json!(running.port)).unwrap();
         assert_eq!(
             status(&saved, Some(&running)).pending_restart,
-            ["audio_enabled"]
+            ["audio_enabled", "microphone_enabled"]
         );
         assert!(!status(&saved, Some(&saved)).restart_required);
         assert!(!status(&saved, None).restart_required);
         saved.audio_enabled = running.audio_enabled;
+        assert_eq!(
+            status(&saved, Some(&running)).pending_restart,
+            ["microphone_enabled"]
+        );
+        saved.microphone_enabled = running.microphone_enabled;
         assert!(!status(&saved, Some(&running)).restart_required);
     }
 

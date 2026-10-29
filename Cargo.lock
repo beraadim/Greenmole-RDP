@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-core"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2188,6 +2188,7 @@ dependencies = [
  "macrdp-display",
  "macrdp-encode",
  "macrdp-input",
+ "macrdp-microphone",
  "macrdp-privacy",
  "rcgen",
  "ring",
@@ -2250,6 +2251,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "macrdp-microphone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom 0.2.17",
+ "ironrdp-server",
+ "rubato",
+ "tracing",
+]
+
+[[package]]
 name = "macrdp-privacy"
 version = "0.1.0"
 dependencies = [
@@ -2265,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-server"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "anyhow",
  "clap",
@@ -3397,6 +3409,16 @@ dependencies = [
  "spki 0.8.0-rc.4",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rubato"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5258099699851cfd0082aeb645feb9c084d9a5e1f1b8d5372086b989fc5e56a1"
+dependencies = [
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]

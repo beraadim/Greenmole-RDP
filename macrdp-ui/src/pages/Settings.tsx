@@ -2,6 +2,7 @@ import { CertificateSettings } from "../components/CertificateSettings";
 import { ClipboardSettings } from "../components/ClipboardSettings";
 import { GraphicsSettings } from "../components/GraphicsSettings";
 import { KeyboardSettings } from "../components/KeyboardSettings";
+import { MicrophoneSettings } from "../components/MicrophoneSettings";
 import { useState, useEffect } from "react";
 import { AlertTriangle } from "lucide-react";
 import { api } from "../lib/ipc";
@@ -26,6 +27,7 @@ const categories = [
   { id: "display", label: "Display" },
   { id: "keyboard", label: "Keyboard" },
   { id: "audio", label: "Audio" },
+  { id: "microphone", label: "Microphone" },
   { id: "clipboard", label: "Clipboard" },
   { id: "general", label: "General" },
 ] as const;
@@ -39,6 +41,7 @@ const restartLabels: Record<string, string> = {
   keyboard_layout: "keyboard layout", keyboard_shortcuts: "keyboard shortcuts",
   idle_timeout_secs: "idle timeout", tls_cert_path: "certificate", tls_key_path: "certificate key",
   tls_server_names: "certificate names", audio_enabled: "system audio",
+  microphone_enabled: "client microphone",
   clipboard_enabled: "clipboard synchronization", clipboard_file_transfer: "file transfers",
   clipboard_max_file_size_mb: "file size limit", resolution: "resolution",
 };
@@ -356,6 +359,12 @@ function Settings() {
         {activeCategory === "clipboard" && (
           <CategorySection title="Clipboard">
             <ClipboardSettings config={config} save={updateConfig} />
+          </CategorySection>
+        )}
+
+        {activeCategory === "microphone" && (
+          <CategorySection title="Microphone">
+            <MicrophoneSettings config={config} running={configurationState?.running ?? true} save={updateConfig} />
           </CategorySection>
         )}
 

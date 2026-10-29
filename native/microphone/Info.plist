@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleExecutable</key><string>GreenmoleMicrophone</string>
+  <key>CFBundleIdentifier</key><string>com.macrdp.microphone</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>Greenmole Remote Microphone</string>
+  <key>CFBundlePackageType</key><string>BNDL</string>
+  <key>CFBundleShortVersionString</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>CFPlugInDynamicRegistration</key><false/>
+  <key>CFPlugInFactories</key><dict>
+    <key>8A086F47-221B-4D7B-9097-36C40975D46C</key><string>GreenmoleMicrophone_Create</string>
+  </dict>
+  <key>CFPlugInTypes</key><dict>
+    <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key><array>
+      <string>8A086F47-221B-4D7B-9097-36C40975D46C</string>
+    </array>
+  </dict>
+</dict></plist>

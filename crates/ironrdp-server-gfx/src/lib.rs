@@ -22,6 +22,7 @@ pub mod gfx;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;
+mod microphone;
 mod server;
 mod sound;
 
@@ -31,6 +32,7 @@ pub use display::*;
 pub use handler::*;
 #[cfg(feature = "helper")]
 pub use helper::*;
+pub use microphone::{MicrophonePcmFormat, MicrophoneServerBackend, MicrophoneServerFactory};
 pub use server::*;
 pub use sound::*;
 

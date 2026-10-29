@@ -209,6 +209,7 @@ fn safe_configuration(config: &UiConfig) -> Value {
         "automatic_resolution": config.resolution == "auto", "show_cursor": config.show_cursor,
         "idle_timeout_secs": config.idle_timeout_secs,
         "audio_enabled": config.audio_enabled,
+        "microphone_enabled": config.microphone_enabled,
         "clipboard_enabled": config.clipboard_enabled,
         "clipboard_file_transfer": config.clipboard_file_transfer,
         "clipboard_max_file_size_mb": config.clipboard_max_file_size_mb,

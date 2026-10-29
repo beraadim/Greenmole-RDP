@@ -25,6 +25,13 @@ impl Default for AudioConfig {
     }
 }
 
+/// Client microphone forwarding is an independent, explicit session opt-in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MicrophoneConfig {
+    pub enabled: bool,
+}
+
 /// Largest configurable per-file limit, matching the aggregate incoming budget.
 pub const MAX_CLIPBOARD_FILE_SIZE_MB: u32 = 256;
 
@@ -104,6 +111,9 @@ pub struct ServerConfig {
     /// Audio forwarding configuration
     #[serde(default)]
     pub audio: AudioConfig,
+    /// Redirect the connecting client's microphone into the macOS virtual input.
+    #[serde(default)]
+    pub microphone: MicrophoneConfig,
     /// Clipboard synchronization configuration
     #[serde(default)]
     pub clipboard: ClipboardConfig,
@@ -138,6 +148,7 @@ impl Default for ServerConfig {
             show_cursor: None,
             bitrate_mbps: None,
             audio: AudioConfig::default(),
+            microphone: MicrophoneConfig::default(),
             clipboard: ClipboardConfig::default(),
         }
     }
@@ -277,6 +288,16 @@ fn config_dir_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_is_an_independent_explicit_opt_in_for_existing_configs() {
+        let config: ServerConfig = toml::from_str("[audio]\nenabled = false\n").unwrap();
+        assert!(!config.microphone.enabled);
+        let config: ServerConfig = toml::from_str("[microphone]\nenabled = true\n").unwrap();
+        assert!(config.microphone.enabled);
+        assert!(config.audio.enabled);
+        assert!(toml::from_str::<ServerConfig>("[microphone]\nenabled = 'true'\n").is_err());
+    }
 
     #[test]
     fn clipboard_file_size_limits_are_validated_even_when_disabled() {

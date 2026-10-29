@@ -8,7 +8,10 @@ use super::clipboard::CliprdrServerFactory;
 use super::display::{DesktopSize, RdpServerDisplay};
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{RdpServer, RdpServerOptions, RdpServerSecurity};
-use crate::{BitmapQuality, DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
+use crate::{
+    BitmapQuality, DisplayUpdate, MicrophoneServerFactory, RdpServerDisplayUpdates,
+    SoundServerFactory,
+};
 
 pub struct WantsAddr {}
 pub struct WantsSecurity {
@@ -32,6 +35,7 @@ pub struct BuilderDone {
     display: Box<dyn RdpServerDisplay>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
+    microphone_factory: Option<Box<dyn MicrophoneServerFactory>>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -129,6 +133,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 handler: self.state.handler,
                 display: Box::new(display),
                 sound_factory: None,
+                microphone_factory: None,
                 cliprdr_factory: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 bitmap_quality: BitmapQuality::default(),
@@ -144,6 +149,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 handler: self.state.handler,
                 display: Box::new(NoopDisplay),
                 sound_factory: None,
+                microphone_factory: None,
                 cliprdr_factory: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 bitmap_quality: BitmapQuality::default(),
@@ -163,6 +169,16 @@ impl RdpServerBuilder<BuilderDone> {
 
     pub fn with_sound_factory(mut self, sound: Option<Box<dyn SoundServerFactory>>) -> Self {
         self.state.sound_factory = sound;
+        self
+    }
+
+    /// Enable client microphone redirection independently of desktop audio output.
+    /// Omitting the factory keeps the AUDIO_INPUT channel unavailable.
+    pub fn with_microphone_factory(
+        mut self,
+        microphone: Option<Box<dyn MicrophoneServerFactory>>,
+    ) -> Self {
+        self.state.microphone_factory = microphone;
         self
     }
 
@@ -190,6 +206,7 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.cliprdr_factory,
         );
         server.set_bitmap_quality(self.state.bitmap_quality);
+        server.set_microphone_factory(self.state.microphone_factory);
         server
     }
 }

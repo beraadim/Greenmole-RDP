@@ -1,6 +1,6 @@
 [package]
 name = "macrdp-core"
-version = "0.1.32"
+version = "0.1.33"
 edition.workspace = true
 license.workspace = true
 
@@ -11,6 +11,7 @@ macrdp-input = { path = "../macrdp-input" }
 macrdp-privacy = { path = "../macrdp-privacy" }
 macrdp-encode = { path = "../macrdp-encode" }
 macrdp-audio = { path = "../macrdp-audio" }
+macrdp-microphone = { path = "../macrdp-microphone" }
 macrdp-clipboard = { path = "../macrdp-clipboard" }
 tokio.workspace = true
 tracing.workspace = true

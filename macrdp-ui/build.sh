@@ -52,11 +52,18 @@ else
 fi
 "$ROOT/tools/fix-swift-binary.sh" "$ROOT/target/$PROFILE/macrdp-server"
 cd "$SCRIPT_DIR"
+MICROPHONE_RESOURCES="$ROOT/target/microphone"
+"$ROOT/native/microphone/build.sh" "$MICROPHONE_RESOURCES"
+export MACRDP_MICROPHONE_DIGEST="$(cat "$MICROPHONE_RESOURCES/driver.sha256")"
 npm run tauri build -- "${TAURI_ARGS[@]}" -- --locked
 [[ -d "$APP_BUNDLE" ]] || { echo "Missing application bundle: $APP_BUNDLE" >&2; exit 1; }
 
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1], JSON.stringify({product_name:process.argv[3],bundle_identifier:process.argv[4],version:process.env.VITE_APP_VERSION,revision:process.env.VITE_BUILD_REVISION,architecture:process.argv[2],built_at:new Date().toISOString()},null,2)+"\n")' "$APP_BUNDLE/Contents/Resources/build-info.json" "$ARCH" "$PRODUCT_NAME" "$BUNDLE_ID"
+mkdir -p "$APP_BUNDLE/Contents/Resources/microphone"
+ditto "$MICROPHONE_RESOURCES/GreenmoleMicrophone.driver" "$APP_BUNDLE/Contents/Resources/microphone/GreenmoleMicrophone.driver"
+install -m 644 "$MICROPHONE_RESOURCES/install-microphone-driver.sh" "$APP_BUNDLE/Contents/Resources/microphone/install-microphone-driver.sh"
+install -m 644 "$MICROPHONE_RESOURCES/uninstall-microphone-driver.sh" "$APP_BUNDLE/Contents/Resources/microphone/uninstall-microphone-driver.sh"
 BUNDLE_ID="$BUNDLE_ID" "$SCRIPT_DIR/fix-swift-runtime.sh" "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 "$SCRIPT_DIR/repack-dmg.sh" "$APP_BUNDLE" "$DMG_PATH"

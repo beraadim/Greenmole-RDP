@@ -155,6 +155,7 @@ export interface UiConfig {
   resolution: string;
   show_cursor: boolean;
   audio_enabled: boolean;
+  microphone_enabled: boolean;
   clipboard_enabled: boolean;
   clipboard_file_transfer: boolean;
   clipboard_max_file_size_mb: number;
@@ -176,6 +177,14 @@ export interface TlsStatus {
     not_after_unix: number;
     server_names: string[];
   } | null;
+}
+
+export interface MicrophoneDriverStatus {
+  installed: boolean;
+  ready: boolean;
+  installation_available: boolean;
+  removal_available: boolean;
+  message: string;
 }
 
 /** @deprecated Use UiConfig instead */

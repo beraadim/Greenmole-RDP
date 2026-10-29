@@ -38,15 +38,20 @@ use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::display_control::DisplayControlChannel;
-use crate::dynamic_channels::DynamicChannels;
+use crate::dynamic_channels::{DynamicChannelSvcGuard, DynamicChannels};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs, UpdateFragmenter};
 use crate::gfx::{ConnectionOutcome, GfxHandler, GfxState};
 use crate::handler::{ClientInputContext, RdpServerInputHandler};
+use crate::microphone::{MicrophoneChannel, MicrophoneServerFactory};
 use crate::{builder, capabilities, SoundServerFactory};
 
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "microphone_registration_tests.rs"]
+mod microphone_registration_tests;
 
 #[cfg(test)]
 #[path = "display_partition_tests.rs"]
@@ -230,7 +235,9 @@ pub struct RdpServer {
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channels: StaticChannelSet,
+    dynamic_channel_input: DynamicChannelSvcGuard,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
+    microphone_factory: Option<Box<dyn MicrophoneServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     ev_sender: ServerEventTx,
     ev_receiver: Arc<Mutex<ServerEventRx>>,
@@ -314,7 +321,9 @@ impl RdpServer {
             handler: Arc::new(Mutex::new(handler)),
             display: Arc::new(Mutex::new(display)),
             static_channels: StaticChannelSet::new(),
+            dynamic_channel_input: DynamicChannelSvcGuard::default(),
             sound_factory,
+            microphone_factory: None,
             cliprdr_factory,
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
@@ -334,6 +343,13 @@ impl RdpServer {
             deferred_input: PendingInput::default(),
             additional_input: AdditionalInputQueue::default(),
         }
+    }
+
+    pub(crate) fn set_microphone_factory(
+        &mut self,
+        factory: Option<Box<dyn MicrophoneServerFactory>>,
+    ) {
+        self.microphone_factory = factory;
     }
 
     /// Set the GFX state (call before run() to share state with display)
@@ -425,7 +441,14 @@ impl RdpServer {
             gfx_enabled = self.gfx_channel_enabled(),
             "Registered Display Control channel for client viewport updates"
         );
-        DynamicChannels(dvc)
+        let microphone = if let Some(factory) = self.microphone_factory.as_ref() {
+            let (channel, control) = MicrophoneChannel::new(factory.build_backend());
+            dvc = dvc.with_dynamic_channel(channel);
+            Some(control)
+        } else {
+            None
+        };
+        DynamicChannels::new(dvc, microphone)
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
@@ -484,6 +507,7 @@ impl RdpServer {
     }
 
     async fn run_connection_inner(&mut self, stream: TcpStream) -> Result<()> {
+        self.dynamic_channel_input = DynamicChannelSvcGuard::default();
         self.deferred_input = PendingInput::default();
         self.additional_input.clear();
         transport::configure_stream(&stream)?;
@@ -1783,7 +1807,11 @@ impl RdpServer {
         let message = decode::<X224<mcs::McsMessage<'_>>>(frame)?;
         match message.0 {
             mcs::McsMessage::SendDataRequest(data) => {
-                debug!(?data, "McsMessage::SendDataRequest");
+                debug!(
+                    channel_id = data.channel_id,
+                    bytes = data.user_data.len(),
+                    "McsMessage::SendDataRequest"
+                );
                 if data.channel_id == io_channel_id {
                     return Ok((self.handle_io_channel_data(data).await?, None));
                 }
@@ -1794,6 +1822,9 @@ impl RdpServer {
                     // Discard even late fragments before touching reassembly or
                     // a backend that retired an ambiguous format request.
                     return Ok((false, None));
+                }
+                if self.get_channel_id_by_type::<DynamicChannels>() == Some(data.channel_id) {
+                    self.dynamic_channel_input.check(&data.user_data)?;
                 }
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
                     let response = (|| -> Result<Vec<u8>> {

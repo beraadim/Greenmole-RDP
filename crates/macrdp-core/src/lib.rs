@@ -16,7 +16,7 @@ pub mod supervised;
 pub mod tls;
 
 pub use callbacks::*;
-pub use config::{config_dir, AudioConfig, ClipboardConfig, ServerConfig};
+pub use config::{config_dir, AudioConfig, ClipboardConfig, MicrophoneConfig, ServerConfig};
 pub use log_bridge::{flush_logs, init_log_file, log_file_path, LogBridgeLayer};
 pub use log_filter::with_transition_diagnostics;
 pub use macrdp_display::{

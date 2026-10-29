@@ -4,7 +4,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$ROOT/tools/run-native-test.sh"
 export CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER="$ROOT/tools/run-native-test.sh"
-cargo test --workspace --lib --bins --locked
+bash native/microphone/test.sh
+cargo test --workspace --exclude macrdp-encode --lib --bins --locked
+# VideoToolbox tests share the process-wide hardware-retirement budget. Running
+# unrelated encoder fixtures concurrently can exhaust it before cleanup finishes.
+cargo test -p macrdp-encode --lib --locked -- --test-threads=1
 cargo test --manifest-path macrdp-ui/src-tauri/Cargo.toml --lib --locked
 cargo build -p macrdp-server --locked
 python3 -m unittest discover -s tools -p 'test_client_benchmark.py'

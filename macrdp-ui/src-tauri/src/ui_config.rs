@@ -41,8 +41,9 @@ pub struct UiConfig {
     pub resolution: String,
     pub show_cursor: bool,
 
-    // Audio and clipboard channels are configured at service startup.
+    // Audio, microphone and clipboard channels are configured at service startup.
     pub audio_enabled: bool,
+    pub microphone_enabled: bool,
     pub clipboard_enabled: bool,
     pub clipboard_file_transfer: bool,
     pub clipboard_max_file_size_mb: u32,
@@ -89,6 +90,7 @@ impl Default for UiConfig {
             resolution: "auto".to_string(),
             show_cursor: false,
             audio_enabled: true,
+            microphone_enabled: false,
             clipboard_enabled: true,
             clipboard_file_transfer: true,
             clipboard_max_file_size_mb: 100,
@@ -383,12 +385,16 @@ impl UiConfig {
             "show_cursor" => {
                 self.show_cursor = value.as_bool().ok_or("show_cursor must be a boolean")?;
             }
-            "audio_enabled" | "clipboard_enabled" | "clipboard_file_transfer" => {
+            "audio_enabled"
+            | "microphone_enabled"
+            | "clipboard_enabled"
+            | "clipboard_file_transfer" => {
                 let enabled = value
                     .as_bool()
                     .ok_or_else(|| format!("{key} must be a boolean"))?;
                 match key {
                     "audio_enabled" => self.audio_enabled = enabled,
+                    "microphone_enabled" => self.microphone_enabled = enabled,
                     "clipboard_enabled" => self.clipboard_enabled = enabled,
                     _ => self.clipboard_file_transfer = enabled,
                 }
@@ -460,6 +466,7 @@ impl UiConfig {
                 | "tls_key_path"
                 | "tls_server_names"
                 | "audio_enabled"
+                | "microphone_enabled"
                 | "clipboard_enabled"
                 | "clipboard_file_transfer"
                 | "clipboard_max_file_size_mb"
@@ -503,6 +510,9 @@ impl UiConfig {
             audio: macrdp_core::AudioConfig {
                 enabled: self.audio_enabled,
                 ..macrdp_core::AudioConfig::default()
+            },
+            microphone: macrdp_core::MicrophoneConfig {
+                enabled: self.microphone_enabled,
             },
             clipboard: macrdp_core::ClipboardConfig {
                 enabled: self.clipboard_enabled,
@@ -720,9 +730,11 @@ mod tests {
         )
         .unwrap();
         assert!(config.audio_enabled && config.clipboard_enabled && config.clipboard_file_transfer);
+        assert!(!config.microphone_enabled);
         assert_eq!(config.clipboard_max_file_size_mb, 100);
         for (key, value) in [
             ("audio_enabled", json!(false)),
+            ("microphone_enabled", json!(true)),
             ("clipboard_enabled", json!(false)),
             ("clipboard_file_transfer", json!(false)),
             ("clipboard_max_file_size_mb", json!(256)),
@@ -738,6 +750,7 @@ mod tests {
         let restored: UiConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let core = restored.to_server_config();
         assert!(!core.audio.enabled && !core.clipboard.enabled && !core.clipboard.file_transfer);
+        assert!(core.microphone.enabled);
         assert_eq!(core.clipboard.max_file_size_mb, 256);
         assert_eq!((core.audio.sample_rate, core.audio.channels), (48000, 2));
         assert!(restored.password.is_empty());
@@ -749,6 +762,7 @@ mod tests {
         let original = serde_json::to_value(&config).unwrap();
         for key in [
             "audio_enabled",
+            "microphone_enabled",
             "clipboard_enabled",
             "clipboard_file_transfer",
         ] {
