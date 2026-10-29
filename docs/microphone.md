@@ -87,6 +87,12 @@ the same latency or echo behavior as a local call.
 
 ## Diagnostics and trust boundary
 
+If a driver installed by 0.1.33 remains unavailable, update to 0.1.34 or later,
+stop the RDP service when convenient and choose **Reinstall driver**. Version
+0.1.33 left the root-owned executable at `0700`, preventing Core Audio's separate
+service account from reading it. The updated installer fixes this; a status
+refresh alone does not change permissions. Reinstallation restarts Core Audio.
+
 Look for `Client microphone` messages in the existing application logs. They
 report negotiated sample rate/channel count, capture denial, driver startup or
 delivery failure, bounded queue drops, stale packets and discontinuities. PCM

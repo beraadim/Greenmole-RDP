@@ -128,13 +128,65 @@ fn is_driver_directory(path: &std::path::Path) -> bool {
             })
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum InstalledDriver {
+    Missing,
+    NeedsRepair,
+    Readable,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn inspect_installed_driver(path: &std::path::Path) -> InstalledDriver {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return InstalledDriver::Missing
+        }
+        Err(_) => return InstalledDriver::NeedsRepair,
+        Ok(_) => {}
+    }
+    // _coreaudiod loads this root-owned bundle as a different user. Testing
+    // metadata rather than this app's read access catches an executable left at
+    // 0700 even when the app itself can inspect its inode. Check every fixed
+    // component without following symlinks; the installer owns any repairs.
+    for (relative, directory, mode) in [
+        ("", true, 0o755),
+        ("Contents", true, 0o755),
+        ("Contents/MacOS", true, 0o755),
+        ("Contents/_CodeSignature", true, 0o755),
+        ("Contents/Info.plist", false, 0o644),
+        ("Contents/_CodeSignature/CodeResources", false, 0o644),
+        ("Contents/MacOS/GreenmoleMicrophone", false, 0o755),
+    ] {
+        let Ok(metadata) = std::fs::symlink_metadata(path.join(relative)) else {
+            return InstalledDriver::NeedsRepair;
+        };
+        let kind = metadata.file_type();
+        if (directory && !kind.is_dir())
+            || (!directory && !kind.is_file())
+            || metadata.permissions().mode() & 0o7777 != mode
+        {
+            return InstalledDriver::NeedsRepair;
+        }
+    }
+    InstalledDriver::Readable
+}
+
+#[cfg(any(target_os = "macos", test))]
+const DRIVER_REPAIR_MESSAGE: &str = "The installed microphone driver has inaccessible or unexpected file permissions or bundle contents, so Core Audio may be unable to load it. Use an updated Greenmole RDP app, stop the RDP service, then choose Reinstall driver to repair the installation.";
+
 #[cfg(target_os = "macos")]
 fn inspect_driver_status(app: &tauri::AppHandle) -> Result<MicrophoneDriverStatus, String> {
-    let installed = is_driver_directory(std::path::Path::new(DRIVER_DESTINATION));
+    let installation = inspect_installed_driver(std::path::Path::new(DRIVER_DESTINATION));
+    let installed = installation != InstalledDriver::Missing;
     let installation_available =
         compiled_driver_digest().is_some() && is_driver_directory(&bundled_driver(app)?);
-    let ready = macrdp_microphone::driver_available();
-    let message = if ready {
+    let ready = installation == InstalledDriver::Readable && macrdp_microphone::driver_available();
+    let message = if installation == InstalledDriver::NeedsRepair {
+        DRIVER_REPAIR_MESSAGE
+    } else if ready {
         "Greenmole Remote Microphone is available in Core Audio and its driver protocol is compatible. The device is silent without an active redirected microphone."
     } else if installed {
         "The driver is installed but its compatible device is not available in Core Audio. Reinstall it, then restart this Mac if the device is still missing."
@@ -271,6 +323,78 @@ fn installer_error(stderr: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn driver_fixture(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for relative in ["", "Contents", "Contents/MacOS", "Contents/_CodeSignature"] {
+            let directory = path.join(relative);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for (relative, mode) in [
+            ("Contents/Info.plist", 0o644),
+            ("Contents/_CodeSignature/CodeResources", 0o644),
+            ("Contents/MacOS/GreenmoleMicrophone", 0o755),
+        ] {
+            let file = path.join(relative);
+            std::fs::write(&file, b"synthetic fixture only").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[test]
+    fn installed_driver_classification_identifies_private_or_writable_payloads() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("Fixture.driver");
+        assert_eq!(inspect_installed_driver(&path), InstalledDriver::Missing);
+        driver_fixture(&path);
+        assert_eq!(inspect_installed_driver(&path), InstalledDriver::Readable);
+        for (relative, broken_mode) in [
+            ("Contents/MacOS/GreenmoleMicrophone", 0o700),
+            ("Contents", 0o700),
+            ("Contents/MacOS", 0o750),
+            ("Contents/_CodeSignature", 0o750),
+            ("Contents/Info.plist", 0o600),
+            ("Contents/_CodeSignature/CodeResources", 0o600),
+            ("Contents/MacOS/GreenmoleMicrophone", 0o777),
+        ] {
+            let component = path.join(relative);
+            let original = std::fs::metadata(&component).unwrap().permissions();
+            std::fs::set_permissions(&component, std::fs::Permissions::from_mode(broken_mode))
+                .unwrap();
+            assert_eq!(
+                inspect_installed_driver(&path),
+                InstalledDriver::NeedsRepair,
+                "{relative}"
+            );
+            std::fs::set_permissions(component, original).unwrap();
+        }
+        assert_eq!(inspect_installed_driver(&path), InstalledDriver::Readable);
+        assert!(DRIVER_REPAIR_MESSAGE.contains("updated Greenmole RDP app"));
+        assert!(DRIVER_REPAIR_MESSAGE.contains("Reinstall driver"));
+    }
+
+    #[test]
+    fn missing_or_symlinked_installed_payload_requires_reinstallation() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("Fixture.driver");
+        driver_fixture(&path);
+        let executable = path.join("Contents/MacOS/GreenmoleMicrophone");
+        std::fs::remove_file(&executable).unwrap();
+        assert_eq!(
+            inspect_installed_driver(&path),
+            InstalledDriver::NeedsRepair
+        );
+        let external = temporary.path().join("external");
+        std::fs::write(&external, b"not a driver").unwrap();
+        symlink(external, executable).unwrap();
+        assert_eq!(
+            inspect_installed_driver(&path),
+            InstalledDriver::NeedsRepair
+        );
+    }
 
     #[test]
     fn pending_status_query_cannot_accumulate_workers_on_refresh() {

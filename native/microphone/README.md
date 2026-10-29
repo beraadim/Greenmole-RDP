@@ -76,7 +76,9 @@ publishes the fixed destination:
 `/Library/Audio/Plug-Ins/HAL/GreenmoleMicrophone.driver`
 
 The installer checks root ownership, symlinks, write permissions and ACLs for
-privileged parent directories. The uninstaller only removes that verified driver.
+privileged parent directories. It stages files privately, then verifies directory
+modes of 0755, data-file modes of 0644 and executable mode 0755 before and after
+publishing, so the `_coreaudiod` loader can read the signed bundle. The uninstaller only removes that verified driver.
 Installing/removing restarts Core Audio and interrupts audio in other apps, so
 both actions must be deliberate user operations while the RDP service is stopped.
 No driver is installed by the build or the synthetic test suite.
@@ -96,3 +98,10 @@ checks, lease/END revocation, foreign-user silence, same-quantum multi-client
 reads, stale epoch rejection and nonfinite sample filtering under Undefined
 Behavior Sanitizer. `build.sh` separately compiles both CPU architectures with
 warnings as errors and verifies the bundled code signature.
+
+The same test command also runs `test-installer-permissions.sh`. That regression
+test sources the shipped staging/finalization functions with only the main
+invocation removed. It operates under the current user in a temporary directory,
+checks private staging and published modes, and rejects the previous 0700 binary
+mode, inaccessible directories, writable directories and symlink payloads. It
+never accesses the system HAL directory or restarts Core Audio.
