@@ -1,0 +1,69 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.33",
+  "status": "built, verified and copied to the current Mac mini Desktop for later user testing; not installed",
+  "source_revision": "b1ebb7f99cf34c7b2694c6b9459413a1fb40e1f6",
+  "implementation_revision": "b921f80",
+  "verified_at_utc": "2026-10-29T09:47:24.151110+00:00",
+  "tests": {
+    "complete_check_script_passed": true,
+    "rust_passed": 952,
+    "existing_manual_rust_ignored": 7,
+    "protocol_server_passed": 190,
+    "microphone_bridge_passed": 11,
+    "desktop_configuration_and_commands_passed": 107,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "frontend_production_build_passed": true,
+    "microphone_clippy_passed_without_new_crate_warnings": true,
+    "native_ubsan_synthetic_driver_passed": true,
+    "native_concurrent_ring_stress": {
+      "frames": 200000,
+      "readers": 3,
+      "passed": true
+    },
+    "native_asan_tsan": "Unavailable on this host: ASan stalled during runtime startup; TSan also crashed for a trivial control program. UBSan and concurrent stress passed.",
+    "hardware_encoder_fixture_execution": "Serialized to respect existing process-wide native retirement budget; initial parallel run exhausted that budget.",
+    "live_driver_installed": false,
+    "physical_microphone_captured": false,
+    "live_remote_connection_started": false,
+    "new_media_persisted": false
+  },
+  "release_checks": {
+    "optimized_cli_and_app_build_passed": true,
+    "staged_secret_scan": "Gitleaks: zero findings",
+    "git_diff_check_passed": true
+  },
+  "package_verification": {
+    "version": "0.1.33",
+    "source_revision": "b1ebb7f99cf34c7b2694c6b9459413a1fb40e1f6",
+    "package": "Greenmole_RDP_0.1.33_aarch64_b1ebb7f99cf3.dmg",
+    "bytes": 14821714,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "driver_strict_signature_verified": true,
+    "driver_architectures": [
+      "x86_64",
+      "arm64"
+    ],
+    "compiled_installer_digest_matches_payload": true,
+    "driver_payload_sha256": "332db6ad1a2717dbe34d6fe8f516bc98add1c5dc6f1989784a58685ba3006d8a",
+    "fixed_file_installer_stage_signature_verified": true,
+    "verification_mount_removed": true,
+    "sha256": "7ec8710769bc1a9685e6b95808c5581f90672d1f4aa90d26e3df3566d86ca4db",
+    "desktop_copy_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.33_aarch64_b1ebb7f99cf3.dmg",
+    "checksum_and_build_info_copied": true,
+    "active_application_binary_unchanged": true,
+    "active_application_info_unchanged": true,
+    "driver_installation_performed": false,
+    "core_audio_restart_performed": false
+  },
+  "manual_acceptance": "Deferred at user request. Test actual HAL discovery and sandbox identities, Windows/Greenmole microphone input, Teams calls, mute/disconnect/reconnect, sleep/wake and user switching. See microphone.md.",
+  "deployment_instruction": "The current machine is the Mac mini. Copy package to /Users/beraadim/Desktop only; user will install later. Preserve the active application and service."
+}

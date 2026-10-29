@@ -56,3 +56,12 @@ tests, the frontend production build and native UBSan/concurrent-ring tests.
 Seven existing manual Rust tests remain ignored. Hardware encoder fixtures now
 run serially in the check script because their shared retirement budget can be
 exhausted by parallel fixtures. Production encoder behavior is unchanged.
+
+The optimized ARM64 DMG was built, verified read-only and copied to the current
+Mac mini's Desktop with its checksum and build metadata. The packaged app and
+universal driver signatures, version/revision, compiled installer digest and
+fixed-file staging signature were verified. The running Desktop app's executable
+and metadata hashes remain unchanged. No driver was installed and Core Audio
+was not restarted; the user will deploy and test later. See the
+[release validation record](release-0.1.33-validation.json) for provenance and
+remaining acceptance checks.
