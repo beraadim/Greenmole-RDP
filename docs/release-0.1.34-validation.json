@@ -1,0 +1,73 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.34",
+  "status": "built, verified and copied to Desktop; corrected driver not reinstalled",
+  "source_revision": "591df2ffd9cd6f20abe7a748328a9236d5d4831c",
+  "verified_at_utc": "2026-10-29T21:45:56.756236+00:00",
+  "diagnosis": {
+    "installed_driver_executable_owner": "root:wheel",
+    "installed_driver_executable_mode": "0700",
+    "core_audio_account": "_coreaudiod",
+    "confirmed_blocker": "Service account cannot read the root-only executable; installer did not finalize its private staging mode."
+  },
+  "tests": {
+    "native_ubsan_protocol_and_concurrent_ring_suite_passed": true,
+    "unprivileged_production_installer_helpers_regression_passed": true,
+    "desktop_rust_passed": 109,
+    "isolated_actual_bundle_cfplugin_probe_passed": true,
+    "optimized_cli_and_app_build_passed": true,
+    "frontend_production_build_passed": true,
+    "secret_scan": "Gitleaks: zero findings",
+    "git_diff_check_passed": true
+  },
+  "package_verification": {
+    "version": "0.1.34",
+    "source_revision": "591df2ffd9cd6f20abe7a748328a9236d5d4831c",
+    "package": "Greenmole_RDP_0.1.34_aarch64_591df2ffd9cd.dmg",
+    "bytes": 14816420,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "mounted_read_only": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "driver_strict_signature_verified": true,
+    "driver_architectures": [
+      "x86_64",
+      "arm64"
+    ],
+    "compiled_installer_digest_matches_payload": true,
+    "compiled_installer_text_matches_fixed_source": true,
+    "driver_payload_sha256": "332db6ad1a2717dbe34d6fe8f516bc98add1c5dc6f1989784a58685ba3006d8a",
+    "published_driver_modes_verified": {
+      ".": "0o755",
+      "Contents": "0o755",
+      "Contents/MacOS": "0o755",
+      "Contents/_CodeSignature": "0o755",
+      "Contents/MacOS/GreenmoleMicrophone": "0o755",
+      "Contents/Info.plist": "0o644",
+      "Contents/_CodeSignature/CodeResources": "0o644"
+    },
+    "published_stage_signature_verified": true,
+    "actual_published_bundle_probe": "PASS CFPlugIn: factory resolved, driver instantiated, QueryInterface succeeded\nPASS metadata: box=2 device=3 input_stream=4 output_streams=0 UID=com.macrdp.microphone PCM=48000Hz/2ch/Float32 protocol=1\nNo Initialize, HAL device open, DoIO, media delivery or Core Audio restart performed",
+    "verification_mount_removed": true,
+    "sha256": "da9122e86d5c3c531a2ea10894b8f006bd294f33bc147f829ef433288f7e368e",
+    "desktop_copy_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.34_aarch64_591df2ffd9cd.dmg",
+    "checksum_and_build_info_copied": true,
+    "active_app_binary_and_metadata_unchanged": true,
+    "installed_driver_metadata_unchanged": true,
+    "installed_driver_mode_left_unchanged": "0o700",
+    "core_audio_process_preserved": true,
+    "driver_reinstall_performed": false,
+    "core_audio_restart_performed": false
+  },
+  "live_state": {
+    "active_app_not_replaced": true,
+    "installed_hal_files_not_repaired": true,
+    "core_audio_not_restarted": true,
+    "live_remote_connection_not_started_or_stopped": true
+  },
+  "manual_acceptance": "When convenient, replace the app with0.1.34, stop its RDP service, choose Settings > Microphone > Reinstall driver and refresh status. Reinstallation restarts Core Audio. Actual system HAL loading and client/Teams audio remain to be retested."
+}

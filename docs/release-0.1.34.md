@@ -26,3 +26,15 @@ tests and desktop command/status tests also run without changing the system HAL.
 
 The microphone transport and audio format are unchanged. The corrected package
 still needs a live reinstall/loading test and subsequent client/Teams acceptance.
+
+Validation passed the complete native suite, the new unprivileged installer
+regression and all 109 desktop Rust tests. The optimized DMG's signatures,
+version/revision, embedded installer and payload digest were verified. Its actual
+driver was staged and finalized in a temporary user-owned directory, checked for
+the required published permissions, signature-verified and loaded through an
+isolated CFPlugIn factory/metadata probe without HAL registration or audio I/O.
+
+The DMG, checksum and build metadata were copied to the current Mac mini's
+Desktop. The active app's hashes, installed driver's metadata and Core Audio
+process were preserved. No live repair, app replacement or service restart was
+performed. See the [validation record](release-0.1.34-validation.json).
