@@ -1,4 +1,4 @@
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::SecurityStatus;
 use crate::auth_identity::AuthIdentityBuffers;
@@ -6,6 +6,9 @@ use crate::crypto::{HASH_SIZE, Rc4};
 use crate::ntlm::messages::computations::*;
 use crate::ntlm::messages::{CLIENT_SEAL_MAGIC, CLIENT_SIGN_MAGIC, SERVER_SEAL_MAGIC, SERVER_SIGN_MAGIC};
 use crate::ntlm::{MESSAGE_INTEGRITY_CHECK_SIZE, Mic, NegotiateFlags, Ntlm, NtlmState, SESSION_KEY_SIZE};
+
+#[cfg(test)]
+mod proof_tests;
 
 pub(crate) fn complete_authenticate(context: &mut Ntlm) -> crate::Result<SecurityStatus> {
     if context.state == NtlmState::Final {
@@ -31,6 +34,7 @@ pub(crate) fn complete_authenticate(context: &mut Ntlm) -> crate::Result<Securit
         .authenticate_message
         .as_ref()
         .expect("authenticate message must be set on authenticate phase");
+    let nt_response = nt_challenge_response(&authenticate_message.message)?;
 
     let candidates = context.allowed_identities.as_ref().ok_or_else(|| {
         crate::Error::new(
@@ -48,6 +52,7 @@ pub(crate) fn complete_authenticate(context: &mut Ntlm) -> crate::Result<Securit
         .as_ref()
         .expect("identity must be set before complete_authenticate");
 
+    let mut proof_matched = false;
     for (i, identity) in candidates.iter().enumerate() {
         let candidate = AuthIdentityBuffers {
             user: wire_identity.user.clone(),
@@ -61,19 +66,18 @@ pub(crate) fn complete_authenticate(context: &mut Ntlm) -> crate::Result<Securit
                 continue;
             }
         };
-        let (_, key_exchange_key) = match compute_ntlm_v2_response(
-            authenticate_message.client_challenge.as_ref(),
+        let key_exchange_key = match verify_ntlm_v2_response(
+            nt_response,
             challenge_message.server_challenge.as_ref(),
-            authenticate_message.target_info.as_ref(),
             ntlm_v2_hash.as_ref(),
-            challenge_message.timestamp,
         ) {
-            Ok(result) => result,
+            Ok(key) => key,
             Err(e) => {
-                debug!(?e, "candidate skipped: compute_ntlm_v2_response failed");
+                debug!(?e, "candidate skipped: NTLMv2 proof verification failed");
                 continue;
             }
         };
+        proof_matched = true;
         let session_key = match authenticate_message.encrypted_random_session_key.map_or(
             Ok(key_exchange_key),
             |encrypted_random_session_key| {
@@ -117,10 +121,38 @@ pub(crate) fn complete_authenticate(context: &mut Ntlm) -> crate::Result<Securit
         }
     }
 
+    warn!(
+        stage = "ntlm_credential_validation",
+        reason = if proof_matched {
+            "ntlm_mic_mismatch"
+        } else {
+            "ntlmv2_proof_mismatch"
+        },
+        "NTLM authentication rejected"
+    );
     Err(crate::Error::new(
         crate::ErrorKind::LogonDenied,
         String::from("no candidate credential matched"),
     ))
+}
+
+/// The NT response security buffer is part of the preserved AUTHENTICATE bytes.
+/// Borrowing its bounded range avoids adding a second copy of token material or
+/// relying on parsed fields that omit the received proof and blob timestamp.
+fn nt_challenge_response(message: &[u8]) -> crate::Result<&[u8]> {
+    let invalid_response =
+        || crate::Error::new(crate::ErrorKind::InvalidToken, "invalid NTLM response security buffer");
+    let descriptor = message.get(20..28).ok_or_else(invalid_response)?;
+    let length = usize::from(u16::from_le_bytes([descriptor[0], descriptor[1]]));
+    let offset = usize::try_from(u32::from_le_bytes([
+        descriptor[4],
+        descriptor[5],
+        descriptor[6],
+        descriptor[7],
+    ]))
+    .map_err(|_| invalid_response())?;
+    let end = offset.checked_add(length).ok_or_else(invalid_response)?;
+    message.get(offset..end).ok_or_else(invalid_response)
 }
 
 fn check_mic_correctness(
@@ -145,14 +177,13 @@ fn check_mic_correctness(
             ));
         };
         mic_buf.clone_from_slice(&[0x00; MESSAGE_INTEGRITY_CHECK_SIZE]);
-        let calculated_mic = compute_message_integrity_check(
-            negotiate_message,
-            challenge_message,
-            authenticate_message.as_ref(),
-            exported_session_key,
-        )?;
-
-        if mic.value != calculated_mic {
+        use hmac::{KeyInit as _, Mac as _};
+        let mut mac = hmac::Hmac::<md5::Md5>::new_from_slice(exported_session_key)
+            .map_err(|_| crate::Error::new(crate::ErrorKind::InternalError, "could not initialize MIC verification"))?;
+        mac.update(negotiate_message);
+        mac.update(challenge_message);
+        mac.update(&authenticate_message);
+        if mac.verify_slice(&mic.value).is_err() {
             return Err(crate::Error::new(
                 crate::ErrorKind::MessageAltered,
                 String::from("Message Integrity Check (MIC) verification failed!"),

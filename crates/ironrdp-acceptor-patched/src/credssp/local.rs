@@ -49,6 +49,13 @@ impl CredentialsProxy for LocalCredentials {
         // The client domain participates in its NTLM proof, so keep that domain
         // after authorizing the configured local account name.
         if !authorized_username(&self.identity.username, username) {
+            tracing::warn!(
+                stage = "account_lookup",
+                reason = "account_not_configured",
+                identity_format = identity_format(username),
+                account_matches = self.identity.username.account_name() == username.account_name(),
+                "Local NLA account lookup rejected"
+            );
             return Err(std::io::Error::other("account is not configured"));
         }
         let mut identity = self.identity.as_ref().clone();
@@ -65,6 +72,25 @@ impl CredentialsProxy for LocalCredentials {
 enum TokenFormat {
     RawNtlm,
     Spnego,
+}
+
+impl TokenFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RawNtlm => "raw_ntlm",
+            Self::Spnego => "spnego",
+        }
+    }
+}
+
+fn identity_format(username: &Username) -> &'static str {
+    match username.parts() {
+        UsernameParts::UserPrincipalName(_) => "upn",
+        UsernameParts::DownLevelLogonName(parts) if parts.netbios_domain().is_some() => {
+            "qualified_down_level"
+        }
+        UsernameParts::DownLevelLogonName(_) => "bare_down_level",
+    }
 }
 
 pub(super) struct LocalServer {
@@ -150,10 +176,7 @@ impl LocalServer {
         self.format = Some(format);
         self.server = Some(server);
         tracing::info!(
-            format = match format {
-                TokenFormat::RawNtlm => "raw_ntlm",
-                TokenFormat::Spnego => "spnego",
-            },
+            format = format.as_str(),
             "Local CredSSP authentication started"
         );
         Ok(())
@@ -168,9 +191,11 @@ impl LocalServer {
             }));
         }
         match self.server.as_mut() {
-            Some(server) => {
-                CredsspProcessGenerator::Local(server.process(request), Arc::clone(&self.verifier))
-            }
+            Some(server) => CredsspProcessGenerator::Local(
+                server.process(request),
+                Arc::clone(&self.verifier),
+                self.format.map(TokenFormat::as_str).unwrap_or("unknown"),
+            ),
             None => CredsspProcessGenerator::Failed(Some(CredsspProcessResult {
                 response: None,
                 finished: false,
@@ -198,6 +223,7 @@ fn safe_error(error: sspi::Error) -> sspi::Error {
 pub(super) fn process_result(
     result: Result<ServerState, sspi::credssp::ServerError>,
     verifier: &AuthIdentity,
+    format: &str,
 ) -> CredsspProcessResult {
     let (request, finished, error) = match result {
         Ok(ServerState::ReplyNeeded(request)) => (Some(request), false, None),
@@ -225,11 +251,21 @@ pub(super) fn process_result(
             }
             (None, true, None)
         }
-        Err(error) => (
-            error.ts_request.map(|request| *request),
-            false,
-            Some(safe_error(error.error)),
-        ),
+        Err(error) => {
+            // Fixed categories and the selected format distinguish raw NTLM
+            // lookup failures from SPNEGO without formatting upstream errors.
+            tracing::warn!(
+                stage = "credssp",
+                format,
+                category = ?error.error.error_type,
+                "Local NLA authentication rejected"
+            );
+            (
+                error.ts_request.map(|request| *request),
+                false,
+                Some(safe_error(error.error)),
+            )
+        }
     };
     let response = request
         .map(|request| {

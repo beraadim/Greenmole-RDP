@@ -34,13 +34,15 @@ pub(crate) fn read_authenticate(context: &mut Ntlm, mut stream: impl Read) -> cr
     let (mut message_fields, flags) = read_header(&mut buffer)?;
     context.flags = flags;
     let _version = try_read_version(context.flags, &mut buffer)?;
-    let mic = read_payload(flags, &mut message_fields, &mut buffer)?;
+    let mic_offset = u8::try_from(buffer.position())
+        .map_err(|_| crate::Error::new(crate::ErrorKind::InvalidToken, "MIC offset exceeds u8"))?;
+    read_payload(&mut message_fields, &mut buffer)?;
     let message = buffer.into_inner();
 
     let (authenticate_message, updated_identity) = process_message_fields(
         &context.identity,
         message_fields,
-        mic,
+        mic_offset,
         message,
         &context.channel_bindings,
     )?;
@@ -110,25 +112,10 @@ fn read_header(mut buffer: impl Read) -> crate::Result<(AuthenticateMessageField
     Ok((message_fields, negotiate_flags))
 }
 
-fn read_payload<T>(
-    negotiate_flags: NegotiateFlags,
-    message_fields: &mut AuthenticateMessageFields,
-    buffer: &mut io::Cursor<T>,
-) -> crate::Result<Option<Mic>>
+fn read_payload<T>(message_fields: &mut AuthenticateMessageFields, buffer: &mut io::Cursor<T>) -> crate::Result<()>
 where
     io::Cursor<T>: Read + io::Seek,
 {
-    let mic = if negotiate_flags.contains(NegotiateFlags::NTLM_SSP_NEGOTIATE_TARGET_INFO) {
-        let mic_offset = u8::try_from(buffer.position())
-            .map_err(|_| crate::Error::new(crate::ErrorKind::InvalidToken, "MIC offset exceeds u8"))?;
-
-        let mut mic_value = [0x00; MESSAGE_INTEGRITY_CHECK_SIZE];
-        buffer.read_exact(&mut mic_value)?;
-        Some(Mic::new(mic_value, mic_offset))
-    } else {
-        None
-    };
-
     message_fields.domain_name.read_buffer_from_cursor(buffer)?;
     message_fields.user_name.read_buffer_from_cursor(buffer)?;
     message_fields.workstation.read_buffer_from_cursor(buffer)?;
@@ -138,13 +125,13 @@ where
         .encrypted_random_session_key
         .read_buffer_from_cursor(buffer)?;
 
-    Ok(mic)
+    Ok(())
 }
 
 fn process_message_fields(
     identity: &Option<AuthIdentityBuffers>,
     message_fields: AuthenticateMessageFields,
-    mic: Option<Mic>,
+    mic_offset: u8,
     authenticate_message: Vec<u8>,
     channel_bindings: &Option<ChannelBindings>,
 ) -> crate::Result<(AuthenticateMessage, AuthIdentityBuffers)> {
@@ -155,27 +142,18 @@ fn process_message_fields(
         ));
     }
 
-    let (target_info, client_challenge) = read_ntlm_v2_response(message_fields.nt_challenge_response.buffer.as_ref())?;
+    let (target_info, _) = read_ntlm_v2_response(message_fields.nt_challenge_response.buffer.as_ref())?;
 
     let av_pairs = AvPair::buffer_to_av_pairs(target_info.as_ref())?;
 
-    // MIC presence is declared by MsvAvFlags inside the NTLMv2 response. A
-    // changed outer negotiate flag must not suppress a declared MIC, including
-    // when the AV flags also contain unknown bits. Preserve all original bytes
-    // for the existing upstream MIC verification; reject inconsistent framing.
-    let mic_required = av_pairs.iter().any(|pair| {
-        matches!(pair, AvPair::Flags(flags) if *flags & MsvAvFlags::MESSAGE_INTEGRITY_CHECK.bits() != 0)
-    });
-    let mic = if mic_required {
-        Some(mic.ok_or_else(|| {
-            crate::Error::new(
-                crate::ErrorKind::InvalidToken,
-                "NTLM response requires a MIC but negotiate flags omit it",
-            )
-        })?)
-    } else {
-        None
-    };
+    // MS-NLMP 3.2.5.1.2 declares MIC presence through MsvAvFlags in the
+    // NTLMv2 response, including when other AV flag bits are unknown.
+    // NEGOTIATE_TARGET_INFO describes the CHALLENGE's TargetInfo field; it
+    // cannot determine whether an AUTHENTICATE message contains a MIC.
+    let mic_required = av_pairs
+        .iter()
+        .any(|pair| matches!(pair, AvPair::Flags(flags) if *flags & MsvAvFlags::MESSAGE_INTEGRITY_CHECK.bits() != 0));
+    let mic = read_mic(&message_fields, mic_offset, &authenticate_message, mic_required)?;
 
     if let Some(AvPair::ChannelBindings(hash)) = av_pairs
         .iter()
@@ -226,13 +204,49 @@ fn process_message_fields(
     }
 
     Ok((
-        AuthenticateMessage::new(
-            authenticate_message,
-            mic,
-            target_info,
-            client_challenge,
-            encrypted_random_session_key,
-        ),
+        AuthenticateMessage::new(authenticate_message, mic, encrypted_random_session_key),
         identity,
     ))
+}
+
+fn read_mic(
+    fields: &AuthenticateMessageFields,
+    mic_offset: u8,
+    message: &[u8],
+    required: bool,
+) -> crate::Result<Option<Mic>> {
+    let header_end = usize::from(mic_offset);
+    let payload_start = if required {
+        header_end + MESSAGE_INTEGRITY_CHECK_SIZE
+    } else {
+        header_end
+    };
+    let minimum_payload_offset = u32::try_from(payload_start)?;
+    // A declared MIC must occupy its own complete field before payload data.
+    // Ignoring zero-length buffers permits their protocol-defined placeholder
+    // offsets, without allowing a missing MIC to consume the first payload.
+    for field in [
+        &fields.domain_name,
+        &fields.user_name,
+        &fields.workstation,
+        &fields.lm_challenge_response,
+        &fields.nt_challenge_response,
+        &fields.encrypted_random_session_key,
+    ] {
+        if !field.buffer.is_empty() && field.buffer_offset < minimum_payload_offset {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidToken,
+                "NTLM authentication payload overlaps its header or declared MIC",
+            ));
+        }
+    }
+    if !required {
+        return Ok(None);
+    }
+    let value = message
+        .get(header_end..payload_start)
+        .ok_or_else(|| crate::Error::new(crate::ErrorKind::InvalidToken, "NTLM authentication MIC is truncated"))?;
+    let mut mic_value = [0; MESSAGE_INTEGRITY_CHECK_SIZE];
+    mic_value.copy_from_slice(value);
+    Ok(Some(Mic::new(mic_value, mic_offset)))
 }

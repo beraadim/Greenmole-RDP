@@ -229,6 +229,40 @@ pub(super) fn compute_ntlm_v2_response(
     Ok((nt_challenge_response, key_exchange_key))
 }
 
+/// Validate the client's proof over its exact NTLMv2 blob before deriving keys.
+/// Reconstructing the blob would substitute the server's timestamp/reserved
+/// fields for authenticated client bytes and can reject interoperable clients.
+pub(super) fn verify_ntlm_v2_response(
+    nt_challenge_response: &[u8],
+    server_challenge: &[u8],
+    ntlm_v2_hash: &[u8],
+) -> crate::Result<[u8; HASH_SIZE]> {
+    use hmac::{KeyInit as _, Mac as _};
+
+    let invalid_response = || crate::Error::new(crate::ErrorKind::InvalidToken, "invalid NTLMv2 response");
+    if nt_challenge_response.len() < HASH_SIZE + NT_V2_RESPONSE_BASE_SIZE {
+        return Err(invalid_response());
+    }
+    let (proof, client_blob) = nt_challenge_response.split_at(HASH_SIZE);
+    if client_blob[..2] != [1, 1] {
+        return Err(invalid_response());
+    }
+
+    let mut mac = hmac::Hmac::<md5::Md5>::new_from_slice(ntlm_v2_hash).map_err(|_| {
+        crate::Error::new(
+            crate::ErrorKind::InternalError,
+            "could not initialize NTLMv2 verification",
+        )
+    })?;
+    mac.update(server_challenge);
+    mac.update(client_blob);
+    // Mac::verify_slice performs constant-time authentication-tag comparison.
+    mac.verify_slice(proof)
+        .map_err(|_| crate::Error::new(crate::ErrorKind::LogonDenied, "NTLMv2 proof verification failed"))?;
+
+    Ok(compute_hmac_md5(ntlm_v2_hash, proof)?)
+}
+
 pub(super) fn read_ntlm_v2_response(mut challenge_response: &[u8]) -> io::Result<(Vec<u8>, [u8; CHALLENGE_SIZE])> {
     let mut response = [0x00; HASH_SIZE];
     challenge_response.read_exact(response.as_mut())?;

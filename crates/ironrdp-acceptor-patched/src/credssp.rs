@@ -59,6 +59,7 @@ pub enum CredsspProcessGenerator<'a> {
     Local(
         Generator<'a, NetworkRequest, sspi::Result<Vec<u8>>, Result<ServerState, ServerError>>,
         std::sync::Arc<AuthIdentity>,
+        &'static str,
     ),
     Failed(Option<CredsspProcessResult>),
 }
@@ -142,12 +143,12 @@ pub(crate) async fn resolve_generator(
             };
             kerberos_result(result)
         }
-        CredsspProcessGenerator::Local(generator, verifier) => {
+        CredsspProcessGenerator::Local(generator, verifier, format) => {
             // The application caps upstream authentication tracing independently
             // of RUST_LOG. Local NTLM never needs network I/O: a yield is a
             // safe unsupported-operation failure, not an outbound request.
             let result = generator.resolve_to_result();
-            local::process_result(result, verifier)
+            local::process_result(result, verifier, format)
         }
         CredsspProcessGenerator::Failed(result) => {
             result.take().unwrap_or_else(|| CredsspProcessResult {

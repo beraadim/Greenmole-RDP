@@ -126,8 +126,6 @@ struct ChallengeMessage {
 struct AuthenticateMessage {
     message: Vec<u8>,
     mic: Option<Mic>,
-    target_info: Vec<u8>,
-    client_challenge: [u8; CHALLENGE_SIZE],
     encrypted_random_session_key: Option<[u8; ENCRYPTED_RANDOM_SESSION_KEY_SIZE]>,
 }
 
@@ -810,15 +808,11 @@ impl AuthenticateMessage {
     fn new(
         message: Vec<u8>,
         mic: Option<Mic>,
-        target_info: Vec<u8>,
-        client_challenge: [u8; CHALLENGE_SIZE],
         encrypted_random_session_key: Option<[u8; ENCRYPTED_RANDOM_SESSION_KEY_SIZE]>,
     ) -> Self {
         Self {
             message,
             mic,
-            target_info,
-            client_challenge,
             encrypted_random_session_key,
         }
     }

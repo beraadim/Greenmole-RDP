@@ -3,7 +3,6 @@ use crate::Utf16StringExt;
 use crate::auth_identity::AuthIdentityBuffers;
 use crate::ntlm::messages::test::*;
 use crate::ntlm::*;
-use crate::utf16string::ZeroizedUtf16String;
 
 const LOCAL_AUTHENTICATE_MESSAGE: [u8; 312] = [
     0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x03, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x5a, 0x00, 0x00,
@@ -585,180 +584,125 @@ fn complete_authenticate_fails_on_incorrect_state() {
 
 #[test]
 fn complete_authenticate_does_not_fail_on_correct_mic() {
-    let mut context = Ntlm::new();
-
-    context.identity = Some(TEST_CREDENTIALS.clone());
+    let (mut context, authenticate) = authentication_exchange(false);
+    read_authenticate(&mut context, authenticate.as_slice()).unwrap();
     context.allowed_identities = Some(vec![TEST_CREDENTIALS.clone()]);
-    context.flags = NegotiateFlags::NTLM_SSP_NEGOTIATE_KEY_EXCH;
-    context.state = NtlmState::Completion;
-    context.negotiate_message = Some(NegotiateMessage::new(vec![0x01, 0x02, 0x03]));
-    context.challenge_message = Some(ChallengeMessage::new(
-        vec![0x04, 0x05, 0x06],
-        Vec::new(),
-        [0x00; CHALLENGE_SIZE],
-        0,
-    ));
-    context.authenticate_message = Some(AuthenticateMessage::new(
-        DOMAIN_AUTHENTICATE_MESSAGE.to_vec(),
-        Some(Mic::new(
-            [
-                0xcf, 0x40, 0x63, 0x95, 0xcf, 0xe2, 0x50, 0x4d, 0xbb, 0x1f, 0x7b, 0x3e, 0x7, 0xd4, 0xb6, 0x49,
-            ],
-            64,
-        )),
-        DOMAIN_TARGET_INFO.to_vec(),
-        DOMAIN_CLIENT_CHALLENGE,
-        Some(DOMAIN_ENCRYPTED_SESSION_KEY),
-    ));
-
     complete_authenticate(&mut context).unwrap();
 }
 
 #[test]
 fn complete_authenticate_fails_on_incorrect_challenge_message() {
-    let mut context = Ntlm::new();
-
-    context.identity = Some(TEST_CREDENTIALS.clone());
+    let (mut context, authenticate) = authentication_exchange(false);
+    read_authenticate(&mut context, authenticate.as_slice()).unwrap();
     context.allowed_identities = Some(vec![TEST_CREDENTIALS.clone()]);
-    context.flags = NegotiateFlags::NTLM_SSP_NEGOTIATE_KEY_EXCH;
-    context.state = NtlmState::Completion;
-    context.negotiate_message = Some(NegotiateMessage::new(vec![0x01, 0x02, 0x03]));
-    context.challenge_message = Some(ChallengeMessage::new(
-        vec![0x05, 0x05, 0x06],
-        Vec::new(),
-        [0x00; CHALLENGE_SIZE],
-        0,
-    ));
-    context.authenticate_message = Some(AuthenticateMessage::new(
-        DOMAIN_AUTHENTICATE_MESSAGE.to_vec(),
-        Some(Mic::new(
-            [
-                0xcf, 0x40, 0x63, 0x95, 0xcf, 0xe2, 0x50, 0x4d, 0xbb, 0x1f, 0x7b, 0x3e, 0x7, 0xd4, 0xb6, 0x49,
-            ],
-            64,
-        )),
-        DOMAIN_TARGET_INFO.to_vec(),
-        DOMAIN_CLIENT_CHALLENGE,
-        Some(DOMAIN_ENCRYPTED_SESSION_KEY),
-    ));
-
+    context.challenge_message.as_mut().unwrap().message[0] ^= 1;
     assert!(complete_authenticate(&mut context).is_err());
 }
 
 #[test]
 fn complete_authenticate_succeeds_with_correct_candidate_among_multiple() {
-    let mut context = Ntlm::new();
-
-    let wrong_creds = AuthIdentityBuffers {
-        user: TEST_CREDENTIALS.user.clone(),
-        domain: TEST_CREDENTIALS.domain.clone(),
-        password: ZeroizedUtf16String::from_bytes_le(
-            "WrongPassword"
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap()
-        .into(),
-    };
-
-    context.identity = Some(TEST_CREDENTIALS.clone());
-    context.allowed_identities = Some(vec![wrong_creds, TEST_CREDENTIALS.clone()]);
-    context.flags = NegotiateFlags::NTLM_SSP_NEGOTIATE_KEY_EXCH;
-    context.state = NtlmState::Completion;
-    context.negotiate_message = Some(NegotiateMessage::new(vec![0x01, 0x02, 0x03]));
-    context.challenge_message = Some(ChallengeMessage::new(
-        vec![0x04, 0x05, 0x06],
-        Vec::new(),
-        [0x00; CHALLENGE_SIZE],
-        0,
-    ));
-    context.authenticate_message = Some(AuthenticateMessage::new(
-        DOMAIN_AUTHENTICATE_MESSAGE.to_vec(),
-        Some(Mic::new(
-            [
-                0xcf, 0x40, 0x63, 0x95, 0xcf, 0xe2, 0x50, 0x4d, 0xbb, 0x1f, 0x7b, 0x3e, 0x7, 0xd4, 0xb6, 0x49,
-            ],
-            64,
-        )),
-        DOMAIN_TARGET_INFO.to_vec(),
-        DOMAIN_CLIENT_CHALLENGE,
-        Some(DOMAIN_ENCRYPTED_SESSION_KEY),
-    ));
-
+    let (mut context, authenticate) = authentication_exchange(false);
+    read_authenticate(&mut context, authenticate.as_slice()).unwrap();
+    context.allowed_identities = Some(vec![
+        AuthIdentityBuffers::from_utf8("User", "Domain", "WrongPassword"),
+        TEST_CREDENTIALS.clone(),
+    ]);
     complete_authenticate(&mut context).unwrap();
 }
 
 #[test]
 fn complete_authenticate_fails_when_no_candidate_matches() {
-    let mut context = Ntlm::new();
-
-    let wrong_creds_1 = AuthIdentityBuffers {
-        user: TEST_CREDENTIALS.user.clone(),
-        domain: TEST_CREDENTIALS.domain.clone(),
-        password: ZeroizedUtf16String::from_bytes_le(
-            "Wrong1"
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap()
-        .into(),
-    };
-    let wrong_creds_2 = AuthIdentityBuffers {
-        user: TEST_CREDENTIALS.user.clone(),
-        domain: TEST_CREDENTIALS.domain.clone(),
-        password: ZeroizedUtf16String::from_bytes_le(
-            "Wrong2"
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap()
-        .into(),
-    };
-
-    context.identity = Some(TEST_CREDENTIALS.clone());
-    context.allowed_identities = Some(vec![wrong_creds_1, wrong_creds_2]);
-    context.flags = NegotiateFlags::NTLM_SSP_NEGOTIATE_KEY_EXCH;
-    context.state = NtlmState::Completion;
-    context.negotiate_message = Some(NegotiateMessage::new(vec![0x01, 0x02, 0x03]));
-    context.challenge_message = Some(ChallengeMessage::new(
-        vec![0x04, 0x05, 0x06],
-        Vec::new(),
-        [0x00; CHALLENGE_SIZE],
-        0,
-    ));
-    context.authenticate_message = Some(AuthenticateMessage::new(
-        DOMAIN_AUTHENTICATE_MESSAGE.to_vec(),
-        Some(Mic::new(
-            [
-                0xcf, 0x40, 0x63, 0x95, 0xcf, 0xe2, 0x50, 0x4d, 0xbb, 0x1f, 0x7b, 0x3e, 0x7, 0xd4, 0xb6, 0x49,
-            ],
-            64,
-        )),
-        DOMAIN_TARGET_INFO.to_vec(),
-        DOMAIN_CLIENT_CHALLENGE,
-        Some(DOMAIN_ENCRYPTED_SESSION_KEY),
-    ));
-
+    let (mut context, authenticate) = authentication_exchange(false);
+    read_authenticate(&mut context, authenticate.as_slice()).unwrap();
+    context.allowed_identities = Some(vec![
+        AuthIdentityBuffers::from_utf8("User", "Domain", "Wrong1"),
+        AuthIdentityBuffers::from_utf8("User", "Domain", "Wrong2"),
+    ]);
     let err = complete_authenticate(&mut context).unwrap_err();
     assert_eq!(err.error_type, ErrorKind::LogonDenied);
 }
 
+fn authentication_exchange(clear_outer_target_info: bool) -> (Ntlm, Vec<u8>) {
+    use crate::ntlm::messages::{client, computations::compute_message_integrity_check};
+
+    let mut client = Ntlm::new();
+    client.state = NtlmState::Negotiate;
+    let mut negotiate = Vec::new();
+    client::write_negotiate(&mut client, &mut negotiate).unwrap();
+
+    let mut server = Ntlm::new();
+    server.state = NtlmState::Negotiate;
+    read_negotiate(&mut server, negotiate.as_slice()).unwrap();
+    let mut challenge = Vec::new();
+    write_challenge(&mut server, &mut challenge).unwrap();
+    client::read_challenge(&mut client, challenge.as_slice()).unwrap();
+    let mut authenticate = Vec::new();
+    client::write_authenticate(&mut client, &TEST_CREDENTIALS, &mut authenticate).unwrap();
+
+    if clear_outer_target_info {
+        // Produce a valid client message whose MIC covers the original wire flags,
+        // without relying on the SSPI client's outer TARGET_INFO convention.
+        let flags = u32::from_le_bytes(authenticate[60..64].try_into().unwrap());
+        let flags = flags & !NegotiateFlags::NTLM_SSP_NEGOTIATE_TARGET_INFO.bits();
+        authenticate[60..64].copy_from_slice(&flags.to_le_bytes());
+        authenticate[72..88].fill(0);
+        let mic = compute_message_integrity_check(&negotiate, &challenge, &authenticate, &client.session_key.unwrap())
+            .unwrap();
+        authenticate[72..88].copy_from_slice(&mic);
+    }
+    (server, authenticate)
+}
+
 #[test]
-fn read_authenticate_rejects_flags_that_hide_a_required_mic() {
+fn complete_authenticate_accepts_valid_mic_without_outer_target_info_flag() {
+    let (mut server, authenticate) = authentication_exchange(true);
+    read_authenticate(&mut server, authenticate.as_slice()).unwrap();
+    assert_eq!(server.authenticate_message.as_ref().unwrap().message, authenticate);
+    assert!(server.authenticate_message.as_ref().unwrap().mic.is_some());
+    server.allowed_identities = Some(vec![TEST_CREDENTIALS.clone()]);
+    assert_eq!(complete_authenticate(&mut server).unwrap(), SecurityStatus::Ok);
+}
+
+#[test]
+fn complete_authenticate_rejects_corrupt_mic_without_outer_target_info_flag() {
+    let (mut server, mut authenticate) = authentication_exchange(true);
+    authenticate[72] ^= 0xff;
+    read_authenticate(&mut server, authenticate.as_slice()).unwrap();
+    server.allowed_identities = Some(vec![TEST_CREDENTIALS.clone()]);
+    assert!(complete_authenticate(&mut server).is_err());
+}
+
+#[test]
+fn read_authenticate_rejects_removed_declared_mic_without_outer_target_info_flag() {
+    let (mut server, mut authenticate) = authentication_exchange(true);
+    authenticate.drain(72..88);
+    // Move all payload references with their data, so parsing the NTLMv2 AV
+    // flags succeeds and the missing MIC is detected as header overlap.
+    for field in [12, 20, 28, 36, 44, 52] {
+        let offset = u32::from_le_bytes(authenticate[field + 4..field + 8].try_into().unwrap());
+        authenticate[field + 4..field + 8].copy_from_slice(&(offset - 16).to_le_bytes());
+    }
+    assert_eq!(
+        read_authenticate(&mut server, authenticate.as_slice())
+            .unwrap_err()
+            .error_type,
+        ErrorKind::InvalidToken
+    );
+}
+
+#[test]
+fn read_authenticate_rejects_payload_overlapping_declared_mic() {
     let mut context = Ntlm::new();
     context.state = NtlmState::Authenticate;
     let mut message = LOCAL_AUTHENTICATE_MESSAGE;
-    let flags = u32::from_le_bytes(message[60..64].try_into().unwrap());
-    assert_ne!(flags & NegotiateFlags::NTLM_SSP_NEGOTIATE_TARGET_INFO.bits(), 0);
-    let stripped_flags = flags & !NegotiateFlags::NTLM_SSP_NEGOTIATE_TARGET_INFO.bits();
-    message[60..64].copy_from_slice(&stripped_flags.to_le_bytes());
-    message[72] ^= 0xff;
-    // The response still declares MIC presence in its authenticated MsvAvFlags.
-    // A changed outer flag must not suppress reading or checking that MIC.
-    assert!(read_authenticate(&mut context, message.as_slice()).is_err());
+    // A nonempty username starts one byte before the complete MIC ends.
+    message[40..44].copy_from_slice(&87_u32.to_le_bytes());
+    assert_eq!(
+        read_authenticate(&mut context, message.as_slice())
+            .unwrap_err()
+            .error_type,
+        ErrorKind::InvalidToken
+    );
 }
 
 #[test]
@@ -766,7 +710,10 @@ fn read_authenticate_keeps_required_mic_with_unknown_av_flag_bits() {
     let mut context = Ntlm::new();
     context.state = NtlmState::Authenticate;
     let mut message = LOCAL_AUTHENTICATE_MESSAGE;
-    let flags_offset = message.windows(8).position(|bytes| bytes == [6, 0, 4, 0, 2, 0, 0, 0]).unwrap();
+    let flags_offset = message
+        .windows(8)
+        .position(|bytes| bytes == [6, 0, 4, 0, 2, 0, 0, 0])
+        .unwrap();
     message[flags_offset + 7] |= 0x80;
     read_authenticate(&mut context, message.as_slice()).unwrap();
     let mic = context.authenticate_message.unwrap().mic.unwrap();

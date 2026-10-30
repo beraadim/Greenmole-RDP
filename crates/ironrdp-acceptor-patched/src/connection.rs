@@ -15,6 +15,7 @@ use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
 use pdu::{gcc, mcs, nego, rdp};
+use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
@@ -28,7 +29,20 @@ const USER_CHANNEL_ID: u16 = 1002;
 /// Keep domain handling unchanged: clients may qualify a local account with
 /// different computer/domain names. An empty password is never a bypass.
 fn non_hybrid_credentials_match(configured: Option<&Credentials>, supplied: &Credentials) -> bool {
-    configured.is_some_and(|expected| expected.username == supplied.username && expected.password == supplied.password)
+    configured.is_some_and(|expected| {
+        expected.username == supplied.username
+            && bool::from(expected.password.as_bytes().ct_eq(supplied.password.as_bytes()))
+    })
+}
+
+/// Diagnostic categories contain no incoming usernames or secret values.
+fn non_hybrid_rejection_reason(configured: Option<&Credentials>, supplied: &Credentials) -> &'static str {
+    match configured {
+        None => "credentials_unconfigured",
+        Some(expected) if expected.username != supplied.username => "account_mismatch",
+        Some(_) if supplied.password.is_empty() => "password_missing",
+        Some(_) => "password_mismatch",
+    }
 }
 
 pub struct Acceptor {
@@ -584,7 +598,12 @@ impl Sequence for Acceptor {
                     // attempt unless it actually matches the configured account;
                     // prompting behavior must never bypass authentication.
                     if !non_hybrid_credentials_match(self.creds.as_ref(), &creds) {
-                        warn!(?protocol, "Credential mismatch; rejecting connection");
+                        warn!(
+                            ?protocol,
+                            stage = "client_info",
+                            reason = non_hybrid_rejection_reason(self.creds.as_ref(), &creds),
+                            "Credential mismatch; rejecting connection"
+                        );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
                             ProtocolIndependentCode::ServerDeniedConnection,
                         ));

@@ -180,8 +180,6 @@ pub(crate) fn write_authenticate(
     context.authenticate_message = Some(AuthenticateMessage::new(
         message,
         Some(mic),
-        target_info,
-        client_challenge,
         Some(encrypted_session_key),
     ));
     context.state = NtlmState::Final;

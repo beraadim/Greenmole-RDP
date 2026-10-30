@@ -8,7 +8,7 @@ pub(super) fn candidates(
     supplied: &Username,
     allow_local_mapping: bool,
 ) -> Vec<Credentials> {
-    configured
+    let candidates: Vec<_> = configured
         .iter()
         .filter_map(|identity| {
             // Preserve the upstream default: format-aware full identity matching.
@@ -33,7 +33,24 @@ pub(super) fn candidates(
             Some(candidate)
         })
         .map(Credentials::from)
-        .collect()
+        .collect();
+    if candidates.is_empty() {
+        let identity_format = match supplied.parts() {
+            UsernameParts::UserPrincipalName(_) => "upn",
+            UsernameParts::DownLevelLogonName(parts) if parts.netbios_domain().is_some() => "qualified_down_level",
+            UsernameParts::DownLevelLogonName(_) => "bare_down_level",
+        };
+        tracing::warn!(
+            stage = "account_lookup",
+            reason = "account_not_configured",
+            identity_format,
+            account_matches = configured
+                .iter()
+                .any(|identity| { identity.username.account_name() == supplied.account_name() }),
+            "Negotiate account lookup rejected"
+        );
+    }
+    candidates
 }
 
 #[cfg(test)]

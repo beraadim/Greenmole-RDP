@@ -7,3 +7,7 @@ Greenmole RDP uses SSPI-rs through IronRDP and as an explicitly versioned
 server-authentication dependency. The accompanying license texts are copied
 from the upstream project. The library retains its original authorship and
 copyright; its inclusion does not imply upstream endorsement.
+
+The vendored runtime includes local account-selection, NTLMv2 proof/MIC
+validation and diagnostic changes. Source provenance and modifications are
+documented in crates/sspi-patched/UPSTREAM.md and PATCHES.md in the source tree.
