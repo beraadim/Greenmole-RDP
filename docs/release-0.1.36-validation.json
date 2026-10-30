@@ -1,0 +1,87 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.36",
+  "source_revision": "450ab83236aa8c4b912913d618d85cbbb900bcec",
+  "diagnosis": {
+    "running_version": "0.1.35",
+    "observed_at_oslo": [
+      "2026-10-30T12:50:55+01:00",
+      "2026-10-30T12:51:26+01:00"
+    ],
+    "client_errors": [
+      "0x904",
+      "extended 0x7"
+    ],
+    "server_errors": [
+      "CredSSP LogonDenied",
+      "TLS ClientInfo credential mismatch"
+    ],
+    "precise_rejected_check_known": false,
+    "explanation": "Existing warning log does not distinguish raw NTLM account policy, proof/password and integrity failure. New validation fixes are not yet established as the cause of the observed failure."
+  },
+  "authentication": {
+    "exact_received_ntlmv2_proof_and_blob_verified": true,
+    "session_key_derived_only_after_verified_proof": true,
+    "proof_and_mic_comparison_constant_time": true,
+    "mic_presence_from_msv_av_flags": true,
+    "mic_outer_target_info_flag_ignored": true,
+    "declared_mic_must_precede_payload": true,
+    "raw_ntlm_spnego_and_credssp_binding_retained": true,
+    "configured_identity_policy_unchanged": true,
+    "safe_warning_level_failure_stages_added": true,
+    "mandatory_sspi_debug_trace_filter_retained": true,
+    "tls_password_constant_time": true
+  },
+  "tests": {
+    "full_standard_check_passed": true,
+    "workspace_and_ui_rust_passed": 959,
+    "patched_acceptor_rust_passed": 19,
+    "vendor_library_rust_passed": 455,
+    "existing_manual_rust_ignored": 7,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "native_driver_tests_passed": true,
+    "frontend_production_build_passed": true,
+    "independent_microsoft_ntlmv2_vector_passed": true,
+    "proof_password_blob_challenge_and_mic_tampering_rejected": true,
+    "valid_mic_with_outer_flag_clear_passed": true,
+    "actual_native_windows_client_tested": false,
+    "initial_full_check": "One existing privacy lease test failed under parallel fork-based tests; full check rerun serially passed all tests. No privacy runtime changes."
+  },
+  "checks": {
+    "source_whitespace_passed": true,
+    "staged_secret_scan_passed": true,
+    "dependency_versions_and_tauri_pins_preserved": true,
+    "peer_review": "Independent read-only review found no blocking issue; integrated raw NTLM/SPNEGO and vendor tests passed."
+  },
+  "manual_acceptance": "User deploys 0.1.36 when convenient and retries Windows with explicit .\\macrdp and configured Greenmole password. Confirm valid credentials work, wrong credentials fail, and Guacamole remains compatible. If failure persists, correlate fixed stage/reason logs. No Windows security downgrade or microphone driver reinstall requested.",
+  "status": "committed, built, verified and copied to Desktop; not installed",
+  "verified_at_utc": "2026-10-30T12:03:16.525006+00:00",
+  "package_verification": {
+    "version": "0.1.36",
+    "source_revision": "450ab83236aa8c4b912913d618d85cbbb900bcec",
+    "package": "Greenmole_RDP_0.1.36_aarch64_450ab83236aa.dmg",
+    "bytes": 15112454,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "arm64_binary_architecture_verified": true,
+    "authentication_and_rdp_licenses_bundled": true,
+    "driver_signature_verified": true,
+    "microphone_payload_matches_0_1_34": true,
+    "microphone_installer_digest_and_text_verified": true,
+    "mounted_read_only_and_removed": true,
+    "sha256": "4b1fdb38d5e04b10969fc94fabbb07d324ffe42eed74d70d4755e3ec12e5a068",
+    "desktop_copy_and_sidecars_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.36_aarch64_450ab83236aa.dmg",
+    "active_app_hashes_and_processes_preserved": true,
+    "core_audio_process_preserved": true,
+    "credentials_changed": false,
+    "app_installed": false,
+    "driver_reinstalled": false,
+    "service_restarted": false
+  }
+}

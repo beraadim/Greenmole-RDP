@@ -35,3 +35,15 @@ the observed 0.1.35 failure cannot be conclusively attributed to these defects.
 The microphone driver payload is unchanged. Building and copying the DMG does
 not install the app, alter credentials, restart the RDP service or restart Core
 Audio. The user deploys and tests the package when convenient.
+
+The complete checks passed: 959 workspace/desktop Rust tests, 19 patched
+acceptor tests, 455 authentication-library tests, 39 Python tests, 11 JavaScript
+tests, the frontend production build and native driver tests. Seven existing
+manual Rust tests remain ignored. The first parallel run hit an existing
+private-session lease test failure; the complete serial rerun passed.
+
+The optimized ARM64 DMG was mounted read-only and verified for its application
+and driver signatures, version/revision, architecture, licenses, installer
+payload and checksum. The DMG and both sidecars are on the current Mac mini's
+Desktop. Active app/configuration hashes and app/Core Audio processes were
+preserved. See [the validation record](release-0.1.36-validation.json).
