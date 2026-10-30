@@ -62,6 +62,7 @@ async fn run() -> Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::registry()
         .with(filter)
+        .with(macrdp_core::auth_log_filter())
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(macrdp_core::LogBridgeLayer::new())
         .init();

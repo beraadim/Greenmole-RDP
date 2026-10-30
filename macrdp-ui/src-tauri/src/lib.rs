@@ -89,6 +89,7 @@ pub fn run() {
     ));
     tracing_subscriber::registry()
         .with(filter_layer)
+        .with(macrdp_core::auth_log_filter())
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(macrdp_core::LogBridgeLayer::new())
         .init();

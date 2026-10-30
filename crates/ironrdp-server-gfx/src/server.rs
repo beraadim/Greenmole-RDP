@@ -50,6 +50,10 @@ use crate::{builder, capabilities, SoundServerFactory};
 mod tests;
 
 #[cfg(test)]
+#[path = "authentication_state_tests.rs"]
+mod authentication_state_tests;
+
+#[cfg(test)]
 #[path = "microphone_registration_tests.rs"]
 mod microphone_registration_tests;
 
@@ -475,6 +479,44 @@ impl RdpServer {
         self.additional_input.clear();
         self.ev_receiver.lock().await.data.discard_pending();
         self.handshake_deadline = None;
+        self.record_authentication_result(peer, &result);
+        if let Err(error) = &result {
+            if self.gfx_state.lock().unwrap().connection_outcome.is_none() {
+                self.record_outcome(error_outcome(error, ConnectionOutcome::HandshakeRejected));
+            }
+        }
+        let outcome = self.gfx_state.lock().unwrap().connection_outcome;
+        info!(
+            reason = outcome
+                .map(ConnectionOutcome::as_str)
+                .unwrap_or("client_disconnect"),
+            authenticated = self.connection_authenticated,
+            "Connection outcome"
+        );
+        result
+    }
+
+    fn record_authentication_result(&mut self, peer: core::net::IpAddr, result: &Result<()>) {
+        if !self.connection_authenticated
+            && result.as_ref().err().is_some_and(|error| {
+                error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<ironrdp_connector::ConnectorError>()
+                        .is_some_and(|error| {
+                            // The acceptor's TLS ClientInfo credential check has
+                            // this fixed error context. Classify the typed failure
+                            // without matching user-controlled error text.
+                            error.context == "invalid credentials"
+                                && matches!(
+                                    error.kind(),
+                                    ironrdp_connector::ConnectorErrorKind::General
+                                )
+                        })
+                })
+            })
+        {
+            self.record_outcome(ConnectionOutcome::AuthenticationFailed);
+        }
         if self.connection_authenticated {
             self.admission.succeeded(peer);
         } else if result.is_err() {
@@ -490,20 +532,19 @@ impl RdpServer {
                 self.admission.failed(peer, tokio::time::Instant::now());
             }
         }
-        if let Err(error) = &result {
-            if self.gfx_state.lock().unwrap().connection_outcome.is_none() {
-                self.record_outcome(error_outcome(error, ConnectionOutcome::HandshakeRejected));
-            }
+    }
+
+    async fn await_credssp_authentication(
+        &mut self,
+        negotiated_nla: bool,
+        authentication: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        self.await_connection_stage("CredSSP authentication", authentication)
+            .await?;
+        if negotiated_nla {
+            self.connection_authenticated = true;
         }
-        let outcome = self.gfx_state.lock().unwrap().connection_outcome;
-        info!(
-            reason = outcome
-                .map(ConnectionOutcome::as_str)
-                .unwrap_or("client_disconnect"),
-            authenticated = self.connection_authenticated,
-            "Connection outcome"
-        );
-        result
+        Ok(())
     }
 
     async fn run_connection_inner(&mut self, stream: TcpStream) -> Result<()> {
@@ -588,7 +629,11 @@ impl RdpServer {
                     // doesn't seem to matter yet
                     let client_name = framed.get_inner().0.get_ref().0.peer_addr()?.to_string();
 
-                    self.await_connection_stage("CredSSP authentication", async {
+                    // accept_credssp also succeeds as a no-op for TLS-only
+                    // fallback. Only a negotiated, completed NLA exchange proves
+                    // authentication before ClientInfo/activation has finished.
+                    let negotiated_nla = acceptor.should_perform_credssp();
+                    self.await_credssp_authentication(negotiated_nla, async {
                         ironrdp_acceptor::accept_credssp(
                             &mut framed,
                             &mut acceptor,
@@ -601,7 +646,6 @@ impl RdpServer {
                         .map_err(Into::into)
                     })
                     .await?;
-                    self.connection_authenticated = true;
                 }
 
                 let framed = self.accept_finalize(framed, acceptor, size).await?;

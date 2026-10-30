@@ -1,0 +1,9 @@
+SSPI-rs authentication library
+
+Project: https://github.com/Devolutions/sspi-rs
+License: MIT OR Apache-2.0
+
+Greenmole RDP uses SSPI-rs through IronRDP and as an explicitly versioned
+server-authentication dependency. The accompanying license texts are copied
+from the upstream project. The library retains its original authorship and
+copyright; its inclusion does not imply upstream endorsement.

@@ -17,10 +17,14 @@ members = [
 [patch.crates-io]
 ironrdp-server = { path = "crates/ironrdp-server-gfx" }
 ironrdp-acceptor = { path = "crates/ironrdp-acceptor-patched" }
+ironrdp-connector = { path = "crates/ironrdp-connector-patched" }
+ironrdp-tokio = { path = "crates/ironrdp-tokio-patched" }
+
+sspi = { path = "crates/sspi-patched" }
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.93"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]

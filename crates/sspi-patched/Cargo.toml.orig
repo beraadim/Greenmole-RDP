@@ -1,0 +1,239 @@
+[package]
+name = "sspi"
+version = "0.23.1"
+edition = "2024"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/devolutions/sspi-rs"
+repository = "https://github.com/devolutions/sspi-rs"
+authors = ["Devolutions Inc. <infos@devolutions.net>"]
+description = "A Rust implementation of the Security Support Provider Interface (SSPI) API"
+keywords = ["ntlm", "auth", "sspi", "windows", "kerberos"]
+rust-version = "1.93"
+
+[workspace]
+resolver = "2"
+members = [
+  "ffi",
+  "ffi/symbol-rename-macro",
+  "crates/winscard",
+  "crates/ffi-types",
+  "crates/dpapi",
+  "crates/dpapi-core",
+  "crates/dpapi-pdu",
+  "crates/dpapi-transport",
+  "crates/dpapi-native-transport",
+  "crates/dpapi-fuzzing",
+  "crates/dpapi-web",
+  "crates/kdc",
+]
+exclude = [
+  "tools/wasm-testcompile",
+  "tools/dpapi-cli-client",
+]
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# == Correctness == #
+ambiguous_negative_literals = "warn"
+
+# == Style, readability == #
+unreachable_pub = "warn"
+single_use_lifetimes = "warn"
+elided_lifetimes_in_paths = "warn"
+unused_lifetimes = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+
+# == Safer unsafe == #
+as_ptr_cast_mut = "warn"
+fn_to_numeric_cast_any = "warn"
+ptr_cast_constness = "warn"
+unnecessary_safety_comment = "warn"
+missing_safety_doc = "warn"
+as_pointer_underscore = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# == Correctness == #
+as_conversions = "warn"
+as_underscore = "warn"
+filetype_is_file = "warn"
+float_cmp_const = "warn"
+float_cmp = "warn"
+get_unwrap = "warn"
+lossy_float_literal = "warn"
+mem_forget = "warn"
+mixed_read_write_in_expression = "warn"
+needless_raw_strings = "warn"
+non_ascii_literal = "warn"
+panic = "warn"
+rc_mutex = "warn"
+suspicious_xor_used_as_pow = "warn"
+unused_result_ok = "warn"
+
+# Only workspace-internal crates belong here, so release-plz detects external dependency updates.
+[workspace.dependencies]
+ffi-types = { path = "crates/ffi-types" }
+winscard = { version = "0.4", path = "crates/winscard" }
+
+dpapi = { version = "0.0.0", path = "crates/dpapi" }
+dpapi-core = { version = "0.1.0", path = "crates/dpapi-core" }
+dpapi-pdu = { version = "0.1.0", path = "crates/dpapi-pdu" }
+dpapi-transport = { version = "0.1.0", path = "crates/dpapi-transport" }
+dpapi-native-transport = { version = "0.1.0", path = "crates/dpapi-native-transport" }
+
+
+[features]
+default = ["aws-lc-rs"]
+
+# Enable reqwest for HTTP requests.
+network_client = ["dep:reqwest", "dep:portpicker", "dep:rustls-native-certs", "__rustls-used"]
+# KDC discovery by querying DNS records.
+dns_resolver = ["dep:hickory-resolver", "dep:hickory-proto","dep:tokio"]
+# TSSSP should be used only on Windows as a native CredSSP replacement.
+tsssp = ["dep:rustls", "__rustls-used"]
+# Turns on Kerberos smart card logon.
+scard = ["dep:winscard", "dep:cryptoki"]
+# Use AWS LC as TLS cryptography provider.
+aws-lc-rs = ["rustls?/aws-lc-rs", "__install-crypto-provider"]
+# Use ring as TLS cryptography provider.
+ring = ["rustls?/ring", "reqwest?/rustls-tls-native-roots", "__install-crypto-provider"]
+
+# Internal (PRIVATE!) features. Do not rely on these whatsoever. They may disappear at anytime.
+
+__test-data = []
+__rustls-used = ["dep:rustls"]
+__install-crypto-provider = []
+
+[dependencies]
+bitflags = "2.11"
+rand = "0.10"
+rand_core = "0.10"
+getrandom = "0.3"
+cfg-if = "1"
+picky = { version = "=7.0.0-rc.27", default-features = false }
+sha1 = { version = "0.11", default-features = false }
+sha2 = "0.11"
+num-derive = "0.5"
+num-traits = { version = "0.2", default-features = true }
+picky-asn1-der = "0.5"
+picky-asn1-x509 = { version = "0.15", features = ["pkcs7"] }
+uuid = { version = "1.23", default-features = true, features = ["v4"] }
+# `rt-multi-thread` feature is required for `tokio::task::block_in_place` function.
+tokio = { version = "1.52", optional = true, features = ["time", "rt", "rt-multi-thread"] }
+winscard = { workspace = true, optional = true }
+rsa = { version = "=0.10.0-rc.18", default-features = false }
+tracing = { version = "0.1", default-features = true }
+serde = "1"
+picky-krb = "0.13.1"
+picky-asn1 = { version = "0.10", features = ["time_conversion"] }
+byteorder = "1.5"
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"] }
+hmac = "0.13"
+widestring = "1.2"
+
+url = "2.5"
+
+md-5 = "0.11"
+md4 = "0.11"
+crypto-mac = "0.11"
+oid = "0.2"
+
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls-no-provider"] }
+hickory-resolver = { version = "0.25", optional = true }
+hickory-proto = { version = "0.25", optional = true }
+portpicker = { version = "0.1", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["logging", "std", "tls12"] }
+rustls-native-certs = { version = "0.8", optional = true }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+async-recursion = "1.1"
+bytemuck = "1.24"
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
+windows = { version = "0.62", features = [ "Win32_Foundation", "Win32_System", "Win32_NetworkManagement_Dns", "Win32_Security_Cryptography"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1.23", default-features = false, features = ["js"]}
+getrandom = { version = "0.3", features = ["wasm_js"] }
+time = { version = "0.3", default-features = false, features = ["wasm-bindgen"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cryptoki = { version = "0.12", optional = true }
+time = { version = "0.3", features = ["std"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+async-dnssd = "0.5"
+futures = "0.3"
+tokio = { version = "1.52", features = ["time", "rt", "rt-multi-thread"] }
+
+# Pin transitive dependencies
+# TODO: Remove when stable versions will be released
+# RustCrypto crates
+pkcs1 = "=0.8.0-rc.4"
+
+[dev-dependencies]
+base64 = "0.23"
+static_assertions = "1"
+whoami = "2.1"
+picky = { version = "=7.0.0-rc.27", default-features = false, features = ["x509"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1.6"
+cfg-if = "1"
+
+[lints]
+workspace = true
+
+[[example]]
+name = "kerberos"
+required-features = ["network_client"]
+
+[profile.ffi-production]
+inherits = "release"
+strip = false
+split-debuginfo = "packed"
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+
+# Optimize for speed the cryptographic libraries.
+[profile.ffi-production.package.crypto-bigint]
+opt-level = 3
+[profile.ffi-production.package.p256]
+opt-level = 3
+[profile.ffi-production.package.p384]
+opt-level = 3
+[profile.ffi-production.package.p521]
+opt-level = 3
+[profile.ffi-production.package.rsa]
+opt-level = 3
+[profile.ffi-production.package.sha1]
+opt-level = 3
+[profile.ffi-production.package.sha2]
+opt-level = 3
+[profile.ffi-production.package.sha3]
+opt-level = 3
+[profile.ffi-production.package.aes-gcm]
+opt-level = 3
+[profile.ffi-production.package.aes]
+opt-level = 3
+[profile.ffi-production.package.aes-kw]
+opt-level = 3
+[profile.ffi-production.package.argon2]
+opt-level = 3
+[profile.ffi-production.package.ctr]
+opt-level = 3
+[profile.ffi-production.package.cbc]
+opt-level = 3
+[profile.ffi-production.package.des]
+opt-level = 3
+[profile.ffi-production.package.pbkdf2]
+opt-level = 3
+[profile.ffi-production.package.hmac]
+opt-level = 3

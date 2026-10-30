@@ -81,6 +81,7 @@ pub(super) fn run() -> Result<()> {
     let (filter, reload_filter) = tracing_subscriber::reload::Layer::new(filter);
     tracing_subscriber::registry()
         .with(filter)
+        .with(crate::auth_log_filter())
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(DiagnosticLayer {
             events: sender.clone(),

@@ -90,6 +90,9 @@ version = "0.8"
 [dependencies.ironrdp-cliprdr]
 version = "0.5"
 
+[dependencies.ironrdp-connector]
+version = "0.8"
+
 [dependencies.ironrdp-core]
 version = "0.1"
 

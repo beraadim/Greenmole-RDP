@@ -59,6 +59,10 @@ version = "0.7"
 [dependencies.ironrdp-svc]
 version = "0.6"
 
+# Compare the final delegated password without a content-dependent early exit.
+[dependencies.subtle]
+version = "2.6"
+
 [dependencies.tracing]
 version = "0.1"
 features = ["log"]

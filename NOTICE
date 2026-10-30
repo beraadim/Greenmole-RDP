@@ -16,7 +16,15 @@ licenses, copyright notices, and attribution. In the source tree, see the licens
 files in crates/ironrdp-server-gfx/ and crates/ironrdp-acceptor-patched/, and the
 artwork license, notice, and provenance in branding/.
 
+The compatibility patches also retain the original IronRDP connector and Tokio
+adapter sources and licenses in crates/ironrdp-connector-patched/ and
+crates/ironrdp-tokio-patched/. IronRDP license texts are bundled under
+licenses/IronRDP/.
+
 The additional keyboard layout tables are adapted from Apache Guacamole under
 the Apache License, Version 2.0. Their source, modification notice and license
 are retained in crates/macrdp-core/src/handler/layouts/. The app bundles these
 notices under licenses/Keyboard-layouts/.
+
+SSPI-rs authentication library licenses and attribution are retained in
+third_party/sspi-rs/ and bundled under licenses/SSPI-rs/.

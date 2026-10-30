@@ -7,3 +7,13 @@ description = "Runtime and captured RDP credentials must never be committed"
 path = '''(^|/)(tmp_logs/.*|config\.toml|config-ui[^/]*\.toml)$'''
 regex = '''(?i)password\s*=\s*["']([^"'\r\n]+)["']'''
 secretGroup = 1
+
+# Public PKU2U unit-test fixture from the verified SSPI 0.23.1 crate archive.
+# The exact file plus fixed high-entropy PEM lines identify this one fixture;
+# this does not exempt the vendor tree or other secrets in the same file.
+[[allowlists]]
+description = "Published SSPI PKU2U unit-test private key fixture"
+condition = "AND"
+paths = ['''^crates/sspi-patched/src/pku2u/mod\.rs$''']
+regexTarget = "match"
+regexes = ['''\-\-\-\-\-BEGIN\ PRIVATE\ KEY\-\-\-\-\-\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDV8b3HI7us0XE1\nkSpdjjXfGtBu4rI2u\+219uZBKmUksXlKYd6So/5wm5bjtnt6\+0B3uuVEnUPTvfHZ[\s\S]*?1pNtUBlMx\+0X6wxVjMYulkRH\n\-\-\-\-\-END\ PRIVATE\ KEY\-\-\-\-\-''']
