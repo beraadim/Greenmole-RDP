@@ -51,3 +51,12 @@ complete raw NTLM, SPNEGO and Kerberos-first/NTLM-selected handshakes and
 credential/integrity/binding rejection cases. Five focused vendor policy/parser
 checks also passed. Seven existing manual workspace tests remain ignored. The
 standard check script now runs the acceptor suite explicitly.
+
+The optimized ARM64 DMG was verified read-only and copied to the current Mac
+mini's Desktop with its checksum and build metadata. Package signatures,
+version/revision, bundled authentication/RDP licenses and microphone installer
+digest were verified. The microphone payload matches 0.1.34. Active app hashes,
+app processes and the Core Audio process were preserved; credentials, installed
+app and driver were not changed. See the
+[validation record](release-0.1.35-validation.json). A real native Windows retest
+remains necessary after the user deploys the update.

@@ -14,7 +14,7 @@ The version remains 0.23.1. The root and UI Cargo patches unify authentication
 on this modern runtime; the vendored connector/tokio adapters retain their
 existing RDP APIs while using the same SSPI version.
 
-The vendored runtime omits upstream tools/, .claude/, AGENTS.md, CLAUDE.md and
+The vendored runtime omits upstream tools/, .agents/, .claude/, .github/, AGENTS.md, CLAUDE.md and
 the package-development Cargo.lock. These are unrelated tooling/agent metadata;
 application dependency versions are pinned in the repository root and UI locks.
 The Rust runtime sources and test assets retain their published contents except

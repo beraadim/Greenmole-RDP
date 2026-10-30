@@ -1,0 +1,86 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.35",
+  "status": "committed, built, verified and copied to Desktop; not installed",
+  "source_revision": "f70a84fc62ee4a22fc2ea1fba70518749109b7ab",
+  "verified_at_utc": "2026-10-30T10:28:29.842594+00:00",
+  "diagnosis": {
+    "running_version": "0.1.34",
+    "observed_errors": [
+      "CredSSP InvalidParameter: mixed username format",
+      "CredSSP InvalidToken: SPNEGO token forwarded to raw NTLM parser"
+    ],
+    "windows_username_correction": "User changed suggested macrdp@... to plain macrdp; negotiation failure persisted."
+  },
+  "authentication": {
+    "sspi_version": "0.23.1",
+    "rdp_connector_and_tokio_versions": "0.8.0 unchanged",
+    "vendor_provenance_recorded": true,
+    "spnego_and_raw_ntlm_supported": true,
+    "required_mechanism_mic_and_tls_binding_retained": true,
+    "local_domain_mapping_opt_in_default_off": true,
+    "final_delegated_credentials_verified": true,
+    "tls_fallback_admission_state_fixed": true,
+    "mandatory_authentication_debug_trace_event_and_span_cap": true
+  },
+  "tests": {
+    "standard_workspace_ui_checks_passed": true,
+    "workspace_and_ui_rust_passed": 959,
+    "patched_acceptor_rust_passed": 19,
+    "vendor_policy_and_parser_focused_tests_passed": 5,
+    "existing_manual_rust_ignored": 7,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "frontend_production_build_passed": true,
+    "native_driver_tests_passed": true,
+    "complete_handshakes": [
+      "raw NTLM",
+      "SPNEGO NTLM",
+      "Kerberos-preferred SPNEGO selecting NTLM"
+    ],
+    "rejection_cases": [
+      "wrong account/password",
+      "wrong qualified identity or UPN alias",
+      "missing/tampered SPNEGO MIC",
+      "tampered NTLM MIC including suppressed-MIC flag",
+      "wrong public-key binding or nonce",
+      "midstream token format change",
+      "oversized framing",
+      "different final encrypted delegated identity/password"
+    ],
+    "actual_native_windows_client_tested": false
+  },
+  "checks": {
+    "secret_scan": "Gitleaks passed; exact published PKU2U unit-test key fixture is narrowly allowlisted by path and fixed PEM data",
+    "authored_and_runtime_source_diff_check_passed": true,
+    "upstream_metadata_formatting": "Published changelog/README/style whitespace retained; unused upstream tooling and agent/CI metadata omitted",
+    "tauri_pins_preserved": true
+  },
+  "package_verification": {
+    "version": "0.1.35",
+    "source_revision": "f70a84fc62ee4a22fc2ea1fba70518749109b7ab",
+    "package": "Greenmole_RDP_0.1.35_aarch64_f70a84fc62ee.dmg",
+    "bytes": 15093585,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "authentication_and_rdp_licenses_bundled": true,
+    "driver_signature_verified": true,
+    "microphone_payload_matches_0_1_34": true,
+    "microphone_installer_digest_and_text_verified": true,
+    "mounted_read_only_and_removed": true,
+    "sha256": "8251e67031c4cfceda45e0a9cf5fe7ea8087d07c14549dc9dfe0919891583265",
+    "desktop_copy_and_sidecars_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.35_aarch64_f70a84fc62ee.dmg",
+    "active_app_hashes_and_processes_preserved": true,
+    "core_audio_process_preserved": true,
+    "credentials_changed": false,
+    "app_installed": false,
+    "driver_reinstalled": false,
+    "service_restarted": false
+  },
+  "manual_acceptance": "User will update the app and restart its RDP service when ready, connect Windows with plain configured username, verify a valid password works and invalid credentials fail, and retest existing Greenmole/Guacamole. No microphone driver reinstallation is needed. No Windows security downgrade requested."
+}
