@@ -1,6 +1,7 @@
 //! Bounded input retained across a resize before protocol processing begins.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use anyhow::{bail, Result};
 use bytes::BytesMut;
@@ -14,7 +15,7 @@ const MAX_WIRE_PDU_BYTES: usize = u16::MAX as usize;
 
 #[derive(Debug, Default)]
 pub(super) struct PendingInput {
-    pdus: VecDeque<(Action, BytesMut)>,
+    pdus: VecDeque<(Action, BytesMut, Option<Instant>)>,
     bytes: usize,
 }
 
@@ -32,11 +33,20 @@ impl PendingInput {
     }
 
     pub(super) fn push(&mut self, action: Action, bytes: BytesMut) -> Result<()> {
+        self.push_at(action, bytes, Some(Instant::now()))
+    }
+
+    pub(super) fn push_at(
+        &mut self,
+        action: Action,
+        bytes: BytesMut,
+        received_at: Option<Instant>,
+    ) -> Result<()> {
         if self.pdus.len() >= MAX_PDUS || bytes.len() > MAX_BYTES - self.bytes {
             bail!("too much input waiting for resize activation");
         }
         self.bytes += bytes.len();
-        self.pdus.push_back((action, bytes));
+        self.pdus.push_back((action, bytes, received_at));
         Ok(())
     }
 
@@ -44,16 +54,35 @@ impl PendingInput {
         self.pdus.is_empty()
     }
 
-    pub(super) fn pop(&mut self) -> Option<(Action, BytesMut)> {
+    pub(super) fn pop_timed(&mut self) -> Option<(Action, BytesMut, Option<Instant>)> {
         let item = self.pdus.pop_front()?;
         self.bytes -= item.1.len();
         Some(item)
+    }
+
+    #[cfg(test)]
+    pub(super) fn pop(&mut self) -> Option<(Action, BytesMut)> {
+        self.pop_timed().map(|(action, bytes, _)| (action, bytes))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_queue_preserves_original_read_time_and_unknown_activation_time() {
+        let mut queue = PendingInput::default();
+        let at = Instant::now() - std::time::Duration::from_secs(2);
+        queue
+            .push_at(Action::FastPath, (&[1][..]).into(), Some(at))
+            .unwrap();
+        queue
+            .push_at(Action::X224, (&[2][..]).into(), None)
+            .unwrap();
+        assert_eq!(queue.pop_timed().unwrap().2, Some(at));
+        assert_eq!(queue.pop_timed().unwrap().2, None);
+    }
 
     #[test]
     fn byte_and_count_limits_remain_bounded_across_resize_replay() {

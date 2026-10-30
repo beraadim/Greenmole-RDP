@@ -6,6 +6,7 @@ pub mod config;
 pub mod credentials;
 pub mod display;
 pub mod handler;
+mod input_diagnostics;
 pub mod log_bridge;
 pub mod log_filter;
 pub mod native_watchdog;

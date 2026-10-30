@@ -2,9 +2,11 @@ use super::{MacInputHandler, ModifierState, SuppressedCtrlState};
 use ironrdp_server::KeyboardEvent;
 
 impl MacInputHandler {
-    pub(super) fn handle_keyboard_event(&mut self, event: KeyboardEvent) {
+    /// Return whether injection failed, preserving the existing warning and
+    /// keyboard-state behavior while exposing only a diagnostic boolean.
+    pub(super) fn handle_keyboard_event(&mut self, event: KeyboardEvent) -> bool {
         if self.keyboard.is_none() {
-            return;
+            return false;
         }
 
         if let Some(wake) = &mut self.wake {
@@ -162,6 +164,9 @@ impl MacInputHandler {
 
         if let Err(e) = result {
             tracing::warn!("Keyboard injection failed: {e}");
+            true
+        } else {
+            false
         }
     }
 }

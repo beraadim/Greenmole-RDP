@@ -49,6 +49,68 @@ impl From<ironrdp_server::gfx::TimingSummary> for TimingPercentiles {
     }
 }
 
+/// Aggregate timing of input observed on this server. These values contain no
+/// input payloads. Read-to-post starts when a complete RDP PDU is read, not when
+/// the user acted; a returned CGEventPost call does not prove application receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct InputTimingMetrics {
+    pub received_events: u64,
+    /// Legacy activation buffers may not preserve the complete-PDU read time.
+    pub untimed_events: u64,
+    pub dispatched_events: u64,
+    pub completed_dispatches: u64,
+    pub dispatch_in_progress: bool,
+    pub current_dispatch_age_ms: Option<f64>,
+    pub native_callbacks: u64,
+    pub blocked_callbacks: u64,
+    pub unavailable_callbacks: u64,
+    pub injection_failures: u64,
+    /// Actual CGEventPost calls invoked, independent of preparation failures.
+    pub post_attempts: u64,
+    /// CGEventPost calls that returned; this is not an OS acceptance receipt.
+    pub post_returns: u64,
+    /// Group preparation/stamping failures before any member was posted.
+    /// CGEventPost itself has no error return value.
+    pub post_errors: u64,
+    pub post_samples_dropped: u64,
+    pub last_receive_age_ms: Option<f64>,
+    pub last_dispatch_age_ms: Option<f64>,
+    pub last_post_age_ms: Option<f64>,
+    pub dispatch_wait: TimingPercentiles,
+    pub handler: TimingPercentiles,
+    pub native_post: TimingPercentiles,
+    pub read_to_post: TimingPercentiles,
+}
+
+impl From<ironrdp_server::gfx::InputTimingSnapshot> for InputTimingMetrics {
+    fn from(value: ironrdp_server::gfx::InputTimingSnapshot) -> Self {
+        Self {
+            received_events: value.received_events,
+            untimed_events: value.untimed_events,
+            dispatched_events: value.dispatched_events,
+            completed_dispatches: value.completed_dispatches,
+            dispatch_in_progress: value.dispatch_in_progress,
+            current_dispatch_age_ms: value.current_dispatch_age_ms,
+            native_callbacks: value.native_callbacks,
+            blocked_callbacks: value.blocked_callbacks,
+            unavailable_callbacks: value.unavailable_callbacks,
+            injection_failures: value.injection_failures,
+            post_attempts: value.post_attempts,
+            post_returns: value.post_returns,
+            post_errors: value.post_errors,
+            post_samples_dropped: value.post_samples_dropped,
+            last_receive_age_ms: value.last_receive_age_ms,
+            last_dispatch_age_ms: value.last_dispatch_age_ms,
+            last_post_age_ms: value.last_post_age_ms,
+            dispatch_wait: value.dispatch_wait.into(),
+            handler: value.handler.into(),
+            native_post: value.native_post.into(),
+            read_to_post: value.read_to_post.into(),
+        }
+    }
+}
+
 /// Independent windows: capture deliveries, encode completions and wire updates
 /// can have different counts. These are stage durations, not end-to-end latency.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -76,6 +138,18 @@ pub struct Metrics {
     pub completion_queue_ms: f64,
     pub write_ms: f64,
     pub capture_frames_coalesced: u64,
+    /// Current graphics activation's capture deliveries, independent of the
+    /// bounded timing window. Resize reactivation starts new graphics counters.
+    #[serde(default)]
+    pub capture_frames_delivered: u64,
+    /// Successfully written display updates; regions may split one capture.
+    #[serde(default)]
+    pub display_updates_sent: u64,
+    /// Last client-reported GFX decode counter, absent until an ACK is received.
+    #[serde(default)]
+    pub client_reported_decoded_frames: Option<u32>,
+    #[serde(default)]
+    pub input_timing: InputTimingMetrics,
     /// Adaptive native capture target, distinct from delivered update rate.
     pub requested_capture_frame_rate: Option<u32>,
     /// Last rate confirmed by the native capture API.

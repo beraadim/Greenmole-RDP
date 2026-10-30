@@ -207,6 +207,7 @@ async fn resize_barrier_waits_for_ordered_mouse_and_keyboard_injection() {
         &server,
         Action::FastPath,
         [0x04, 0x04, 0x00, 0x1e].as_slice().into(),
+        Some(std::time::Instant::now()),
         &mut writer,
         permit,
         1003,

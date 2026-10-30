@@ -120,6 +120,7 @@ impl RdpServer {
                     return result.map(|ready| Some((ready, pending))).context("capture activation failed");
                 },
                 pdu = reader.read_pdu(), if pending.can_read() => {
+                    let received_at = std::time::Instant::now();
                     let (action, bytes) = pdu.map_err(|error| {
                         let error = anyhow::Error::from(error);
                         self.record_outcome(error_outcome(&error, ConnectionOutcome::ProtocolError));
@@ -133,7 +134,7 @@ impl RdpServer {
                     if is_user_input(&action, &bytes, io_channel_id) {
                         self.input_activity.send_replace(tokio::time::Instant::now());
                     }
-                    pending.push(action, bytes).map_err(|error| {
+                    pending.push_at(action, bytes, Some(received_at)).map_err(|error| {
                         self.record_outcome(ConnectionOutcome::ProtocolError);
                         error
                     })?;

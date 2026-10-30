@@ -2,6 +2,51 @@ use super::*;
 use core_graphics::event::{CGEventFlags, CGEventType};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
+#[test]
+fn posting_observations_preserve_group_preparation_order_and_prevent_partial_posts() {
+    use crate::PostObservationScope;
+    use std::cell::RefCell;
+    let calls = RefCell::new(Vec::new());
+    let scope = PostObservationScope::begin();
+    post_prepared_events(
+        &[1, 2],
+        |item| {
+            calls.borrow_mut().push(("prepare", *item));
+            Ok(())
+        },
+        |item| calls.borrow_mut().push(("post", *item)),
+    )
+    .unwrap();
+    assert_eq!(
+        *calls.borrow(),
+        [("prepare", 1), ("prepare", 2), ("post", 1), ("post", 2)]
+    );
+    let observation = scope.finish();
+    assert_eq!(observation.post_attempts, 2);
+    assert_eq!(observation.post_returns, 2);
+    assert_eq!(observation.post_errors, 0);
+    assert_eq!(observation.post_ms.len(), 2);
+
+    calls.borrow_mut().clear();
+    let scope = PostObservationScope::begin();
+    assert!(post_prepared_events(
+        &[1, 2],
+        |item| {
+            calls.borrow_mut().push(("prepare", *item));
+            anyhow::ensure!(*item != 2, "synthetic source allocation failure");
+            Ok(())
+        },
+        |item| calls.borrow_mut().push(("post", *item)),
+    )
+    .is_err());
+    assert_eq!(*calls.borrow(), [("prepare", 1), ("prepare", 2)]);
+    let observation = scope.finish();
+    assert_eq!(observation.post_attempts, 0);
+    assert_eq!(observation.post_returns, 0);
+    assert_eq!(observation.post_errors, 1);
+    assert!(observation.last_post_at.is_none());
+}
+
 fn event() -> CGEvent {
     let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
     CGEvent::new(source).unwrap()

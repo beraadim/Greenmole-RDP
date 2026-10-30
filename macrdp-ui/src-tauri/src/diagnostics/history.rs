@@ -42,7 +42,14 @@ impl DiagnosticHistory {
             self.last_terminal = None;
         }
         // Stop/default events must not replace the evidence that preceded them.
-        if metrics.bytes_sent == 0 && metrics.connection_outcome.is_none() {
+        if metrics.bytes_sent == 0
+            && metrics.connection_outcome.is_none()
+            && metrics.input_timing.received_events == 0
+            && metrics.input_timing.dispatched_events == 0
+            && metrics.input_timing.native_callbacks == 0
+            && metrics.capture_frames_delivered == 0
+            && metrics.display_updates_sent == 0
+        {
             return;
         }
         let key = (
@@ -92,6 +99,7 @@ impl DiagnosticHistory {
         json!({"samples": self.samples, "session_outcomes": self.outcomes,
             "sample_limit": MAX_SAMPLES, "outcome_limit": MAX_OUTCOMES,
             "retention": "In memory until the application exits; survives service stop and restart.",
+            "input_timings": "Server-observed complete-PDU read to handler dispatch and native posting-call return. Untimed legacy activation events are counted but excluded from read-based durations. No client clock or one-way network latency is measured. Post attempts count actual CGEventPost calls; post errors count preparation/stamping failures before posting. CGEventPost returns no status, and its return does not prove WindowServer or application consumption. Input counters reset on a real reconnect, not resize reactivation. No keys, text, pointer coordinates or event payloads are retained.",
             "timings": "Nearest-rank percentiles of up to 1024 real events per stage. Bitmap write events may be regions; stages have independent sample counts. Not end-to-end latency."})
     }
 }
@@ -116,6 +124,78 @@ mod tests {
         metrics.timestamp_ms = 10999;
         history.record_metrics(1, &metrics);
         assert_eq!(history.snapshot()["samples"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn input_progress_survives_idle_polls_and_is_preserved_in_terminal_evidence() {
+        let mut history = DiagnosticHistory::default();
+        let mut metrics = Metrics {
+            session_active: true,
+            bytes_sent: 1024,
+            timestamp: 1,
+            timestamp_ms: 1000,
+            sample_id: 1,
+            capture_frames_delivered: 30,
+            display_updates_sent: 20,
+            client_reported_decoded_frames: Some(19),
+            ..Default::default()
+        };
+        metrics.input_timing.received_events = 10;
+        metrics.input_timing.post_returns = 9;
+        metrics.input_timing.last_receive_age_ms = Some(2.0);
+        metrics.input_timing.dispatch_wait.samples = 10;
+        metrics.input_timing.dispatch_wait.max_ms = Some(80.0);
+        history.record_metrics(1, &metrics);
+        history.record_disconnect(
+            1,
+            &DisconnectionInfo {
+                disconnected_at: "2026-10-30T13:45:12Z".into(),
+                reason: "client_disconnect".into(),
+                final_metrics: metrics.clone(),
+                ..Default::default()
+            },
+        );
+        let idle = Metrics {
+            bytes_sent: 1024,
+            timestamp: 2,
+            sample_id: 2,
+            connection_outcome: Some("client_disconnect".into()),
+            ..Default::default()
+        };
+        history.record_metrics(1, &idle);
+        history.record_metrics(1, &idle);
+        let snapshot = history.snapshot();
+        let live = &snapshot["samples"][0]["metrics"];
+        assert_eq!(live["input_timing"]["received_events"], 10);
+        let terminal = &snapshot["session_outcomes"][0]["final_metrics"];
+        assert_eq!(terminal["input_timing"]["post_returns"], 9);
+        assert_eq!(terminal["input_timing"]["dispatch_wait"]["max_ms"], 80.0);
+        assert_eq!(terminal["capture_frames_delivered"], 30);
+        assert_eq!(terminal["display_updates_sent"], 20);
+        assert_eq!(terminal["client_reported_decoded_frames"], 19);
+        assert!(terminal.get("fps").is_none());
+        assert_eq!(snapshot["samples"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn input_before_the_first_display_update_is_not_discarded_as_idle() {
+        let mut history = DiagnosticHistory::default();
+        let mut metrics = Metrics {
+            session_active: true,
+            sample_id: 1,
+            ..Default::default()
+        };
+        metrics.input_timing.received_events = 4;
+        metrics.input_timing.dispatched_events = 4;
+        metrics.input_timing.unavailable_callbacks = 4;
+        history.record_metrics(1, &metrics);
+        history.record_metrics(1, &Metrics::default());
+        let snapshot = history.snapshot();
+        assert_eq!(snapshot["samples"].as_array().unwrap().len(), 1);
+        let retained = &snapshot["samples"][0]["metrics"];
+        assert_eq!(retained["bytes_sent"], 0);
+        assert_eq!(retained["input_timing"]["received_events"], 4);
+        assert_eq!(retained["input_timing"]["unavailable_callbacks"], 4);
     }
 
     #[test]

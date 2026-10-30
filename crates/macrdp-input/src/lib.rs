@@ -1,6 +1,7 @@
 //! Keyboard and mouse input injection via CGEvent
 
 mod event_tag;
+mod post_observation;
 pub mod keyboard;
 pub mod keymap;
 pub mod host_layout;
@@ -8,6 +9,7 @@ pub mod mouse;
 pub mod power;
 
 pub use event_tag::{clear_remote_event_tag, set_remote_event_tag};
+pub use post_observation::{PostObservation, PostObservationScope};
 pub use keyboard::KeyboardInjector;
 pub use keymap::scancode_to_keycode;
 pub use mouse::{MouseButton, MouseInjector};

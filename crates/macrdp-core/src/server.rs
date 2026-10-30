@@ -720,6 +720,7 @@ async fn start_server_inner(
                 audio_metrics::enrich(&mut metrics, &metrics_audio);
             }
             *latest_metrics.lock().unwrap() = metrics.clone();
+            crate::input_diagnostics::log_progress(&metrics, false);
             handler_for_metrics.on_metrics(metrics);
         }
     });

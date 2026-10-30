@@ -92,11 +92,24 @@ pub(crate) fn post_remote_event(event: &CGEvent) -> anyhow::Result<()> {
 /// Prepare an ordered group completely before posting any member. Shortcut
 /// modifier restoration must remain guaranteed even if source allocation fails.
 pub(crate) fn post_remote_events(events: &[CGEvent]) -> anyhow::Result<()> {
+    post_prepared_events(events, stamp_remote_event, |event| {
+        event.post(CGEventTapLocation::HID)
+    })
+}
+
+fn post_prepared_events<T>(
+    events: &[T],
+    mut prepare: impl FnMut(&T) -> anyhow::Result<()>,
+    mut post: impl FnMut(&T),
+) -> anyhow::Result<()> {
     for event in events {
-        stamp_remote_event(event)?;
+        if let Err(error) = prepare(event) {
+            crate::post_observation::preparation_failed();
+            return Err(error);
+        }
     }
     for event in events {
-        event.post(CGEventTapLocation::HID);
+        crate::post_observation::observe_post(|| post(event));
     }
     Ok(())
 }

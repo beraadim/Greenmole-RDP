@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 mod keyboard_policy_tests;
 mod modifier_reconciliation_tests;
 mod shortcut_tests;
+mod input_diagnostics_tests;
 
 #[test]
 fn mouse_mapper_scales_linearly_across_resized_desktop() {

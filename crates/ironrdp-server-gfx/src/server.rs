@@ -54,6 +54,10 @@ mod tests;
 mod authentication_state_tests;
 
 #[cfg(test)]
+#[path = "input_diagnostics_tests.rs"]
+mod input_diagnostics_tests;
+
+#[cfg(test)]
 #[path = "microphone_registration_tests.rs"]
 mod microphone_registration_tests;
 
@@ -774,6 +778,7 @@ impl RdpServer {
         server: &Mutex<&mut Self>,
         action: Action,
         bytes: bytes::BytesMut,
+        received_at: Option<std::time::Instant>,
         writer: &mut SharedWriter<'_, impl FramedWrite>,
         permit: MessagePermit,
         io_channel_id: u16,
@@ -781,6 +786,7 @@ impl RdpServer {
     ) -> Result<RunState> {
         let (state, output, clipboard_sender) = {
             let mut server = server.lock().await;
+            let _input_context = server.additional_input.context(received_at);
             let (state, output) = server
                 .dispatch_pdu(action, bytes, io_channel_id, user_channel_id)
                 .await?;
@@ -1277,7 +1283,9 @@ impl RdpServer {
                 .ok_or_else(|| anyhow!("empty deferred input PDU"))?;
             let action = Action::from_fp_output_header(*header)
                 .map_err(|code| anyhow!("invalid deferred input PDU action: {code}"))?;
-            pending.push(action, frame.as_slice().into())?;
+            // The acceptor's activation backlog contains no original read
+            // timestamp. Keep that absence explicit rather than claiming zero delay.
+            pending.push_at(action, frame.as_slice().into(), None)?;
         }
         let Some((mut display_updates, pending)) = self
             .await_capture_ready(reader, io_channel_id, pending, activation)
@@ -1327,14 +1335,15 @@ impl RdpServer {
                     // reader permit that would prevent deactivation forever.
                     return std::future::pending::<Result<RunState>>().await;
                 };
-                let (action, bytes) = pending_input
+                let (action, bytes, received_at) = pending_input
                     .borrow_mut()
-                    .pop()
+                    .pop_timed()
                     .expect("pending input exists");
                 match Self::dispatch_input_pdu(
                     &this,
                     action,
                     bytes,
+                    received_at,
                     &mut writer,
                     permit,
                     io_channel_id,
@@ -1759,60 +1768,56 @@ impl RdpServer {
         Ok(state)
     }
 
+    fn observe_input_dispatch(
+        &self,
+        handler: &mut dyn RdpServerInputHandler,
+        received_at: Option<std::time::Instant>,
+        dispatch: impl FnOnce(&mut dyn RdpServerInputHandler),
+    ) {
+        let started_at = std::time::Instant::now();
+        self.gfx_state.lock().unwrap().input.begin_dispatch(received_at, started_at);
+        dispatch(handler);
+        self.gfx_state.lock().unwrap().input.end_dispatch(started_at, std::time::Instant::now());
+    }
+
     async fn drain_additional_input(&mut self) {
-        // The connection dispatcher is the only consumer. Complete each PDU's
-        // input under its message permit before a resize can change geometry.
-        // No independent task survives disconnect or overtakes keyboard input.
-        if let Some(first) = self.additional_input.pop() {
+        // Keep every callback under the original ordered message permit. The
+        // timestamp is from the completed PDU read, not the client's clock.
+        if let Some((first, received_at)) = self.additional_input.pop_timed() {
+            self.gfx_state.lock().unwrap().input.record_received(received_at, 1);
             let mut handler = self.handler.lock().await;
-            handler.ainput_pdu(first);
-            while let Some(event) = self.additional_input.pop() {
-                handler.ainput_pdu(event);
+            self.observe_input_dispatch(handler.as_mut(), received_at, |handler| handler.ainput_pdu(first));
+            while let Some((event, received_at)) = self.additional_input.pop_timed() {
+                self.gfx_state.lock().unwrap().input.record_received(received_at, 1);
+                self.observe_input_dispatch(handler.as_mut(), received_at, |handler| handler.ainput_pdu(event));
             }
         }
     }
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {
         self.drain_additional_input().await;
-        if input
-            .input_events()
-            .iter()
-            .any(|event| !matches!(event, FastPathInputEvent::QoeEvent(_)))
-        {
-            self.input_activity
-                .send_replace(tokio::time::Instant::now());
+        let received_at = self.additional_input.received_at();
+        let count = input.input_events().iter()
+            .filter(|event| !matches!(event, FastPathInputEvent::QoeEvent(_))).count() as u64;
+        self.gfx_state.lock().unwrap().input.record_received(received_at, count);
+        if count != 0 {
+            self.input_activity.send_replace(tokio::time::Instant::now());
         }
         for event in input.input_events().iter().copied() {
-            let mut handler = self.handler.lock().await;
-            match event {
-                FastPathInputEvent::KeyboardEvent(flags, key) => {
-                    handler.keyboard((key, flags).into());
-                }
-
-                FastPathInputEvent::UnicodeKeyboardEvent(flags, key) => {
-                    handler.keyboard((key, flags).into());
-                }
-
-                FastPathInputEvent::SyncEvent(flags) => {
-                    handler.keyboard(flags.into());
-                }
-
-                FastPathInputEvent::MouseEvent(mouse) => {
-                    handler.mouse_pdu(mouse);
-                }
-
-                FastPathInputEvent::MouseEventEx(mouse) => {
-                    handler.mouse_x_pdu(mouse);
-                }
-
-                FastPathInputEvent::MouseEventRel(mouse) => {
-                    handler.mouse_rel_pdu(mouse);
-                }
-
-                FastPathInputEvent::QoeEvent(quality) => {
-                    warn!("Received QoE: {}", quality);
-                }
+            if let FastPathInputEvent::QoeEvent(quality) = event {
+                warn!("Received QoE: {}", quality);
+                continue;
             }
+            let mut handler = self.handler.lock().await;
+            self.observe_input_dispatch(handler.as_mut(), received_at, |handler| match event {
+                FastPathInputEvent::KeyboardEvent(flags, key) => handler.keyboard((key, flags).into()),
+                FastPathInputEvent::UnicodeKeyboardEvent(flags, key) => handler.keyboard((key, flags).into()),
+                FastPathInputEvent::SyncEvent(flags) => handler.keyboard(flags.into()),
+                FastPathInputEvent::MouseEvent(mouse) => handler.mouse_pdu(mouse),
+                FastPathInputEvent::MouseEventEx(mouse) => handler.mouse_x_pdu(mouse),
+                FastPathInputEvent::MouseEventRel(mouse) => handler.mouse_rel_pdu(mouse),
+                FastPathInputEvent::QoeEvent(_) => unreachable!("QoE handled before dispatch"),
+            });
         }
     }
 
@@ -1927,43 +1932,27 @@ impl RdpServer {
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
         self.drain_additional_input().await;
-        if input
-            .0
-            .iter()
-            .any(|event| !matches!(event, ironrdp_pdu::input::InputEvent::Unused(_)))
-        {
-            self.input_activity
-                .send_replace(tokio::time::Instant::now());
+        let received_at = self.additional_input.received_at();
+        let count = input.0.iter()
+            .filter(|event| !matches!(event, ironrdp_pdu::input::InputEvent::Unused(_))).count() as u64;
+        self.gfx_state.lock().unwrap().input.record_received(received_at, count);
+        if count != 0 {
+            self.input_activity.send_replace(tokio::time::Instant::now());
         }
         for event in input.0 {
-            let mut handler = self.handler.lock().await;
-            match event {
-                ironrdp_pdu::input::InputEvent::ScanCode(key) => {
-                    handler.keyboard((key.key_code, key.flags).into());
-                }
-
-                ironrdp_pdu::input::InputEvent::Unicode(key) => {
-                    handler.keyboard((key.unicode_code, key.flags).into());
-                }
-
-                ironrdp_pdu::input::InputEvent::Sync(sync) => {
-                    handler.keyboard(sync.flags.into());
-                }
-
-                ironrdp_pdu::input::InputEvent::Mouse(mouse) => {
-                    handler.mouse_pdu(mouse);
-                }
-
-                ironrdp_pdu::input::InputEvent::MouseX(mouse) => {
-                    handler.mouse_x_pdu(mouse);
-                }
-
-                ironrdp_pdu::input::InputEvent::MouseRel(mouse) => {
-                    handler.mouse_rel_pdu(mouse);
-                }
-
-                ironrdp_pdu::input::InputEvent::Unused(_) => {}
+            if matches!(event, ironrdp_pdu::input::InputEvent::Unused(_)) {
+                continue;
             }
+            let mut handler = self.handler.lock().await;
+            self.observe_input_dispatch(handler.as_mut(), received_at, |handler| match event {
+                ironrdp_pdu::input::InputEvent::ScanCode(key) => handler.keyboard((key.key_code, key.flags).into()),
+                ironrdp_pdu::input::InputEvent::Unicode(key) => handler.keyboard((key.unicode_code, key.flags).into()),
+                ironrdp_pdu::input::InputEvent::Sync(sync) => handler.keyboard(sync.flags.into()),
+                ironrdp_pdu::input::InputEvent::Mouse(mouse) => handler.mouse_pdu(mouse),
+                ironrdp_pdu::input::InputEvent::MouseX(mouse) => handler.mouse_x_pdu(mouse),
+                ironrdp_pdu::input::InputEvent::MouseRel(mouse) => handler.mouse_rel_pdu(mouse),
+                ironrdp_pdu::input::InputEvent::Unused(_) => unreachable!("unused input excluded"),
+            });
         }
     }
 

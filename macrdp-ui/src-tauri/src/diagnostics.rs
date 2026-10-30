@@ -85,7 +85,7 @@ pub async fn export_diagnostics(
             },
         );
         let report = json!({
-            "schema_version": 5,
+            "schema_version": 6,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -235,6 +235,9 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
         "completion_queue_ms",
         "write_ms",
         "capture_frames_coalesced",
+        "capture_frames_delivered",
+        "display_updates_sent",
+        "client_reported_decoded_frames",
         "requested_capture_frame_rate",
         "applied_frame_rate",
         "capture_frame_rate_update_failures",
@@ -263,6 +266,10 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
             selected.insert(key.into(), field.clone());
         }
     }
+    selected.insert(
+        "input_timing".into(),
+        safe_input_timing(value.get("input_timing").unwrap_or(&Value::Null)),
+    );
     selected.insert(
         "transport_mode".into(),
         json!(selection(
@@ -333,6 +340,66 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
     Value::Object(selected)
 }
 
+/// Keep nested input diagnostics typed and explicitly selected even if future
+/// metrics add raw input details. Never copy the entire serialized object.
+fn safe_input_timing(value: &Value) -> Value {
+    let mut selected = serde_json::Map::new();
+    for key in [
+        "received_events",
+        "untimed_events",
+        "dispatched_events",
+        "completed_dispatches",
+        "native_callbacks",
+        "blocked_callbacks",
+        "unavailable_callbacks",
+        "injection_failures",
+        "post_attempts",
+        "post_returns",
+        "post_errors",
+        "post_samples_dropped",
+    ] {
+        if let Some(count) = value.get(key).and_then(Value::as_u64) {
+            selected.insert(key.into(), json!(count));
+        }
+    }
+    for key in [
+        "last_receive_age_ms",
+        "last_dispatch_age_ms",
+        "last_post_age_ms",
+        "current_dispatch_age_ms",
+    ] {
+        if let Some(age) = value.get(key).filter(|age| safe_duration(age)) {
+            selected.insert(key.into(), age.clone());
+        }
+    }
+    if let Some(in_progress) = value.get("dispatch_in_progress").and_then(Value::as_bool) {
+        selected.insert("dispatch_in_progress".into(), json!(in_progress));
+    }
+    for key in ["dispatch_wait", "handler", "native_post", "read_to_post"] {
+        if let Some(timing) = value.get(key).filter(|timing| timing.is_object()) {
+            let mut summary = serde_json::Map::new();
+            if let Some(samples) = timing.get("samples").and_then(Value::as_u64) {
+                summary.insert("samples".into(), json!(samples));
+            }
+            for field in ["p50_ms", "p95_ms", "p99_ms", "max_ms"] {
+                if let Some(duration) = timing.get(field).filter(|duration| safe_duration(duration))
+                {
+                    summary.insert(field.into(), duration.clone());
+                }
+            }
+            selected.insert(key.into(), Value::Object(summary));
+        }
+    }
+    Value::Object(selected)
+}
+
+fn safe_duration(value: &Value) -> bool {
+    value.is_null()
+        || value
+            .as_f64()
+            .is_some_and(|duration| duration.is_finite() && duration >= 0.0)
+}
+
 fn safe_outcome(value: &str) -> &str {
     selection(
         value,
@@ -364,6 +431,7 @@ fn safe_outcome(value: &str) -> &str {
 
 fn event_category(message: &str) -> &'static str {
     for (prefix, category) in [
+        ("Input pipeline progress", "input_pipeline"),
         ("Connection transport ended", "connection_transport_ended"),
         ("TCP keepalive configured", "transport_policy"),
         (
@@ -508,6 +576,73 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             if let Some(value) = event["fields"].get(key).filter(|v| v.is_number()) {
                 fields.insert(key.into(), value.clone());
             }
+        }
+        if category == "input_pipeline" {
+            for key in [
+                "sample_id",
+                "received_events",
+                "untimed_events",
+                "dispatched_events",
+                "completed_dispatches",
+                "native_callbacks",
+                "blocked_callbacks",
+                "unavailable_callbacks",
+                "injection_failures",
+                "post_attempts",
+                "post_returns",
+                "post_errors",
+                "post_samples_dropped",
+                "captures_delivered",
+                "display_updates_sent",
+                "client_reported_decoded_frames",
+                "bytes_sent",
+            ] {
+                if let Some(count) = event["fields"].get(key).and_then(Value::as_u64) {
+                    fields.insert(key.into(), json!(count));
+                }
+            }
+            for key in [
+                "last_receive_age_ms",
+                "last_dispatch_age_ms",
+                "last_post_age_ms",
+                "current_dispatch_age_ms",
+                "dispatch_wait_p95_ms",
+                "dispatch_wait_max_ms",
+                "handler_p95_ms",
+                "handler_max_ms",
+                "native_post_p95_ms",
+                "native_post_max_ms",
+                "read_to_post_p95_ms",
+                "read_to_post_max_ms",
+            ] {
+                if let Some(duration) =
+                    event["fields"]
+                        .get(key)
+                        .and_then(Value::as_f64)
+                        .filter(|duration| {
+                            duration.is_finite() && (*duration >= 0.0 || *duration == -1.0)
+                        })
+                {
+                    fields.insert(key.into(), json!(duration));
+                }
+            }
+            if let Some(in_progress) = event["fields"]["dispatch_in_progress"].as_bool() {
+                fields.insert("dispatch_in_progress".into(), json!(in_progress));
+            }
+            fields.insert(
+                "phase".into(),
+                json!(selection(
+                    event["fields"]["phase"].as_str().unwrap_or(""),
+                    &["progress", "complete"]
+                )),
+            );
+            fields.insert(
+                "state".into(),
+                json!(selection(
+                    event["fields"]["state"].as_str().unwrap_or(""),
+                    &["observed"]
+                )),
+            );
         }
         if matches!(
             category,

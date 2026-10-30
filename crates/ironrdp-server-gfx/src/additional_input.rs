@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ironrdp_ainput::{ClientPdu, MousePdu, ServerPdu, VersionPdu};
 use ironrdp_core::{decode, impl_as_any};
@@ -14,24 +15,62 @@ use tokio::sync::watch;
 const MAX_PENDING_INPUT: usize = 128;
 
 #[derive(Clone, Default)]
-pub(super) struct AdditionalInputQueue(Arc<Mutex<VecDeque<MousePdu>>>);
+pub(super) struct AdditionalInputQueue(Arc<Mutex<InputQueueState>>);
+
+#[derive(Default)]
+struct InputQueueState {
+    pending: VecDeque<(MousePdu, Option<Instant>)>,
+    pdu_received_at: Option<Instant>,
+}
+
+/// Restore the previous context even if protocol processing is cancelled.
+pub(super) struct PduInputContext {
+    queue: AdditionalInputQueue,
+    previous: Option<Instant>,
+}
+
+impl Drop for PduInputContext {
+    fn drop(&mut self) {
+        self.queue.0.lock().unwrap().pdu_received_at = self.previous;
+    }
+}
 
 impl AdditionalInputQueue {
     fn push(&self, event: MousePdu) -> std::io::Result<()> {
         let mut pending = self.0.lock().unwrap();
-        if pending.len() == MAX_PENDING_INPUT {
+        if pending.pending.len() == MAX_PENDING_INPUT {
             return Err(std::io::Error::other("additional input queue is full"));
         }
-        pending.push_back(event);
+        let at = pending.pdu_received_at;
+        pending.pending.push_back((event, at));
         Ok(())
     }
 
+    pub(super) fn pop_timed(&self) -> Option<(MousePdu, Option<Instant>)> {
+        self.0.lock().unwrap().pending.pop_front()
+    }
+
+    #[cfg(test)]
     pub(super) fn pop(&self) -> Option<MousePdu> {
-        self.0.lock().unwrap().pop_front()
+        self.pop_timed().map(|(event, _)| event)
+    }
+
+    pub(super) fn received_at(&self) -> Option<Instant> {
+        self.0.lock().unwrap().pdu_received_at
+    }
+
+    pub(super) fn context(&self, received_at: Option<Instant>) -> PduInputContext {
+        let previous = std::mem::replace(&mut self.0.lock().unwrap().pdu_received_at, received_at);
+        PduInputContext {
+            queue: self.clone(),
+            previous,
+        }
     }
 
     pub(super) fn clear(&self) {
-        self.0.lock().unwrap().clear();
+        let mut state = self.0.lock().unwrap();
+        state.pending.clear();
+        state.pdu_received_at = None;
     }
 }
 
@@ -81,6 +120,26 @@ impl DvcServerProcessor for AInputHandler {}
 mod tests {
     use super::*;
     use ironrdp_ainput::MouseEventFlags;
+
+    #[test]
+    fn staging_preserves_the_pdu_read_time_and_context_is_scoped() {
+        let queue = AdditionalInputQueue::default();
+        let at = Instant::now() - std::time::Duration::from_secs(1);
+        let event = MousePdu {
+            flags: MouseEventFlags::MOVE,
+            x: 0,
+            y: 0,
+            time: 0,
+        };
+        {
+            let _context = queue.context(Some(at));
+            queue.push(event.clone()).unwrap();
+        }
+        queue.push(event).unwrap();
+        assert_eq!(queue.pop_timed().unwrap().1, Some(at));
+        assert_eq!(queue.pop_timed().unwrap().1, None);
+        assert_eq!(queue.received_at(), None);
+    }
 
     #[test]
     fn input_queue_is_bounded_and_clear_discards_old_connection_events() {

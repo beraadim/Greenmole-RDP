@@ -146,6 +146,12 @@ impl MetricsSnapshot {
             completion_queue_ms: sanitize_f64(gfx.completion_queue_ms),
             write_ms: sanitize_f64(gfx.last_write_ms),
             capture_frames_coalesced: gfx.capture_frames_coalesced,
+            capture_frames_delivered: gfx.total_captures_delivered,
+            display_updates_sent: gfx.total_frames_sent,
+            client_reported_decoded_frames: (gfx.last_ack_frame != 0
+                || gfx.frame_acknowledgements_suspended)
+                .then_some(gfx.client_total_frames_decoded),
+            input_timing: gfx.input.snapshot(now).into(),
             requested_capture_frame_rate: gfx.requested_capture_frame_rate,
             applied_frame_rate: gfx.applied_frame_rate,
             capture_frame_rate_update_failures: gfx.capture_frame_rate_update_failures,
@@ -190,6 +196,107 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_diagnostics_retain_resize_history_but_clear_on_real_reconnect() {
+        let mut gfx = GfxState::new(1920, 1080, false, false);
+        let now = Instant::now();
+        let received = now - Duration::from_millis(40);
+        let dispatched = now - Duration::from_millis(20);
+        gfx.input.record_received(Some(received), 2);
+        gfx.input.begin_dispatch(Some(received), dispatched);
+        gfx.input
+            .end_dispatch(dispatched, now - Duration::from_millis(10));
+        gfx.record_capture_queue(0.5);
+        gfx.total_frames_sent = 7;
+        gfx.last_ack_frame = 6;
+        gfx.client_total_frames_decoded = 6;
+        let mut snapshot = MetricsSnapshot::default();
+        let live = snapshot.sample_live(&gfx, true);
+        assert_eq!(live.input_timing.received_events, 2);
+        assert_eq!(live.input_timing.dispatched_events, 1);
+        assert_eq!(live.input_timing.completed_dispatches, 1);
+        assert!(!live.input_timing.dispatch_in_progress);
+        assert_eq!(live.input_timing.current_dispatch_age_ms, None);
+        assert_eq!(live.input_timing.dispatch_wait.p95_ms, Some(20.0));
+        assert_eq!(live.input_timing.handler.p95_ms, Some(10.0));
+        assert!(live.input_timing.last_receive_age_ms.unwrap() >= 40.0);
+        assert_eq!(live.capture_frames_delivered, 1);
+        assert_eq!(live.display_updates_sent, 7);
+        assert_eq!(live.client_reported_decoded_frames, Some(6));
+
+        let idle = snapshot.sample_live(&gfx, false);
+        assert_eq!(idle.input_timing.received_events, 0);
+        assert_eq!(idle.input_timing.last_receive_age_ms, None);
+        assert_eq!(idle.input_timing.dispatch_wait.samples, 0);
+        assert_eq!(idle.capture_frames_delivered, 0);
+        assert_eq!(idle.display_updates_sent, 0);
+        assert_eq!(idle.client_reported_decoded_frames, None);
+        // Terminal evidence remains available separately from idle polling.
+        assert_eq!(snapshot.sample(&gfx).input_timing.received_events, 2);
+
+        gfx.reset_connection_state(true);
+        assert_eq!(snapshot.sample(&gfx).input_timing.received_events, 2);
+        gfx.begin_connection(None);
+        let fresh = snapshot.sample(&gfx);
+        assert_eq!(fresh.input_timing.received_events, 0);
+        assert_eq!(fresh.input_timing.dispatch_wait.samples, 0);
+        assert_eq!(fresh.input_timing.last_receive_age_ms, None);
+    }
+
+    #[test]
+    fn native_timing_mapping_preserves_missing_measurements_and_error_counts() {
+        let mut snapshot = ironrdp_server::gfx::InputTimingSnapshot::default();
+        snapshot.received_events = 4;
+        snapshot.untimed_events = 1;
+        snapshot.completed_dispatches = 2;
+        snapshot.dispatch_in_progress = true;
+        snapshot.current_dispatch_age_ms = Some(25.0);
+        snapshot.post_attempts = 3;
+        snapshot.post_returns = 2;
+        snapshot.post_errors = 1;
+        snapshot.injection_failures = 2;
+        snapshot.last_post_age_ms = Some(3.0);
+        snapshot.read_to_post.samples = 2;
+        snapshot.read_to_post.max_ms = Some(52.0);
+        let mapped = crate::InputTimingMetrics::from(snapshot);
+        assert_eq!(mapped.received_events, 4);
+        assert_eq!(mapped.untimed_events, 1);
+        assert_eq!(mapped.completed_dispatches, 2);
+        assert!(mapped.dispatch_in_progress);
+        assert_eq!(mapped.current_dispatch_age_ms, Some(25.0));
+        assert_eq!(mapped.post_attempts, 3);
+        assert_eq!(mapped.post_returns, 2);
+        assert_eq!(mapped.post_errors, 1);
+        assert_eq!(mapped.injection_failures, 2);
+        assert_eq!(mapped.last_post_age_ms, Some(3.0));
+        assert_eq!(mapped.last_receive_age_ms, None);
+        assert_eq!(mapped.native_post.samples, 0);
+        assert_eq!(mapped.native_post.max_ms, None);
+        assert_eq!(mapped.read_to_post.max_ms, Some(52.0));
+    }
+
+    #[test]
+    fn older_serialized_metrics_default_new_diagnostic_fields() {
+        let mut value = serde_json::to_value(Metrics::default()).unwrap();
+        for field in [
+            "input_timing",
+            "capture_frames_delivered",
+            "display_updates_sent",
+            "client_reported_decoded_frames",
+        ] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        let old: Metrics = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(old.input_timing.received_events, 0);
+        assert_eq!(old.input_timing.last_post_age_ms, None);
+        assert_eq!(old.capture_frames_delivered, 0);
+        assert_eq!(old.client_reported_decoded_frames, None);
+        value["input_timing"] = serde_json::json!({"received_events": 5});
+        let partial: Metrics = serde_json::from_value(value).unwrap();
+        assert_eq!(partial.input_timing.received_events, 5);
+        assert_eq!(partial.input_timing.post_returns, 0);
+    }
 
     #[test]
     fn idle_heartbeats_do_not_repeat_completed_frame_activity() {

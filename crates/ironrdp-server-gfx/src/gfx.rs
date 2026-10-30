@@ -24,6 +24,10 @@ use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
 mod timings;
 pub use timings::{StageTimings, TimingSummary};
 
+#[path = "input_diagnostics.rs"]
+mod input_diagnostics;
+pub use input_diagnostics::{InputDiagnostics, InputTimingSnapshot, NativeInputObservation};
+
 #[path = "connection_outcome.rs"]
 mod connection_outcome;
 pub use connection_outcome::ConnectionOutcome;
@@ -298,6 +302,8 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 /// Shared state between GfxHandler and the server
 #[derive(Debug)]
 pub struct GfxState {
+    /// Payload-free input history spans resize reactivation, but not reconnects.
+    pub input: InputDiagnostics,
     /// Stable terminal reason, published before disconnect callbacks run.
     pub connection_outcome: Option<ConnectionOutcome>,
     /// Clipboard was quarantined for this connection; a reconnect resets it.
@@ -348,6 +354,7 @@ pub struct GfxState {
     /// Successfully delivered GFX frames or classic bitmap updates. Bitmap
     /// regions may split one captured frame, so this is an update-rate counter.
     pub total_frames_sent: u64,
+    pub total_captures_delivered: u64,
     pub capture_queue_ms: f64,
     pub capture_frames_coalesced: u64,
     pub completion_queue_ms: f64,
@@ -431,6 +438,7 @@ pub struct GfxState {
 impl GfxState {
     pub fn new(width: u16, height: u16, avc444_enabled: bool, gfx_validation_mode: bool) -> Self {
         Self {
+            input: InputDiagnostics::default(),
             connection_outcome: None,
             clipboard_disabled: false,
             session_uses_gfx: false,
@@ -459,6 +467,7 @@ impl GfxState {
             last_write_ms: 0.0,
             timings: StageTimings::default(),
             total_frames_sent: 0,
+            total_captures_delivered: 0,
             capture_queue_ms: 0.0,
             capture_frames_coalesced: 0,
             completion_queue_ms: 0.0,
@@ -550,6 +559,7 @@ impl GfxState {
     }
 
     pub fn record_capture_queue(&mut self, ms: f64) {
+        self.total_captures_delivered = self.total_captures_delivered.saturating_add(1);
         self.capture_queue_ms = ms;
         self.timings.capture.record(ms);
     }
@@ -716,6 +726,7 @@ impl GfxState {
         self.last_write_ms = 0.0;
         self.timings = StageTimings::default();
         self.total_frames_sent = 0;
+        self.total_captures_delivered = 0;
         self.capture_queue_ms = 0.0;
         self.capture_frames_coalesced = 0;
         self.requested_capture_frame_rate = None;

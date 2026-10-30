@@ -31,6 +31,10 @@ export interface Metrics {
   completion_queue_ms: number;
   write_ms: number;
   capture_frames_coalesced: number;
+  capture_frames_delivered?: number;
+  display_updates_sent?: number;
+  client_reported_decoded_frames?: number | null;
+  input_timing?: InputTimingMetrics;
   requested_capture_frame_rate: number | null;
   applied_frame_rate: number | null;
   capture_frame_rate_update_failures: number;
@@ -62,6 +66,31 @@ export interface Metrics {
   completion_timings: TimingPercentiles;
   write_timings: TimingPercentiles;
   connection_outcome: string | null;
+}
+
+// Aggregate server timing only; no input payload or client clock is retained.
+export interface InputTimingMetrics {
+  received_events: number;
+  untimed_events: number;
+  dispatched_events: number;
+  completed_dispatches: number;
+  dispatch_in_progress: boolean;
+  current_dispatch_age_ms: number | null;
+  native_callbacks: number;
+  blocked_callbacks: number;
+  unavailable_callbacks: number;
+  injection_failures: number;
+  post_attempts: number;
+  post_returns: number;
+  post_errors: number;
+  post_samples_dropped: number;
+  last_receive_age_ms: number | null;
+  last_dispatch_age_ms: number | null;
+  last_post_age_ms: number | null;
+  dispatch_wait: TimingPercentiles;
+  handler: TimingPercentiles;
+  native_post: TimingPercentiles;
+  read_to_post: TimingPercentiles;
 }
 
 export interface Connection {

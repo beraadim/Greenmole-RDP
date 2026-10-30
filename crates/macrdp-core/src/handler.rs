@@ -1,6 +1,6 @@
 use ironrdp_server::{ClientInputContext, KeyboardEvent, MouseEvent, RdpServerInputHandler};
 pub use macrdp_capture::MouseCoordMapper;
-use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, RemoteSessionWake};
+use macrdp_input::{KeyboardInjector, MouseInjector, RemoteSessionWake};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -8,6 +8,8 @@ use crate::callbacks::InputDebugState;
 
 mod keyboard_device;
 mod keyboard_events;
+mod mouse_events;
+mod input_diagnostics;
 mod keyboard_policy;
 mod layouts;
 mod privacy;
@@ -532,6 +534,7 @@ impl RdpServerInputHandler for MacInputHandler {
                     crate::server::final_metrics(&gfx, &events.audio_stats),
                 )
             };
+            crate::input_diagnostics::log_progress(&final_metrics, true);
             events
                 .handler
                 .on_connection(crate::callbacks::ConnectionEvent::Disconnected(
@@ -578,65 +581,27 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn keyboard(&mut self, event: KeyboardEvent) {
-        if !self.privacy.input_allowed() {
-            return;
-        }
-        self.handle_keyboard_event(event);
+        self.observe_input_callback(|handler| {
+            if !handler.privacy.input_allowed() {
+                return input_diagnostics::CallbackResult::blocked();
+            }
+            if handler.keyboard.is_none() {
+                return input_diagnostics::CallbackResult::unavailable();
+            }
+            input_diagnostics::CallbackResult::completed(handler.handle_keyboard_event(event))
+        });
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        if !self.privacy.input_allowed() {
-            return;
-        }
-        let Some(m) = &mut self.mouse else { return };
-
-        if let Some(wake) = &mut self.wake {
-            if let Err(e) = wake.wake_display_for_input("mouse") {
-                tracing::warn!("Failed to declare remote mouse activity: {e}");
+        self.observe_input_callback(|handler| {
+            if !handler.privacy.input_allowed() {
+                return input_diagnostics::CallbackResult::blocked();
             }
-        }
-
-        let result = match event {
-            MouseEvent::Move { x, y } => {
-                let (mx, my) = self.coord_mapper.map(x, y);
-                m.move_to(mx, my).map(|()| {
-                    self.last_mouse_x = mx;
-                    self.last_mouse_y = my;
-                })
+            if handler.mouse.is_none() {
+                return input_diagnostics::CallbackResult::unavailable();
             }
-            MouseEvent::RelMove { x, y } => {
-                let (mx, my) =
-                    self.coord_mapper
-                        .map_relative((self.last_mouse_x, self.last_mouse_y), x, y);
-                m.move_to(mx, my).map(|()| {
-                    self.last_mouse_x = mx;
-                    self.last_mouse_y = my;
-                })
-            }
-            MouseEvent::VerticalScroll { value } => m.scroll(0, i32::from(value)),
-            MouseEvent::Scroll { x, y } => m.scroll(x, y),
-            MouseEvent::ScrollHighResolution { x, y } => m.scroll_high_resolution(x, y),
-            button => {
-                let (button, pressed) = match button {
-                    MouseEvent::LeftPressed => (MouseButton::Left, true),
-                    MouseEvent::LeftReleased => (MouseButton::Left, false),
-                    MouseEvent::RightPressed => (MouseButton::Right, true),
-                    MouseEvent::RightReleased => (MouseButton::Right, false),
-                    MouseEvent::MiddlePressed => (MouseButton::Middle, true),
-                    MouseEvent::MiddleReleased => (MouseButton::Middle, false),
-                    MouseEvent::Button4Pressed => (MouseButton::Button4, true),
-                    MouseEvent::Button4Released => (MouseButton::Button4, false),
-                    MouseEvent::Button5Pressed => (MouseButton::Button5, true),
-                    MouseEvent::Button5Released => (MouseButton::Button5, false),
-                    _ => unreachable!("movement and scroll handled above"),
-                };
-                m.button_event(button, pressed, self.last_mouse_x, self.last_mouse_y)
-            }
-        };
-
-        if let Err(e) = result {
-            tracing::warn!("Mouse injection failed: {e}");
-        }
+            input_diagnostics::CallbackResult::completed(handler.handle_mouse_event(event))
+        });
     }
 }
 

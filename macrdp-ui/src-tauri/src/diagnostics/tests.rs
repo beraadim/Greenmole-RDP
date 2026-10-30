@@ -1,6 +1,112 @@
 use super::*;
 
 #[test]
+fn input_timing_export_selects_only_numeric_aggregate_fields() {
+    let secret = "private-input-payload-canary";
+    let value = json!({
+        "received_events": 12, "untimed_events": 1, "dispatched_events": 11,
+        "completed_dispatches": 10, "dispatch_in_progress": true,
+        "current_dispatch_age_ms": 70.0,
+        "post_attempts": 10, "post_returns": 9, "post_errors": 1,
+        "native_callbacks": 11, "blocked_callbacks": 1,
+        "unavailable_callbacks": 2, "injection_failures": 3,
+        "post_samples_dropped": 4,
+        "last_receive_age_ms": 1.0, "last_dispatch_age_ms": null,
+        "last_post_age_ms": 2.5,
+        "dispatch_wait": {"samples": 11, "p50_ms": 0.1, "p95_ms": 5.0,
+            "p99_ms": 12.0, "max_ms": 12.0, "raw_event": secret},
+        "handler": {"samples": 11, "p50_ms": null, "p95_ms": null,
+            "p99_ms": null, "max_ms": 25.0},
+        "native_post": {"samples": 9, "p50_ms": 0.1, "p95_ms": 0.2,
+            "p99_ms": 0.3, "max_ms": 0.3},
+        "read_to_post": {"samples": 9, "p50_ms": 1.0, "p95_ms": 10.0,
+            "p99_ms": 40.0, "max_ms": 40.0},
+        "keys": secret, "text": secret, "coordinates": secret,
+        "client_name": secret, "future_input_field": {"value": secret},
+    });
+    let exported = safe_input_timing(&value);
+    assert!(!exported.to_string().contains(secret));
+    assert_eq!(exported.as_object().unwrap().len(), 21);
+    assert_eq!(exported["received_events"], 12);
+    assert_eq!(exported["post_returns"], 9);
+    assert_eq!(exported["completed_dispatches"], 10);
+    assert_eq!(exported["dispatch_in_progress"], true);
+    assert_eq!(exported["current_dispatch_age_ms"], 70.0);
+    assert_eq!(exported["dispatch_wait"]["max_ms"], 12.0);
+    assert_eq!(exported["read_to_post"]["max_ms"], 40.0);
+    assert!(exported["last_dispatch_age_ms"].is_null());
+    assert_eq!(exported["dispatch_wait"].as_object().unwrap().len(), 5);
+
+    // Reject malformed values even under known names, rather than trusting
+    // future serializer additions or a free-form object at the nesting boundary.
+    let malformed = json!({"received_events": secret, "post_returns": -1,
+        "dispatch_in_progress": secret, "completed_dispatches": secret,
+        "post_attempts": 1.5, "last_receive_age_ms": -0.1,
+        "last_dispatch_age_ms": secret, "handler": secret,
+        "native_post": {"samples": secret, "p50_ms": -1, "max_ms": secret}});
+    let exported = safe_input_timing(&malformed);
+    assert!(!exported.to_string().contains(secret));
+    assert_eq!(exported, json!({"native_post": {}}));
+}
+
+#[test]
+fn metrics_export_keeps_input_and_graphics_progress_counters() {
+    let mut metrics = macrdp_core::Metrics::default();
+    metrics.input_timing.received_events = 120;
+    metrics.input_timing.dispatched_events = 119;
+    metrics.input_timing.post_returns = 118;
+    metrics.input_timing.last_post_age_ms = Some(4.5);
+    metrics.input_timing.read_to_post.samples = 118;
+    metrics.input_timing.read_to_post.max_ms = Some(42.0);
+    metrics.capture_frames_delivered = 3000;
+    metrics.display_updates_sent = 1500;
+    metrics.client_reported_decoded_frames = Some(1498);
+    let exported = safe_metrics(&metrics);
+    assert_eq!(exported["input_timing"]["received_events"], 120);
+    assert_eq!(exported["input_timing"]["read_to_post"]["max_ms"], 42.0);
+    assert_eq!(exported["capture_frames_delivered"], 3000);
+    assert_eq!(exported["display_updates_sent"], 1500);
+    assert_eq!(exported["client_reported_decoded_frames"], 1498);
+}
+
+#[test]
+fn persisted_input_progress_keeps_stages_and_numbers_without_input_payloads() {
+    let secret = "private-input-canary";
+    let record = json!({"level": "info", "message": "Input pipeline progress",
+        "fields": {"phase": "complete", "state": "observed", "received_events": 12,
+            "completed_dispatches": 11, "dispatch_in_progress": true, "current_dispatch_age_ms": 60.0,
+            "post_returns": 11, "post_errors": 1, "untimed_events": 2,
+            "last_post_age_ms": -1.0, "read_to_post_max_ms": 85.0,
+            "captures_delivered": 30, "display_updates_sent": 20,
+            "client_reported_decoded_frames": 19,
+            "keys": secret, "coordinates": secret, "text": secret,
+            "native_error": secret, "future_field": secret}});
+    let summary = summarize_bytes(format!("{record}\n").as_bytes(), false);
+    let event = &summary["events"][0];
+    assert_eq!(event["category"], "input_pipeline");
+    assert_eq!(event["fields"]["phase"], "complete");
+    assert_eq!(event["fields"]["received_events"], 12);
+    assert_eq!(event["fields"]["completed_dispatches"], 11);
+    assert_eq!(event["fields"]["dispatch_in_progress"], true);
+    assert_eq!(event["fields"]["current_dispatch_age_ms"], 60.0);
+    assert_eq!(event["fields"]["last_post_age_ms"], -1.0);
+    assert_eq!(event["fields"]["read_to_post_max_ms"], 85.0);
+    assert_eq!(event["fields"]["captures_delivered"], 30);
+    assert_eq!(event["fields"]["client_reported_decoded_frames"], 19);
+    assert!(!summary.to_string().contains(secret));
+    let malformed = json!({"level": "info", "message": "Input pipeline progress",
+        "fields": {"received_events": secret, "post_returns": -1,
+            "read_to_post_max_ms": -2, "last_post_age_ms": secret,
+            "phase": secret, "state": secret}});
+    let summary = summarize_bytes(format!("{malformed}\n").as_bytes(), false);
+    assert!(!summary.to_string().contains(secret));
+    assert_eq!(
+        summary["events"][0]["fields"],
+        json!({"phase":"unknown", "state":"unknown"})
+    );
+}
+
+#[test]
 fn supervised_recovery_exports_stage_age_and_result_without_free_form_text() {
     let mut supervision = macrdp_core::supervised::SupervisionDiagnostics {
         enabled: true,
