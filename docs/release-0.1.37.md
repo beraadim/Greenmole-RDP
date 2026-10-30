@@ -36,3 +36,11 @@ tests remain ignored. Focused tests cover queued lock waits, protocol variants,
 resize/reconnect boundaries, ongoing dispatches, scoped native posting, absent
 injectors, failures, cleanup exclusion, bounded storage and sanitized exports.
 An independent integration review found no blocking issues.
+
+The optimized ARM64 DMG was mounted read-only and verified for its application
+and driver signatures, version/revision, architecture, bundled licenses, input
+diagnostics markers, installer payload and checksum. It and both sidecars are
+on the Desktop. Active app/configuration hashes, app/RDP worker processes and
+Core Audio were preserved. See the
+[package validation record](release-0.1.37-validation.json). The new diagnostics
+still need a native Windows reproduction after the user deploys this build.
