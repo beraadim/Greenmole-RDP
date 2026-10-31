@@ -72,3 +72,10 @@ tests, native microphone checks and the production frontend build. The 7
 existing manual Rust tests remain ignored. Independent review covered bounds,
 privacy, unavailable comparisons, source changes, posting categories, and
 connection counter lifetimes. Dependency pins remain unchanged.
+
+The ARM64 DMG was mounted read-only and verified for application/driver deep
+strict signatures, version/revision, architecture, bundled licenses, packaged
+diagnostic markers, unchanged microphone payload and checksum. The DMG and
+checksum/build-info sidecars are on the Desktop. Active app hashes and app,
+helper and Core Audio processes were preserved. Nothing was installed or
+restarted. See the [package validation record](release-0.1.41-validation.json).
