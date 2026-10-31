@@ -12,7 +12,37 @@ fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
                 "source_format":"bgra", "width":1920, "height":1200,
                 "sample_available":true, "sampled_pixels":256, "near_black_pixels":10,
                 "near_black_luma_max":4, "luma_min":0.0, "luma_max":250.0, "luma_mean":80.5,
+                "comparison_available":true, "compared_sample_points":256, "changed_sample_points":31,
+                "timestamp_available":true, "timestamp_baseline_available":true,
+                "timestamp_advanced":true, "timestamp_duplicate":false, "timestamp_regressed":false,
                 "pixels":secret, "image_hash":secret,
+            }),
+        ),
+        (
+            "Capture geometry stream prepared",
+            "capture_geometry",
+            json!({
+                "phase":"stream", "state":"prepared", "display_id":31,
+                "source_format":"bgra", "source_width":1920, "source_height":1200,
+                "requested_width":1920, "requested_height":1200,
+                "output_width":1920, "output_height":1200, "cg_geometry_available":true,
+                "cg_origin_x":-1920.0, "cg_origin_y":0.0,
+                "cg_logical_width":1920.0, "cg_logical_height":1200.0,
+                "window_names":secret, "pointer_coordinates":secret,
+            }),
+        ),
+        (
+            "Capture geometry first frame observed",
+            "capture_geometry",
+            json!({
+                "phase":"frame", "state":"observed", "display_id":31,
+                "source_format":"bgra", "width":1920, "height":1200,
+                "content_rect_available":true, "content_rect_x":0.0, "content_rect_y":0.0,
+                "content_rect_width":1920.0, "content_rect_height":1200.0,
+                "content_pixels_available":true, "content_pixels_x":0.0, "content_pixels_y":0.0,
+                "content_pixels_width":1920.0, "content_pixels_height":1200.0,
+                "scale_factor_available":true, "scale_factor":1.0,
+                "content_scale_available":true, "content_scale":1.0, "pixels":secret,
             }),
         ),
         (
@@ -202,6 +232,77 @@ fn metrics_export_keeps_input_and_graphics_progress_counters() {
     assert_eq!(exported["capture_frames_delivered"], 3000);
     assert_eq!(exported["display_updates_sent"], 1500);
     assert_eq!(exported["client_reported_decoded_frames"], 1498);
+}
+
+#[test]
+fn input_classifications_survive_metrics_and_log_selection_without_payloads() {
+    let mut source = json!({"phase":"complete", "state":"observed", "coordinates":"input-canary"});
+    for (index, key) in input::CLASSIFICATION_COUNTS.iter().enumerate() {
+        source[*key] = json!(index + 1);
+    }
+    let metrics = safe_input_timing(&source);
+    let record = json!({"level":"info", "message":"Input pipeline progress", "fields":source});
+    let summary = summarize_bytes(format!("{record}\n").as_bytes(), false);
+    for (index, key) in input::CLASSIFICATION_COUNTS.iter().enumerate() {
+        assert_eq!(metrics[*key], json!(index + 1));
+        assert_eq!(summary["events"][0]["fields"][*key], json!(index + 1));
+    }
+    assert!(!metrics.to_string().contains("input-canary"));
+    assert!(!summary.to_string().contains("input-canary"));
+
+    for key in input::CLASSIFICATION_COUNTS {
+        source[*key] = json!(-1);
+    }
+    assert_eq!(safe_input_timing(&source), json!({}));
+}
+
+#[test]
+fn capture_geometry_export_rejects_free_form_and_malformed_evidence() {
+    let fields = json!({"phase":"frame", "state":"observed", "source_format":"bgra",
+        "content_pixels_available":false, "content_pixels_width":-1.0,
+        "comparison_available":"geometry-canary", "changed_sample_points":-1,
+        "cg_origin_x":"geometry-canary", "scale_factor":null,
+        "source_width":-1, "display_id":0.5, "pointer_x":34, "raw_samples":"geometry-canary"});
+    let safe = startup::safe_fields("capture_geometry", &fields).unwrap();
+    assert_eq!(safe["content_pixels_available"], false);
+    assert_eq!(safe["content_pixels_width"], -1.0);
+    for field in [
+        "comparison_available",
+        "changed_sample_points",
+        "cg_origin_x",
+        "scale_factor",
+        "source_width",
+        "display_id",
+        "pointer_x",
+        "raw_samples",
+    ] {
+        assert!(!safe.contains_key(field));
+    }
+    assert!(!serde_json::to_string(&safe)
+        .unwrap()
+        .contains("geometry-canary"));
+    let safe = startup::safe_fields(
+        "capture_health",
+        &json!({
+            "phase":"progress", "state":"observed", "source_format":"nv12_unsampled",
+            "sample_available":false, "comparison_available":false,
+            "compared_sample_points":0, "changed_sample_points":0,
+            "timestamp_available":false, "timestamp_advanced":"geometry-canary",
+        }),
+    )
+    .unwrap();
+    assert_eq!(safe["comparison_available"], false);
+    assert_eq!(safe["compared_sample_points"], 0);
+    assert!(!safe.contains_key("timestamp_advanced"));
+}
+
+#[test]
+fn bitmap_encoder_preference_is_named_in_diagnostics() {
+    let mut config = UiConfig::default();
+    config.encoder = "bitmap".into();
+    assert_eq!(safe_configuration(&config)["encoder"], "bitmap");
+    config.encoder = "private-canary".into();
+    assert_eq!(safe_configuration(&config)["encoder"], "unknown");
 }
 
 #[test]
@@ -402,12 +503,13 @@ fn clipboard_and_capture_failures_keep_only_selected_diagnostic_fields() {
 fn log_summary_bounds_events_and_discards_partial_records() {
     let event = b"{\"level\":\"error\",\"message\":\"unknown user data\"}\n";
     let mut bytes = b"partial record\n".to_vec();
-    for _ in 0..300 {
+    let total_events = MAX_EVENTS + 100;
+    for _ in 0..total_events {
         bytes.extend_from_slice(event);
     }
     bytes.extend_from_slice(b"{\"level\":\"error\"}");
     let value = summarize_bytes(&bytes, true);
-    assert_eq!(value["counts"]["error"], 300);
+    assert_eq!(value["counts"]["error"], total_events);
     assert_eq!(value["events"].as_array().unwrap().len(), MAX_EVENTS);
     assert!(!value.to_string().contains("unknown user data"));
 }

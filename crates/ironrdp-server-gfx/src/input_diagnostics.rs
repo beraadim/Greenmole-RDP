@@ -5,10 +5,25 @@ use std::time::Instant;
 
 use super::timings::{TimingSummary, TimingWindow};
 
+/// Decoded callbacks after packet expansion, without retaining input values.
+/// A standard absolute button packet supplies both a move and a button callback.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum InputCallbackKind {
+    Keyboard,
+    MouseMove,
+    MouseRelativeMove,
+    MouseButtonDown,
+    MouseButtonUp,
+    MouseScroll,
+    #[default]
+    Unclassified,
+}
+
 /// One native handler callback. Samples contain durations only and must remain
 /// bounded by the producer; counters also cover samples omitted by that bound.
 #[derive(Debug, Default)]
 pub struct NativeInputObservation {
+    pub kind: InputCallbackKind,
     pub callback_blocked: bool,
     pub callback_unavailable: bool,
     pub callback_failed: bool,
@@ -17,6 +32,13 @@ pub struct NativeInputObservation {
     /// Preparation errors before a posting call; the OS posting API is void.
     pub post_errors: u64,
     pub post_samples_dropped: u64,
+    pub keyboard_posts: u64,
+    pub mouse_move_posts: u64,
+    pub mouse_button_down_posts: u64,
+    pub mouse_button_up_posts: u64,
+    pub mouse_drag_posts: u64,
+    pub mouse_scroll_posts: u64,
+    pub other_posts: u64,
     pub last_post_at: Option<Instant>,
     pub post_ms: Vec<f64>,
 }
@@ -30,6 +52,12 @@ pub struct InputTimingSnapshot {
     pub dispatch_in_progress: bool,
     pub current_dispatch_age_ms: Option<f64>,
     pub native_callbacks: u64,
+    pub keyboard_events: u64,
+    pub mouse_move_events: u64,
+    pub mouse_relative_move_events: u64,
+    pub mouse_button_down_events: u64,
+    pub mouse_button_up_events: u64,
+    pub mouse_scroll_events: u64,
     pub blocked_callbacks: u64,
     pub unavailable_callbacks: u64,
     pub injection_failures: u64,
@@ -37,6 +65,13 @@ pub struct InputTimingSnapshot {
     pub post_returns: u64,
     pub post_errors: u64,
     pub post_samples_dropped: u64,
+    pub keyboard_posts: u64,
+    pub mouse_move_posts: u64,
+    pub mouse_button_down_posts: u64,
+    pub mouse_button_up_posts: u64,
+    pub mouse_drag_posts: u64,
+    pub mouse_scroll_posts: u64,
+    pub other_posts: u64,
     pub last_receive_age_ms: Option<f64>,
     pub last_dispatch_age_ms: Option<f64>,
     pub last_post_age_ms: Option<f64>,
@@ -99,6 +134,48 @@ impl InputDiagnostics {
 
     pub fn record_native_callback(&mut self, observation: NativeInputObservation) {
         self.totals.native_callbacks = self.totals.native_callbacks.saturating_add(1);
+        let counter = match observation.kind {
+            InputCallbackKind::Keyboard => Some(&mut self.totals.keyboard_events),
+            InputCallbackKind::MouseMove => Some(&mut self.totals.mouse_move_events),
+            InputCallbackKind::MouseRelativeMove => {
+                Some(&mut self.totals.mouse_relative_move_events)
+            }
+            InputCallbackKind::MouseButtonDown => Some(&mut self.totals.mouse_button_down_events),
+            InputCallbackKind::MouseButtonUp => Some(&mut self.totals.mouse_button_up_events),
+            InputCallbackKind::MouseScroll => Some(&mut self.totals.mouse_scroll_events),
+            InputCallbackKind::Unclassified => None,
+        };
+        if let Some(counter) = counter {
+            *counter = counter.saturating_add(1);
+        }
+        self.totals.keyboard_posts = self
+            .totals
+            .keyboard_posts
+            .saturating_add(observation.keyboard_posts);
+        self.totals.mouse_move_posts = self
+            .totals
+            .mouse_move_posts
+            .saturating_add(observation.mouse_move_posts);
+        self.totals.mouse_button_down_posts = self
+            .totals
+            .mouse_button_down_posts
+            .saturating_add(observation.mouse_button_down_posts);
+        self.totals.mouse_button_up_posts = self
+            .totals
+            .mouse_button_up_posts
+            .saturating_add(observation.mouse_button_up_posts);
+        self.totals.mouse_drag_posts = self
+            .totals
+            .mouse_drag_posts
+            .saturating_add(observation.mouse_drag_posts);
+        self.totals.mouse_scroll_posts = self
+            .totals
+            .mouse_scroll_posts
+            .saturating_add(observation.mouse_scroll_posts);
+        self.totals.other_posts = self
+            .totals
+            .other_posts
+            .saturating_add(observation.other_posts);
         self.totals.blocked_callbacks = self
             .totals
             .blocked_callbacks
@@ -241,5 +318,29 @@ mod tests {
         let fresh = InputDiagnostics::default().snapshot(Instant::now());
         assert_eq!(fresh.received_events, 0);
         assert_eq!(fresh.native_post.samples, 0);
+    }
+
+    #[test]
+    fn input_categories_and_post_totals_saturate_independently_of_timing_samples() {
+        let mut stats = InputDiagnostics::default();
+        stats.totals.mouse_button_down_events = u64::MAX;
+        for _ in 0..2 {
+            stats.record_native_callback(NativeInputObservation {
+                kind: InputCallbackKind::MouseButtonDown,
+                mouse_button_down_posts: u64::MAX,
+                mouse_button_up_posts: 1,
+                mouse_drag_posts: 2,
+                keyboard_posts: 3,
+                ..Default::default()
+            });
+        }
+        let snapshot = stats.snapshot(Instant::now());
+        assert_eq!(snapshot.native_callbacks, 2);
+        assert_eq!(snapshot.mouse_button_down_events, u64::MAX);
+        assert_eq!(snapshot.mouse_button_down_posts, u64::MAX);
+        assert_eq!(snapshot.mouse_button_up_posts, 2);
+        assert_eq!(snapshot.mouse_drag_posts, 4);
+        assert_eq!(snapshot.keyboard_posts, 6);
+        assert_eq!(snapshot.native_post.samples, 0);
     }
 }

@@ -14,6 +14,7 @@ fn posting_observations_preserve_group_preparation_order_and_prevent_partial_pos
             calls.borrow_mut().push(("prepare", *item));
             Ok(())
         },
+        |_| crate::post_observation::PostEventKind::Other,
         |item| calls.borrow_mut().push(("post", *item)),
     )
     .unwrap();
@@ -36,6 +37,7 @@ fn posting_observations_preserve_group_preparation_order_and_prevent_partial_pos
             anyhow::ensure!(*item != 2, "synthetic source allocation failure");
             Ok(())
         },
+        |_| crate::post_observation::PostEventKind::MouseButtonDown,
         |item| calls.borrow_mut().push(("post", *item)),
     )
     .is_err());
@@ -44,7 +46,57 @@ fn posting_observations_preserve_group_preparation_order_and_prevent_partial_pos
     assert_eq!(observation.post_attempts, 0);
     assert_eq!(observation.post_returns, 0);
     assert_eq!(observation.post_errors, 1);
+    assert_eq!(observation.mouse_button_down_posts, 0);
     assert!(observation.last_post_at.is_none());
+}
+
+#[test]
+fn posting_family_counts_cover_button_drag_and_keyboard_without_desktop_input() {
+    use crate::post_observation::PostEventKind;
+    use crate::PostObservationScope;
+    let events: Vec<_> = [
+        CGEventType::KeyDown,
+        CGEventType::KeyUp,
+        CGEventType::FlagsChanged,
+        CGEventType::MouseMoved,
+        CGEventType::LeftMouseDown,
+        CGEventType::RightMouseDown,
+        CGEventType::OtherMouseDown,
+        CGEventType::LeftMouseUp,
+        CGEventType::RightMouseUp,
+        CGEventType::OtherMouseUp,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+        CGEventType::OtherMouseDragged,
+        CGEventType::ScrollWheel,
+        CGEventType::Null,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let event = event();
+        event.set_type(kind);
+        event
+    })
+    .collect();
+    let scope = PostObservationScope::begin();
+    let mut calls = 0;
+    post_prepared_events(
+        &events,
+        |event| stamp(event, 0),
+        |event| PostEventKind::from_type(event.get_type()),
+        |_| calls += 1, // Count mock calls; never invoke CGEventPost.
+    )
+    .unwrap();
+    let observation = scope.finish();
+    assert_eq!(calls, 15);
+    assert_eq!(observation.post_returns, 15);
+    assert_eq!(observation.keyboard_posts, 3);
+    assert_eq!(observation.mouse_move_posts, 1);
+    assert_eq!(observation.mouse_button_down_posts, 3);
+    assert_eq!(observation.mouse_button_up_posts, 3);
+    assert_eq!(observation.mouse_drag_posts, 3);
+    assert_eq!(observation.mouse_scroll_posts, 1);
+    assert_eq!(observation.other_posts, 1);
 }
 
 fn event() -> CGEvent {

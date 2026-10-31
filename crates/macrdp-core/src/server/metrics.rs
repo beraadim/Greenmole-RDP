@@ -256,6 +256,19 @@ mod tests {
         snapshot.post_returns = 2;
         snapshot.post_errors = 1;
         snapshot.injection_failures = 2;
+        snapshot.keyboard_events = 1;
+        snapshot.mouse_move_events = 2;
+        snapshot.mouse_relative_move_events = 3;
+        snapshot.mouse_button_down_events = 4;
+        snapshot.mouse_button_up_events = 5;
+        snapshot.mouse_scroll_events = 6;
+        snapshot.keyboard_posts = 7;
+        snapshot.mouse_move_posts = 8;
+        snapshot.mouse_button_down_posts = 9;
+        snapshot.mouse_button_up_posts = 10;
+        snapshot.mouse_drag_posts = 11;
+        snapshot.mouse_scroll_posts = 12;
+        snapshot.other_posts = 13;
         snapshot.last_post_age_ms = Some(3.0);
         snapshot.read_to_post.samples = 2;
         snapshot.read_to_post.max_ms = Some(52.0);
@@ -269,6 +282,19 @@ mod tests {
         assert_eq!(mapped.post_returns, 2);
         assert_eq!(mapped.post_errors, 1);
         assert_eq!(mapped.injection_failures, 2);
+        assert_eq!(mapped.keyboard_events, 1);
+        assert_eq!(mapped.mouse_move_events, 2);
+        assert_eq!(mapped.mouse_relative_move_events, 3);
+        assert_eq!(mapped.mouse_button_down_events, 4);
+        assert_eq!(mapped.mouse_button_up_events, 5);
+        assert_eq!(mapped.mouse_scroll_events, 6);
+        assert_eq!(mapped.keyboard_posts, 7);
+        assert_eq!(mapped.mouse_move_posts, 8);
+        assert_eq!(mapped.mouse_button_down_posts, 9);
+        assert_eq!(mapped.mouse_button_up_posts, 10);
+        assert_eq!(mapped.mouse_drag_posts, 11);
+        assert_eq!(mapped.mouse_scroll_posts, 12);
+        assert_eq!(mapped.other_posts, 13);
         assert_eq!(mapped.last_post_age_ms, Some(3.0));
         assert_eq!(mapped.last_receive_age_ms, None);
         assert_eq!(mapped.native_post.samples, 0);
@@ -296,6 +322,11 @@ mod tests {
         let partial: Metrics = serde_json::from_value(value).unwrap();
         assert_eq!(partial.input_timing.received_events, 5);
         assert_eq!(partial.input_timing.post_returns, 0);
+        assert_eq!(partial.input_timing.mouse_button_down_events, 0);
+        assert_eq!(partial.input_timing.mouse_button_up_events, 0);
+        assert_eq!(partial.input_timing.keyboard_events, 0);
+        assert_eq!(partial.input_timing.mouse_button_down_posts, 0);
+        assert_eq!(partial.input_timing.mouse_drag_posts, 0);
     }
 
     #[test]

@@ -28,7 +28,7 @@ fn ignores_padding_and_alpha_while_classifying_visible_brightness() {
     assert_eq!(sample.luma_min, 0);
     assert_eq!(sample.luma_max, 255);
     assert_eq!(sample.luma_sum, 264);
-    let summary = LogSummary::from(Some(sample));
+    let summary = LogSummary::from(Some(&sample));
     assert!(summary.available);
     assert_eq!(summary.luma_mean, 66.0);
 }
@@ -75,7 +75,7 @@ fn startup_observations_are_rate_limited_and_expire() {
     let now = Instant::now();
     let mut health = FrameHealth::new(now);
     assert_eq!(health.take_observation(now), Some(("baseline", 0)));
-    for second in 1..=5 {
+    for second in 1..=60 {
         assert!(health
             .take_observation(now + Duration::from_millis(second * 1_000 - 1))
             .is_none());
@@ -85,12 +85,13 @@ fn startup_observations_are_rate_limited_and_expire() {
         );
     }
     assert!(health
-        .take_observation(now + Duration::from_secs(6))
+        .take_observation(now + Duration::from_secs(61))
         .is_none());
     assert!(health
         .take_observation(now + Duration::from_secs(6_000))
         .is_none());
     assert!(health.take_observation(now).is_none());
+    assert_eq!(health.observations, MAX_OBSERVATIONS);
 }
 
 #[test]
@@ -98,11 +99,11 @@ fn delayed_first_frame_has_one_baseline_and_no_late_progress() {
     let now = Instant::now();
     let mut health = FrameHealth::new(now);
     assert_eq!(
-        health.take_observation(now + Duration::from_secs(10)),
-        Some(("baseline", 10_000))
+        health.take_observation(now + Duration::from_secs(70)),
+        Some(("baseline", 70_000))
     );
     assert!(health
-        .take_observation(now + Duration::from_secs(11))
+        .take_observation(now + Duration::from_secs(71))
         .is_none());
 }
 
@@ -154,7 +155,7 @@ fn default_logging_preserves_only_explicit_aggregate_fields() {
         health.observe(&frame, 31, now);
         health.observe(&frame, 31, now + Duration::from_millis(500));
         health.observe(&frame, 31, now + Duration::from_secs(1));
-        health.observe(&frame, 31, now + Duration::from_secs(6));
+        health.observe(&frame, 31, now + Duration::from_secs(61));
     });
     let records = records.lock().unwrap();
     assert_eq!(records.len(), 2);
@@ -176,6 +177,14 @@ fn default_logging_preserves_only_explicit_aggregate_fields() {
         "luma_min",
         "luma_max",
         "luma_mean",
+        "comparison_available",
+        "compared_sample_points",
+        "changed_sample_points",
+        "timestamp_available",
+        "timestamp_baseline_available",
+        "timestamp_advanced",
+        "timestamp_duplicate",
+        "timestamp_regressed",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -201,4 +210,122 @@ fn default_logging_preserves_only_explicit_aggregate_fields() {
     assert!(records[1]
         .0
         .contains(&("phase".into(), "\"progress\"".into())));
+}
+
+fn context(display_id: u32, width: u32, height: u32, source: FrameSource) -> SampleContext {
+    SampleContext {
+        display_id,
+        width,
+        height,
+        source,
+    }
+}
+
+#[test]
+fn comparison_ignores_alpha_and_padding_but_detects_equal_luma_color_changes() {
+    let before = sample_bgra(&[0, 0, 4, 1, 99, 98, 97, 96, 0, 0, 4, 2], 1, 2, 8).unwrap();
+    let alpha_padding = sample_bgra(&[0, 0, 4, 255, 9, 8, 7, 6, 0, 0, 4, 255], 1, 2, 8).unwrap();
+    assert_eq!(
+        compare_samples(Some(&before), Some(&alpha_padding)),
+        Comparison {
+            available: true,
+            compared: 2,
+            changed: 0,
+        }
+    );
+    let changed = sample_bgra(&[1, 0, 4, 255, 9, 8, 7, 6, 0, 0, 4, 255], 1, 2, 8).unwrap();
+    assert_eq!(before.luma_sum, changed.luma_sum);
+    assert_eq!(
+        compare_samples(Some(&before), Some(&changed)),
+        Comparison {
+            available: true,
+            compared: 2,
+            changed: 1,
+        }
+    );
+    // Equal sample counts do not mean the grids cover the same pixel positions.
+    let resized = sample_bgra(&[0; 8], 2, 1, 8).unwrap();
+    assert!(!compare_samples(Some(&before), Some(&resized)).available);
+}
+
+#[test]
+fn unavailable_pixels_and_source_changes_require_a_new_comparison_baseline() {
+    let now = Instant::now();
+    let mut health = FrameHealth::new(now);
+    let initial = context(31, 2, 1, FrameSource::Raw);
+    let sample = || sample_bgra(&[5; 8], 2, 1, 8);
+    let (comparison, _) = health.compare_observation(initial, sample(), 10);
+    assert!(!comparison.available);
+    let (comparison, _) = health.compare_observation(initial, sample(), 20);
+    assert_eq!(comparison.changed, 0);
+    let (comparison, timestamp) = health.compare_observation(initial, None, 30);
+    assert!(!comparison.available);
+    assert_eq!(comparison.changed, -1);
+    assert!(health.previous_sample.is_none());
+    // Failed access cannot establish an unchanged image; clock evidence remains useful.
+    assert!(timestamp.advanced);
+    let (comparison, _) = health.compare_observation(initial, sample(), 40);
+    assert!(!comparison.available);
+    for changed_context in [
+        context(32, 2, 1, FrameSource::Raw),
+        context(31, 1, 2, FrameSource::Raw),
+        context(31, 2, 1, FrameSource::BgraBuffer),
+        context(31, 2, 1, FrameSource::Nv12Buffer),
+    ] {
+        health.compare_observation(initial, sample(), 100);
+        let (comparison, timestamp) = health.compare_observation(changed_context, sample(), 200);
+        assert!(!comparison.available);
+        assert!(!timestamp.baseline_available);
+    }
+    health.compare_observation(initial, sample(), 100);
+    let (comparison, _) = health.compare_observation(initial, None, 200);
+    assert!(!comparison.available);
+    assert!(health.previous_sample.is_none());
+}
+
+#[test]
+fn timestamps_distinguish_progress_duplicates_and_regressions_without_inferring_pixels() {
+    let mut health = FrameHealth::new(Instant::now());
+    let source = context(31, 1920, 1200, FrameSource::Raw);
+    let (_, baseline) = health.compare_observation(source, None, 100);
+    assert!(baseline.available);
+    assert!(!baseline.baseline_available);
+    let (_, same) = health.compare_observation(source, None, 100);
+    assert!(same.duplicate);
+    assert!(!same.advanced);
+    let (_, newer) = health.compare_observation(source, None, 101);
+    assert!(newer.advanced);
+    let (_, older) = health.compare_observation(source, None, 99);
+    assert!(older.regressed);
+    let (_, missing) = health.compare_observation(source, None, 0);
+    assert!(!missing.available);
+    assert!(!missing.baseline_available);
+    assert!(!missing.regressed);
+    let (_, restored) = health.compare_observation(source, None, 200);
+    assert!(!restored.baseline_available);
+    assert!(!restored.advanced);
+    assert!(health.previous_sample.is_none());
+}
+
+#[test]
+fn observation_expiry_clears_private_samples_and_does_not_reopen_after_invalid_frames() {
+    let now = Instant::now();
+    let mut health = FrameHealth::new(now);
+    assert!(health.take_observation(now).is_some());
+    health.compare_observation(
+        context(1, 1, 1, FrameSource::Raw),
+        sample_bgra(&[7; 4], 1, 1, 4),
+        100,
+    );
+    assert!(health.previous_sample.is_some());
+    assert!(health
+        .take_observation(now + Duration::from_secs(61))
+        .is_none());
+    assert!(health.previous_sample.is_none());
+    assert!(health.previous_timestamp_us.is_none());
+    assert!(health.previous_context.is_none());
+    assert!(health
+        .take_observation(now + Duration::from_secs(62))
+        .is_none());
+    assert_eq!(health.observations, 1);
 }

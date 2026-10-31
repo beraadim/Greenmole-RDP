@@ -2,6 +2,7 @@
 
 mod audio;
 mod cursor;
+mod diagnostics;
 mod fallback_image;
 mod geometry;
 pub use cursor::{CursorCapture, CursorUpdate};
@@ -185,6 +186,7 @@ impl CaptureReceiver {
 struct VideoOutputHandler {
     frame_tx: mailbox::FrameSender,
     pixel_format: CapturePixelFormat,
+    geometry: diagnostics::FrameGeometryDiagnostics,
 }
 
 impl SCStreamOutputTrait for VideoOutputHandler {
@@ -198,6 +200,9 @@ impl SCStreamOutputTrait for VideoOutputHandler {
             CapturePixelFormat::Bgra => extract_frame(&sample),
         };
         let Some(event) = event else { return };
+        if let CaptureEvent::Frame(frame) = &event {
+            self.geometry.observe(&sample, frame);
+        }
 
         self.frame_tx.send(event);
     }
@@ -537,6 +542,14 @@ impl ScreenCapturer {
             config.height
         };
 
+        diagnostics::stream_prepared(
+            &config,
+            display.width(),
+            display.height(),
+            actual_width,
+            actual_height,
+        );
+
         let filter = SCContentFilter::create()
             .with_display(&display)
             .with_excluding_windows(&[])
@@ -552,6 +565,10 @@ impl ScreenCapturer {
         let video_handler = VideoOutputHandler {
             frame_tx,
             pixel_format: config.pixel_format,
+            geometry: diagnostics::FrameGeometryDiagnostics::new(
+                config.display_id,
+                config.pixel_format,
+            ),
         };
 
         let native_stopped = Arc::new(AtomicBool::new(false));

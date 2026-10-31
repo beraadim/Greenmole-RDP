@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, Value>> {
     let (phases, states): (&[&str], &[&str]) = match category {
         "capture_health" => (&["baseline", "progress"], &["observed"]),
+        "capture_geometry" => (&["stream", "frame"], &["prepared", "observed"]),
         "graphics_surface" => (&["created"], &["prepared"]),
         "graphics_startup" => (&["first_avc"], &["prepared"]),
         "graphics_cache" => (&["offer"], &["declined"]),
@@ -32,14 +33,82 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
                 "sampled_pixels",
                 "near_black_pixels",
                 "near_black_luma_max",
+                "compared_sample_points",
             ] {
                 unsigned(source, &mut fields, key);
             }
-            boolean(source, &mut fields, "sample_available");
+            if let Some(changed) = source["changed_sample_points"]
+                .as_i64()
+                .filter(|count| (-1..=256).contains(count))
+            {
+                fields.insert("changed_sample_points".into(), json!(changed));
+            }
+            for key in [
+                "sample_available",
+                "comparison_available",
+                "timestamp_available",
+                "timestamp_baseline_available",
+                "timestamp_advanced",
+                "timestamp_duplicate",
+                "timestamp_regressed",
+            ] {
+                boolean(source, &mut fields, key);
+            }
             for key in ["luma_min", "luma_max", "luma_mean"] {
                 if let Some(value) = source[key].as_f64().filter(|value| {
                     value.is_finite() && (*value == -1.0 || (0.0..=255.0).contains(value))
                 }) {
+                    fields.insert(key.into(), json!(value));
+                }
+            }
+            fields.insert(
+                "source_format".into(),
+                json!(super::selection(
+                    source["source_format"].as_str().unwrap_or(""),
+                    &["bgra", "nv12_unsampled"],
+                )),
+            );
+        }
+        "capture_geometry" => {
+            for key in [
+                "display_id",
+                "source_width",
+                "source_height",
+                "requested_width",
+                "requested_height",
+                "output_width",
+                "output_height",
+            ] {
+                unsigned(source, &mut fields, key);
+            }
+            for key in [
+                "cg_geometry_available",
+                "content_rect_available",
+                "content_pixels_available",
+                "scale_factor_available",
+                "content_scale_available",
+            ] {
+                boolean(source, &mut fields, key);
+            }
+            // These describe capture/display geometry, never pointer positions.
+            // Origins may legitimately be negative on an extended desktop.
+            for key in [
+                "cg_origin_x",
+                "cg_origin_y",
+                "cg_logical_width",
+                "cg_logical_height",
+                "content_rect_x",
+                "content_rect_y",
+                "content_rect_width",
+                "content_rect_height",
+                "content_pixels_x",
+                "content_pixels_y",
+                "content_pixels_width",
+                "content_pixels_height",
+                "scale_factor",
+                "content_scale",
+            ] {
+                if let Some(value) = source[key].as_f64().filter(|value| value.is_finite()) {
                     fields.insert(key.into(), json!(value));
                 }
             }

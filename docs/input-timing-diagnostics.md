@@ -77,3 +77,40 @@ existing bounded transition-diagnostics target keeps these available at the
 default warning log setting. Flat log fields use `-1` for missing ages/timings;
 the structured metric export uses null. No input callback writes a per-event
 log record or waits for file I/O.
+
+## Input families and capture comparisons in 0.1.41
+
+The new `keyboard_events`, `mouse_move_events`, `mouse_relative_move_events`,
+`mouse_button_down_events`, `mouse_button_up_events` and `mouse_scroll_events`
+count decoded native-handler callbacks, including callbacks blocked or unable
+to inject. They are not wire event counts: an absolute button packet may expand
+into a pointer-position callback and a button transition. Keyboard synchronization
+is included in the keyboard family. No button identity, key or position is saved.
+
+`keyboard_posts`, `mouse_move_posts`, `mouse_button_down_posts`,
+`mouse_button_up_posts`, `mouse_drag_posts`, `mouse_scroll_posts` and `other_posts`
+classify actual native posting calls that returned. These include cleanup
+performed inside a timed callback, while cleanup outside a callback remains
+excluded. A successful call return still does not prove OS or application
+consumption. If button callbacks arrive but no corresponding native posts occur,
+blocked/unavailable/failure counts help identify the server-side boundary.
+
+Capture health now samples up to 256 BGR points at most once per second for the
+first minute, up to 61 observations per desktop activation. `comparison_available`
+and `compared_sample_points` identify an eligible previous sample;
+`changed_sample_points` counts changed BGR points, or is `-1` when unavailable.
+Up to 256 color triplets live temporarily in private memory only; no sampled
+colors, image hashes or coordinates enter diagnostics. NV12 stays unsampled.
+Unchanged sparse samples are not proof that every desktop pixel was unchanged.
+Timestamp booleans describe progress of source timestamps between observations,
+without retaining their values or inferring display latency.
+A delayed first frame can produce one baseline after that minute without
+reopening the observation window.
+
+`capture_geometry` records source/output/display dimensions and the first
+frame's content transform once per native stream. These describe capture
+geometry rather than pointer positions. Comparing them across working and
+frozen sessions can reveal different capture-to-input transforms that the output
+buffer dimensions alone cannot expose. Schema 8 exports select these fields
+explicitly and retain at most 400 operational events within the existing byte
+limits.

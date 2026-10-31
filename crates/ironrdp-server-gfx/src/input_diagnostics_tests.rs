@@ -128,13 +128,25 @@ fn resize_preserves_input_history_and_reconnect_clears_it() {
     let mut state = GfxState::new(800, 600, false, false);
     let now = Instant::now();
     state.input.record_received(Some(now), 4);
+    state.input.record_native_callback(NativeInputObservation {
+        kind: crate::gfx::InputCallbackKind::MouseButtonDown,
+        mouse_button_down_posts: 1,
+        mouse_drag_posts: 2,
+        ..Default::default()
+    });
     state.record_capture_queue(1.0);
     assert_eq!(state.total_captures_delivered, 1);
     state.reset_connection_state(true);
     assert_eq!(state.input.snapshot(now).received_events, 4);
+    assert_eq!(state.input.snapshot(now).mouse_button_down_events, 1);
+    assert_eq!(state.input.snapshot(now).mouse_button_down_posts, 1);
+    assert_eq!(state.input.snapshot(now).mouse_drag_posts, 2);
     state.begin_connection(None);
     let snapshot = state.input.snapshot(now);
     assert_eq!(snapshot.received_events, 0);
     assert_eq!(snapshot.last_receive_age_ms, None);
     assert_eq!(snapshot.post_returns, 0);
+    assert_eq!(snapshot.mouse_button_down_events, 0);
+    assert_eq!(snapshot.mouse_button_down_posts, 0);
+    assert_eq!(snapshot.mouse_drag_posts, 0);
 }

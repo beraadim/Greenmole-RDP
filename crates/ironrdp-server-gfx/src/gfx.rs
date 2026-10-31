@@ -26,7 +26,7 @@ pub use timings::{StageTimings, TimingSummary};
 
 #[path = "input_diagnostics.rs"]
 mod input_diagnostics;
-pub use input_diagnostics::{InputDiagnostics, InputTimingSnapshot, NativeInputObservation};
+pub use input_diagnostics::{InputCallbackKind, InputDiagnostics, InputTimingSnapshot, NativeInputObservation};
 
 #[path = "graphics_diagnostics.rs"]
 mod graphics_diagnostics;

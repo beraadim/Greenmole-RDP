@@ -14,10 +14,14 @@ use tauri::State;
 use crate::{state::AppState, ui_config::UiConfig};
 
 const LOG_BYTES: u64 = 1024 * 1024;
-const MAX_EVENTS: usize = 200;
+// Keep both one-minute capture/input traces plus their activation evidence.
+// The log-read and total export byte limits remain independently enforced.
+const MAX_EVENTS: usize = 400;
 const EXPORT_BYTES: usize = 2 * 1024 * 1024;
 
 mod history;
+mod input;
+use input::safe_input_timing;
 mod save_dialog;
 mod startup;
 pub(crate) use history::DiagnosticHistory;
@@ -86,7 +90,7 @@ pub async fn export_diagnostics(
             },
         );
         let report = json!({
-            "schema_version": 7,
+            "schema_version": 8,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -200,7 +204,7 @@ fn safe_configuration(config: &UiConfig) -> Value {
         .and_then(|(w, h)| Some([w.parse::<u16>().ok()?, h.parse::<u16>().ok()?]));
     json!({
         "frame_rate": config.frame_rate, "bitrate_mbps": config.bitrate_mbps,
-        "encoder": selection(&config.encoder, &["auto", "hardware", "software"]),
+        "encoder": selection(&config.encoder, &["auto", "hardware", "software", "bitmap"]),
         "quality": selection(&config.quality, &["low_latency", "balanced", "high_quality", "lossless"]),
         "chroma": selection(&config.chroma_mode, &["avc420", "avc444"]),
         "display_backend": config.display_backend, "resolution": resolution,
@@ -341,59 +345,6 @@ fn safe_metrics(metrics: &macrdp_core::Metrics) -> Value {
     Value::Object(selected)
 }
 
-/// Keep nested input diagnostics typed and explicitly selected even if future
-/// metrics add raw input details. Never copy the entire serialized object.
-fn safe_input_timing(value: &Value) -> Value {
-    let mut selected = serde_json::Map::new();
-    for key in [
-        "received_events",
-        "untimed_events",
-        "dispatched_events",
-        "completed_dispatches",
-        "native_callbacks",
-        "blocked_callbacks",
-        "unavailable_callbacks",
-        "injection_failures",
-        "post_attempts",
-        "post_returns",
-        "post_errors",
-        "post_samples_dropped",
-    ] {
-        if let Some(count) = value.get(key).and_then(Value::as_u64) {
-            selected.insert(key.into(), json!(count));
-        }
-    }
-    for key in [
-        "last_receive_age_ms",
-        "last_dispatch_age_ms",
-        "last_post_age_ms",
-        "current_dispatch_age_ms",
-    ] {
-        if let Some(age) = value.get(key).filter(|age| safe_duration(age)) {
-            selected.insert(key.into(), age.clone());
-        }
-    }
-    if let Some(in_progress) = value.get("dispatch_in_progress").and_then(Value::as_bool) {
-        selected.insert("dispatch_in_progress".into(), json!(in_progress));
-    }
-    for key in ["dispatch_wait", "handler", "native_post", "read_to_post"] {
-        if let Some(timing) = value.get(key).filter(|timing| timing.is_object()) {
-            let mut summary = serde_json::Map::new();
-            if let Some(samples) = timing.get("samples").and_then(Value::as_u64) {
-                summary.insert("samples".into(), json!(samples));
-            }
-            for field in ["p50_ms", "p95_ms", "p99_ms", "max_ms"] {
-                if let Some(duration) = timing.get(field).filter(|duration| safe_duration(duration))
-                {
-                    summary.insert(field.into(), duration.clone());
-                }
-            }
-            selected.insert(key.into(), Value::Object(summary));
-        }
-    }
-    Value::Object(selected)
-}
-
 fn safe_duration(value: &Value) -> bool {
     value.is_null()
         || value
@@ -433,6 +384,7 @@ fn safe_outcome(value: &str) -> &str {
 fn event_category(message: &str) -> &'static str {
     for (prefix, category) in [
         ("Capture startup pixel health", "capture_health"),
+        ("Capture geometry", "capture_geometry"),
         ("GFX surface setup prepared", "graphics_surface"),
         ("First AVC frame prepared", "graphics_startup"),
         ("Graphics receive envelope observation", "graphics_receive"),
@@ -608,7 +560,10 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
                 "display_updates_sent",
                 "client_reported_decoded_frames",
                 "bytes_sent",
-            ] {
+            ]
+            .into_iter()
+            .chain(input::CLASSIFICATION_COUNTS.iter().copied())
+            {
                 if let Some(count) = event["fields"].get(key).and_then(Value::as_u64) {
                     fields.insert(key.into(), json!(count));
                 }

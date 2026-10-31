@@ -581,7 +581,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn keyboard(&mut self, event: KeyboardEvent) {
-        self.observe_input_callback(|handler| {
+        self.observe_input_callback(ironrdp_server::gfx::InputCallbackKind::Keyboard, |handler| {
             if !handler.privacy.input_allowed() {
                 return input_diagnostics::CallbackResult::blocked();
             }
@@ -593,7 +593,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        self.observe_input_callback(|handler| {
+        self.observe_input_callback(input_diagnostics::mouse_kind(&event), |handler| {
             if !handler.privacy.input_allowed() {
                 return input_diagnostics::CallbackResult::blocked();
             }
