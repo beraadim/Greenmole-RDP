@@ -52,3 +52,10 @@ Seven existing manual Rust tests remain ignored. Independent wire tests
 reproduce the old guard's rejection and pass with the replacement. Independent
 receive-boundary review, staged whitespace/secret checks and dependency-pin
 comparison passed.
+
+The ARM64 DMG was mounted read-only and verified for application/driver deep
+strict signatures, version/revision, actual architecture, bundled licenses,
+receive/startup diagnostic markers, unchanged microphone payload and checksum.
+The DMG and checksum/build-info sidecars are on the Desktop. Active application
+and configuration hashes, app/helper processes and Core Audio were preserved.
+See the [package validation record](release-0.1.39-validation.json).
