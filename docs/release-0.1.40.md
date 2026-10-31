@@ -52,3 +52,11 @@ existing manual Rust tests remain ignored. Independent review covered cached
 and fresh dispatch, failed seed preparation, first video IDR, browser/bitmap
 paths, repeated NV12 wakeups and large-frame transport bounds. Staged
 whitespace/secret checks and dependency-pin comparison passed.
+
+The optimized ARM64 DMG was mounted read-only and verified for deep strict
+application/driver signatures, version/revision, actual architecture, bundled
+licenses, the new RGB baseline implementation marker and existing diagnostics,
+unchanged microphone payload, and checksum. The DMG and checksum/build-info
+sidecars are on the Desktop. Active app/configuration hashes and app, helper
+and Core Audio processes were preserved. See the
+[package validation record](release-0.1.40-validation.json).
