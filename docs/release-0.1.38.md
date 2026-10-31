@@ -58,3 +58,10 @@ by a complete server-library run (215 passed, three existing manual tests
 ignored). Across the final suites, 1,025 distinct Rust tests passed; seven
 existing manual Rust tests remain ignored. Staged whitespace/secret checks and
 an independent review of the protocol, sampling and export boundaries passed.
+
+The optimized ARM64 DMG was mounted read-only and verified for deep strict
+application/driver signatures, version/revision, actual architecture, bundled
+licenses, startup/input diagnostic markers, the unchanged microphone payload,
+and checksum. The DMG and checksum/build-info sidecars are on the Desktop.
+Active application/configuration hashes, RDP worker and Core Audio processes
+were preserved. See the [package validation record](release-0.1.38-validation.json).
