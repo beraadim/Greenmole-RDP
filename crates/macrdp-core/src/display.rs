@@ -10,6 +10,7 @@ pub(crate) mod encoder_startup;
 mod native_capture;
 use native_capture::NativeCapture;
 mod event_wait;
+mod frame_health;
 mod idle_encode;
 mod idle_policy;
 mod live_controls;
@@ -894,6 +895,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             shared_audio_tx: self.shared_audio_tx.clone(),
             display_frame_count: 0,
+            frame_health: frame_health::FrameHealth::new(Instant::now()),
             slow_video_encodes: 0,
             idle_frame_count: 0,
             idle_since: None,
@@ -1000,6 +1002,7 @@ struct MacDisplayUpdates {
     mode_444: bool,
     shared_audio_tx: Option<SharedAudioTx>,
     display_frame_count: u64,
+    frame_health: frame_health::FrameHealth,
     /// Counts slow video completions for bounded diagnostic logging. Native
     /// work and the capture mailbox already bound/coalesce outstanding frames.
     slow_video_encodes: u64,
@@ -2411,6 +2414,8 @@ impl MacDisplayUpdates {
         frame: CapturedFrame,
         damage: FrameDamage,
     ) -> Result<Option<DisplayUpdate>> {
+        self.frame_health
+            .observe(&frame, self.capture_config.display_id, Instant::now());
         self.sync_bitmap_transport();
         self.coord_mapper.update_frame_content_rect(
             frame.width,

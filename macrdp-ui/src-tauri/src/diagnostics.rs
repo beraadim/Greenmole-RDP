@@ -19,6 +19,7 @@ const EXPORT_BYTES: usize = 2 * 1024 * 1024;
 
 mod history;
 mod save_dialog;
+mod startup;
 pub(crate) use history::DiagnosticHistory;
 
 #[derive(Serialize)]
@@ -85,7 +86,7 @@ pub async fn export_diagnostics(
             },
         );
         let report = json!({
-            "schema_version": 6,
+            "schema_version": 7,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "application": {"version": env!("CARGO_PKG_VERSION"),
                 "revision": option_env!("MACRDP_BUILD_REVISION").unwrap_or("development")},
@@ -431,6 +432,13 @@ fn safe_outcome(value: &str) -> &str {
 
 fn event_category(message: &str) -> &'static str {
     for (prefix, category) in [
+        ("Capture startup pixel health", "capture_health"),
+        ("GFX surface setup prepared", "graphics_surface"),
+        ("First AVC frame prepared", "graphics_startup"),
+        (
+            "Persistent graphics cache offer declined with an empty import reply",
+            "graphics_cache",
+        ),
         ("Input pipeline progress", "input_pipeline"),
         ("Connection transport ended", "connection_transport_ended"),
         ("TCP keepalive configured", "transport_policy"),
@@ -576,6 +584,9 @@ fn summarize_bytes(bytes: &[u8], truncated: bool) -> Value {
             if let Some(value) = event["fields"].get(key).filter(|v| v.is_number()) {
                 fields.insert(key.into(), value.clone());
             }
+        }
+        if let Some(startup) = startup::safe_fields(category, &event["fields"]) {
+            fields = startup;
         }
         if category == "input_pipeline" {
             for key in [

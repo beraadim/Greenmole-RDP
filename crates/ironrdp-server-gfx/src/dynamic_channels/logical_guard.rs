@@ -4,7 +4,11 @@ use ironrdp_pdu::{pdu_other_err, PduResult};
 
 use super::microphone_guard::{channel_header, field};
 
-const MAX_LOGICAL_DVC_MESSAGE: usize = 64 * 1024;
+// A valid maximum CacheImportOffer contains its 10-byte header/count plus
+// 5461 metadata entries of 12 bytes (MS-RDPEGFX 2.2.2.16). This is six bytes
+// above 64KiB. Keep the fixed per-channel bounds while admitting that message;
+// microphone preflight still applies its own smaller media-message limit.
+const MAX_LOGICAL_DVC_MESSAGE: usize = 10 + 5461 * 12;
 // Registration currently includes Display Control, Additional Input, GFX and
 // microphone. Add another bounded slot here when introducing another channel.
 const REGISTERED_CHANNEL_LIMIT: usize = 4;
@@ -67,7 +71,7 @@ impl LogicalDvcGuard {
                 ));
             }
             if fragment.expected != 0 {
-                // Both operands are already <=64KiB, so subtraction/addition
+                // Both operands are already bounded, so subtraction/addition
                 // stays bounded even when the peer sends arbitrary fragments.
                 if actual > fragment.expected - fragment.received {
                     return Err(pdu_other_err!(

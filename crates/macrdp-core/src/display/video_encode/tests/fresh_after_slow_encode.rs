@@ -97,6 +97,7 @@ pub(super) fn fixture(avc444: bool) -> MacDisplayUpdates {
         mode_444: avc444,
         shared_audio_tx: None,
         display_frame_count: 0,
+        frame_health: crate::display::frame_health::FrameHealth::new(now),
         slow_video_encodes: 0,
         idle_frame_count: 0,
         idle_since: None,

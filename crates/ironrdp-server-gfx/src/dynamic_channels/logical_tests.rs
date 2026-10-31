@@ -96,7 +96,7 @@ fn interleaved_fragments_on_all_registered_channels_complete_independently() {
 #[test]
 fn adversarial_large_declarations_and_unknown_ids_fail_before_reassembly() {
     for channel in 0..4 {
-        for declared in [65_537, u32::MAX] {
+        for declared in [65_543, u32::MAX] {
             let (mut channels, observed) = setup();
             assert!(channels.process(&first(channel, declared, 1)).is_err());
             assert!(observed
@@ -138,12 +138,82 @@ fn repeated_small_fragments_cannot_exceed_any_channels_declared_budget() {
 #[test]
 fn exactly_bounded_messages_complete_and_replacement_first_is_rejected() {
     let (mut channels, observed) = setup();
-    channels.process(&first(2, 65_536, 1)).unwrap();
+    channels.process(&first(2, 65_542, 1)).unwrap();
     for _ in 0..40 {
         channels.process(&data(2, 1600)).unwrap();
     }
-    channels.process(&data(2, 1535)).unwrap();
-    assert_eq!(*observed[2].lock().unwrap(), vec![65_536]);
+    channels.process(&data(2, 1541)).unwrap();
+    assert_eq!(*observed[2].lock().unwrap(), vec![65_542]);
     channels.process(&first(2, 10, 1)).unwrap();
     assert!(channels.process(&first(2, 10, 1)).is_err());
+}
+
+#[test]
+fn maximum_valid_cache_offer_crosses_fragment_guard_and_receives_empty_reply() {
+    use ironrdp_core::decode;
+    use ironrdp_dvc::pdu::DrdynvcServerPdu;
+    use ironrdp_svc::StaticVirtualChannel;
+
+    use crate::gfx::{GfxHandler, GfxState};
+
+    let state = Arc::new(Mutex::new(GfxState::new(640, 480, false, false)));
+    let inner = DrdynvcServer::new().with_dynamic_channel(GfxHandler::new(state));
+    let mut channels = DynamicChannels::new(inner, None);
+    channels
+        .process(
+            &encode_vec(&DrdynvcClientPdu::Capabilities(
+                CapabilitiesResponsePdu::new(CapsVersion::V1),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    channels
+        .process(
+            &encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+                0,
+                CreationStatus::OK,
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+
+    // Maximum valid raw client CacheImportOffer: the metadata is deliberately
+    // opaque here, just as it is to the zero-import server path.
+    let mut offer = vec![0; 65_542];
+    offer[..2].copy_from_slice(&0x10u16.to_le_bytes());
+    offer[4..8].copy_from_slice(&65_542u32.to_le_bytes());
+    offer[8..10].copy_from_slice(&5461u16.to_le_bytes());
+    let mut fragments = offer.chunks(1400);
+    let first_fragment = encode_vec(&DrdynvcClientPdu::Data(DrdynvcDataPdu::DataFirst(
+        DataFirstPdu::new(0, 65_542, fragments.next().unwrap().to_vec()),
+    )))
+    .unwrap();
+    assert!(channels.process(&first_fragment).unwrap().is_empty());
+    let mut replies = Vec::new();
+    for chunk in fragments {
+        replies.extend(
+            channels
+                .process(
+                    &encode_vec(&DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+                        0,
+                        chunk.to_vec(),
+                    ))))
+                    .unwrap(),
+                )
+                .unwrap(),
+        );
+    }
+    let chunks = StaticVirtualChannel::chunkify(replies).unwrap();
+    assert_eq!(chunks.len(), 1);
+    let reply: DrdynvcServerPdu = decode(&chunks[0].filled()[8..]).unwrap();
+    let DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(reply)) = reply else {
+        panic!("expected a graphics reply on the original channel")
+    };
+    // Normal ZGFX framing followed by one zero-entry CacheImportReply.
+    assert_eq!(reply.data(), [0xe0, 4, 0x11, 0, 0, 0, 10, 0, 0, 0, 0, 0]);
+
+    // The one-byte-larger declaration must fail before the reassembler or GFX
+    // handler sees any metadata, including after a successful maximum offer.
+    assert!(channels.process(&first(0, 65_543, 1)).is_err());
+    assert!(channels.process(&data(0, 65_543)).is_err());
 }

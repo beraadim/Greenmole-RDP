@@ -1,6 +1,107 @@
 use super::*;
 
 #[test]
+fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
+    let secret = "private-startup-payload-canary";
+    let cases = [
+        (
+            "Capture startup pixel health",
+            "capture_health",
+            json!({
+                "phase":"baseline", "state":"observed", "display_id":31,
+                "source_format":"bgra", "width":1920, "height":1200,
+                "sample_available":true, "sampled_pixels":256, "near_black_pixels":10,
+                "near_black_luma_max":4, "luma_min":0.0, "luma_max":250.0, "luma_mean":80.5,
+                "pixels":secret, "image_hash":secret,
+            }),
+        ),
+        (
+            "GFX surface setup prepared",
+            "graphics_surface",
+            json!({
+                "phase":"created", "state":"prepared", "surface_id":0,
+                "surface_generation":1, "width":1920, "height":1200,
+                "frame_width":1920, "frame_height":1200, "avc_frame":true,
+                "keyframe":true, "deleted_previous_surface":false, "payload":secret,
+            }),
+        ),
+        (
+            "First AVC frame prepared",
+            "graphics_startup",
+            json!({
+                "phase":"first_avc", "state":"prepared", "surface_generation":1,
+                "graphics_frame_id":1, "bitmap_dispatches":1, "main_bytes":70000,
+                "keyframe":true, "main_has_sps":true, "main_has_pps":true,
+                "main_has_idr":true, "aux_has_idr":false, "nal_data":secret,
+            }),
+        ),
+        (
+            "Persistent graphics cache offer declined with an empty import reply",
+            "graphics_cache",
+            json!({
+                "phase":"offer", "state":"declined", "offer_count":20,
+                "reply_count":0, "cache_keys":secret, "entry_metadata":secret,
+            }),
+        ),
+    ];
+    let mut records = String::new();
+    for (message, _, fields) in &cases {
+        records.push_str(&format!(
+            "{}\n",
+            json!({"level":"info", "message":message, "fields":fields})
+        ));
+    }
+    let summary = summarize_bytes(records.as_bytes(), false);
+    let events = summary["events"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        cases.len(),
+        "startup INFO must survive normal export filtering"
+    );
+    assert!(!summary.to_string().contains(secret));
+    for (event, (_, category, fields)) in events.iter().zip(&cases) {
+        assert_eq!(event["category"], *category);
+        for (key, value) in fields.as_object().unwrap() {
+            if value != secret {
+                assert_eq!(&event["fields"][key], value, "{category}:{key}");
+            }
+        }
+    }
+}
+
+#[test]
+fn startup_export_rejects_free_form_values_and_distinguishes_missing_pixel_samples() {
+    let fields = json!({"phase":"baseline", "state":"observed", "source_format":"nv12_unsampled",
+        "sample_available":false, "sampled_pixels":0, "luma_min":-1, "luma_max":-1,
+        "luma_mean":-1, "width":"private-canary", "display_id":-1,
+        "near_black_pixels":0.5, "worker_pid":[], "main_has_sps":"private-canary"});
+    let safe = startup::safe_fields("capture_health", &fields).unwrap();
+    assert_eq!(safe["sample_available"], false);
+    assert_eq!(safe["luma_mean"], -1.0);
+    assert!(!safe.contains_key("width"));
+    assert!(!safe.contains_key("display_id"));
+    assert!(!safe.contains_key("near_black_pixels"));
+    assert!(!serde_json::to_string(&safe)
+        .unwrap()
+        .contains("private-canary"));
+    let safe = startup::safe_fields(
+        "graphics_startup",
+        &json!({
+            "phase":"private-canary", "state":"private-canary", "main_has_sps":"private-canary",
+            "bitmap_dispatches":-1, "main_bytes":{}, "payload":"private-canary",
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        safe,
+        json!({"phase":"unknown", "state":"unknown"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
 fn input_timing_export_selects_only_numeric_aggregate_fields() {
     let secret = "private-input-payload-canary";
     let value = json!({

@@ -28,10 +28,16 @@ pub use timings::{StageTimings, TimingSummary};
 mod input_diagnostics;
 pub use input_diagnostics::{InputDiagnostics, InputTimingSnapshot, NativeInputObservation};
 
+#[path = "graphics_diagnostics.rs"]
+mod graphics_diagnostics;
+
 #[path = "connection_outcome.rs"]
 mod connection_outcome;
 pub use connection_outcome::ConnectionOutcome;
 pub(crate) use connection_outcome::terminal_fallback;
+
+#[path = "gfx_cache_import.rs"]
+mod cache_import;
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -70,7 +76,8 @@ impl DvcEncode for RawGfxPdu {}
 unsafe impl Send for RawGfxPdu {}
 
 /// Wrap raw GFX PDU bytes in RDP_SEGMENTED_DATA (ZGFX) format.
-/// MS-RDPEGFX Section 2.2.5: ALL GFX PDUs must be ZGFX-wrapped before DVC transport.
+/// Server-to-client GFX PDUs use ZGFX framing before DVC transport; client PDUs
+/// are raw (MS-RDPEGFX 2.1).
 /// Using uncompressed mode (descriptor 0xE0/0xE1, compression type 0x04).
 fn wrap_zgfx(data: &[u8]) -> Vec<u8> {
     const SINGLE: u8 = 0xE0;
@@ -264,11 +271,19 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
             let seg_count = u16::from_le_bytes([data[1], data[2]]) as usize;
+            let expected_size =
+                u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
+            // This helper accepts only uncompressed segments. Their combined
+            // payload cannot exceed the received bytes; do not allocate from
+            // a peer's unvalidated size declaration.
+            if seg_count == 0 || expected_size > data.len() {
+                return None;
+            }
             let mut offset = 7;
-            let mut result = Vec::new();
+            let mut result = Vec::with_capacity(expected_size);
             for _ in 0..seg_count {
                 if offset + 4 > data.len() {
-                    break;
+                    return None;
                 }
                 let seg_size = u32::from_le_bytes([
                     data[offset],
@@ -277,17 +292,16 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
                     data[offset + 3],
                 ]) as usize;
                 offset += 4;
-                if offset < data.len() && data[offset] == 0x04 {
-                    // Uncompressed: skip compression_type byte
-                    offset += 1;
-                    let end = (offset + seg_size - 1).min(data.len());
-                    result.extend_from_slice(&data[offset..end]);
-                    offset = end;
-                } else {
-                    break;
+                // segmentSize includes the one-byte compression header. A
+                // zero value used to construct a reversed slice and panic.
+                let end = offset.checked_add(seg_size)?;
+                if seg_size == 0 || end > data.len() || data[offset] != 0x04 {
+                    return None;
                 }
+                result.extend_from_slice(&data[offset + 1..end]);
+                offset = end;
             }
-            Some(result)
+            (offset == data.len() && result.len() == expected_size).then_some(result)
         }
         _ => None, // Not ZGFX-wrapped
     }
@@ -314,6 +328,7 @@ pub struct GfxState {
     pub surface_created: bool,
     /// ResetGraphics resizes output but does not delete existing surfaces.
     surface_delete_pending: bool,
+    startup_diagnostics: graphics_diagnostics::GraphicsStartupDiagnostics,
     pub caps_confirmed: bool,
     pub frame_id: u32,
     pub avc420_supported: bool,
@@ -445,6 +460,7 @@ impl GfxState {
             channel_id: None,
             surface_created: false,
             surface_delete_pending: false,
+            startup_diagnostics: graphics_diagnostics::GraphicsStartupDiagnostics::default(),
             caps_confirmed: false,
             frame_id: 0,
             avc420_supported: false,
@@ -704,6 +720,7 @@ impl GfxState {
         self.channel_id = None;
         self.surface_created = false;
         self.surface_delete_pending = false;
+        self.startup_diagnostics = graphics_diagnostics::GraphicsStartupDiagnostics::default();
         self.caps_confirmed = false;
         self.confirmed_cap = None;
         self.avc420_supported = false;
@@ -848,6 +865,7 @@ impl GfxHandler {
 
         // First frame: surface setup (CapConfirm already sent by DVC handler)
         if !state.surface_created {
+            let deleted_previous_surface = state.surface_delete_pending;
             append_pending_surface_delete(state, &mut raw_pdus);
             if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
                 width: state.width as u32,
@@ -881,6 +899,21 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
+            state.startup_diagnostics.surface_prepared(
+                graphics_diagnostics::SurfaceMetadata {
+                    width: state.width,
+                    height: state.height,
+                    frame_width: frame.width,
+                    frame_height: frame.height,
+                    encoded_width: enc_w,
+                    encoded_height: enc_h,
+                    graphics_frame_id: state.frame_id.wrapping_add(1),
+                    bitmap_dispatches: state.bitmap_dispatches,
+                    avc_frame: true,
+                    keyframe: frame.is_keyframe,
+                    deleted_previous_surface,
+                },
+            );
             info!(
                 "GFX surface created: {}x{} (enc: {}x{})",
                 state.width, state.height, enc_w, enc_h
@@ -888,6 +921,7 @@ impl GfxHandler {
         }
 
         let frame_id = state.next_frame_id();
+        graphics_diagnostics::first_avc_prepared(state, frame, frame_id);
 
         // StartFrame
         if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
@@ -1015,6 +1049,7 @@ impl GfxHandler {
 
         // First frame: surface setup (same as H.264 path)
         if !state.surface_created {
+            let deleted_previous_surface = state.surface_delete_pending;
             append_pending_surface_delete(state, &mut raw_pdus);
             if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
                 width: state.width as u32,
@@ -1048,6 +1083,21 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
+            state.startup_diagnostics.surface_prepared(
+                graphics_diagnostics::SurfaceMetadata {
+                    width: state.width,
+                    height: state.height,
+                    frame_width: update.width,
+                    frame_height: update.height,
+                    encoded_width: 0,
+                    encoded_height: 0,
+                    graphics_frame_id: state.frame_id.wrapping_add(1),
+                    bitmap_dispatches: state.bitmap_dispatches,
+                    avc_frame: false,
+                    keyframe: false,
+                    deleted_previous_surface,
+                },
+            );
             info!(
                 "GFX surface created (uncompressed): {}x{}",
                 state.width, state.height
@@ -1141,14 +1191,38 @@ impl DvcProcessor for GfxHandler {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        // Client GFX data is also ZGFX-wrapped. Unwrap the ZGFX layer first.
+        // MS-RDPEGFX 2.1 sends client PDUs without an external structure.
+        // Retain tolerance for the uncompressed ZGFX wrappers accepted by
+        // earlier releases, but reject malformed wrappers before decoding.
         let raw_data = unwrap_zgfx(payload);
+        if matches!(payload.first(), Some(0xe0 | 0xe1)) && raw_data.is_none() {
+            return Err(ironrdp_pdu::pdu_other_err!("Invalid graphics data wrapper"));
+        }
         let data = raw_data.as_deref().unwrap_or(payload);
+
+        // The pinned client decoder reads its fixed header without checking
+        // the cursor size. Validate it before entering any decoder so a short
+        // authenticated packet cannot panic the server's connection task.
+        if data.len() < 8 {
+            return Err(ironrdp_pdu::pdu_other_err!("Truncated graphics client header"));
+        }
+        let flags = u16::from_le_bytes([data[2], data[3]]);
+        let declared = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if flags != 0 || declared != data.len() {
+            return Err(ironrdp_pdu::pdu_other_err!("Invalid graphics client envelope"));
+        }
+
+        // The pinned client-PDU decoder has no CacheImportOffer variant.
+        // Complete this required exchange even though this server does not
+        // import or retain the client's persistent bitmap cache metadata.
+        if let Some(response) = cache_import::decline_offer(data)? {
+            return Ok(vec![response]);
+        }
 
         let client_pdu: ClientPdu = match decode(data) {
             Ok(pdu) => pdu,
             Err(e) => {
-                // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16, CacheImportOffer 0x10)
+                // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16).
                 // Log and ignore rather than crashing the connection
                 debug!(
                     payload_len = data.len(),
