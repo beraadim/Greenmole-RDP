@@ -19,9 +19,9 @@ const ENTRY_SIZE: usize = 12;
 const MAX_ENTRIES: u16 = 5461;
 const MAX_OFFER_SIZE: usize = FIXED_SIZE + MAX_ENTRIES as usize * ENTRY_SIZE;
 
-/// Recognize one complete offer and return its required zero-import reply.
-/// Errors are fixed strings and contain no bytes supplied by the peer.
-pub(super) fn decline_offer(data: &[u8]) -> PduResult<Option<DvcMessage>> {
+/// Validate one complete offer without allocating metadata or producing a
+/// reply/log. Batch preparation must finish before any replies are generated.
+pub(super) fn validate_offer(data: &[u8]) -> PduResult<Option<u16>> {
     if data.get(..2) != Some(OFFER_COMMAND.as_slice()) {
         return Ok(None);
     }
@@ -29,18 +29,16 @@ pub(super) fn decline_offer(data: &[u8]) -> PduResult<Option<DvcMessage>> {
         return Err(pdu_other_err!("Invalid graphics cache offer length"));
     }
     // Length was checked before accessing the fixed header and count.
-    let flags = u16::from_le_bytes([data[2], data[3]]);
     let declared = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     let entries = u16::from_le_bytes([data[8], data[9]]);
     let expected = FIXED_SIZE + usize::from(entries) * ENTRY_SIZE;
-    if flags != 0
-        || entries > MAX_ENTRIES
-        || declared as usize != expected
-        || data.len() != expected
-    {
+    if entries > MAX_ENTRIES || declared as usize != expected || data.len() != expected {
         return Err(pdu_other_err!("Invalid graphics cache offer envelope"));
     }
+    Ok(Some(entries))
+}
 
+pub(super) fn empty_reply(entries: u16) -> PduResult<DvcMessage> {
     let response = make_dvc_message(&ServerPdu::CacheImportReply(CacheImportReplyPdu {
         cache_slots: Vec::new(),
     }))?;
@@ -48,7 +46,12 @@ pub(super) fn decline_offer(data: &[u8]) -> PduResult<Option<DvcMessage>> {
         component = "graphics_cache", phase = "offer", state = "declined",
         offer_count = entries, reply_count = 0u16,
         "Persistent graphics cache offer declined with an empty import reply");
-    Ok(Some(response))
+    Ok(response)
+}
+
+#[cfg(test)]
+fn decline_offer(data: &[u8]) -> PduResult<Option<DvcMessage>> {
+    validate_offer(data)?.map(empty_reply).transpose()
 }
 
 #[cfg(test)]

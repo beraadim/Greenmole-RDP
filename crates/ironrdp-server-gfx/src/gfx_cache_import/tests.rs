@@ -46,11 +46,8 @@ fn truncated_offer_is_rejected_at_every_boundary() {
 }
 
 #[test]
-fn offer_envelope_rejects_flags_bad_lengths_trailing_data_and_excessive_counts() {
+fn offer_envelope_rejects_bad_lengths_trailing_data_and_excessive_counts() {
     let mut variants = Vec::new();
-    let mut flags = offer(1);
-    flags[2] = 1;
-    variants.push(flags);
     for declared in [0, 7, 10, 21, 23, u32::MAX] {
         let mut data = offer(1);
         data[4..8].copy_from_slice(&declared.to_le_bytes());
@@ -69,6 +66,11 @@ fn offer_envelope_rejects_flags_bad_lengths_trailing_data_and_excessive_counts()
     for data in variants {
         assert!(decline_offer(&data).is_err());
     }
+    // Reserved flags have no import semantics and must not disconnect an
+    // otherwise usable client. The supported message body is still validated.
+    let mut flags = offer(1);
+    flags[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_empty_reply(&decline_offer(&flags).unwrap().unwrap());
 }
 
 #[test]
@@ -106,7 +108,7 @@ fn handler_replies_to_repeated_raw_and_segmented_offers_without_mutating_graphic
 fn all_short_client_headers_return_errors_without_panicking() {
     let state = Arc::new(Mutex::new(GfxState::new(640, 480, false, false)));
     let mut handler = GfxHandler::new(state);
-    for command in [0u16, 0x0d, 0x10, 0x12, 0x16, u16::MAX] {
+    for command in [0x0du16, 0x10, 0x12] {
         let mut header = [0; 8];
         header[..2].copy_from_slice(&command.to_le_bytes());
         for length in 0..8 {
@@ -117,7 +119,7 @@ fn all_short_client_headers_return_errors_without_panicking() {
 }
 
 #[test]
-fn generic_client_envelope_checks_flags_and_declared_lengths_before_decode() {
+fn supported_client_envelope_checks_lengths_and_ignores_reserved_flags() {
     let state = Arc::new(Mutex::new(GfxState::new(640, 480, false, false)));
     let mut handler = GfxHandler::new(state);
     let mut ack = vec![0; 20];
@@ -130,7 +132,7 @@ fn generic_client_envelope_checks_flags_and_declared_lengths_before_decode() {
     }
     ack[4..8].copy_from_slice(&20u32.to_le_bytes());
     ack[2] = 1;
-    assert!(handler.process(7, &ack).is_err());
+    assert!(handler.process(7, &ack).unwrap().is_empty());
 }
 
 #[test]

@@ -435,6 +435,7 @@ fn event_category(message: &str) -> &'static str {
         ("Capture startup pixel health", "capture_health"),
         ("GFX surface setup prepared", "graphics_surface"),
         ("First AVC frame prepared", "graphics_startup"),
+        ("Graphics receive envelope observation", "graphics_receive"),
         (
             "Persistent graphics cache offer declined with an empty import reply",
             "graphics_cache",

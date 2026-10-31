@@ -1,5 +1,9 @@
 # Greenmole RDP 0.1.38
 
+Windows acceptance exposed a rapid-disconnect regression in this package's
+graphics envelope validation. Use [0.1.39](release-0.1.39.md), which corrects that
+regression while retaining the cache reply and startup diagnostics below.
+
 Windows testing of 0.1.37 exposed a black reconnect at 1920×1200 even though
 capture, input posting, socket delivery and client frame acknowledgements kept
 advancing. The preceding successful session resized from 1920×1080 to 1920×1200.

@@ -8,6 +8,7 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
         "graphics_surface" => (&["created"], &["prepared"]),
         "graphics_startup" => (&["first_avc"], &["prepared"]),
         "graphics_cache" => (&["offer"], &["declined"]),
+        "graphics_receive" => (&["envelope"], &["ignored", "rejected"]),
         _ => return None,
     };
     let mut fields = Map::new();
@@ -84,6 +85,17 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
         }
         "graphics_cache" => {
             for key in ["offer_count", "reply_count"] {
+                unsigned(source, &mut fields, key);
+            }
+        }
+        "graphics_receive" => {
+            for key in [
+                "cmd_id",
+                "header_flags",
+                "declared_bytes",
+                "available_bytes",
+                "stream_offset",
+            ] {
                 unsigned(source, &mut fields, key);
             }
         }

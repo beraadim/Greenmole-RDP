@@ -9,7 +9,7 @@ sspi = { path = "../../crates/sspi-patched" }
 
 [package]
 name = "macrdp-ui"
-version = "0.1.38"
+version = "0.1.39"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Greenmole RDP GUI — Tauri v2 desktop application"

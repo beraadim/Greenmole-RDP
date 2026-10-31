@@ -13,7 +13,7 @@ use ironrdp_pdu::rdp::vc::dvc::gfx::{
     EndFramePdu, MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, QueueDepth,
     ResetGraphicsPdu, ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
-use ironrdp_pdu::{decode, PduResult};
+use ironrdp_pdu::PduResult;
 
 type DvcMessage = ironrdp_dvc::DvcMessage;
 use tracing::{debug, info};
@@ -38,6 +38,9 @@ pub(crate) use connection_outcome::terminal_fallback;
 
 #[path = "gfx_cache_import.rs"]
 mod cache_import;
+
+#[path = "gfx_client_receive.rs"]
+mod client_receive;
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -821,13 +824,154 @@ fn append_pending_surface_delete(state: &mut GfxState, raw_pdus: &mut Vec<u8>) {
 /// GFX DVC processor
 pub struct GfxHandler {
     pub state: Arc<Mutex<GfxState>>,
+    receive_observations: client_receive::Observations,
 }
 
 impl_as_any!(GfxHandler);
 
 impl GfxHandler {
     pub fn new(state: Arc<Mutex<GfxState>>) -> Self {
-        Self { state }
+        Self {
+            state,
+            receive_observations: client_receive::Observations::default(),
+        }
+    }
+
+    fn process_client_pdu(&mut self, client_pdu: ClientPdu) -> PduResult<Vec<DvcMessage>> {
+        match client_pdu {
+            ClientPdu::CapabilitiesAdvertise(caps) => {
+                let cap_sets = &caps.0;
+                info!("GFX client capabilities: {} sets", cap_sets.len());
+
+                let mut state = self.state.lock().unwrap();
+
+                // If already confirmed, ignore duplicate CapabilitiesAdvertise
+                if state.caps_confirmed {
+                    info!("GFX caps already confirmed, ignoring duplicate CapabilitiesAdvertise");
+                    return Ok(Vec::new());
+                }
+
+                let (confirmed, selection) = choose_confirmed_capability(cap_sets);
+                state.avc420_supported = selection.avc420;
+                state.avc444_supported = selection.avc444;
+                state.bitmap_fallback_mode = should_prefer_bitmap_fallback(selection);
+                state.avc_fallback_to_uncompressed = false;
+
+                debug!(
+                    offered_caps = ?cap_sets,
+                    selected_cap = ?confirmed,
+                    selected_rank = selection.rank,
+                    selected_avc420 = selection.avc420,
+                    selected_avc444 = selection.avc444,
+                    bitmap_fallback_mode = state.bitmap_fallback_mode,
+                    "GFX capability selection"
+                );
+
+                info!(
+                    confirmed_cap = ?confirmed,
+                    avc420 = state.avc420_supported,
+                    avc444_client = state.avc444_supported,
+                    avc444_enabled = state.avc444_enabled,
+                    experimental_browser_avc420 = state.browser_avc420,
+                    experimental_browser_avc444 = state.browser_avc444,
+                    bitmap_fallback_mode = state.bitmap_fallback_mode,
+                    effective_mode = if state.bitmap_mode() {
+                        "bitmap-fallback-preferred"
+                    } else if state.use_avc444() {
+                        "gfx-avc444"
+                    } else if state.avc420_supported {
+                        "gfx-avc420"
+                    } else {
+                        "gfx-uncompressed-only"
+                    },
+                    "GFX capabilities negotiated"
+                );
+
+                // Send CapabilitiesConfirm from the DVC handler so it goes through
+                // DrdynvcServer's proper encoding path. Some clients still need
+                // session-local fallback to classic bitmap updates even after GFX
+                // negotiation succeeds.
+                state.confirmed_cap = Some(confirmed.clone());
+                state.caps_confirmed = true;
+
+                if state.bitmap_fallback_mode {
+                    info!(
+                        confirmed_cap = ?confirmed,
+                        "GFX negotiated without explicit AVC support; preferring classic bitmap updates for client compatibility"
+                    );
+                }
+
+                let confirm_pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(confirmed));
+                let msg = make_dvc_message(&confirm_pdu)?;
+                info!("GFX CapabilitiesConfirm sent via DVC handler");
+                Ok(vec![msg])
+            }
+
+            ClientPdu::FrameAcknowledge(ack) => {
+                let mut state = self.state.lock().unwrap();
+                let had_send_time = state.frame_send_times.contains_key(&ack.frame_id);
+                state.acknowledge_frame(ack.frame_id, ack.queue_depth, ack.total_frames_decoded);
+
+                debug!(
+                    ack_frame_id = ack.frame_id,
+                    tracked = had_send_time,
+                    pending_acks = state.pending_acks,
+                    last_ack_frame = state.last_ack_frame,
+                    acknowledgements_suspended = state.frame_acknowledgements_suspended,
+                    client_queue_depth_bytes = state.client_queue_depth_bytes,
+                    total_frames_decoded = state.client_total_frames_decoded,
+                    rtt_ewma_ms = state.rtt_ewma_ms,
+                    "GFX frame acknowledged"
+                );
+
+                // Log stats every 60 acked frames (~1 second at 60fps)
+                if ack.frame_id % 60 == 0 {
+                    // Compute instant bitrate stats from samples since last log
+                    let n = state.bitrate_samples.len() as f64;
+                    let (inst_avg, inst_std) = if n > 0.0 {
+                        let sum: f64 = state.bitrate_samples.iter().sum();
+                        let avg = sum / n;
+                        let var: f64 = state
+                            .bitrate_samples
+                            .iter()
+                            .map(|x| (x - avg).powi(2))
+                            .sum::<f64>()
+                            / n;
+                        (avg, var.sqrt())
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let inst_max = if state.bitrate_max > 0.0 {
+                        state.bitrate_max
+                    } else {
+                        0.0
+                    };
+                    let inst_min = if state.bitrate_min < f64::MAX {
+                        state.bitrate_min
+                    } else {
+                        0.0
+                    };
+
+                    info!(
+                        "ACK turnaround {:.1}ms | encode {:.1}ms | instant {:.1}/{:.1}/{:.1} Mbps (avg/max/min) | std {:.1} | {}KB/f | {} pending",
+                        state.rtt_ewma_ms,
+                        state.last_encode_ms,
+                        inst_avg,
+                        inst_max,
+                        inst_min,
+                        inst_std,
+                        state.last_frame_bytes / 1024,
+                        state.pending_acks,
+                    );
+
+                    // Reset for next window
+                    state.bitrate_samples.clear();
+                    state.bitrate_max = 0.0;
+                    state.bitrate_min = f64::MAX;
+                }
+                Ok(Vec::new())
+            }
+        }
     }
 
     fn bgra_to_xrgb_bytes(src: &[u8]) -> Vec<u8> {
@@ -1191,182 +1335,28 @@ impl DvcProcessor for GfxHandler {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        // MS-RDPEGFX 2.1 sends client PDUs without an external structure.
-        // Retain tolerance for the uncompressed ZGFX wrappers accepted by
-        // earlier releases, but reject malformed wrappers before decoding.
+        // Client messages normally carry raw GFX PDUs. Preserve bounded
+        // uncompressed-ZGFX compatibility without trusting malformed wrappers.
         let raw_data = unwrap_zgfx(payload);
         if matches!(payload.first(), Some(0xe0 | 0xe1)) && raw_data.is_none() {
             return Err(ironrdp_pdu::pdu_other_err!("Invalid graphics data wrapper"));
         }
         let data = raw_data.as_deref().unwrap_or(payload);
-
-        // The pinned client decoder reads its fixed header without checking
-        // the cursor size. Validate it before entering any decoder so a short
-        // authenticated packet cannot panic the server's connection task.
-        if data.len() < 8 {
-            return Err(ironrdp_pdu::pdu_other_err!("Truncated graphics client header"));
-        }
-        let flags = u16::from_le_bytes([data[2], data[3]]);
-        let declared = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-        if flags != 0 || declared != data.len() {
-            return Err(ironrdp_pdu::pdu_other_err!("Invalid graphics client envelope"));
-        }
-
-        // The pinned client-PDU decoder has no CacheImportOffer variant.
-        // Complete this required exchange even though this server does not
-        // import or retain the client's persistent bitmap cache metadata.
-        if let Some(response) = cache_import::decline_offer(data)? {
-            return Ok(vec![response]);
-        }
-
-        let client_pdu: ClientPdu = match decode(data) {
-            Ok(pdu) => pdu,
-            Err(e) => {
-                // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16).
-                // Log and ignore rather than crashing the connection
-                debug!(
-                    payload_len = data.len(),
-                    first_bytes = ?&data[..data.len().min(8)],
-                    "GFX: ignoring unknown client PDU: {e}"
-                );
-                return Ok(Vec::new());
-            }
-        };
-
-        match client_pdu {
-            ClientPdu::CapabilitiesAdvertise(caps) => {
-                let cap_sets = &caps.0;
-                info!("GFX client capabilities: {} sets", cap_sets.len());
-
-                let mut state = self.state.lock().unwrap();
-
-                // If already confirmed, ignore duplicate CapabilitiesAdvertise
-                if state.caps_confirmed {
-                    info!("GFX caps already confirmed, ignoring duplicate CapabilitiesAdvertise");
-                    return Ok(Vec::new());
+        // Validate all expected PDUs before changing ACK/capability/cache state.
+        // A DVC transport message can contain multiple graphics messages.
+        let messages = client_receive::prepare(data, &mut self.receive_observations)?;
+        let mut responses = Vec::new();
+        for message in messages {
+            match message {
+                client_receive::Prepared::Client(pdu) => {
+                    responses.extend(self.process_client_pdu(pdu)?);
                 }
-
-                let (confirmed, selection) = choose_confirmed_capability(cap_sets);
-                state.avc420_supported = selection.avc420;
-                state.avc444_supported = selection.avc444;
-                state.bitmap_fallback_mode = should_prefer_bitmap_fallback(selection);
-                state.avc_fallback_to_uncompressed = false;
-
-                debug!(
-                    offered_caps = ?cap_sets,
-                    selected_cap = ?confirmed,
-                    selected_rank = selection.rank,
-                    selected_avc420 = selection.avc420,
-                    selected_avc444 = selection.avc444,
-                    bitmap_fallback_mode = state.bitmap_fallback_mode,
-                    "GFX capability selection"
-                );
-
-                info!(
-                    confirmed_cap = ?confirmed,
-                    avc420 = state.avc420_supported,
-                    avc444_client = state.avc444_supported,
-                    avc444_enabled = state.avc444_enabled,
-                    experimental_browser_avc420 = state.browser_avc420,
-                    experimental_browser_avc444 = state.browser_avc444,
-                    bitmap_fallback_mode = state.bitmap_fallback_mode,
-                    effective_mode = if state.bitmap_mode() {
-                        "bitmap-fallback-preferred"
-                    } else if state.use_avc444() {
-                        "gfx-avc444"
-                    } else if state.avc420_supported {
-                        "gfx-avc420"
-                    } else {
-                        "gfx-uncompressed-only"
-                    },
-                    "GFX capabilities negotiated"
-                );
-
-                // Send CapabilitiesConfirm from the DVC handler so it goes through
-                // DrdynvcServer's proper encoding path. Some clients still need
-                // session-local fallback to classic bitmap updates even after GFX
-                // negotiation succeeds.
-                state.confirmed_cap = Some(confirmed.clone());
-                state.caps_confirmed = true;
-
-                if state.bitmap_fallback_mode {
-                    info!(
-                        confirmed_cap = ?confirmed,
-                        "GFX negotiated without explicit AVC support; preferring classic bitmap updates for client compatibility"
-                    );
+                client_receive::Prepared::CacheOffer(entries) => {
+                    responses.push(cache_import::empty_reply(entries)?);
                 }
-
-                let confirm_pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(confirmed));
-                let msg = make_dvc_message(&confirm_pdu)?;
-                info!("GFX CapabilitiesConfirm sent via DVC handler");
-                Ok(vec![msg])
-            }
-
-            ClientPdu::FrameAcknowledge(ack) => {
-                let mut state = self.state.lock().unwrap();
-                let had_send_time = state.frame_send_times.contains_key(&ack.frame_id);
-                state.acknowledge_frame(ack.frame_id, ack.queue_depth, ack.total_frames_decoded);
-
-                debug!(
-                    ack_frame_id = ack.frame_id,
-                    tracked = had_send_time,
-                    pending_acks = state.pending_acks,
-                    last_ack_frame = state.last_ack_frame,
-                    acknowledgements_suspended = state.frame_acknowledgements_suspended,
-                    client_queue_depth_bytes = state.client_queue_depth_bytes,
-                    total_frames_decoded = state.client_total_frames_decoded,
-                    rtt_ewma_ms = state.rtt_ewma_ms,
-                    "GFX frame acknowledged"
-                );
-
-                // Log stats every 60 acked frames (~1 second at 60fps)
-                if ack.frame_id % 60 == 0 {
-                    // Compute instant bitrate stats from samples since last log
-                    let n = state.bitrate_samples.len() as f64;
-                    let (inst_avg, inst_std) = if n > 0.0 {
-                        let sum: f64 = state.bitrate_samples.iter().sum();
-                        let avg = sum / n;
-                        let var: f64 = state
-                            .bitrate_samples
-                            .iter()
-                            .map(|x| (x - avg).powi(2))
-                            .sum::<f64>()
-                            / n;
-                        (avg, var.sqrt())
-                    } else {
-                        (0.0, 0.0)
-                    };
-                    let inst_max = if state.bitrate_max > 0.0 {
-                        state.bitrate_max
-                    } else {
-                        0.0
-                    };
-                    let inst_min = if state.bitrate_min < f64::MAX {
-                        state.bitrate_min
-                    } else {
-                        0.0
-                    };
-
-                    info!(
-                        "ACK turnaround {:.1}ms | encode {:.1}ms | instant {:.1}/{:.1}/{:.1} Mbps (avg/max/min) | std {:.1} | {}KB/f | {} pending",
-                        state.rtt_ewma_ms,
-                        state.last_encode_ms,
-                        inst_avg,
-                        inst_max,
-                        inst_min,
-                        inst_std,
-                        state.last_frame_bytes / 1024,
-                        state.pending_acks,
-                    );
-
-                    // Reset for next window
-                    state.bitrate_samples.clear();
-                    state.bitrate_max = 0.0;
-                    state.bitrate_min = f64::MAX;
-                }
-                Ok(Vec::new())
             }
         }
+        Ok(responses)
     }
 
     fn close(&mut self, channel_id: u32) {
@@ -1378,6 +1368,10 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+#[path = "gfx_receive_interop_tests.rs"]
+mod receive_interop_tests;
 
 #[cfg(test)]
 #[path = "gfx_browser_tests.rs"]

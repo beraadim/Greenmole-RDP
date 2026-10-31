@@ -102,6 +102,40 @@ fn startup_export_rejects_free_form_values_and_distinguishes_missing_pixel_sampl
 }
 
 #[test]
+fn graphics_receive_export_keeps_only_fixed_envelope_metadata() {
+    let event = json!({"level":"info", "message":"Graphics receive envelope observation",
+        "fields":{"component":"graphics_receive", "phase":"envelope", "state":"ignored",
+            "worker_pid":42, "cmd_id":22, "header_flags":1, "declared_bytes":20,
+            "available_bytes":40, "stream_offset":20, "payload":"private-packet-canary",
+            "body":"private-packet-canary", "hex":"private-packet-canary"}});
+    let summary = summarize_bytes(format!("{event}\n").as_bytes(), false);
+    let fields = &summary["events"][0]["fields"];
+    assert_eq!(summary["events"][0]["category"], "graphics_receive");
+    assert_eq!(fields["state"], "ignored");
+    assert_eq!(fields["cmd_id"], 22);
+    assert_eq!(fields["header_flags"], 1);
+    assert_eq!(fields["stream_offset"], 20);
+    assert!(!summary.to_string().contains("private-packet-canary"));
+
+    let safe = startup::safe_fields(
+        "graphics_receive",
+        &json!({
+            "phase":"private-packet-canary", "state":"private-packet-canary",
+            "cmd_id":"private-packet-canary", "available_bytes":-1,
+            "declared_bytes":0.5, "header_flags":null,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        safe,
+        json!({"phase":"unknown", "state":"unknown"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
 fn input_timing_export_selects_only_numeric_aggregate_fields() {
     let secret = "private-input-payload-canary";
     let value = json!({
