@@ -19,6 +19,8 @@ mod display_control;
 mod dynamic_channels;
 mod encoder;
 pub mod gfx;
+#[cfg(test)]
+mod gfx_large_baseline_tests;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;

@@ -11,6 +11,7 @@ mod native_capture;
 use native_capture::NativeCapture;
 mod event_wait;
 mod frame_health;
+mod gfx_seed;
 mod idle_encode;
 mod idle_policy;
 mod live_controls;
@@ -923,6 +924,7 @@ impl RdpServerDisplay for MacDisplay {
             bitmap_perf_bytes: 0,
             last_full_bitmap_sent: None,
             needs_full_gfx_seed: true,
+            raw_gfx_baseline_prepared: false,
             logged_gfx_uncompressed_mode: false,
             logged_gfx_avc_mode: false,
             logged_bitmap_mode: false,
@@ -1054,6 +1056,9 @@ struct MacDisplayUpdates {
     last_full_bitmap_sent: Option<Instant>,
     /// Force one full-frame GFX update before relying on incremental/pipelined paths.
     needs_full_gfx_seed: bool,
+    /// A complete RGB baseline has been prepared during this activation.
+    /// Later opaque NV12 recovery must not restart the BGRA baseline cycle.
+    raw_gfx_baseline_prepared: bool,
     logged_gfx_uncompressed_mode: bool,
     logged_gfx_avc_mode: bool,
     logged_bitmap_mode: bool,
@@ -1712,51 +1717,6 @@ impl MacDisplayUpdates {
         }
     }
 
-    fn cached_full_frame_uncompressed_update(&self) -> Option<GfxUncompressedUpdate> {
-        let cache = self.last_frame_cache.as_ref()?;
-        let full_rect = ClampedRect {
-            x: 0,
-            y: 0,
-            width: cache.width(),
-            height: cache.height(),
-        };
-        let width = cache.width() as u16;
-        let height = cache.height() as u16;
-
-        let rects = match cache {
-            CachedFrame::Bgra { data, stride, .. } => extract_bgra_rect(data, *stride, full_rect)
-                .map(|pixel_data| {
-                    vec![UncompressedRect {
-                        x: 0,
-                        y: 0,
-                        width,
-                        height,
-                        pixel_data,
-                    }]
-                }),
-            CachedFrame::BgraPixelBuffer(buf, width_u32, height_u32, _) => buf
-                .with_locked_bgra(*width_u32, *height_u32, |bgra, stride| {
-                    extract_bgra_rect(bgra, stride, full_rect).map(|pixel_data| {
-                        vec![UncompressedRect {
-                            x: 0,
-                            y: 0,
-                            width,
-                            height,
-                            pixel_data,
-                        }]
-                    })
-                })
-                .flatten(),
-            CachedFrame::PixelBuffer(_, _, _) => None,
-        }?;
-
-        Some(GfxUncompressedUpdate {
-            rects,
-            width,
-            height,
-        })
-    }
-
     fn cached_full_frame_bitmap_update(&self) -> Option<BitmapUpdate> {
         let cache = self.last_frame_cache.as_ref()?;
         let width = NonZeroU16::new(cache.width() as u16)?;
@@ -1793,14 +1753,20 @@ impl MacDisplayUpdates {
 
     fn send_cached_full_frame_recovery(&mut self) -> Option<DisplayUpdate> {
         self.sync_bitmap_transport();
-        let (session_uses_gfx, gfx_channel_ready, gfx_avc_ready) = {
+        let (session_uses_gfx, gfx_channel_ready, gfx_avc_ready, browser_video) = {
             let state = self.gfx_state.lock().unwrap();
             let session_uses_gfx = state.session_uses_gfx && !self.uses_bitmap_transport(&state);
             let gfx_channel_ready = session_uses_gfx && state.has_gfx_channel();
             let gfx_avc_ready =
                 gfx_channel_ready && state.avc420_supported && self.encoder.is_some();
-            (session_uses_gfx, gfx_channel_ready, gfx_avc_ready)
+            (session_uses_gfx, gfx_channel_ready, gfx_avc_ready, state.browser_video())
         };
+
+        // Startup uses this cached path as soon as the encoder becomes ready.
+        // It must honor the same RGB baseline policy as a newly captured frame.
+        if gfx_channel_ready && self.raw_gfx_seed_required(browser_video, gfx_avc_ready) {
+            return self.prepare_cached_raw_gfx_seed(gfx_avc_ready);
+        }
 
         if gfx_avc_ready {
             if let Some(update) = self.send_idle_idr() {
@@ -1917,6 +1883,10 @@ impl MacDisplayUpdates {
             return CapturePixelFormat::Bgra;
         }
         let gfx = self.gfx_state.lock().unwrap();
+        // A later video IDR refresh is distinct from the activation's first
+        // RGB baseline. Cursor/pacing wakes during an NV12 replacement must
+        // not switch capture back to BGRA before its first frame arrives.
+        let needs_initial_rgb = self.needs_initial_rgb_baseline(gfx.browser_video());
         if should_use_nv12_capture_for_gfx(
             gfx.session_uses_gfx,
             gfx.is_ready(),
@@ -1927,12 +1897,12 @@ impl MacDisplayUpdates {
             gfx.bitmap_mode(),
             self.encoder_pref,
             self.mode_444 && !gfx.browser_avc420,
-            self.needs_full_gfx_seed,
+            needs_initial_rgb,
         ) || (!gfx.session_uses_gfx
             && gfx.is_ready()
             && self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
             && !self.mode_444
-            && !self.needs_full_gfx_seed)
+            && !needs_initial_rgb)
         {
             CapturePixelFormat::Nv12
         } else {
@@ -2535,81 +2505,10 @@ impl MacDisplayUpdates {
             // raw seed or tiny RGB patch after video starts would require
             // terminating passthrough and re-encoding the surface as images.
             // Windows clients and explicit raw validation keep their raw seed.
-            if self.needs_full_gfx_seed && !(browser_video && gfx_avc_ready) {
-                let full_rect = ClampedRect {
-                    x: 0,
-                    y: 0,
-                    width: frame.width,
-                    height: frame.height,
-                };
-                let rects: Vec<UncompressedRect> = match &frame.data {
-                    FrameData::Raw(bgra) => extract_bgra_rect(bgra, frame.stride, full_rect)
-                        .map(|pixel_data| {
-                            vec![UncompressedRect {
-                                x: 0,
-                                y: 0,
-                                width: frame.width as u16,
-                                height: frame.height as u16,
-                                pixel_data,
-                            }]
-                        })
-                        .unwrap_or_default(),
-                    FrameData::BgraPixelBuffer(buf) => buf
-                        .with_locked_bgra(frame.width, frame.height, |bgra, stride| {
-                            extract_bgra_rect(bgra, stride, full_rect).map(|pixel_data| {
-                                vec![UncompressedRect {
-                                    x: 0,
-                                    y: 0,
-                                    width: frame.width as u16,
-                                    height: frame.height as u16,
-                                    pixel_data,
-                                }]
-                            })
-                        })
-                        .flatten()
-                        .unwrap_or_default(),
-                    FrameData::PixelBuffer(_) => Vec::new(),
-                };
-
-                if !rects.is_empty() {
-                    if !self.logged_gfx_uncompressed_mode {
-                        tracing::info!(
-                            mode = "gfx-uncompressed-full-frame-seed",
-                            pixel_format = ?self.capture_config.pixel_format,
-                            encoder_pref = ?self.encoder_pref,
-                            session_uses_gfx,
-                            gfx_avc_ready,
-                            "Negotiated graphics transport active"
-                        );
-                        self.logged_gfx_uncompressed_mode = true;
-                    }
-                    self.display_frame_count += 1;
-                    self.needs_full_gfx_seed = false;
-                    let total_bytes: usize = rects.iter().map(|r| r.pixel_data.len()).sum();
-                    {
-                        let mut st = self.gfx_state.lock().unwrap();
-                        st.last_encode_ms = 0.0;
-                        st.last_frame_bytes = total_bytes as u32;
-                    }
-                    tracing::debug!(
-                        display_frame = self.display_frame_count,
-                        total_bytes,
-                        "Display: sending initial full-frame GFX seed"
-                    );
-                    self.record_uncompressed_audit(
-                        &rects,
-                        frame.width as u32 * frame.height as u32,
-                        "gfx-seed-full-frame",
-                    );
-                    self.clear_client_stale_flag("gfx-seed-full-frame");
-                    return Ok(Some(DisplayUpdate::GfxUncompressed(
-                        GfxUncompressedUpdate {
-                            rects,
-                            width: frame.width as u16,
-                            height: frame.height as u16,
-                        },
-                    )));
-                }
+            if self.raw_gfx_seed_required(browser_video, gfx_avc_ready) {
+                // The fresh frame is already retained in last_frame_cache.
+                // Share the single-copy seed path with cached startup recovery.
+                return Ok(self.prepare_cached_raw_gfx_seed(gfx_avc_ready));
             }
 
             // During encoder startup/failure or validation, send the latest

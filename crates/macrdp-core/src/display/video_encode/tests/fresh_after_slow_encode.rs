@@ -125,6 +125,7 @@ pub(super) fn fixture(avc444: bool) -> MacDisplayUpdates {
         bitmap_perf_bytes: 0,
         last_full_bitmap_sent: None,
         needs_full_gfx_seed: false,
+        raw_gfx_baseline_prepared: false,
         logged_gfx_uncompressed_mode: false,
         logged_gfx_avc_mode: false,
         logged_bitmap_mode: false,
