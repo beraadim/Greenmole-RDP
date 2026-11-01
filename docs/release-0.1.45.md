@@ -49,9 +49,10 @@ limits are preserved.
 This is a compatibility isolation, not a demonstrated Windows protocol bug.
 Microsoft permits fragmented Bitmap updates. Reference classic server paths
 commonly use small rectangles; large strips versus small independently received
-updates remain a useful difference to test. If this build works, acceptance will
-establish the smaller-message policy's value, not which Windows internal stage
-previously failed.
+updates remain a useful difference to test. The user subsequently confirmed
+that 0.1.45 works. This accepts the combined change for the reported Windows
+problem, without isolating the contribution of each change or identifying a
+Windows internal failure.
 
 Bitmap crop validation now rejects wrapped relative/absolute coordinates,
 invalid strides, truncated backing data and arithmetic overflow, returning no
@@ -79,8 +80,11 @@ safe crop boundaries, core intent selection and bounded/private diagnostics.
 The user installs the DMG from this Mac mini's Desktop. Keep **Bitmap fallback**
 and **Lossless desktop**. Test three consecutive 1920×1200 connections. On each,
 observe whether the whole desktop draws before activating a full-screen window,
-then drag a window and disconnect. Compare Guacamole afterward. Native Windows
-acceptance remains pending; the user deploys the package.
+then drag a window and disconnect. Compare Guacamole afterward. On 1 November
+2026, the user confirmed that 0.1.45 works and authorized publication. This
+confirmation follows the Windows Bitmap fallback/Lossless desktop test; it does
+not provide separate acceptance for other encoder profiles or a measured
+performance comparison.
 
 References:
 

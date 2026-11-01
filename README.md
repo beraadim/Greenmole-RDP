@@ -51,6 +51,13 @@ and its contributors. See [NOTICE](NOTICE) for source attribution.
 
 ## Quick Start
 
+Download the latest Apple Silicon DMG from [GitHub Releases](https://github.com/beraadim/Greenmole-RDP/releases/latest).
+Release notes identify the signing status and include a SHA-256 checksum. The
+validated Windows compatibility profile for 0.1.45 is **Bitmap fallback** with
+**Lossless desktop** at 1920×1200.
+
+To build and run the standalone server from source:
+
 ```bash
 # Build
 cargo build --release

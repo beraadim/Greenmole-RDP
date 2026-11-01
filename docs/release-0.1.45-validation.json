@@ -2,7 +2,7 @@
   "schema": "macrdp-release-validation-v1",
   "product_name": "Greenmole RDP",
   "version": "0.1.45",
-  "purpose": "Honor explicit bitmap repaint intent and isolate classic output to complete single-packet updates; Windows acceptance remains pending.",
+  "purpose": "Honor explicit bitmap repaint intent and use complete single-packet classic updates; user confirmed the reported Windows rendering problem is resolved.",
   "observation_on_0_1_44": {
     "version_revision": "53cb1aa745e3",
     "user_result": "long thin updated rectangles; both connections alive; fullscreen-sized window repaired first picture once, inconsistently",
@@ -114,8 +114,8 @@
     "avc_capture_or_display_lifecycle_policy_changed": false,
     "root_cause_conclusively_claimed": false
   },
-  "manual_acceptance": "User installs Desktop DMG. Bitmap fallback + Lossless desktop; three consecutive 1920x1200 connections, observe initial full picture before a fullscreen-window workaround, then drag a window. Compare Guacamole. No automatic installation or driver reinstall.",
-  "status": "committed, built, verified and copied to Desktop; not installed",
+  "manual_acceptance": "User confirmed 0.1.45 works in the ongoing Windows Bitmap fallback/Lossless desktop test and authorized publication. No additional reconnect count or performance measurement was reported. The combined fix is accepted for the reported problem; individual change causality and other encoder profiles are not established.",
+  "status": "user confirmed Windows rendering works; verified ARM64 package approved for publication",
   "tests": {
     "full_standard_check_passed": true,
     "rust_passed": 1084,
@@ -138,7 +138,7 @@
     "core_mandatory_vs_ordinary_intent_and_bounded_count_verified": true,
     "bounded_repaint_observation_and_private_export_verified": true,
     "new_tests_capture_screen_or_inject_input": false,
-    "native_windows_new_build_acceptance": false
+    "native_windows_new_build_acceptance": true
   },
   "checks": {
     "whitespace_passed": true,
@@ -178,5 +178,25 @@
     "app_installed": false,
     "driver_reinstalled": false,
     "service_restarted": false
+  },
+  "user_acceptance": {
+    "reported_date": "2026-11-01",
+    "timezone": "Europe/Oslo",
+    "reported_result": "0.1.45 works; request to push origin and publish latest release",
+    "configuration_context": {
+      "client": "Windows Remote Desktop",
+      "windows_version": "25H2",
+      "windows_build": "26200.9711",
+      "resolution": [
+        1920,
+        1200
+      ],
+      "encoder": "Bitmap fallback",
+      "quality": "Lossless desktop"
+    },
+    "individual_change_causality_proven": false,
+    "explicit_reconnect_count_reported": null,
+    "other_encoder_profiles_separately_confirmed": false,
+    "performance_change_measured": false
   }
 }
