@@ -158,10 +158,6 @@
         }
       }
     ],
-    "windows_capture_geometry": [
-      1920,
-      1200
-    ],
     "guacamole_final_capture_geometry": [
       1920,
       1064
@@ -179,6 +175,14 @@
       "actual RDP6 alpha omission",
       "optional compression header inclusion",
       "actual client presentation"
+    ],
+    "windows_final_capture_geometry": [
+      1920,
+      1200
+    ],
+    "first_windows_initial_activation_geometry": [
+      1920,
+      1080
     ]
   },
   "changes": {
@@ -196,7 +200,7 @@
     "root_cause_conclusively_claimed": false
   },
   "manual_acceptance": "User installs Desktop DMG. Keep Bitmap fallback and Lossless desktop. Test initial 1920x1200 connection plus three reconnects, then Guacamole. No automatic installation or driver reinstall.",
-  "status": "source checks passed; package verification pending",
+  "status": "committed, built, verified and copied to Desktop; not installed",
   "tests": {
     "full_standard_check_passed": true,
     "rust_passed": 1072,
@@ -220,5 +224,37 @@
     "added_lines_secret_pattern_check_passed": true,
     "cargo_and_npm_dependency_pins_preserved": true,
     "independent_review": "No blockers: client-permitted omission, conservative default, capability advertisement, exact flags/lengths, unchanged pixel stream and alpha, preserved row/work bounds, quality reconstruction and typed diagnostics verified."
+  },
+  "source_revision": "53cb1aa745e3094a7f501eeee6d476e65e2df24e",
+  "verified_at_utc": "2026-11-01T12:44:54.597673+00:00",
+  "package_verification": {
+    "version": "0.1.44",
+    "source_revision": "53cb1aa745e3094a7f501eeee6d476e65e2df24e",
+    "package": "Greenmole_RDP_0.1.44_aarch64_53cb1aa745e3.dmg",
+    "bytes": 15173324,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "arm64_binary_architecture_verified": true,
+    "authentication_and_rdp_licenses_bundled": true,
+    "driver_signature_verified": true,
+    "input_and_graphics_startup_diagnostics_present_in_packaged_binary": true,
+    "input_categories_capture_changes_and_geometry_markers_present": true,
+    "bitmap_transport_diagnostic_markers_present": true,
+    "bitmap_header_and_alpha_diagnostic_markers_present": true,
+    "microphone_payload_matches_0_1_34": true,
+    "microphone_installer_digest_and_text_verified": true,
+    "mounted_read_only_and_removed": true,
+    "sha256": "b9ede900d7b1f1dc8933e9a6748c1121b18d40b0939d4a150b810353665074cb",
+    "desktop_copy_and_sidecars_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.44_aarch64_53cb1aa745e3.dmg",
+    "active_app_hashes_and_processes_preserved": true,
+    "core_audio_process_preserved": true,
+    "credentials_changed": false,
+    "app_installed": false,
+    "driver_reinstalled": false,
+    "service_restarted": false
   }
 }

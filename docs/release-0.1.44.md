@@ -1,8 +1,8 @@
 # Greenmole RDP 0.1.44
 
 The 0.1.43 logs show the initial Windows connection and three reconnects using
-RDP6-RLE, 32 bpp, and the single-rectangle layout. All four sessions captured
-matching 1920×1200 source/output/content geometry at origin (0,0) and scale 1.
+RDP6-RLE, 32 bpp, and the single-rectangle layout. Their final source/output/content geometry matched 1920×1200 at origin (0,0)
+and scale 1. The first activation began at 1920×1080 before resizing.
 Their 77 source-health observations were non-black, and pixels changed in 45
 of 73 comparisons. Capture stopped and display ownership retired before every
 new session. There is no evidence that capture cleanup caused the persistent
@@ -77,3 +77,10 @@ existing manual Rust tests remain ignored. Independent review found no blocking
 issues in negotiation, fallback, literal wire framing, policy preservation or
 diagnostic privacy. Whitespace and added-lines secret-pattern checks passed;
 dependency pins remain unchanged.
+
+The ARM64 DMG was mounted read-only and verified for strict deep application
+and driver signatures, version/revision, architecture, licenses, packaged wire
+policy diagnostics, unchanged microphone payload and checksum. The DMG and
+checksum/build-info sidecars are on the Desktop. Active application hashes,
+GUI/helper processes and Core Audio were preserved. Nothing was installed or
+restarted. See the [package validation record](release-0.1.44-validation.json).
