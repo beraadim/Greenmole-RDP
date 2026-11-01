@@ -72,6 +72,7 @@ pub(crate) struct UpdateEncoderCodecs {
     limits: UpdateLimits,
     quality: crate::BitmapQuality,
     allow_skip_alpha: bool,
+    omit_bitmap_compression_header: bool,
     #[cfg(feature = "qoi")]
     qoi: Option<u8>,
     #[cfg(feature = "qoiz")]
@@ -86,6 +87,7 @@ impl UpdateEncoderCodecs {
             limits: UpdateLimits::default(),
             quality: crate::BitmapQuality::default(),
             allow_skip_alpha: false,
+            omit_bitmap_compression_header: false,
             #[cfg(feature = "qoi")]
             qoi: None,
             #[cfg(feature = "qoiz")]
@@ -123,6 +125,11 @@ impl UpdateEncoderCodecs {
 
     pub(crate) fn set_allow_skip_alpha(&mut self, allowed: bool) {
         self.allow_skip_alpha = allowed;
+    }
+
+    /// Omit TS_CD_HEADER only when the peer's General capability permits it.
+    pub(crate) fn set_omit_bitmap_compression_header(&mut self, allowed: bool) {
+        self.omit_bitmap_compression_header = allowed;
     }
 
     #[cfg(feature = "qoi")]
@@ -177,6 +184,9 @@ impl UpdateEncoder {
         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/028ed301-385c-4b17-84ec-0a158a22c1b2
         let mut bitmap = BitmapHandler::new();
         bitmap.bitmap.set_skip_alpha(codecs.allow_skip_alpha);
+        bitmap
+            .bitmap
+            .set_omit_compression_header(codecs.omit_bitmap_compression_header);
         let mut bitmap_updater = BitmapUpdater::Bitmap(bitmap);
         if codecs.quality != crate::BitmapQuality::Lossless {
             if let Some((algo, id, mode)) = codecs
@@ -275,6 +285,22 @@ impl UpdateEncoder {
     pub(crate) fn remotefx_image_mode(&self) -> Option<bool> {
         match self.bitmap_updater.as_ref() {
             Some(BitmapUpdater::RemoteFx(handler)) => Some(handler.remotefx.is_image_mode()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bitmap_compression_header_present(&self) -> Option<bool> {
+        match self.bitmap_updater.as_ref() {
+            Some(BitmapUpdater::Bitmap(handler)) => {
+                Some(handler.bitmap.compression_header_present())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bitmap_alpha_skipped(&self) -> Option<bool> {
+        match self.bitmap_updater.as_ref() {
+            Some(BitmapUpdater::Bitmap(handler)) => Some(handler.bitmap.alpha_skipped()),
             _ => None,
         }
     }
@@ -897,6 +923,49 @@ mod tests {
     use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu};
 
     use super::*;
+
+    #[test]
+    fn bitmap_wire_policy_defaults_and_live_quality_replacement_follow_negotiation() {
+        let size = DesktopSize {
+            width: 64,
+            height: 64,
+        };
+        let defaults =
+            UpdateEncoder::new(size, CmdFlags::empty(), UpdateEncoderCodecs::new()).unwrap();
+        assert_eq!(defaults.bitmap_compression_header_present(), Some(true));
+        assert_eq!(defaults.bitmap_alpha_skipped(), Some(false));
+
+        for omit_header in [false, true] {
+            for skip_alpha in [false, true] {
+                let mut codecs = UpdateEncoderCodecs::new();
+                codecs.set_omit_bitmap_compression_header(omit_header);
+                codecs.set_allow_skip_alpha(skip_alpha);
+                codecs.set_remotefx(Some((EntropyBits::Rlgr3, 3, OperatingMode::IMAGE_MODE)));
+                let mut encoder =
+                    UpdateEncoder::new(size, CmdFlags::STREAM_SURFACE_BITS, codecs).unwrap();
+                assert_eq!(encoder.bitmap_codec(), "remotefx");
+                assert_eq!(encoder.bitmap_compression_header_present(), None);
+                assert_eq!(encoder.bitmap_alpha_skipped(), None);
+                for quality in [
+                    crate::BitmapQuality::Lossless,
+                    crate::BitmapQuality::Balanced,
+                    crate::BitmapQuality::Lossless,
+                ] {
+                    assert!(encoder.set_quality(quality).unwrap());
+                    if quality == crate::BitmapQuality::Lossless {
+                        assert_eq!(
+                            encoder.bitmap_compression_header_present(),
+                            Some(!omit_header)
+                        );
+                        assert_eq!(encoder.bitmap_alpha_skipped(), Some(skip_alpha));
+                    } else {
+                        assert_eq!(encoder.bitmap_compression_header_present(), None);
+                        assert_eq!(encoder.bitmap_alpha_skipped(), None);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn color_pointer_uses_new_pointer_fastpath_update() {

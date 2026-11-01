@@ -15,116 +15,12 @@ use crate::BitmapUpdate;
 pub(crate) struct BitmapEncoder {
     buffer: Vec<u8>,
     skip_alpha: bool,
+    omit_compression_header: bool,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use ironrdp_graphics::rdp6::BitmapStreamDecoder;
-    use std::num::NonZeroU16;
-
-    #[test]
-    fn single_row_with_large_trailing_stride_encodes_without_arithmetic_overflow() {
-        let mut bitmap = BitmapUpdate {
-            x: 0,
-            y: 0,
-            width: NonZeroU16::new(1).unwrap(),
-            height: NonZeroU16::new(1).unwrap(),
-            format: PixelFormat::BgrA32,
-            data: Bytes::from_static(&[10, 20, 30, 255]),
-            stride: NonZeroUsize::new(1usize << (usize::BITS - 1)).unwrap(),
-            dirty_rects: Vec::new(),
-        };
-        let mut output = vec![0; 1024];
-        let len = BitmapEncoder::new().encode(&bitmap, &mut output).unwrap();
-        let decoded: BitmapUpdateData<'_> = ironrdp_core::decode(&output[..len]).unwrap();
-        assert_eq!(decoded.rectangles.len(), 1);
-        assert_eq!(decoded.rectangles[0].height, 1);
-        bitmap.height = NonZeroU16::new(2).unwrap();
-        assert!(BitmapEncoder::new().encode(&bitmap, &mut output).is_err());
-    }
-
-    #[test]
-    fn odd_widths_and_partial_final_stride_roundtrip_without_losing_pixels() {
-        for width in [1u16, 3, 417] {
-            let row_bytes = usize::from(width) * 4;
-            let stride = row_bytes + 12;
-            let mut pixels = vec![0u8; stride + row_bytes];
-            for y in 0..2 {
-                for x in 0..usize::from(width) {
-                    let offset = y * stride + x * 4;
-                    pixels[offset..offset + 4].copy_from_slice(&[10 + y as u8, 20, 30, 255]);
-                }
-            }
-            let bitmap = BitmapUpdate {
-                x: 7,
-                y: 9,
-                width: NonZeroU16::new(width).unwrap(),
-                height: NonZeroU16::new(2).unwrap(),
-                format: PixelFormat::BgrA32,
-                data: Bytes::from(pixels),
-                stride: NonZeroUsize::new(stride).unwrap(),
-                dirty_rects: Vec::new(),
-            };
-            let mut encoded = vec![0u8; 65536];
-            let length = BitmapEncoder::new().encode(&bitmap, &mut encoded).unwrap();
-            let update: BitmapUpdateData<'_> = ironrdp_core::decode(&encoded[..length]).unwrap();
-            assert_eq!(update.rectangles.len(), 1);
-            let rectangle = &update.rectangles[0];
-            assert_eq!(rectangle.width, width);
-            assert_eq!(rectangle.height, 2);
-            assert_eq!(rectangle.rectangle.bottom, 10);
-            assert_eq!(
-                rectangle
-                    .compressed_data_header
-                    .as_ref()
-                    .unwrap()
-                    .scan_width,
-                width * 4
-            );
-            let mut decoded = Vec::new();
-            BitmapStreamDecoder::default()
-                .decode_bitmap_stream_to_rgb24(
-                    rectangle.bitmap_data,
-                    &mut decoded,
-                    usize::from(width),
-                    2,
-                )
-                .unwrap();
-            assert_eq!(decoded.len(), usize::from(width) * 2 * 3);
-            for (row, blue) in decoded.chunks_exact(usize::from(width) * 3).zip([11u8, 10]) {
-                assert!(row.chunks_exact(3).all(|pixel| pixel == [30, 20, blue]));
-            }
-        }
-    }
-
-    #[test]
-    fn multiple_rectangle_candidate_is_rejected_before_writing_output() {
-        let mut encoder = BitmapEncoder::new();
-        let mut bitmap = BitmapUpdate {
-            x: 0,
-            y: 0,
-            width: NonZeroU16::new(1920).unwrap(),
-            height: NonZeroU16::new(9).unwrap(),
-            format: PixelFormat::BgrA32,
-            data: Bytes::from(vec![255; 1920 * 9 * 4]),
-            stride: NonZeroUsize::new(1920 * 4).unwrap(),
-            dirty_rects: Vec::new(),
-        };
-        let rows = encoder.max_rows(&bitmap).unwrap();
-        assert_eq!(rows, 8);
-        let mut output = vec![0xa5; 100_000];
-        assert!(encoder.encode(&bitmap, &mut output).is_err());
-        assert!(output.iter().all(|byte| *byte == 0xa5));
-
-        bitmap.height = NonZeroU16::new(rows).unwrap();
-        let length = encoder.encode(&bitmap, &mut output).unwrap();
-        let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output[..length]).unwrap();
-        assert_eq!(update.rectangles.len(), 1);
-        assert_eq!(update.rectangles[0].height, rows);
-    }
-}
+#[path = "bitmap_tests.rs"]
+mod tests;
 
 impl BitmapEncoder {
     /// Size the initial output from visible pixels, not the source stride. A
@@ -162,11 +58,24 @@ impl BitmapEncoder {
         Self {
             buffer: vec![0; usize::from(u16::MAX)],
             skip_alpha: true,
+            omit_compression_header: false,
         }
     }
 
     pub(crate) fn set_skip_alpha(&mut self, allowed: bool) {
         self.skip_alpha = allowed;
+    }
+
+    pub(crate) fn set_omit_compression_header(&mut self, allowed: bool) {
+        self.omit_compression_header = allowed;
+    }
+
+    pub(super) fn compression_header_present(&self) -> bool {
+        !self.omit_compression_header
+    }
+
+    pub(super) fn alpha_skipped(&self) -> bool {
+        self.skip_alpha
     }
 
     /// Largest row strip that fits the uncompressed and compressed u16 fields.
@@ -187,7 +96,9 @@ impl BitmapEncoder {
         // RLE adds a control byte per group of up to 15 raw samples. Including
         // alpha can exceed the old raw-pixel budget for narrow tall regions.
         // Bound both the uncompressed u16 length and compressed bitmap length
-        // (which also includes the eight-byte compression header).
+        // (including the eight-byte compression header). Keep this conservative
+        // bound when the negotiated header is omitted, preserving the maximum
+        // strip height and pre-encode work bound.
         let width = usize::from(bitmap.width.get());
         let plane_count = if self.skip_alpha { 3 } else { 4 };
         let compressed_row_bound = plane_count * (width + width.div_ceil(15));
@@ -251,6 +162,21 @@ impl BitmapEncoder {
             self.buffer.as_mut_slice(),
             self.skip_alpha,
         )?;
+        let compressed_data_header = if self.omit_compression_header {
+            None
+        } else {
+            Some(bitmap::CompressedDataHeader {
+                main_body_size: cast_length!("main body size", len)
+                    .map_err(BitmapEncodeError::Encode)?,
+                // Preserve the existing byte-stride header convention.
+                scan_width: row_len,
+                uncompressed_size: height * row_len,
+            })
+        };
+        let mut compression_flags = Compression::BITMAP_COMPRESSION;
+        if self.omit_compression_header {
+            compression_flags |= Compression::NO_BITMAP_COMPRESSION_HDR;
+        }
         let data = BitmapData {
             rectangle: InclusiveRectangle {
                 left: bitmap.x,
@@ -261,14 +187,8 @@ impl BitmapEncoder {
             width: u16::from(bitmap.width),
             height,
             bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
-            compression_flags: Compression::BITMAP_COMPRESSION,
-            compressed_data_header: Some(bitmap::CompressedDataHeader {
-                main_body_size: cast_length!("main body size", len)
-                    .map_err(BitmapEncodeError::Encode)?,
-                // Preserve the existing byte-stride header convention.
-                scan_width: row_len,
-                uncompressed_size: height * row_len,
-            }),
+            compression_flags,
+            compressed_data_header,
             bitmap_data: &self.buffer[..len],
         };
         data.encode(&mut cursor)

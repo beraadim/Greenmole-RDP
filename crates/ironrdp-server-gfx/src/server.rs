@@ -1668,9 +1668,16 @@ impl RdpServer {
         update_codecs.set_quality(self.bitmap_quality);
         let mut surface_flags = CmdFlags::empty();
         let mut client_depth = None;
+        let mut client_general_flags = None;
+        let mut client_bitmap_drawing_flags = None;
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
+                    client_general_flags = Some(c.extra_flags.bits());
+                    update_codecs.set_omit_bitmap_compression_header(
+                        c.extra_flags
+                            .contains(GeneralExtraFlags::NO_BITMAP_COMPRESSION_HDR),
+                    );
                     let fastpath = c
                         .extra_flags
                         .contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
@@ -1686,6 +1693,7 @@ impl RdpServer {
                 }
                 CapabilitySet::Bitmap(c) => {
                     client_depth = Some(c.pref_bits_per_pix);
+                    client_bitmap_drawing_flags = Some(c.drawing_flags.bits());
                     update_codecs.set_allow_skip_alpha(
                         c.drawing_flags
                             .contains(rdp::capability_sets::BitmapDrawingFlags::ALLOW_SKIP_ALPHA),
@@ -1750,6 +1758,10 @@ impl RdpServer {
             bitmap_wire_depth = 32, max_bitmap_update_bytes,
             surface_frame_markers = encoder.surface_frame_markers(),
             bitmap_single_rectangle_updates = bitmap_codec == "rdp6-rle",
+            bitmap_compression_header_present = encoder.bitmap_compression_header_present(),
+            bitmap_alpha_skipped = encoder.bitmap_alpha_skipped(),
+            client_general_flags, client_bitmap_drawing_flags,
+            activation_width = desktop_size.width, activation_height = desktop_size.height,
             "Configured bitmap transport"
         );
 

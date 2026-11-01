@@ -1,12 +1,13 @@
 //! Exercise complete legacy bitmap delivery with a receiver independent of the
-//! RDP6 encoder/decoder implementation. Geometry and compression-header units
-//! follow MS-RDPBCGR 2.2.9.1.1.3.1.2.2; plane RLE follows MS-RDPEGDI 3.1.9.2.
+//! RDP6 encoder/decoder implementation. Literal framing follows MS-RDPBCGR
+//! 2.2.9.1.1.3.1.2.2; plane RLE follows MS-RDPEGDI 3.1.9.2. The legacy
+//! scan-width convention and its specification discrepancy are documented below.
 
 use super::*;
 use bytes::Bytes;
 use core::num::NonZeroUsize;
 use ironrdp_core::{decode_cursor, ReadCursor};
-use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData};
+use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
 use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation};
 
 fn reassemble(mut output: UpdateFragmenter, fragmented: &mut bool) -> Vec<u8> {
@@ -123,16 +124,24 @@ fn decode_plane(data: &[u8], offset: &mut usize, width: usize, height: usize) ->
 
 pub(crate) fn decode_rectangle(rect: &BitmapData<'_>) -> Vec<u8> {
     assert_eq!(rect.bits_per_pixel, 32);
-    let header = rect.compressed_data_header.as_ref().unwrap();
-    assert_eq!(usize::from(header.main_body_size), rect.bitmap_data.len());
-    // Match the byte-stride convention used by FreeRDP's shadow server.
-    // The Microsoft TS_CD_HEADER prose calls this pixels; that discrepancy
-    // is not resolved by this test and must not be treated as a codec failure.
-    assert_eq!(header.scan_width, rect.width * 4);
-    assert_eq!(
-        usize::from(header.uncompressed_size),
-        usize::from(rect.width) * usize::from(rect.height) * 4
-    );
+    assert!(rect
+        .compression_flags
+        .contains(Compression::BITMAP_COMPRESSION));
+    let omit_header = rect
+        .compression_flags
+        .contains(Compression::NO_BITMAP_COMPRESSION_HDR);
+    assert_eq!(rect.compressed_data_header.is_none(), omit_header);
+    if let Some(header) = &rect.compressed_data_header {
+        assert_eq!(usize::from(header.main_body_size), rect.bitmap_data.len());
+        // Match the byte-stride convention used by FreeRDP's shadow server.
+        // The Microsoft TS_CD_HEADER prose calls this pixels; that discrepancy
+        // is not resolved by this test and must not be treated as a codec failure.
+        assert_eq!(header.scan_width, rect.width * 4);
+        assert_eq!(
+            usize::from(header.uncompressed_size),
+            usize::from(rect.width) * usize::from(rect.height) * 4
+        );
+    }
     let format = rect.bitmap_data[0];
     assert_eq!(format & !0x30, 0, "ARGB/RLE receiver only");
     assert_ne!(format & 0x10, 0);
@@ -156,17 +165,64 @@ pub(crate) fn decode_rectangle(rect: &BitmapData<'_>) -> Vec<u8> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct WirePolicy {
+    skip_alpha: bool,
+    omit_header: bool,
+}
+
+/// Check literal protocol offsets without ironrdp-pdu's header decoder, so a
+/// shared encoder/decoder mistake cannot hide an eight-byte layout shift.
+fn assert_bitmap_layout(bytes: &[u8], policy: WirePolicy) {
+    let read_u16 = |offset| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    assert!(bytes.len() >= 23);
+    assert_eq!(read_u16(0), 1, "TS_UPDATE_BITMAP updateType");
+    assert_eq!(read_u16(2), 1, "one TS_BITMAP_DATA rectangle");
+    assert_eq!(read_u16(8) - read_u16(4) + 1, read_u16(12));
+    assert_eq!(read_u16(10) - read_u16(6) + 1, read_u16(14));
+    assert_eq!(read_u16(16), 32);
+    assert_eq!(
+        read_u16(18),
+        if policy.omit_header { 0x0401 } else { 0x0001 }
+    );
+    let bitmap_length = usize::from(read_u16(20));
+    assert_eq!(bytes.len(), 22 + bitmap_length);
+    let stream_offset = if policy.omit_header {
+        22
+    } else {
+        assert!(bitmap_length >= 9);
+        assert_eq!(read_u16(22), 0, "cbCompFirstRowSize");
+        assert_eq!(
+            usize::from(read_u16(24)),
+            bitmap_length - 8,
+            "cbCompMainBodySize"
+        );
+        assert_eq!(usize::from(read_u16(26)), usize::from(read_u16(12)) * 4);
+        assert_eq!(
+            usize::from(read_u16(28)),
+            usize::from(read_u16(12)) * usize::from(read_u16(14)) * 4
+        );
+        30
+    };
+    assert_eq!(
+        bytes[stream_offset],
+        if policy.skip_alpha { 0x30 } else { 0x10 }
+    );
+}
+
 async fn receive(
     encoder: &mut UpdateEncoder,
     bitmap: BitmapUpdate,
     canvas: &mut [u8],
     covered: &mut [u8],
     fragmented: &mut bool,
+    policy: WirePolicy,
 ) -> usize {
     let mut iter = encoder.update(DisplayUpdate::Bitmap(bitmap));
     let mut rectangles = 0;
     while let Some(output) = iter.next().await {
         let bytes = reassemble(output.unwrap(), fragmented);
+        assert_bitmap_layout(&bytes, policy);
         let update: BitmapUpdateData<'_> = ironrdp_core::decode(&bytes).unwrap();
         assert_eq!(
             update.rectangles.len(),
@@ -196,7 +252,13 @@ async fn receive(
 #[tokio::test]
 async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel() {
     for budget in [65_536, 131_072, 524_288] {
-        for skip_alpha in [false, true] {
+        for (skip_alpha, omit_header) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let policy = WirePolicy {
+                skip_alpha,
+                omit_header,
+            };
             let mut pixels = fullscreen_pixels();
             let mut expected = pixels.clone();
             for pixel in expected.chunks_exact_mut(4) {
@@ -214,6 +276,7 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
             };
             let mut codecs = UpdateEncoderCodecs::new();
             codecs.set_allow_skip_alpha(skip_alpha);
+            codecs.set_omit_bitmap_compression_header(omit_header);
             codecs.set_max_request_size(16_777_215);
             let mut encoder = UpdateEncoder::new(
                 DesktopSize {
@@ -225,6 +288,11 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
             )
             .unwrap();
             assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
+            assert_eq!(
+                encoder.bitmap_compression_header_present(),
+                Some(!omit_header)
+            );
+            assert_eq!(encoder.bitmap_alpha_skipped(), Some(skip_alpha));
             assert_eq!(encoder.set_bitmap_working_budget(budget), budget);
             let mut canvas = vec![0; pixels.len()];
             let mut covered = vec![0; 1920 * 1200];
@@ -235,7 +303,8 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                     source,
                     &mut canvas,
                     &mut covered,
-                    &mut fragmented
+                    &mut fragmented,
+                    policy,
                 )
                 .await
                     > 0
@@ -278,7 +347,8 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                     patch,
                     &mut canvas,
                     &mut covered,
-                    &mut fragmented
+                    &mut fragmented,
+                    policy,
                 )
                 .await
                     > 0
@@ -302,7 +372,8 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                     unchanged,
                     &mut canvas,
                     &mut covered,
-                    &mut fragmented
+                    &mut fragmented,
+                    policy,
                 )
                 .await,
                 0

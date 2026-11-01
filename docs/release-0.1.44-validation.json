@@ -1,0 +1,224 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.44",
+  "purpose": "Negotiate optional RDP6 compression-header omission and expose actual wire-layout choices; Windows rendering acceptance remains pending.",
+  "observation_on_0_1_43": {
+    "version": "0.1.43",
+    "revision": "f9cc3ba1188b",
+    "sessions": [
+      {
+        "client": "Windows",
+        "disconnected_at": "2026-11-01T12:26:58.268774+00:00",
+        "duration_secs": 19,
+        "captures": 140,
+        "display_update_writes": 232,
+        "bytes_written": 9151577,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 8.98875,
+          "p50_ms": 0.024125,
+          "p95_ms": 0.118458,
+          "p99_ms": 6.804417,
+          "samples": 140
+        },
+        "encode_timings": {
+          "max_ms": 27.223540000000003,
+          "p50_ms": 0.328083,
+          "p95_ms": 3.513499,
+          "p99_ms": 18.923667000000005,
+          "samples": 232
+        },
+        "write_timings": {
+          "max_ms": 89.94355,
+          "p50_ms": 0.07175,
+          "p95_ms": 0.588793,
+          "p99_ms": 3.431208000000001,
+          "samples": 232
+        }
+      },
+      {
+        "client": "Windows",
+        "disconnected_at": "2026-11-01T12:28:08.070493+00:00",
+        "duration_secs": 34,
+        "captures": 442,
+        "display_update_writes": 910,
+        "bytes_written": 36514208,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 101.92225,
+          "p50_ms": 0.023042,
+          "p95_ms": 0.188792,
+          "p99_ms": 3.755209,
+          "samples": 442
+        },
+        "encode_timings": {
+          "max_ms": 41.56121400000001,
+          "p50_ms": 0.438,
+          "p95_ms": 3.301874,
+          "p99_ms": 6.690831,
+          "samples": 918
+        },
+        "write_timings": {
+          "max_ms": 100.34783400000003,
+          "p50_ms": 0.086209,
+          "p95_ms": 0.924043,
+          "p99_ms": 16.266083999999996,
+          "samples": 910
+        }
+      },
+      {
+        "client": "Windows",
+        "disconnected_at": "2026-11-01T12:28:55.761218+00:00",
+        "duration_secs": 12,
+        "captures": 106,
+        "display_update_writes": 305,
+        "bytes_written": 12027919,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 36.585709,
+          "p50_ms": 0.025333,
+          "p95_ms": 0.245709,
+          "p99_ms": 12.431416,
+          "samples": 106
+        },
+        "encode_timings": {
+          "max_ms": 26.848168,
+          "p50_ms": 0.452041,
+          "p95_ms": 4.561667,
+          "p99_ms": 9.427289,
+          "samples": 306
+        },
+        "write_timings": {
+          "max_ms": 77.417047,
+          "p50_ms": 0.072667,
+          "p95_ms": 0.696124,
+          "p99_ms": 1.1781219999999994,
+          "samples": 305
+        }
+      },
+      {
+        "client": "Windows",
+        "disconnected_at": "2026-11-01T12:29:30.846135+00:00",
+        "duration_secs": 19,
+        "captures": 133,
+        "display_update_writes": 340,
+        "bytes_written": 14000436,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 18.8155,
+          "p50_ms": 0.027041000000000003,
+          "p95_ms": 0.124584,
+          "p99_ms": 6.050208,
+          "samples": 133
+        },
+        "encode_timings": {
+          "max_ms": 35.905217000000015,
+          "p50_ms": 0.4283330000000001,
+          "p95_ms": 4.459375999999999,
+          "p99_ms": 7.178084,
+          "samples": 341
+        },
+        "write_timings": {
+          "max_ms": 107.16416400000011,
+          "p50_ms": 0.094834,
+          "p95_ms": 0.736083,
+          "p99_ms": 1.0898760000000003,
+          "samples": 340
+        }
+      },
+      {
+        "client": "Guacamole",
+        "disconnected_at": "2026-11-01T12:29:56.219681+00:00",
+        "duration_secs": 18,
+        "captures": 72,
+        "display_update_writes": 136,
+        "bytes_written": 12966630,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 20.581084,
+          "p50_ms": 0.034999999999999996,
+          "p95_ms": 0.33391699999999996,
+          "p99_ms": 20.581084,
+          "samples": 72
+        },
+        "encode_timings": {
+          "max_ms": 29.71520900000001,
+          "p50_ms": 0.510625,
+          "p95_ms": 17.250922999999993,
+          "p99_ms": 21.23328999999999,
+          "samples": 139
+        },
+        "write_timings": {
+          "max_ms": 181.10070600000017,
+          "p50_ms": 0.10216599999999998,
+          "p95_ms": 1.918789999999999,
+          "p99_ms": 29.677244999999996,
+          "samples": 136
+        }
+      }
+    ],
+    "windows_capture_geometry": [
+      1920,
+      1200
+    ],
+    "guacamole_final_capture_geometry": [
+      1920,
+      1064
+    ],
+    "windows_health_samples": 77,
+    "windows_near_black_sample_points": 0,
+    "windows_compared_health_samples": 73,
+    "windows_changed_health_comparisons": 45,
+    "all_activations_single_rectangle_rdp6": true,
+    "capture_cleanup_succeeded_between_connections": true,
+    "precise_rendering_cause_proven": false,
+    "known_observability_gaps": [
+      "negotiated General extra flags",
+      "negotiated Bitmap drawing flags",
+      "actual RDP6 alpha omission",
+      "optional compression header inclusion",
+      "actual client presentation"
+    ]
+  },
+  "changes": {
+    "server_advertises_header_omission_support": true,
+    "header_omitted_only_when_client_permits": true,
+    "default_header_present_fallback": true,
+    "rdp6_pixel_encoder_unchanged": true,
+    "alpha_policy_unchanged": true,
+    "max_row_bounds_and_budget_policy_preserved": true,
+    "quality_rebuild_preserves_negotiated_header_policy": true,
+    "typed_alpha_header_capability_and_activation_geometry_diagnostics": true,
+    "diagnostic_schema": 8,
+    "native_capture_or_input_policy_changed": false,
+    "gfx_or_avc_policy_changed": false,
+    "root_cause_conclusively_claimed": false
+  },
+  "manual_acceptance": "User installs Desktop DMG. Keep Bitmap fallback and Lossless desktop. Test initial 1920x1200 connection plus three reconnects, then Guacamole. No automatic installation or driver reinstall.",
+  "status": "source checks passed; package verification pending",
+  "tests": {
+    "full_standard_check_passed": true,
+    "rust_passed": 1072,
+    "existing_manual_rust_ignored": 7,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "native_driver_tests_passed": true,
+    "frontend_production_build_passed": true,
+    "literal_flags_lengths_and_header_offsets_checked": true,
+    "same_strip_compressed_payload_equivalence_verified": true,
+    "header_alpha_budget_matrix_cases": 12,
+    "independent_fullscreen_rdp6_receiver_passed": true,
+    "fragmentation_padded_damage_cache_and_pointer_dispatch_preserved": true,
+    "quality_rebuild_negotiated_policy_preservation_verified": true,
+    "malformed_diagnostic_fields_rejected": true,
+    "new_tests_capture_screen_or_inject_input": false,
+    "native_windows_new_build_acceptance": false
+  },
+  "checks": {
+    "whitespace_passed": true,
+    "added_lines_secret_pattern_check_passed": true,
+    "cargo_and_npm_dependency_pins_preserved": true,
+    "independent_review": "No blockers: client-permitted omission, conservative default, capability advertisement, exact flags/lengths, unchanged pixel stream and alpha, preserved row/work bounds, quality reconstruction and typed diagnostics verified."
+  }
+}

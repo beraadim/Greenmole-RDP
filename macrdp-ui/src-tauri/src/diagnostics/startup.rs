@@ -164,6 +164,10 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
                 "max_bitmap_update_bytes",
                 "bitmap_wire_depth",
                 "client_preferred_depth",
+                "client_general_flags",
+                "client_bitmap_drawing_flags",
+                "activation_width",
+                "activation_height",
             ] {
                 unsigned(source, &mut fields, key);
             }
@@ -171,6 +175,8 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
                 "remotefx_image_mode",
                 "surface_frame_markers",
                 "bitmap_single_rectangle_updates",
+                "bitmap_compression_header_present",
+                "bitmap_alpha_skipped",
             ] {
                 boolean(source, &mut fields, key);
             }

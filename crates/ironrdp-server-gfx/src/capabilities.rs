@@ -21,7 +21,8 @@ pub(crate) fn capabilities(
 
 fn general_capabilities() -> capability_sets::General {
     capability_sets::General {
-        extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED,
+        extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED
+            | GeneralExtraFlags::NO_BITMAP_COMPRESSION_HDR,
         ..Default::default()
     }
 }
@@ -95,6 +96,13 @@ fn multifragment_update() -> capability_sets::MultifragmentUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn general_capabilities_allow_compressed_bitmaps_without_optional_header() {
+        let flags = general_capabilities().extra_flags;
+        assert!(flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED));
+        assert!(flags.contains(GeneralExtraFlags::NO_BITMAP_COMPRESSION_HDR));
+    }
 
     #[test]
     fn input_capabilities_advertise_implemented_extended_mouse_features() {
