@@ -111,3 +111,12 @@ repaint/payload-limit diagnostics, unchanged microphone payload and checksum.
 The verified DMG and checksum/build-info sidecars are on the Desktop. Active
 application hashes, GUI/helper processes and Core Audio were preserved. Nothing
 was installed or restarted. See the [package validation record](release-0.1.45-validation.json).
+
+Published as the [latest GitHub release](https://github.com/beraadim/Greenmole-RDP/releases/tag/v0.1.45)
+on 1 November 2026. The tag points to tested source `39d5f051d520`, and the exact
+ARM64 DMG, checksum and build-info sidecar were downloaded from the published
+release and matched against the tested originals. Main and the working branch
+contain the release history and user acceptance record. The automatic tag
+rebuild was cancelled to prevent it replacing the tested package; this publishes
+the existing ad-hoc-signed, unnotarized ARM64 artifact, matching the previous
+release convention. The repository workflow remains enabled.

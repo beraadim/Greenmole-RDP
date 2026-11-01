@@ -115,7 +115,7 @@
     "root_cause_conclusively_claimed": false
   },
   "manual_acceptance": "User confirmed 0.1.45 works in the ongoing Windows Bitmap fallback/Lossless desktop test and authorized publication. No additional reconnect count or performance measurement was reported. The combined fix is accepted for the reported problem; individual change causality and other encoder profiles are not established.",
-  "status": "user confirmed Windows rendering works; verified ARM64 package approved for publication",
+  "status": "user accepted; source pushed and verified ARM64 package published as latest GitHub release",
   "tests": {
     "full_standard_check_passed": true,
     "rust_passed": 1084,
@@ -198,5 +198,45 @@
     "explicit_reconnect_count_reported": null,
     "other_encoder_profiles_separately_confirmed": false,
     "performance_change_measured": false
+  },
+  "publication": {
+    "release_id": 430669922,
+    "release_url": "https://github.com/beraadim/Greenmole-RDP/releases/tag/v0.1.45",
+    "tag": "v0.1.45",
+    "tag_source_revision": "39d5f051d520f16b53b88e3302bcdf709863262a",
+    "published_at_utc": "2026-11-01T15:27:54Z",
+    "latest_release_verified": true,
+    "architecture": "aarch64",
+    "signing": "ad-hoc",
+    "notarized": false,
+    "downloaded_assets_match_tested_files": true,
+    "assets": [
+      {
+        "name": "Greenmole_RDP_0.1.45_aarch64_39d5f051d520.dmg",
+        "size": 15181433,
+        "sha256": "bf8e20c7514de046369e7ab6b0c0bf3b26690e8f66837f71316ee1408f2fa67d"
+      },
+      {
+        "name": "Greenmole_RDP_0.1.45_aarch64_39d5f051d520.dmg.sha256",
+        "size": 112,
+        "sha256": "8f4174a8ef4e918ce2f1509c191b061642693cc1f85cc8ae85d69ec9fbfcb82f"
+      },
+      {
+        "name": "Greenmole_RDP_0.1.45_aarch64_39d5f051d520.dmg.build-info.json",
+        "size": 203,
+        "sha256": "546115e78efdcc30a7d30db0f762f6e900e2fefed42e5d42b487492770d4b459"
+      }
+    ],
+    "source_pushed_to": [
+      "main",
+      "codex/microphone-redirection"
+    ],
+    "unpublished_history_gitleaks_scan_passed": true,
+    "tag_workflow": {
+      "run_id": 41321189622,
+      "url": "https://github.com/beraadim/Greenmole-RDP/actions/runs/41321189622",
+      "conclusion": "cancelled",
+      "reason": "Cancel the redundant rebuild/publisher to preserve the exact locally verified and user-tested ARM64 artifact; existing workflow remains enabled."
+    }
   }
 }
