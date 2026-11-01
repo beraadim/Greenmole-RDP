@@ -24,7 +24,7 @@ fn negotiated_icap_preserves_mode_entropy_and_client_codec_id_together() {
                     width: 64,
                     height: 64,
                 },
-                CmdFlags::SET_SURFACE_BITS,
+                CmdFlags::STREAM_SURFACE_BITS,
                 codecs,
             )
             .unwrap();
@@ -34,7 +34,7 @@ fn negotiated_icap_preserves_mode_entropy_and_client_codec_id_together() {
                 .unwrap()
                 .handle(&fixture(1, 1, false))
                 .unwrap();
-            let SurfaceCommand::SetSurfaceBits(surface) = decode(&output.data).unwrap() else {
+            let SurfaceCommand::StreamSurfaceBits(surface) = decode(&output.data).unwrap() else {
                 panic!("surface")
             };
             assert_eq!(surface.extended_bitmap_data.codec_id, 17);
@@ -98,7 +98,7 @@ fn check_remotefx(
     frame_index: u32,
     covered: &mut [u8],
 ) {
-    let SurfaceCommand::SetSurfaceBits(surface) = decode(bytes).unwrap() else {
+    let SurfaceCommand::StreamSurfaceBits(surface) = decode(bytes).unwrap() else {
         panic!("expected surface bits")
     };
     let width = usize::from(surface.extended_bitmap_data.width);
@@ -214,7 +214,7 @@ async fn noisy_remotefx_updates_fit_small_client_limits_and_decode_independently
                     width: 640,
                     height: 480,
                 },
-                CmdFlags::SET_SURFACE_BITS,
+                CmdFlags::STREAM_SURFACE_BITS,
                 codecs,
             )
             .unwrap();
@@ -403,7 +403,7 @@ async fn adaptive_bitmap_budgets_preserve_hard_caps_and_independent_noisy_update
                 width: 640,
                 height: 480,
             },
-            CmdFlags::SET_SURFACE_BITS,
+            CmdFlags::STREAM_SURFACE_BITS,
             codecs,
         )
         .unwrap();
@@ -446,7 +446,7 @@ async fn abandoning_a_partitioned_frame_does_not_commit_unsent_pixels() {
             width: 129,
             height: 65,
         },
-        CmdFlags::SET_SURFACE_BITS,
+        CmdFlags::STREAM_SURFACE_BITS,
         codecs,
     )
     .unwrap();
@@ -575,7 +575,7 @@ async fn pointer_interleaving_preserves_pending_pixels_video_indices_and_framebu
             width: 129,
             height: 65,
         },
-        CmdFlags::SET_SURFACE_BITS,
+        CmdFlags::STREAM_SURFACE_BITS,
         codecs,
     )
     .unwrap();

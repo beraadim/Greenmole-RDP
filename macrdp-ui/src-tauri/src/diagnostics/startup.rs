@@ -10,6 +10,7 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
         "graphics_startup" => (&["first_avc"], &["prepared"]),
         "graphics_cache" => (&["offer"], &["declined"]),
         "graphics_receive" => (&["envelope"], &["ignored", "rejected"]),
+        "bitmap_transport" => (&["activation"], &["configured"]),
         _ => return None,
     };
     let mut fields = Map::new();
@@ -156,6 +157,33 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
             for key in ["offer_count", "reply_count"] {
                 unsigned(source, &mut fields, key);
             }
+        }
+        "bitmap_transport" => {
+            for key in [
+                "surface_command_id",
+                "max_bitmap_update_bytes",
+                "bitmap_wire_depth",
+                "client_preferred_depth",
+            ] {
+                unsigned(source, &mut fields, key);
+            }
+            for key in ["remotefx_image_mode", "surface_frame_markers"] {
+                boolean(source, &mut fields, key);
+            }
+            fields.insert(
+                "bitmap_codec".into(),
+                json!(super::selection(
+                    source["bitmap_codec"].as_str().unwrap_or(""),
+                    &[
+                        "surface-raw",
+                        "rdp6-rle",
+                        "remotefx",
+                        "qoi",
+                        "qoiz",
+                        "encoding"
+                    ],
+                )),
+            );
         }
         "graphics_receive" => {
             for key in [

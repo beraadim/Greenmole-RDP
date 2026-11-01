@@ -1738,12 +1738,13 @@ impl RdpServer {
             state.bitmap_codec = Some(bitmap_codec);
             state.negotiated_client_depth = client_depth;
         }
-        info!(
-            bitmap_codec,
-            quality = ?self.bitmap_quality,
-            client_preferred_depth = ?client_depth,
-            bitmap_wire_depth = 32,
-            max_bitmap_update_bytes,
+        info!(target: "macrdp_transition",
+            component = "bitmap_transport", phase = "activation", state = "configured",
+            worker_pid = std::process::id(), bitmap_codec,
+            surface_command_id = encoder.surface_command_id(),
+            remotefx_image_mode = encoder.remotefx_image_mode(),
+            client_preferred_depth = client_depth,
+            bitmap_wire_depth = 32, max_bitmap_update_bytes,
             surface_frame_markers = encoder.surface_frame_markers(),
             "Configured bitmap transport"
         );

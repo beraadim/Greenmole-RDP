@@ -9,12 +9,12 @@ use ironrdp_graphics::diff::{find_different_rects_sub, Rect};
 use ironrdp_pdu::codecs::rfx::OperatingMode;
 use ironrdp_pdu::encode_vec;
 use ironrdp_pdu::fast_path::UpdateCode;
-use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::pointer::{
     ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute,
 };
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, RfxICap, RfxICapFlags};
-use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
+#[cfg(test)]
+use ironrdp_pdu::surface_commands::SurfaceCommand;
 use tracing::{debug, warn};
 
 use self::bitmap::BitmapEncoder;
@@ -36,8 +36,12 @@ use iter::State;
 mod limits_tests;
 #[cfg(test)]
 mod quality_tests;
+#[cfg(test)]
+mod remotefx_transport_tests;
 pub(crate) mod rfx;
 mod rfx_rlgr;
+mod surface_bits;
+use surface_bits::{set_surface, stream_surface, stream_surface_command};
 
 pub(crate) use fast_path::*;
 use ironrdp_graphics::rdp6::BitmapEncodeError;
@@ -165,38 +169,46 @@ impl UpdateEncoder {
         surface_flags: CmdFlags,
         codecs: UpdateEncoderCodecs,
     ) -> Result<Self> {
-        let bitmap_updater = if codecs.quality != crate::BitmapQuality::Lossless
-            && surface_flags.contains(CmdFlags::SET_SURFACE_BITS)
-        {
-            let mut bitmap = BitmapUpdater::None(NoneHandler);
-
-            if let Some((algo, id, mode)) = codecs.remotefx {
-                bitmap = BitmapUpdater::RemoteFx(RemoteFxHandler::new(
+        // RemoteFX is a codec stream, including when operating in image mode.
+        // MS-RDPRFX 1.5 and 3.1.8.3.1 require STREAM_SURFACE_BITS (0x0006),
+        // independently of SET_SURFACE_BITS support. Never infer one from the other.
+        // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/028ed301-385c-4b17-84ec-0a158a22c1b2
+        let mut bitmap = BitmapHandler::new();
+        bitmap.bitmap.set_skip_alpha(codecs.allow_skip_alpha);
+        let mut bitmap_updater = BitmapUpdater::Bitmap(bitmap);
+        if codecs.quality != crate::BitmapQuality::Lossless {
+            if let Some((algo, id, mode)) = codecs
+                .remotefx
+                .filter(|_| surface_flags.contains(CmdFlags::STREAM_SURFACE_BITS))
+            {
+                bitmap_updater = BitmapUpdater::RemoteFx(RemoteFxHandler::new(
                     algo,
                     id,
                     desktop_size,
                     codecs.quality,
                     mode,
                 ));
+            } else if codecs.remotefx.is_none()
+                && surface_flags.contains(CmdFlags::SET_SURFACE_BITS)
+            {
+                bitmap_updater = BitmapUpdater::None(NoneHandler);
             }
-
-            #[cfg(feature = "qoi")]
-            if let Some(id) = codecs.qoi {
-                bitmap = BitmapUpdater::Qoi(QoiHandler::new(id));
+            // Other Surface Bits codecs retain their Set Surface Bits capability.
+            // A RemoteFX offer without STREAM support falls back to compressed
+            // BitmapUpdate rather than emitting an unsupported RemoteFX command.
+            if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
+                #[cfg(feature = "qoi")]
+                if let Some(id) = codecs.qoi {
+                    bitmap_updater = BitmapUpdater::Qoi(QoiHandler::new(id));
+                }
+                #[cfg(feature = "qoiz")]
+                if let Some(id) = codecs.qoiz {
+                    bitmap_updater = BitmapUpdater::Qoiz(
+                        QoizHandler::new(id).context("failed to initialize qoiz handler")?,
+                    );
+                }
             }
-            #[cfg(feature = "qoiz")]
-            if let Some(id) = codecs.qoiz {
-                bitmap = BitmapUpdater::Qoiz(
-                    QoizHandler::new(id).context("failed to initialize qoiz handler")?,
-                );
-            }
-
-            bitmap
-        } else {
-            let mut bitmap = BitmapHandler::new();
-            bitmap.bitmap.set_skip_alpha(codecs.allow_skip_alpha);
-            BitmapUpdater::Bitmap(bitmap)
-        };
+        }
 
         // Surface markers only describe the Surface Commands graphics path.
         // Legacy BitmapUpdate must remain compatible even when the client has
@@ -245,6 +257,23 @@ impl UpdateEncoder {
             #[cfg(feature = "qoiz")]
             Some(BitmapUpdater::Qoiz(_)) => "qoiz",
             None => "encoding",
+        }
+    }
+
+    /// Wire command selected from this activation's independent capabilities.
+    /// Zero identifies classic BitmapUpdate, which has no surface command.
+    pub(crate) fn surface_command_id(&self) -> u16 {
+        match self.bitmap_updater.as_ref() {
+            Some(BitmapUpdater::RemoteFx(_)) => 0x0006,
+            Some(BitmapUpdater::Bitmap(_)) | None => 0,
+            _ => 0x0001,
+        }
+    }
+
+    pub(crate) fn remotefx_image_mode(&self) -> Option<bool> {
+        match self.bitmap_updater.as_ref() {
+            Some(BitmapUpdater::RemoteFx(handler)) => Some(handler.remotefx.is_image_mode()),
+            _ => None,
         }
     }
 
@@ -699,7 +728,7 @@ impl RemoteFxHandler {
         bitmap: &BitmapUpdate,
         limit: usize,
     ) -> Result<Option<UpdateFragmenter>> {
-        let overhead = surface_command(bitmap, self.codec_id, &[]).size();
+        let overhead = stream_surface_command(bitmap, self.codec_id, &[]).size();
         let Some(payload_limit) = limit.checked_sub(overhead) else {
             return Ok(None);
         };
@@ -710,7 +739,7 @@ impl RemoteFxHandler {
             else {
                 return Ok(None);
             };
-            let output = set_surface(bitmap, self.codec_id, &self.output[..len])?;
+            let output = stream_surface(bitmap, self.codec_id, &self.output[..len])?;
             self.remotefx.commit_frame();
             Ok(Some(output))
         })();
@@ -849,35 +878,6 @@ fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
     .raw_channels(raw_channels)
     .build()?;
     Ok(enc.encode_to_vec()?)
-}
-
-fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<UpdateFragmenter> {
-    Ok(UpdateFragmenter::new(
-        UpdateCode::SurfaceCommands,
-        encode_vec(&surface_command(bitmap, codec_id, data))?,
-    ))
-}
-
-fn surface_command<'a>(bitmap: &BitmapUpdate, codec_id: u8, data: &'a [u8]) -> SurfaceCommand<'a> {
-    let destination = ExclusiveRectangle {
-        left: bitmap.x,
-        top: bitmap.y,
-        right: bitmap.x + bitmap.width.get(),
-        bottom: bitmap.y + bitmap.height.get(),
-    };
-    let extended_bitmap_data = ExtendedBitmapDataPdu {
-        bpp: bitmap.format.bytes_per_pixel() * 8,
-        width: bitmap.width.get(),
-        height: bitmap.height.get(),
-        codec_id,
-        header: None,
-        data,
-    };
-    let pdu = SurfaceBitsPdu {
-        destination,
-        extended_bitmap_data,
-    };
-    SurfaceCommand::SetSurfaceBits(pdu)
 }
 
 #[cfg(test)]

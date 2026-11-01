@@ -46,6 +46,17 @@ fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
             }),
         ),
         (
+            "Configured bitmap transport",
+            "bitmap_transport",
+            json!({
+                "phase":"activation", "state":"configured", "worker_pid":42,
+                "bitmap_codec":"remotefx", "surface_command_id":6,
+                "remotefx_image_mode":false, "surface_frame_markers":true,
+                "max_bitmap_update_bytes":65536, "bitmap_wire_depth":32,
+                "client_preferred_depth":32, "payload":secret,
+            }),
+        ),
+        (
             "GFX surface setup prepared",
             "graphics_surface",
             json!({
@@ -97,6 +108,35 @@ fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
             }
         }
     }
+}
+
+#[test]
+fn bitmap_transport_export_rejects_payloads_and_free_form_codec_names() {
+    let safe = startup::safe_fields(
+        "bitmap_transport",
+        &json!({
+            "phase":"activation", "state":"configured", "bitmap_codec":"private-canary",
+            "surface_command_id":"private-canary", "remotefx_image_mode":"private-canary",
+            "surface_frame_markers":true, "max_bitmap_update_bytes":-1,
+            "bitmap_wire_depth":32, "client_preferred_depth":null, "payload":"private-canary",
+        }),
+    )
+    .unwrap();
+    assert_eq!(safe["bitmap_codec"], "unknown");
+    assert_eq!(safe["surface_frame_markers"], true);
+    assert_eq!(safe["bitmap_wire_depth"], 32);
+    for field in [
+        "surface_command_id",
+        "remotefx_image_mode",
+        "max_bitmap_update_bytes",
+        "client_preferred_depth",
+        "payload",
+    ] {
+        assert!(!safe.contains_key(field));
+    }
+    assert!(!serde_json::to_string(&safe)
+        .unwrap()
+        .contains("private-canary"));
 }
 
 #[test]

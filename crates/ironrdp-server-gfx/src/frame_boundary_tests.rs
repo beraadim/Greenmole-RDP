@@ -382,7 +382,7 @@ async fn live_lossless_change_closes_prior_surface_frame_before_bitmap_and_resto
             width: 256,
             height: 128,
         },
-        CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+        CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS | CmdFlags::FRAME_MARKER,
         codecs,
     )
     .unwrap();
@@ -490,5 +490,139 @@ async fn already_produced_gfx_updates_finish_in_order_after_an_image_policy_requ
             "discarding a produced AU can poison the next P-frame after a rapid policy reversal"
         );
         assert_eq!(state.lock().unwrap().frame_id, 1);
+    }
+}
+
+#[tokio::test]
+async fn fullscreen_remotefx_streams_reassemble_with_complete_markers_on_fresh_connections() {
+    use ironrdp_pdu::codecs::rfx::{Block, CodecChannel, OperatingMode};
+    for mode in [OperatingMode::empty(), OperatingMode::IMAGE_MODE] {
+        // A new encoder/connection must restart both outer marker and inner
+        // RemoteFX frame numbering, without retaining the previous framebuffer.
+        for _connection in 0..2 {
+            let mut codecs = UpdateEncoderCodecs::new();
+            codecs.set_remotefx(Some((rdp::capability_sets::EntropyBits::Rlgr3, 17, mode)));
+            codecs.set_max_request_size(262_144);
+            let encoder = UpdateEncoder::new(
+                DesktopSize {
+                    width: 1920,
+                    height: 1200,
+                },
+                CmdFlags::STREAM_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+                codecs,
+            )
+            .unwrap();
+            // A periodic image compresses into single Fast-Path packets even
+            // at fullscreen size. Deterministic noise exercises real fragments.
+            let mut random = 0x4D41_4352_u32;
+            let pixels: Vec<u8> = (0..1920 * 1200)
+                .flat_map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    let bytes = random.to_le_bytes();
+                    [bytes[0], bytes[1], bytes[2], 255]
+                })
+                .collect();
+            let mut source = bitmap(0, 1920, 1200);
+            source.data = pixels.into();
+            let packets = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let _encoder = dispatch(
+                encoder,
+                DisplayUpdate::Bitmap(source),
+                &mut Regions::default(),
+                packets.clone(),
+            )
+            .await;
+            let updates = commands(&packets.borrow());
+            let boundary = markers(&updates);
+            assert_eq!(
+                boundary,
+                [
+                    (0, FrameAction::Begin, 1),
+                    (updates.len() - 1, FrameAction::End, 1)
+                ]
+            );
+            let mut covered = vec![0u8; 1920 * 1200];
+            let mut partitions = 0u32;
+            for (code, bytes) in &updates {
+                if *code != UpdateCode::SurfaceCommands {
+                    continue;
+                }
+                // Raw command-byte check is independent of our encoder helper.
+                match u16::from_le_bytes(bytes[..2].try_into().unwrap()) {
+                    0x0004 => continue,
+                    0x0006 => {}
+                    other => panic!("RemoteFX used unexpected command {other:#x}"),
+                }
+                let SurfaceCommand::StreamSurfaceBits(surface) = decode(bytes).unwrap() else {
+                    panic!("stream")
+                };
+                assert_eq!(surface.extended_bitmap_data.codec_id, 17);
+                assert_eq!(surface.extended_bitmap_data.bpp, 32);
+                let rect = surface.destination;
+                assert!(rect.left < rect.right && rect.right <= 1920);
+                assert!(rect.top < rect.bottom && rect.bottom <= 1200);
+                assert_eq!(rect.right - rect.left, surface.extended_bitmap_data.width);
+                assert_eq!(rect.bottom - rect.top, surface.extended_bitmap_data.height);
+                for y in rect.top..rect.bottom {
+                    for x in rect.left..rect.right {
+                        covered[usize::from(y) * 1920 + usize::from(x)] += 1;
+                    }
+                }
+                let mut stream = ReadCursor::new(surface.extended_bitmap_data.data);
+                assert!(matches!(
+                    decode_cursor::<Block<'_>>(&mut stream).unwrap(),
+                    Block::Sync(_)
+                ));
+                let mut began = false;
+                let mut ended = false;
+                while !stream.is_empty() {
+                    match decode_cursor::<Block<'_>>(&mut stream).unwrap() {
+                        Block::CodecChannel(CodecChannel::Context(context)) => {
+                            assert_eq!(context.flags, mode)
+                        }
+                        Block::CodecChannel(CodecChannel::FrameBegin(frame)) => {
+                            assert!(!began);
+                            assert_eq!(
+                                frame.index,
+                                if mode.contains(OperatingMode::IMAGE_MODE) {
+                                    0
+                                } else {
+                                    partitions
+                                }
+                            );
+                            began = true;
+                        }
+                        Block::CodecChannel(CodecChannel::FrameEnd(_)) => {
+                            assert!(began && !ended);
+                            ended = true;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(began && ended);
+                partitions += 1;
+            }
+            assert!(partitions > 1);
+            assert!(
+                covered.iter().all(|count| *count == 1),
+                "every desktop pixel must be covered exactly once"
+            );
+            let fragmented = packets.borrow().iter().any(|packet| {
+                let mut cursor = ReadCursor::new(packet);
+                let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+                matches!(
+                    decode_cursor::<FastPathUpdatePdu<'_>>(&mut cursor)
+                        .unwrap()
+                        .fragmentation,
+                    Fragmentation::First
+                )
+            });
+            assert!(
+                fragmented,
+                "exercise real Fast-Path reassembly, not just a single packet"
+            );
+        }
     }
 }

@@ -67,7 +67,7 @@ fn remotefx_error(bitmap: &BitmapUpdate, quality: BitmapQuality, entropy: Entrop
     );
     let output = handler.handle(bitmap).unwrap();
     let surface: SurfaceCommand<'_> = ironrdp_core::decode(&output.data).unwrap();
-    let SurfaceCommand::SetSurfaceBits(surface) = surface else {
+    let SurfaceCommand::StreamSurfaceBits(surface) = surface else {
         panic!("expected surface bits")
     };
     let mut cursor = ReadCursor::new(surface.extended_bitmap_data.data);
@@ -190,7 +190,7 @@ fn tiny_remotefx_frame_keeps_initialization_headers_across_output_growth() {
         }
         let output = handler.handle(&bitmap).unwrap();
         let surface: SurfaceCommand<'_> = ironrdp_core::decode(&output.data).unwrap();
-        let SurfaceCommand::SetSurfaceBits(surface) = surface else {
+        let SurfaceCommand::StreamSurfaceBits(surface) = surface else {
             panic!("expected surface bits")
         };
         let mut cursor = ReadCursor::new(surface.extended_bitmap_data.data);
@@ -318,7 +318,7 @@ fn alpha_plane_for_narrow_tall_updates_stays_within_wire_length_limits() {
 }
 
 fn remote_fx_quants(output: &UpdateFragmenter) -> (bool, Vec<Quant>) {
-    let SurfaceCommand::SetSurfaceBits(surface) = ironrdp_core::decode(&output.data).unwrap()
+    let SurfaceCommand::StreamSurfaceBits(surface) = ironrdp_core::decode(&output.data).unwrap()
     else {
         panic!("expected RemoteFX surface bits");
     };
@@ -345,7 +345,7 @@ async fn live_quality_changes_repaint_unchanged_pixels_with_new_quantization_and
             width: 64,
             height: 64,
         },
-        CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+        CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS | CmdFlags::FRAME_MARKER,
         codecs,
     )
     .unwrap();

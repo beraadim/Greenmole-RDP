@@ -65,7 +65,7 @@ async fn full_frame_delivers_shape_and_hide_between_complete_partitions() {
     codecs.set_max_request_size(32_768);
     let encoder = UpdateEncoder::new(
         DesktopSize { width, height },
-        CmdFlags::SET_SURFACE_BITS,
+        CmdFlags::STREAM_SURFACE_BITS,
         codecs,
     )
     .unwrap();
