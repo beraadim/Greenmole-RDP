@@ -206,6 +206,11 @@ pub struct BitmapUpdate {
     /// Optional damage hints in absolute framebuffer coordinates.
     /// Empty means the encoder should derive diffs on its own.
     pub dirty_rects: Vec<Rect>,
+    /// Encode every pixel in this supplied region, even if it matches the
+    /// encoder's cached source. This takes precedence over damage hints for
+    /// baseline/recovery delivery; codec and receive-size limits still apply.
+    /// Ordinary damage updates should set this to false.
+    pub force_refresh: bool,
 }
 
 impl BitmapUpdate {
@@ -239,6 +244,8 @@ impl BitmapUpdate {
     ///     format: PixelFormat::ARgb32,
     ///     data: Bytes::from(vec![0; 40000]),
     ///     stride: NonZeroUsize::new(400).unwrap(),
+    ///     dirty_rects: Vec::new(),
+    ///     force_refresh: false,
     /// };
     ///
     /// let sub_region = original.sub(10, 10, NonZeroU16::new(50).unwrap(), NonZeroU16::new(50).unwrap());
@@ -246,25 +253,45 @@ impl BitmapUpdate {
     /// ```
     #[must_use]
     pub fn sub(&self, x: u16, y: u16, width: NonZeroU16, height: NonZeroU16) -> Option<Self> {
-        if x + width.get() > self.width.get() || y + height.get() > self.height.get() {
-            None
-        } else {
-            let bpp = usize::from(self.format.bytes_per_pixel());
-            let start = usize::from(y) * self.stride.get() + usize::from(x) * bpp;
-            let end = start
-                + usize::from(height.get() - 1) * self.stride.get()
-                + usize::from(width.get()) * bpp;
-            Some(Self {
-                x: self.x + x,
-                y: self.y + y,
-                width,
-                height,
-                format: self.format,
-                data: self.data.slice(start..end),
-                stride: self.stride,
-                dirty_rects: Vec::new(),
-            })
+        if x.checked_add(width.get())? > self.width.get()
+            || y.checked_add(height.get())? > self.height.get()
+        {
+            return None;
         }
+        // Desktop dimensions are u16; reject wrapped absolute extents as well
+        // as malformed rows before deriving a shared slice from the backing.
+        self.x.checked_add(self.width.get())?;
+        self.y.checked_add(self.height.get())?;
+        let absolute_x = self.x.checked_add(x)?;
+        let absolute_y = self.y.checked_add(y)?;
+        let bpp = usize::from(self.format.bytes_per_pixel());
+        let stride = self.stride.get();
+        let source_row_bytes = usize::from(self.width.get()).checked_mul(bpp)?;
+        if stride < source_row_bytes {
+            return None;
+        }
+        let source_len = usize::from(self.height.get() - 1)
+            .checked_mul(stride)?
+            .checked_add(source_row_bytes)?;
+        self.data.get(..source_len)?;
+        let start = usize::from(y)
+            .checked_mul(stride)?
+            .checked_add(usize::from(x).checked_mul(bpp)?)?;
+        let end = start
+            .checked_add(usize::from(height.get() - 1).checked_mul(stride)?)?
+            .checked_add(usize::from(width.get()).checked_mul(bpp)?)?;
+        let data = self.data.get(start..end)?;
+        Some(Self {
+            x: absolute_x,
+            y: absolute_y,
+            width,
+            height,
+            format: self.format,
+            data: self.data.slice_ref(data),
+            stride: self.stride,
+            dirty_rects: Vec::new(),
+            force_refresh: self.force_refresh,
+        })
     }
 }
 
@@ -278,9 +305,14 @@ impl core::fmt::Debug for BitmapUpdate {
             .field("format", &self.format)
             .field("stride", &self.stride)
             .field("dirty_rects", &self.dirty_rects.len())
+            .field("force_refresh", &self.force_refresh)
             .finish()
     }
 }
+
+#[cfg(test)]
+#[path = "bitmap_update_tests.rs"]
+mod bitmap_update_tests;
 
 /// Display Updates receiver for an RDP server
 ///
@@ -558,6 +590,7 @@ mod tests {
             format: fmt,
             data: data.into(),
             stride,
+            force_refresh: false,
             dirty_rects: Vec::new(),
         };
         let diffs = vec![Rect::new(2, 3, 4, 5)];

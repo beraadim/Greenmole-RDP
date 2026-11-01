@@ -102,7 +102,10 @@ impl EncoderIter<'_> {
                     };
                     // Bound work/allocation before encoding. Exact output size is
                     // checked below, since noisy compressed pixels can expand.
-                    if encoder.limits.should_partition(&rect) {
+                    let encoded_limit = encoder
+                        .bitmap_payload_limit()
+                        .unwrap_or_else(|| encoder.limits.bitmap_budget());
+                    if encoder.limits.should_partition(&rect, encoded_limit) {
                         if let Some((first, second)) = limits::split_rect(&rect) {
                             pending.push(second);
                             pending.push(first);
@@ -162,8 +165,7 @@ impl EncoderIter<'_> {
                     };
 
                     let Some(sub) = bitmap.sub(x, y, width, height) else {
-                        warn!("Failed to extract bitmap subregion");
-                        return None;
+                        return Some(Err(anyhow!("invalid bitmap region or backing layout")));
                     };
                     let row_limit = match encoder.bitmap_max_rows(&sub) {
                         Ok(limit) => limit,

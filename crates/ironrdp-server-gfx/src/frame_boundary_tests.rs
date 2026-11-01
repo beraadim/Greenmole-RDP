@@ -47,6 +47,7 @@ fn bitmap(x: u16, width: u16, height: u16) -> BitmapUpdate {
         format: PixelFormat::BgrA32,
         data: pixels.into(),
         stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     }
 }

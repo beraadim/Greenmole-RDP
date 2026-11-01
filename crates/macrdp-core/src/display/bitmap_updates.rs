@@ -188,6 +188,7 @@ pub(super) fn materialize(
             format: PixelFormat::BgrA32,
             data,
             stride: NonZeroUsize::new(stride)?,
+            force_refresh: false,
             // The newest image may have changed outside the original hints.
             // The wire encoder's framebuffer must compare the entire region.
             dirty_rects: if refreshed {

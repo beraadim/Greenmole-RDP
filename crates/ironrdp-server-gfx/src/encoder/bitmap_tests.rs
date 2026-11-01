@@ -13,6 +13,7 @@ fn single_row_with_large_trailing_stride_encodes_without_arithmetic_overflow() {
         format: PixelFormat::BgrA32,
         data: Bytes::from_static(&[10, 20, 30, 255]),
         stride: NonZeroUsize::new(1usize << (usize::BITS - 1)).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     };
     let mut output = vec![0; 1024];
@@ -44,6 +45,7 @@ fn odd_widths_and_partial_final_stride_roundtrip_without_losing_pixels() {
             format: PixelFormat::BgrA32,
             data: Bytes::from(pixels),
             stride: NonZeroUsize::new(stride).unwrap(),
+            force_refresh: false,
             dirty_rects: Vec::new(),
         };
         let mut encoded = vec![0u8; 65536];
@@ -89,6 +91,7 @@ fn multiple_rectangle_candidate_is_rejected_before_writing_output() {
         format: PixelFormat::BgrA32,
         data: Bytes::from(vec![255; 1920 * 9 * 4]),
         stride: NonZeroUsize::new(1920 * 4).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     };
     let rows = encoder.max_rows(&bitmap).unwrap();
@@ -102,6 +105,66 @@ fn multiple_rectangle_candidate_is_rejected_before_writing_output() {
     let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output[..length]).unwrap();
     assert_eq!(update.rectangles.len(), 1);
     assert_eq!(update.rectangles[0].height, rows);
+}
+
+#[test]
+fn narrow_alpha_plane_keeps_the_compressed_u16_row_boundary() {
+    let mut bitmap = BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: NonZeroU16::new(1).unwrap(),
+        height: NonZeroU16::new(8192).unwrap(),
+        format: PixelFormat::BgrA32,
+        data: Bytes::from([13, 21, 34, 255].repeat(8192)),
+        stride: NonZeroUsize::new(4).unwrap(),
+        force_refresh: false,
+        dirty_rects: Vec::new(),
+    };
+    for skip_alpha in [false, true] {
+        let mut encoder = BitmapEncoder::new();
+        encoder.set_skip_alpha(skip_alpha);
+        if !skip_alpha {
+            assert_eq!(encoder.max_rows(&bitmap).unwrap(), 8190);
+            bitmap.height = NonZeroU16::new(8191).unwrap();
+            let mut unchanged = vec![0xa5; 70_000];
+            assert!(encoder.encode(&bitmap, &mut unchanged).is_err());
+            assert!(unchanged.iter().all(|byte| *byte == 0xa5));
+        }
+        let rows = if skip_alpha { 8192 } else { 8190 };
+        bitmap.height = NonZeroU16::new(rows).unwrap();
+        assert!(encoder.max_rows(&bitmap).unwrap() >= rows);
+        let mut encoded = vec![0; 70_000];
+        let length = encoder.encode(&bitmap, &mut encoded).unwrap();
+        let update: BitmapUpdateData<'_> = ironrdp_core::decode(&encoded[..length]).unwrap();
+        assert_eq!(update.rectangles.len(), 1);
+        let rectangle = &update.rectangles[0];
+        assert_eq!(rectangle.height, rows);
+        assert_eq!(
+            rectangle.bitmap_data[0],
+            if skip_alpha { 0x30 } else { 0x10 }
+        );
+        let body_length = usize::from(u16::from_le_bytes([encoded[20], encoded[21]]));
+        assert_eq!(body_length, length - 22);
+        assert_eq!(body_length, rectangle.bitmap_data.len() + 8);
+        assert!(body_length <= usize::from(u16::MAX));
+        let header = rectangle.compressed_data_header.as_ref().unwrap();
+        assert_eq!(
+            usize::from(header.main_body_size),
+            rectangle.bitmap_data.len()
+        );
+        assert_eq!(header.scan_width, 4);
+        assert_eq!(header.uncompressed_size, rows * 4);
+        let mut decoded = Vec::new();
+        BitmapStreamDecoder::default()
+            .decode_bitmap_stream_to_rgb24(
+                rectangle.bitmap_data,
+                &mut decoded,
+                1,
+                usize::from(rows),
+            )
+            .unwrap();
+        assert_eq!(decoded, [34, 21, 13].repeat(usize::from(rows)));
+    }
 }
 
 #[test]
@@ -129,6 +192,7 @@ fn negotiated_compression_header_omission_changes_only_wire_framing() {
         format: PixelFormat::BgrA32,
         data: Bytes::from(pixels),
         stride: NonZeroUsize::new(stride).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     };
     for skip_alpha in [false, true] {

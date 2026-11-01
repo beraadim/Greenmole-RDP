@@ -47,6 +47,7 @@ async fn rdp6_server_dispatch_covers_fullscreen_while_pointer_updates_interleave
         data: bytes::Bytes::copy_from_slice(&source_pixels),
         stride: NonZeroUsize::new(1920 * 4).unwrap(),
         dirty_rects: Vec::new(),
+        force_refresh: false,
     };
     let mut codecs = UpdateEncoderCodecs::new();
     codecs.set_max_request_size(16_777_215);
@@ -87,11 +88,9 @@ async fn rdp6_server_dispatch_covers_fullscreen_while_pointer_updates_interleave
     .await
     .unwrap();
     assert!(regions.pointer_polls > 1);
-    let mut partial = None;
     let mut covered = vec![0u8; 1920 * 1200];
     let mut pointers = 0;
     let mut updates = 0;
-    let mut fragmented = false;
     for packet in packets.borrow().iter() {
         let mut cursor = ReadCursor::new(packet);
         let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
@@ -99,65 +98,38 @@ async fn rdp6_server_dispatch_covers_fullscreen_while_pointer_updates_interleave
         let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
         assert!(cursor.is_empty());
         assert_eq!(header_len + header.data_length, packet.len());
+        assert_eq!(update.fragmentation, Fragmentation::Single);
         if update.update_code == UpdateCode::HiddenPointer {
-            assert!(
-                partial.is_none(),
-                "pointer cannot split a logical image update"
-            );
-            assert_eq!(update.fragmentation, Fragmentation::Single);
             pointers += 1;
             continue;
         }
         assert_eq!(update.update_code, UpdateCode::Bitmap);
-        let complete = match update.fragmentation {
-            Fragmentation::Single => {
-                assert!(partial.is_none());
-                Some(update.data.to_vec())
-            }
-            Fragmentation::First => {
-                assert!(partial.is_none());
-                fragmented = true;
-                partial = Some(update.data.to_vec());
-                None
-            }
-            Fragmentation::Next | Fragmentation::Last => {
-                partial.as_mut().unwrap().extend_from_slice(update.data);
-                if update.fragmentation == Fragmentation::Last {
-                    partial.take()
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(data) = complete {
-            updates += 1;
-            let update: BitmapUpdateData<'_> = decode(&data).unwrap();
-            assert_eq!(
-                update.rectangles.len(),
-                1,
-                "one RDP6 rectangle per logical update"
-            );
-            for rect in update.rectangles {
-                let pixels = decode_rectangle(&rect);
-                for y in rect.rectangle.top..=rect.rectangle.bottom {
-                    for x in rect.rectangle.left..=rect.rectangle.right {
-                        let dst = usize::from(y) * 1920 + usize::from(x);
-                        let src = usize::from(rect.rectangle.bottom - y) * usize::from(rect.width)
-                            + usize::from(x - rect.rectangle.left);
-                        assert_eq!(
-                            &pixels[src * 4..src * 4 + 3],
-                            &source_pixels[dst * 4..dst * 4 + 3]
-                        );
-                        assert_eq!(pixels[src * 4 + 3], 255);
-                        covered[dst] += 1;
-                    }
+        assert!(update.data.len() <= 16_374);
+        updates += 1;
+        let update: BitmapUpdateData<'_> = decode(update.data).unwrap();
+        assert_eq!(
+            update.rectangles.len(),
+            1,
+            "one RDP6 rectangle per logical update"
+        );
+        for rect in update.rectangles {
+            let pixels = decode_rectangle(&rect);
+            for y in rect.rectangle.top..=rect.rectangle.bottom {
+                for x in rect.rectangle.left..=rect.rectangle.right {
+                    let dst = usize::from(y) * 1920 + usize::from(x);
+                    let src = usize::from(rect.rectangle.bottom - y) * usize::from(rect.width)
+                        + usize::from(x - rect.rectangle.left);
+                    assert_eq!(
+                        &pixels[src * 4..src * 4 + 3],
+                        &source_pixels[dst * 4..dst * 4 + 3]
+                    );
+                    assert_eq!(pixels[src * 4 + 3], 255);
+                    covered[dst] += 1;
                 }
             }
         }
     }
-    assert!(partial.is_none());
     assert!(updates > 1);
-    assert!(fragmented, "noisy rectangles must span Fast-Path packets");
     assert_eq!(pointers, 1);
     assert!(covered.iter().all(|count| *count == 1));
     let state = state.lock().unwrap();

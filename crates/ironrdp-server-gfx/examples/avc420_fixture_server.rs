@@ -123,6 +123,7 @@ impl RdpServerDisplayUpdates for SyntheticUpdates {
                 format: PixelFormat::BgrA32,
                 data,
                 stride: NonZeroUsize::new(usize::from(WIDTH) * 4).unwrap(),
+                force_refresh: false,
                 dirty_rects: Vec::new(),
             })));
         }

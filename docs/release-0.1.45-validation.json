@@ -1,0 +1,89 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.45",
+  "purpose": "Honor explicit bitmap repaint intent and isolate classic output to complete single-packet updates; Windows acceptance remains pending.",
+  "observation_on_0_1_44": {
+    "version_revision": "53cb1aa745e3",
+    "user_result": "long thin updated rectangles; both connections alive; fullscreen-sized window repaired first picture once, inconsistently",
+    "bitmap_codec": "rdp6-rle",
+    "alpha_skipped": true,
+    "compression_header_present": false,
+    "final_windows_capture_geometry": [
+      1920,
+      1200
+    ],
+    "initial_first_activation_geometry": [
+      1920,
+      1080
+    ],
+    "capture_frames": [
+      565,
+      287
+    ],
+    "display_update_writes": [
+      1344,
+      722
+    ],
+    "bytes_written": [
+      71085381,
+      44865421
+    ],
+    "source_health_observations": 90,
+    "source_timestamp_comparisons_advanced": 88,
+    "source_changed_comparisons": 52,
+    "max_changed_sample_points": 179,
+    "capture_cleanup_succeeded_between_connections": true,
+    "exact_client_rendering_cause_proven": false
+  },
+  "changes": {
+    "explicit_force_refresh_before_hints_and_cached_diffs": true,
+    "mandatory_seed_stale_requested_and_cached_recovery_force_refresh": true,
+    "ordinary_unknown_or_chaotic_full_reads_keep_diffing": true,
+    "no_periodic_repaint_mechanism_added": true,
+    "classic_rdp6_encoded_payload_ceiling": 16374,
+    "smaller_client_and_working_limits_preserved": true,
+    "codec_aware_preflight_partitioning": true,
+    "generic_and_remotefx_fragmentation_preserved": true,
+    "header_and_alpha_negotiation_preserved": true,
+    "checked_crop_arithmetic_and_backing": true,
+    "invalid_wire_crop_errors_without_cache_commit": true,
+    "bounded_repaint_preparation_diagnostics_per_activation": 16,
+    "typed_recovery_and_payload_limit_diagnostics": true,
+    "diagnostic_schema": 8,
+    "avc_capture_or_display_lifecycle_policy_changed": false,
+    "root_cause_conclusively_claimed": false
+  },
+  "manual_acceptance": "User installs Desktop DMG. Bitmap fallback + Lossless desktop; three consecutive 1920x1200 connections, observe initial full picture before a fullscreen-window workaround, then drag a window. Compare Guacamole. No automatic installation or driver reinstall.",
+  "status": "source checks passed; package verification pending",
+  "tests": {
+    "full_standard_check_passed": true,
+    "rust_passed": 1084,
+    "existing_manual_rust_ignored": 7,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "native_driver_tests_passed": true,
+    "frontend_production_build_passed": true,
+    "server_example_compile_passed": true,
+    "bitmap_crop_doctest_passed": true,
+    "synthetic_client_full_and_partial_repair_verified": true,
+    "force_refresh_overrides_cache_and_misleading_hints": true,
+    "ordinary_unchanged_suppression_preserved": true,
+    "header_alpha_budget_matrix_cases": 12,
+    "all_classic_updates_single_packet": true,
+    "smaller_negotiated_limit_preserved": true,
+    "generic_and_fullscreen_remotefx_fragmentation_verified": true,
+    "checked_crop_and_invalid_wire_backing_tests_passed": true,
+    "narrow_alpha_u16_boundary_regression_preserved": true,
+    "core_mandatory_vs_ordinary_intent_and_bounded_count_verified": true,
+    "bounded_repaint_observation_and_private_export_verified": true,
+    "new_tests_capture_screen_or_inject_input": false,
+    "native_windows_new_build_acceptance": false
+  },
+  "checks": {
+    "whitespace_passed": true,
+    "added_lines_secret_pattern_check_passed": true,
+    "exact_lockfile_package_and_npm_json_comparison_preserves_dependency_pins": true,
+    "independent_review": "No blockers: explicit supplied-region repair, ordinary cache suppression, checked crops, invalid-layout error, exact classic-only packet cap and smaller limits, unchanged generic/RemoteFX fragmentation and typed bounded diagnostics."
+  }
+}

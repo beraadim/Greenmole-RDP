@@ -1,5 +1,6 @@
 mod bitmap_freshness;
 mod bitmap_pacing;
+mod bitmap_recovery;
 mod bitmap_updates;
 pub(crate) mod capture_lifecycle;
 mod capture_recovery;
@@ -110,6 +111,7 @@ struct SessionAudit {
     uncompressed_bytes: u64,
     bitmap_frames: u64,
     bitmap_bytes: u64,
+    bitmap_repaints: bitmap_recovery::Diagnostics,
     max_dirty_rects: usize,
     max_dirty_pixels: u32,
 }
@@ -132,6 +134,7 @@ impl SessionAudit {
             uncompressed_bytes: 0,
             bitmap_frames: 0,
             bitmap_bytes: 0,
+            bitmap_repaints: bitmap_recovery::Diagnostics::default(),
             max_dirty_rects: 0,
             max_dirty_pixels: 0,
         }
@@ -1731,6 +1734,7 @@ impl MacDisplayUpdates {
                 format: RdpPixelFormat::BgrA32,
                 data: data.clone(),
                 stride: NonZeroUsize::new(*stride)?,
+                force_refresh: true,
                 dirty_rects: Vec::new(),
             }),
             CachedFrame::BgraPixelBuffer(buf, width_u32, height_u32, _) => buf
@@ -1743,6 +1747,7 @@ impl MacDisplayUpdates {
                         format: RdpPixelFormat::BgrA32,
                         data: Bytes::copy_from_slice(bgra),
                         stride: NonZeroUsize::new(stride)?,
+                        force_refresh: true,
                         dirty_rects: Vec::new(),
                     })
                 })
@@ -1853,7 +1858,17 @@ impl MacDisplayUpdates {
     }
 
     fn record_bitmap_audit(&mut self, bitmap: &BitmapUpdate, detail: &'static str) {
-        let dirty_pixels = if bitmap.dirty_rects.is_empty() {
+        let source = if detail == "bitmap-cached-full-frame-recovery" {
+            bitmap_recovery::Source::Cached
+        } else {
+            bitmap_recovery::Source::Captured
+        };
+        self.session_audit.bitmap_repaints.record(
+            bitmap,
+            source,
+            self.session_audit.session_id,
+        );
+        let dirty_pixels = if bitmap.force_refresh || bitmap.dirty_rects.is_empty() {
             bitmap.width.get() as u32 * bitmap.height.get() as u32
         } else {
             bitmap
@@ -3078,13 +3093,19 @@ impl MacDisplayUpdates {
                 width = frame.width,
                 height = frame.height,
                 dirty_rects = frame.dirty_rects.len(),
-                "Sending full-frame bitmap seed and deferring incremental diffing to ironrdp-server"
+                "Preparing mandatory full-frame bitmap seed"
             );
         }
 
+        // A full source read can still use cached diffs. Explicit baseline and
+        // recovery requests must instead reach every pixel on the wire, even
+        // when the host's cached source has not changed.
+        let force_wire_refresh = self.client_may_be_stale
+            || self.needs_full_bitmap_seed
+            || self.forced_full_bitmap_updates_remaining > 0;
         let force_full_bitmap_reason = if self.client_may_be_stale {
             Some("stale-recovery")
-        } else if self.forced_full_bitmap_updates_remaining > 0 {
+        } else if self.needs_full_bitmap_seed || self.forced_full_bitmap_updates_remaining > 0 {
             Some("seed")
         } else if frame.dirty_rects.is_empty() {
             Some("unknown-or-forced-damage")
@@ -3104,7 +3125,8 @@ impl MacDisplayUpdates {
         let materialized = regions
             .pop_front()
             .and_then(|region| bitmap_updates::materialize(region, &frame, false));
-        if let Some(materialized) = materialized {
+        if let Some(mut materialized) = materialized {
+            materialized.update.force_refresh = force_wire_refresh;
             self.bitmap_copy_stats.record(&materialized);
             self.needs_full_bitmap_seed = false;
             if emitted_full_frame {

@@ -1760,6 +1760,7 @@ impl RdpServer {
             bitmap_single_rectangle_updates = bitmap_codec == "rdp6-rle",
             bitmap_compression_header_present = encoder.bitmap_compression_header_present(),
             bitmap_alpha_skipped = encoder.bitmap_alpha_skipped(),
+            bitmap_payload_limit = encoder.bitmap_payload_limit(),
             client_general_flags, client_bitmap_drawing_flags,
             activation_width = desktop_size.width, activation_height = desktop_size.height,
             "Configured bitmap transport"

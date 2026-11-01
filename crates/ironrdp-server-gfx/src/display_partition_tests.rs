@@ -53,6 +53,7 @@ async fn full_frame_delivers_shape_and_hide_between_complete_partitions() {
         format: PixelFormat::BgrA32,
         data: pixels.into(),
         stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     };
     let mut codecs = UpdateEncoderCodecs::new();

@@ -28,6 +28,7 @@ fn fixture(width: u16, height: u16, padding: usize, noise: bool) -> BitmapUpdate
         format: PixelFormat::BgrA32,
         data: Bytes::from(data),
         stride: NonZeroUsize::new(stride).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     }
 }

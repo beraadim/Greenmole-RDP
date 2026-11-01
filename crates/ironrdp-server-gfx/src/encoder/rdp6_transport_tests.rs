@@ -10,39 +10,44 @@ use ironrdp_core::{decode_cursor, ReadCursor};
 use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
 use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation};
 
-fn reassemble(mut output: UpdateFragmenter, fragmented: &mut bool) -> Vec<u8> {
-    let mut bytes = Vec::new();
+fn single_bitmap_packet(mut output: UpdateFragmenter) -> Vec<u8> {
+    assert!(output.data.len() <= MAX_FASTPATH_UPDATE_SIZE);
     let mut packet = vec![0; output.size_hint()];
-    let mut started = false;
-    let mut complete = false;
-    while let Some(len) = output.next(&mut packet) {
-        assert!(!complete);
-        let mut cursor = ReadCursor::new(&packet[..len]);
-        let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
-        let header_len = cursor.pos();
-        let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
-        assert!(cursor.is_empty());
-        assert_eq!(header_len + header.data_length, len);
-        assert_eq!(update.update_code, UpdateCode::Bitmap);
-        match update.fragmentation {
-            Fragmentation::Single => {
-                assert!(!started);
-                complete = true;
-            }
-            Fragmentation::First => {
-                assert!(!started);
-                *fragmented = true;
-            }
-            Fragmentation::Next => assert!(started),
-            Fragmentation::Last => {
-                assert!(started);
-                complete = true;
-            }
-        }
-        started = true;
-        bytes.extend_from_slice(update.data);
-    }
-    assert!(complete);
+    let len = output.next(&mut packet).unwrap();
+    // Check raw outer framing too: action/security zero, full packet length,
+    // Bitmap|Single|no bulk compression, and a little-endian payload size.
+    assert_eq!(packet[0], 0);
+    let (packet_length, raw_header_len) = if packet[1] & 0x80 == 0 {
+        (usize::from(packet[1]), 2)
+    } else {
+        (
+            (usize::from(packet[1] & 0x7f) << 8) | usize::from(packet[2]),
+            3,
+        )
+    };
+    assert_eq!(packet_length, len);
+    assert_eq!(packet[raw_header_len], 0x01);
+    assert_eq!(
+        usize::from(u16::from_le_bytes([
+            packet[raw_header_len + 1],
+            packet[raw_header_len + 2]
+        ])),
+        len - raw_header_len - 3
+    );
+    let mut cursor = ReadCursor::new(&packet[..len]);
+    let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+    let header_len = cursor.pos();
+    let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+    assert!(cursor.is_empty());
+    assert_eq!(header_len + header.data_length, len);
+    assert_eq!(update.update_code, UpdateCode::Bitmap);
+    assert_eq!(update.fragmentation, Fragmentation::Single);
+    assert_eq!(update.compression_flags, None);
+    let bytes = update.data.to_vec();
+    assert!(
+        output.next(&mut packet).is_none(),
+        "one packet per RDP6 update"
+    );
     bytes
 }
 
@@ -62,8 +67,8 @@ pub(crate) fn fullscreen_pixels() -> Vec<u8> {
             .repeat(1920)
         })
         .collect();
-    // Incompressible content makes a logical rectangle cross Fast-Path packet
-    // boundaries even though Windows compatibility requires one rectangle/PDU.
+    // Incompressible content requires additional spatial partitions to keep
+    // every complete RDP6 update inside one Fast-Path packet.
     let mut random = 0x39a5_0c71u32;
     for pixel in pixels[128 * 1920 * 4..192 * 1920 * 4].chunks_exact_mut(4) {
         for channel in &mut pixel[..3] {
@@ -171,6 +176,31 @@ struct WirePolicy {
     omit_header: bool,
 }
 
+fn configured_encoder(budget: usize, policy: WirePolicy) -> UpdateEncoder {
+    let mut codecs = UpdateEncoderCodecs::new();
+    codecs.set_allow_skip_alpha(policy.skip_alpha);
+    codecs.set_omit_bitmap_compression_header(policy.omit_header);
+    codecs.set_max_request_size(16_777_215);
+    let mut encoder = UpdateEncoder::new(
+        DesktopSize {
+            width: 1920,
+            height: 1200,
+        },
+        CmdFlags::empty(),
+        codecs,
+    )
+    .unwrap();
+    assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
+    assert_eq!(
+        encoder.bitmap_compression_header_present(),
+        Some(!policy.omit_header)
+    );
+    assert_eq!(encoder.bitmap_alpha_skipped(), Some(policy.skip_alpha));
+    assert_eq!(encoder.set_bitmap_working_budget(budget), budget);
+    assert_eq!(encoder.bitmap_payload_limit(), Some(16_374));
+    encoder
+}
+
 /// Check literal protocol offsets without ironrdp-pdu's header decoder, so a
 /// shared encoder/decoder mistake cannot hide an eight-byte layout shift.
 fn assert_bitmap_layout(bytes: &[u8], policy: WirePolicy) {
@@ -215,13 +245,12 @@ async fn receive(
     bitmap: BitmapUpdate,
     canvas: &mut [u8],
     covered: &mut [u8],
-    fragmented: &mut bool,
     policy: WirePolicy,
 ) -> usize {
     let mut iter = encoder.update(DisplayUpdate::Bitmap(bitmap));
     let mut rectangles = 0;
     while let Some(output) = iter.next().await {
-        let bytes = reassemble(output.unwrap(), fragmented);
+        let bytes = single_bitmap_packet(output.unwrap());
         assert_bitmap_layout(&bytes, policy);
         let update: BitmapUpdateData<'_> = ironrdp_core::decode(&bytes).unwrap();
         assert_eq!(
@@ -250,7 +279,7 @@ async fn receive(
 }
 
 #[tokio::test]
-async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel() {
+async fn fullscreen_rdp6_single_packet_updates_cover_and_decode_every_pixel() {
     for budget in [65_536, 131_072, 524_288] {
         for (skip_alpha, omit_header) in
             [(false, false), (false, true), (true, false), (true, true)]
@@ -273,45 +302,12 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                 data: Bytes::copy_from_slice(&pixels),
                 stride: NonZeroUsize::new(1920 * 4).unwrap(),
                 dirty_rects: Vec::new(),
+                force_refresh: false,
             };
-            let mut codecs = UpdateEncoderCodecs::new();
-            codecs.set_allow_skip_alpha(skip_alpha);
-            codecs.set_omit_bitmap_compression_header(omit_header);
-            codecs.set_max_request_size(16_777_215);
-            let mut encoder = UpdateEncoder::new(
-                DesktopSize {
-                    width: 1920,
-                    height: 1200,
-                },
-                CmdFlags::empty(),
-                codecs,
-            )
-            .unwrap();
-            assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
-            assert_eq!(
-                encoder.bitmap_compression_header_present(),
-                Some(!omit_header)
-            );
-            assert_eq!(encoder.bitmap_alpha_skipped(), Some(skip_alpha));
-            assert_eq!(encoder.set_bitmap_working_budget(budget), budget);
+            let mut encoder = configured_encoder(budget, policy);
             let mut canvas = vec![0; pixels.len()];
             let mut covered = vec![0; 1920 * 1200];
-            let mut fragmented = false;
-            assert!(
-                receive(
-                    &mut encoder,
-                    source,
-                    &mut canvas,
-                    &mut covered,
-                    &mut fragmented,
-                    policy,
-                )
-                .await
-                    > 0
-            );
-            if budget >= 131_072 {
-                assert!(fragmented, "noisy rectangles must span Fast-Path packets");
-            }
+            assert!(receive(&mut encoder, source, &mut canvas, &mut covered, policy,).await > 0);
             assert!(covered.iter().all(|count| *count == 1));
             assert_eq!(canvas, expected);
 
@@ -332,6 +328,7 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                 data: Bytes::from(patch_pixels),
                 stride: NonZeroUsize::new(160).unwrap(),
                 dirty_rects: Vec::new(),
+                force_refresh: false,
             };
             for y in 91..114 {
                 for x in 137..172 {
@@ -341,18 +338,7 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                 }
             }
             covered.fill(0);
-            assert!(
-                receive(
-                    &mut encoder,
-                    patch,
-                    &mut canvas,
-                    &mut covered,
-                    &mut fragmented,
-                    policy,
-                )
-                .await
-                    > 0
-            );
+            assert!(receive(&mut encoder, patch, &mut canvas, &mut covered, policy,).await > 0);
             assert_eq!(canvas, expected);
             assert_eq!(covered.iter().filter(|count| **count != 0).count(), 35 * 23);
             let unchanged = BitmapUpdate {
@@ -364,21 +350,185 @@ async fn fullscreen_rdp6_baseline_and_later_damage_cover_and_decode_every_pixel(
                 data: Bytes::copy_from_slice(&pixels),
                 stride: NonZeroUsize::new(1920 * 4).unwrap(),
                 dirty_rects: Vec::new(),
+                force_refresh: false,
             };
             covered.fill(0);
             assert_eq!(
-                receive(
-                    &mut encoder,
-                    unchanged,
-                    &mut canvas,
-                    &mut covered,
-                    &mut fragmented,
-                    policy,
-                )
-                .await,
+                receive(&mut encoder, unchanged, &mut canvas, &mut covered, policy,).await,
                 0
             );
             assert!(covered.iter().all(|count| *count == 0));
         }
     }
+}
+
+#[tokio::test]
+async fn rdp6_truncated_backing_returns_an_error_without_cache_commit() {
+    let policy = WirePolicy {
+        skip_alpha: true,
+        omit_header: true,
+    };
+    let mut encoder = configured_encoder(131_072, policy);
+    let malformed = BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: NonZeroU16::new(8).unwrap(),
+        height: NonZeroU16::new(8).unwrap(),
+        format: ironrdp_graphics::image_processing::PixelFormat::BgrA32,
+        data: Bytes::from(vec![0; 8 * 8 * 4 - 1]),
+        stride: NonZeroUsize::new(8 * 4).unwrap(),
+        dirty_rects: Vec::new(),
+        force_refresh: false,
+    };
+    let mut updates = encoder.update(DisplayUpdate::Bitmap(malformed));
+    let error = updates
+        .next()
+        .await
+        .expect("invalid frames must be reported")
+        .unwrap_err();
+    assert_eq!(error.to_string(), "invalid bitmap region or backing layout");
+    drop(updates);
+    assert!(
+        encoder.framebuffer.is_none(),
+        "invalid pixels cannot enter the cache"
+    );
+}
+
+#[tokio::test]
+async fn rdp6_forced_refresh_repairs_unchanged_fullscreen_and_nonzero_region() {
+    let policy = WirePolicy {
+        skip_alpha: true,
+        omit_header: true,
+    };
+    let mut encoder = configured_encoder(131_072, policy);
+    let pixels = fullscreen_pixels();
+    let mut expected = pixels.clone();
+    for pixel in expected.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    let source = BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: NonZeroU16::new(1920).unwrap(),
+        height: NonZeroU16::new(1200).unwrap(),
+        format: ironrdp_graphics::image_processing::PixelFormat::BgrA32,
+        data: Bytes::from(pixels),
+        stride: NonZeroUsize::new(1920 * 4).unwrap(),
+        dirty_rects: Vec::new(),
+        force_refresh: false,
+    };
+    let mut canvas = vec![0; expected.len()];
+    let mut covered = vec![0; 1920 * 1200];
+    assert!(
+        receive(
+            &mut encoder,
+            source.clone(),
+            &mut canvas,
+            &mut covered,
+            policy
+        )
+        .await
+            > 0
+    );
+    assert_eq!(canvas, expected);
+
+    // Simulate a client that missed pixels even though the server's source
+    // cache is current. An ordinary identical capture must still be suppressed.
+    canvas.fill(0);
+    covered.fill(0);
+    assert_eq!(
+        receive(
+            &mut encoder,
+            source.clone(),
+            &mut canvas,
+            &mut covered,
+            policy
+        )
+        .await,
+        0
+    );
+    assert!(canvas.iter().all(|byte| *byte == 0));
+    assert!(covered.iter().all(|count| *count == 0));
+    let mut forced = source.clone();
+    forced.force_refresh = true;
+    forced.dirty_rects = vec![Rect {
+        x: 10,
+        y: 20,
+        width: 1,
+        height: 1,
+    }];
+    assert!(receive(&mut encoder, forced, &mut canvas, &mut covered, policy).await > 0);
+    assert!(covered.iter().all(|count| *count == 1));
+    assert_eq!(canvas, expected);
+    covered.fill(0);
+    assert_eq!(
+        receive(
+            &mut encoder,
+            source.clone(),
+            &mut canvas,
+            &mut covered,
+            policy
+        )
+        .await,
+        0
+    );
+    assert!(covered.iter().all(|count| *count == 0));
+
+    let region = source
+        .sub(
+            137,
+            91,
+            NonZeroU16::new(257).unwrap(),
+            NonZeroU16::new(173).unwrap(),
+        )
+        .unwrap();
+    for y in 91..264 {
+        for x in 137..394 {
+            let offset = (y * 1920 + x) * 4;
+            canvas[offset..offset + 4].fill(0);
+        }
+    }
+    assert_eq!(
+        receive(
+            &mut encoder,
+            region.clone(),
+            &mut canvas,
+            &mut covered,
+            policy
+        )
+        .await,
+        0
+    );
+    let mut forced_region = region.clone();
+    forced_region.force_refresh = true;
+    forced_region.dirty_rects = vec![Rect {
+        x: 150,
+        y: 100,
+        width: 1,
+        height: 1,
+    }];
+    assert!(
+        receive(
+            &mut encoder,
+            forced_region,
+            &mut canvas,
+            &mut covered,
+            policy
+        )
+        .await
+            > 0
+    );
+    assert_eq!(canvas, expected);
+    for y in 0..1200 {
+        for x in 0..1920 {
+            let inside = (91..264).contains(&y) && (137..394).contains(&x);
+            assert_eq!(covered[y * 1920 + x], u8::from(inside));
+        }
+    }
+    covered.fill(0);
+    assert_eq!(
+        receive(&mut encoder, region, &mut canvas, &mut covered, policy).await,
+        0
+    );
+    assert!(covered.iter().all(|count| *count == 0));
 }

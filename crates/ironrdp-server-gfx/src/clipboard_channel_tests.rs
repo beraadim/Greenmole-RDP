@@ -226,6 +226,7 @@ async fn quarantined_clipboard_reports_status_while_real_session_keeps_display_a
                     stride: core::num::NonZeroUsize::new(4).unwrap(),
                     format: crate::PixelFormat::BgrA32,
                     data: vec![1, 2, 3, 255].into(),
+                    force_refresh: false,
                     dirty_rects: Vec::new(),
                 }))
                 .await

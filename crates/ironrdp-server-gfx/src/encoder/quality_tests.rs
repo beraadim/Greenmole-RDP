@@ -7,6 +7,7 @@ use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_pdu::bitmap::BitmapUpdateData;
 use ironrdp_pdu::codecs::rfx::{Block, CodecChannel, EntropyAlgorithm, Quant};
+use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation};
 
 pub(super) fn fixture(width: u16, height: u16, noise: bool) -> BitmapUpdate {
     let stride = usize::from(width) * 4 + 12;
@@ -41,6 +42,7 @@ pub(super) fn fixture(width: u16, height: u16, noise: bool) -> BitmapUpdate {
         format: PixelFormat::BgrA32,
         data: Bytes::from(data),
         stride: NonZeroUsize::new(stride).unwrap(),
+        force_refresh: false,
         dirty_rects: Vec::new(),
     }
 }
@@ -319,8 +321,8 @@ async fn alpha_plane_for_narrow_tall_updates_stays_within_wire_length_limits() {
         let mut codecs = UpdateEncoderCodecs::new();
         codecs.set_quality(BitmapQuality::Lossless);
         codecs.set_allow_skip_alpha(skip_alpha);
-        // Do not let a small spatial budget conceal the compressed-u16 row
-        // bound. Alpha needs two strips; negotiated alpha omission fits one.
+        // A generous client limit must still retain the classic BitmapUpdate
+        // single-packet ceiling. Direct codec tests cover its u16 row bounds.
         codecs.set_max_request_size(16_777_215);
         let mut encoder = UpdateEncoder::new(
             DesktopSize {
@@ -337,17 +339,33 @@ async fn alpha_plane_for_narrow_tall_updates_stays_within_wire_length_limits() {
         let mut rows = 0;
         let mut updates = encoder.update(DisplayUpdate::Bitmap(bitmap.clone()));
         while let Some(output) = updates.next().await {
-            let output = output.unwrap();
-            let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output.data).unwrap();
+            let mut output = output.unwrap();
+            assert!(output.data.len() <= MAX_FASTPATH_UPDATE_SIZE);
+            let mut packet = vec![0; output.size_hint()];
+            let length = output.next(&mut packet).unwrap();
+            let mut cursor = ReadCursor::new(&packet[..length]);
+            let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+            let header_length = cursor.pos();
+            let wire: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+            assert!(cursor.is_empty());
+            assert_eq!(header_length + header.data_length, length);
+            assert_eq!(wire.update_code, UpdateCode::Bitmap);
+            assert_eq!(wire.fragmentation, Fragmentation::Single);
+            assert_eq!(wire.data, output.data);
+            let update: BitmapUpdateData<'_> = ironrdp_core::decode(wire.data).unwrap();
             assert_eq!(update.rectangles.len(), 1);
             logical_updates += 1;
             for rectangle in &update.rectangles {
                 rows += usize::from(rectangle.height);
                 check_lossless_rectangle(rectangle, &bitmap, skip_alpha, &mut covered);
             }
+            assert!(output.next(&mut packet).is_none());
         }
         assert_eq!(rows, 8192);
-        assert_eq!(logical_updates, if skip_alpha { 1 } else { 2 });
+        assert!(
+            logical_updates > 1,
+            "8192 rows must span independent single-packet updates"
+        );
         assert!(covered.iter().all(|count| *count == 1));
     }
 }

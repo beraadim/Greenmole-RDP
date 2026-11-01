@@ -11,6 +11,7 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
         "graphics_cache" => (&["offer"], &["declined"]),
         "graphics_receive" => (&["envelope"], &["ignored", "rejected"]),
         "bitmap_transport" => (&["activation"], &["configured"]),
+        "bitmap_recovery" => (&["refresh"], &["prepared"]),
         _ => return None,
     };
     let mut fields = Map::new();
@@ -168,6 +169,7 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
                 "client_bitmap_drawing_flags",
                 "activation_width",
                 "activation_height",
+                "bitmap_payload_limit",
             ] {
                 unsigned(source, &mut fields, key);
             }
@@ -192,6 +194,19 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
                         "qoiz",
                         "encoding"
                     ],
+                )),
+            );
+        }
+        "bitmap_recovery" => {
+            for key in ["session_id", "sample_id", "x", "y"] {
+                unsigned(source, &mut fields, key);
+            }
+            boolean(source, &mut fields, "force_refresh");
+            fields.insert(
+                "source".into(),
+                json!(super::selection(
+                    source["source"].as_str().unwrap_or(""),
+                    &["captured", "cached"],
                 )),
             );
         }

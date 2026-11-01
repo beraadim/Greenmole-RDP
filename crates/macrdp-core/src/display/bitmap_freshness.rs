@@ -77,6 +77,7 @@ mod tests {
             format: PixelFormat::BgrA32,
             data: Bytes::from(vec![1; 16]),
             stride: NonZeroUsize::new(8).unwrap(),
+            force_refresh: false,
             dirty_rects: vec![DiffRect {
                 x: 2,
                 y: 0,
@@ -141,6 +142,7 @@ mod tests {
             format: PixelFormat::BgrA32,
             data: Bytes::from(vec![1; 8]),
             stride: NonZeroUsize::new(8).unwrap(),
+            force_refresh: false,
             dirty_rects: vec![],
         };
         let first = make_frame(&[2, 1, 3, 1, 1, 1], &[0, 2]);
@@ -200,6 +202,7 @@ mod tests {
             format: PixelFormat::BgrA32,
             data: Bytes::from(vec![1; 8]),
             stride: NonZeroUsize::new(8).unwrap(),
+            force_refresh: false,
             dirty_rects: vec![],
         };
         assert!(refresh_region(&mut queued, &intermediate));

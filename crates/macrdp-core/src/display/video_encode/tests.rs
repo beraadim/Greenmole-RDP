@@ -300,5 +300,6 @@ async fn a_slow_drop_and_later_pending_pair_share_the_first_unsent_submission_bu
 }
 
 mod fresh_after_slow_encode;
+mod bitmap_refresh;
 mod gfx_seed;
 mod image_fallback;

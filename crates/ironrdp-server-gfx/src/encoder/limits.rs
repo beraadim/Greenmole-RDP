@@ -54,11 +54,12 @@ impl UpdateLimits {
         self.bitmap_budget
     }
 
-    pub(super) fn should_partition(self, rect: &Rect) -> bool {
+    pub(super) fn should_partition(self, rect: &Rect, encoded_limit: usize) -> bool {
         // Avoid first encoding an entire desktop for a small receive buffer.
         // Keep at least one RemoteFX tile so edge padding cannot inflate the
         // amount of work; the actual encoded byte limit is checked afterward.
-        rect.width.saturating_mul(rect.height) > (self.bitmap_budget / 4).max(64 * 64)
+        let budget = self.bitmap_budget.min(encoded_limit);
+        rect.width.saturating_mul(rect.height) > (budget / 4).max(64 * 64)
     }
 }
 

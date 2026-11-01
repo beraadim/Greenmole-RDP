@@ -37,9 +37,9 @@ mod limits_tests;
 #[cfg(test)]
 mod quality_tests;
 #[cfg(test)]
-mod remotefx_transport_tests;
-#[cfg(test)]
 pub(crate) mod rdp6_transport_tests;
+#[cfg(test)]
+mod remotefx_transport_tests;
 pub(crate) mod rfx;
 mod rfx_rlgr;
 mod surface_bits;
@@ -305,8 +305,20 @@ impl UpdateEncoder {
         }
     }
 
+    /// Actual complete-update ceiling for the classic bitmap compatibility path.
+    /// Other codecs retain their negotiated and working-budget limits.
+    pub(crate) fn bitmap_payload_limit(&self) -> Option<usize> {
+        match self.bitmap_updater.as_ref() {
+            Some(updater @ BitmapUpdater::Bitmap(_)) => {
+                Some(updater.payload_limit(self.limits.bitmap_budget()))
+            }
+            _ => None,
+        }
+    }
+
     /// Bound each complete bitmap update below the client's hard receive limit.
-    /// Zero restores that hard limit. Pointer updates keep their negotiated cap.
+    /// Zero restores that working budget; codec compatibility ceilings still
+    /// apply. Pointer updates keep their negotiated cap.
     pub(crate) fn set_bitmap_working_budget(&mut self, bytes: usize) -> usize {
         self.limits.set_bitmap_budget(bytes)
     }
@@ -416,6 +428,17 @@ impl UpdateEncoder {
         const MAX_HINT_RECTS: usize = 24;
         const MAX_HINT_AREA_NUM: u64 = 3;
         const MAX_HINT_AREA_DEN: u64 = 4;
+
+        if bitmap.force_refresh {
+            // A repair request means the client's pixels may differ even when
+            // our framebuffer cache matches. Damage hints cannot narrow it.
+            return vec![Rect {
+                x: 0,
+                y: 0,
+                width: bitmap.width.get().into(),
+                height: bitmap.height.get().into(),
+            }];
+        }
 
         if !bitmap.dirty_rects.is_empty() {
             let mut hints = normalize_bitmap_hints(bitmap);
@@ -620,11 +643,23 @@ enum BitmapUpdater {
 }
 
 impl BitmapUpdater {
+    fn payload_limit(&self, limit: usize) -> usize {
+        if matches!(self, Self::Bitmap(_)) {
+            // Keep classic RDP6 updates in a single Fast-Path packet for modern
+            // Windows compatibility. Oversized complete images are spatially
+            // split by EncoderIter, preserving full coverage and cache commit.
+            limit.min(MAX_FASTPATH_UPDATE_SIZE)
+        } else {
+            limit
+        }
+    }
+
     fn handle_with_limit(
         &mut self,
         bitmap: &BitmapUpdate,
         limit: usize,
     ) -> Result<Option<UpdateFragmenter>> {
+        let limit = self.payload_limit(limit);
         // RemoteFX sizes its already-compressed tiles before serialization and
         // commits its frame index only after the complete surface PDU fits.
         if let Self::RemoteFx(handler) = self {
@@ -934,6 +969,7 @@ mod tests {
             UpdateEncoder::new(size, CmdFlags::empty(), UpdateEncoderCodecs::new()).unwrap();
         assert_eq!(defaults.bitmap_compression_header_present(), Some(true));
         assert_eq!(defaults.bitmap_alpha_skipped(), Some(false));
+        assert_eq!(defaults.bitmap_payload_limit(), Some(16_374));
 
         for omit_header in [false, true] {
             for skip_alpha in [false, true] {
@@ -946,6 +982,7 @@ mod tests {
                 assert_eq!(encoder.bitmap_codec(), "remotefx");
                 assert_eq!(encoder.bitmap_compression_header_present(), None);
                 assert_eq!(encoder.bitmap_alpha_skipped(), None);
+                assert_eq!(encoder.bitmap_payload_limit(), None);
                 for quality in [
                     crate::BitmapQuality::Lossless,
                     crate::BitmapQuality::Balanced,
@@ -958,12 +995,39 @@ mod tests {
                             Some(!omit_header)
                         );
                         assert_eq!(encoder.bitmap_alpha_skipped(), Some(skip_alpha));
+                        assert_eq!(encoder.bitmap_payload_limit(), Some(16_374));
                     } else {
                         assert_eq!(encoder.bitmap_compression_header_present(), None);
                         assert_eq!(encoder.bitmap_alpha_skipped(), None);
+                        assert_eq!(encoder.bitmap_payload_limit(), None);
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn rdp6_single_packet_ceiling_preserves_smaller_client_receive_limits() {
+        for client_limit in [1024, 16_374, 131_072] {
+            let mut codecs = UpdateEncoderCodecs::new();
+            codecs.set_max_request_size(client_limit);
+            let mut encoder = UpdateEncoder::new(
+                DesktopSize {
+                    width: 64,
+                    height: 64,
+                },
+                CmdFlags::empty(),
+                codecs,
+            )
+            .unwrap();
+            assert_eq!(
+                encoder.set_bitmap_working_budget(524_288),
+                client_limit as usize
+            );
+            assert_eq!(
+                encoder.bitmap_payload_limit(),
+                Some(client_limit.min(16_374) as usize)
+            );
         }
     }
 

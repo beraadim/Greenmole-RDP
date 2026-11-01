@@ -67,7 +67,17 @@ fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
                 "bitmap_compression_header_present":false, "bitmap_alpha_skipped":true,
                 "client_general_flags":1025, "client_bitmap_drawing_flags":8,
                 "activation_width":1920, "activation_height":1200,
+                "bitmap_payload_limit":16374,
                 "payload":secret,
+            }),
+        ),
+        (
+            "Bitmap repaint prepared",
+            "bitmap_recovery",
+            json!({
+                "phase":"refresh", "state":"prepared", "worker_pid":42,
+                "session_id":3, "sample_id":1, "source":"cached", "force_refresh":true,
+                "x":0, "y":0, "width":1920, "height":1200, "pixels":secret,
             }),
         ),
         (
@@ -125,6 +135,36 @@ fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
 }
 
 #[test]
+fn bitmap_recovery_export_rejects_payloads_and_malformed_fields() {
+    let safe = startup::safe_fields(
+        "bitmap_recovery",
+        &json!({
+            "phase":"refresh", "state":"prepared", "source":"private-canary",
+            "force_refresh":"private-canary", "session_id":-1, "sample_id":[],
+            "x":-1, "y":"private-canary", "width":1920, "height":1200,
+            "pixels":"private-canary",
+        }),
+    )
+    .unwrap();
+    assert_eq!(safe["source"], "unknown");
+    assert_eq!(safe["width"], 1920);
+    assert_eq!(safe["height"], 1200);
+    for key in [
+        "force_refresh",
+        "session_id",
+        "sample_id",
+        "x",
+        "y",
+        "pixels",
+    ] {
+        assert!(!safe.contains_key(key));
+    }
+    assert!(!serde_json::to_string(&safe)
+        .unwrap()
+        .contains("private-canary"));
+}
+
+#[test]
 fn bitmap_transport_export_rejects_payloads_and_free_form_codec_names() {
     let safe = startup::safe_fields(
         "bitmap_transport",
@@ -135,6 +175,7 @@ fn bitmap_transport_export_rejects_payloads_and_free_form_codec_names() {
             "bitmap_compression_header_present":"private-canary", "bitmap_alpha_skipped":[],
             "client_general_flags":-1, "client_bitmap_drawing_flags":"private-canary",
             "activation_width":null, "activation_height":{},
+            "bitmap_payload_limit":"private-canary",
             "surface_frame_markers":true, "max_bitmap_update_bytes":-1,
             "bitmap_wire_depth":32, "client_preferred_depth":null, "payload":"private-canary",
         }),
@@ -153,6 +194,7 @@ fn bitmap_transport_export_rejects_payloads_and_free_form_codec_names() {
         "client_bitmap_drawing_flags",
         "activation_width",
         "activation_height",
+        "bitmap_payload_limit",
         "max_bitmap_update_bytes",
         "client_preferred_depth",
         "payload",

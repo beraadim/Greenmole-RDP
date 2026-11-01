@@ -148,6 +148,10 @@ fn forced_seed_and_unknown_damage_materialize_the_complete_frame() {
             (0, 0, 4, 2)
         );
         assert!(update.dirty_rects.is_empty());
+        assert!(
+            !update.force_refresh,
+            "full source reads alone do not force delivery"
+        );
         assert_eq!(update.data.len(), 36);
     }
 }
