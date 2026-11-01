@@ -68,6 +68,9 @@ mod display_partition_tests;
 #[path = "frame_boundary_tests.rs"]
 mod frame_boundary_tests;
 #[cfg(test)]
+#[path = "rdp6_dispatch_tests.rs"]
+mod rdp6_dispatch_tests;
+#[cfg(test)]
 #[path = "transport_tests.rs"]
 mod transport_tests;
 
@@ -1746,6 +1749,7 @@ impl RdpServer {
             client_preferred_depth = client_depth,
             bitmap_wire_depth = 32, max_bitmap_update_bytes,
             surface_frame_markers = encoder.surface_frame_markers(),
+            bitmap_single_rectangle_updates = bitmap_codec == "rdp6-rle",
             "Configured bitmap transport"
         );
 

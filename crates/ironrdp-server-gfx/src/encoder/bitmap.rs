@@ -1,6 +1,6 @@
 use core::num::NonZeroUsize;
 
-use ironrdp_core::{cast_int, cast_length, invalid_field_err, Encode as _, WriteCursor};
+use ironrdp_core::{cast_length, invalid_field_err, Encode as _, WriteCursor};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::rdp6::{
     ABgrChannels, ARgbChannels, BgrAChannels, BitmapEncodeError, BitmapStreamEncoder, RgbAChannels,
@@ -98,6 +98,32 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn multiple_rectangle_candidate_is_rejected_before_writing_output() {
+        let mut encoder = BitmapEncoder::new();
+        let mut bitmap = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(1920).unwrap(),
+            height: NonZeroU16::new(9).unwrap(),
+            format: PixelFormat::BgrA32,
+            data: Bytes::from(vec![255; 1920 * 9 * 4]),
+            stride: NonZeroUsize::new(1920 * 4).unwrap(),
+            dirty_rects: Vec::new(),
+        };
+        let rows = encoder.max_rows(&bitmap).unwrap();
+        assert_eq!(rows, 8);
+        let mut output = vec![0xa5; 100_000];
+        assert!(encoder.encode(&bitmap, &mut output).is_err());
+        assert!(output.iter().all(|byte| *byte == 0xa5));
+
+        bitmap.height = NonZeroU16::new(rows).unwrap();
+        let length = encoder.encode(&bitmap, &mut output).unwrap();
+        let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output[..length]).unwrap();
+        assert_eq!(update.rectangles.len(), 1);
+        assert_eq!(update.rectangles[0].height, rows);
+    }
 }
 
 impl BitmapEncoder {
@@ -143,11 +169,10 @@ impl BitmapEncoder {
         self.skip_alpha = allowed;
     }
 
-    pub(crate) fn encode(
-        &mut self,
-        bitmap: &BitmapUpdate,
-        output: &mut [u8],
-    ) -> Result<usize, BitmapEncodeError> {
+    /// Largest row strip that fits the uncompressed and compressed u16 fields.
+    /// The display iterator uses this same bound before encoding, so each
+    /// logical BitmapUpdate carries one rectangle for Windows compatibility.
+    pub(super) fn max_rows(&self, bitmap: &BitmapUpdate) -> Result<u16, BitmapEncodeError> {
         let bytes_per_pixel = u16::from(bitmap.format.bytes_per_pixel());
         let row_len = bitmap
             .width
@@ -167,15 +192,30 @@ impl BitmapEncoder {
         let plane_count = if self.skip_alpha { 3 } else { 4 };
         let compressed_row_bound = plane_count * (width + width.div_ceil(15));
         let compressed_rows = (usize::from(u16::MAX) - 9) / compressed_row_bound;
-        let chunk_height = (u16::MAX / row_len)
-            .min(u16::try_from(compressed_rows).unwrap_or(u16::MAX))
-            .min(bitmap.height.get());
-        if chunk_height == 0 {
+        let max_rows = (u16::MAX / row_len).min(u16::try_from(compressed_rows).unwrap_or(u16::MAX));
+        if max_rows == 0 {
             return Err(BitmapEncodeError::Encode(invalid_field_err!(
                 "bitmap",
                 "Row exceeds compressed bitmap bounds"
             )));
         }
+        Ok(max_rows)
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        bitmap: &BitmapUpdate,
+        output: &mut [u8],
+    ) -> Result<usize, BitmapEncodeError> {
+        if bitmap.height.get() > self.max_rows(bitmap)? {
+            return Err(BitmapEncodeError::Encode(invalid_field_err!(
+                "bitmap",
+                "Bitmap update exceeds one rectangle row strip"
+            )));
+        }
+        let bytes_per_pixel = u16::from(bitmap.format.bytes_per_pixel());
+        // max_rows checked this product before any output or source access.
+        let row_len = bitmap.width.get() * bytes_per_pixel;
 
         let mut cursor = WriteCursor::new(output);
         let stride = bitmap.stride.get();
@@ -191,71 +231,48 @@ impl BitmapEncoder {
                 "Truncated bitmap rows"
             )));
         }
-        let chunk_bytes = stride
-            .checked_mul(usize::from(chunk_height))
-            .ok_or_else(|| {
-                BitmapEncodeError::Encode(invalid_field_err!("bitmap", "Chunk stride overflow"))
-            })?;
-        let chunks = bitmap.data[..required].chunks(chunk_bytes);
-
-        let total = cast_int!("chunks length lower bound", chunks.size_hint().0)
+        // Several valid rectangles in one logical update render incompletely
+        // on affected Windows clients. Encode only this independently bounded
+        // strip; the iterator yields subsequent strips as separate updates.
+        // https://github.com/FreeRDP/FreeRDP/pull/10455
+        BitmapUpdateData::encode_header(1, &mut cursor).map_err(BitmapEncodeError::Encode)?;
+        let height = bitmap.height.get();
+        let encoder =
+            BitmapStreamEncoder::new(NonZeroUsize::from(bitmap.width).get(), usize::from(height));
+        let pixels = bitmap.data[..required]
+            .chunks(stride)
+            .map(|row| &row[..usize::from(row_len)])
+            .rev()
+            .flat_map(|row| row.chunks(usize::from(bytes_per_pixel)));
+        let len = Self::encode_iter(
+            encoder,
+            bitmap.format,
+            pixels,
+            self.buffer.as_mut_slice(),
+            self.skip_alpha,
+        )?;
+        let data = BitmapData {
+            rectangle: InclusiveRectangle {
+                left: bitmap.x,
+                top: bitmap.y,
+                right: bitmap.x + bitmap.width.get() - 1,
+                bottom: bitmap.y + height - 1,
+            },
+            width: u16::from(bitmap.width),
+            height,
+            bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
+            compression_flags: Compression::BITMAP_COMPRESSION,
+            compressed_data_header: Some(bitmap::CompressedDataHeader {
+                main_body_size: cast_length!("main body size", len)
+                    .map_err(BitmapEncodeError::Encode)?,
+                // Preserve the existing byte-stride header convention.
+                scan_width: row_len,
+                uncompressed_size: height * row_len,
+            }),
+            bitmap_data: &self.buffer[..len],
+        };
+        data.encode(&mut cursor)
             .map_err(BitmapEncodeError::Encode)?;
-        BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
-
-        for (i, chunk) in chunks.enumerate() {
-            // Subregions omit padding after their final row. Floor division
-            // lost that row, even though its pixels are present in the slice.
-            let height = cast_int!("bitmap height", chunk.len().div_ceil(stride))
-                .map_err(BitmapEncodeError::Encode)?;
-            let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
-            let top = bitmap.y + i * chunk_height;
-
-            let encoder = BitmapStreamEncoder::new(
-                NonZeroUsize::from(bitmap.width).get(),
-                usize::from(height),
-            );
-
-            let len = {
-                let pixels = chunk
-                    .chunks(stride)
-                    .map(|row| &row[..usize::from(row_len)])
-                    .rev()
-                    .flat_map(|row| row.chunks(usize::from(bytes_per_pixel)));
-
-                Self::encode_iter(
-                    encoder,
-                    bitmap.format,
-                    pixels,
-                    self.buffer.as_mut_slice(),
-                    self.skip_alpha,
-                )?
-            };
-
-            let data = BitmapData {
-                rectangle: InclusiveRectangle {
-                    left: bitmap.x,
-                    top,
-                    right: bitmap.x + bitmap.width.get() - 1,
-                    bottom: top + height - 1,
-                },
-                width: u16::from(bitmap.width),
-                height,
-                bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
-                compression_flags: Compression::BITMAP_COMPRESSION,
-                compressed_data_header: Some(bitmap::CompressedDataHeader {
-                    main_body_size: cast_length!("main body size", len)
-                        .map_err(BitmapEncodeError::Encode)?,
-                    // cbScanWidth is measured in bytes, not pixels. Our 32bpp
-                    // rows are always DWORD aligned, including odd widths.
-                    scan_width: row_len,
-                    uncompressed_size: height * row_len,
-                }),
-                bitmap_data: &self.buffer[..len],
-            };
-
-            data.encode(&mut cursor)
-                .map_err(BitmapEncodeError::Encode)?;
-        }
 
         Ok(cursor.pos())
     }

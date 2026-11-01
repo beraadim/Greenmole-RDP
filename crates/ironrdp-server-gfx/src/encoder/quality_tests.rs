@@ -200,8 +200,77 @@ fn tiny_remotefx_frame_keeps_initialization_headers_across_output_growth() {
     }
 }
 
-#[test]
-fn lossless_overrides_surface_codecs_and_roundtrips_rgb_across_bitmap_chunks() {
+/// Check each logical row-strip update independently, then use a source-sized
+/// coverage map to catch overlaps or omissions across spatial/row partitions.
+fn check_lossless_rectangle(
+    rectangle: &ironrdp_pdu::bitmap::BitmapData<'_>,
+    bitmap: &BitmapUpdate,
+    skip_alpha: bool,
+    covered: &mut [u8],
+) {
+    assert_eq!(rectangle.bits_per_pixel, 32);
+    assert!(rectangle.rectangle.left >= bitmap.x);
+    assert!(rectangle.rectangle.top >= bitmap.y);
+    assert!(rectangle.rectangle.right < bitmap.x + bitmap.width.get());
+    assert!(rectangle.rectangle.bottom < bitmap.y + bitmap.height.get());
+    assert_eq!(
+        rectangle.rectangle.right - rectangle.rectangle.left + 1,
+        rectangle.width
+    );
+    assert_eq!(
+        rectangle.rectangle.bottom - rectangle.rectangle.top + 1,
+        rectangle.height
+    );
+    let compression = rectangle.compressed_data_header.as_ref().unwrap();
+    assert_eq!(
+        usize::from(compression.main_body_size),
+        rectangle.bitmap_data.len()
+    );
+    assert!(rectangle.bitmap_data.len() + 8 <= usize::from(u16::MAX));
+    assert_eq!(compression.scan_width, rectangle.width * 4);
+    assert_eq!(
+        usize::from(compression.uncompressed_size),
+        usize::from(rectangle.width) * usize::from(rectangle.height) * 4
+    );
+    let header: ironrdp_pdu::bitmap::rdp6::BitmapStreamHeader =
+        ironrdp_core::decode(rectangle.bitmap_data).unwrap();
+    assert_eq!(header.use_alpha, !skip_alpha);
+    assert!(header.enable_rle_compression);
+    assert_eq!(
+        header.color_plane_definition,
+        ironrdp_pdu::bitmap::rdp6::ColorPlaneDefinition::Argb
+    );
+    let mut rgb = Vec::new();
+    BitmapStreamDecoder::default()
+        .decode_bitmap_stream_to_rgb24(
+            rectangle.bitmap_data,
+            &mut rgb,
+            usize::from(rectangle.width),
+            usize::from(rectangle.height),
+        )
+        .unwrap();
+    for row in 0..usize::from(rectangle.height) {
+        let source_row = usize::from(rectangle.rectangle.bottom - bitmap.y) - row;
+        for column in 0..usize::from(rectangle.width) {
+            let source_column = usize::from(rectangle.rectangle.left - bitmap.x) + column;
+            let source = source_row * bitmap.stride.get() + source_column * 4;
+            let dest = (row * usize::from(rectangle.width) + column) * 3;
+            assert_eq!(
+                &rgb[dest..dest + 3],
+                &[
+                    bitmap.data[source + 2],
+                    bitmap.data[source + 1],
+                    bitmap.data[source]
+                ]
+            );
+            let index = source_row * usize::from(bitmap.width.get()) + source_column;
+            covered[index] = covered[index].checked_add(1).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn lossless_overrides_surface_codecs_and_roundtrips_rgb_across_bitmap_chunks() {
     for (noise, skip_alpha) in [(false, false), (false, true), (true, false), (true, true)] {
         let bitmap = fixture(257, 97, noise);
         let mut codecs = UpdateEncoderCodecs::new();
@@ -217,103 +286,69 @@ fn lossless_overrides_surface_codecs_and_roundtrips_rgb_across_bitmap_chunks() {
                 width: 300,
                 height: 200,
             },
-            CmdFlags::SET_SURFACE_BITS,
+            CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS,
             codecs,
         )
         .unwrap();
         assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
-        let output = encoder
-            .bitmap_updater
-            .as_mut()
-            .unwrap()
-            .handle(&bitmap)
-            .unwrap();
-        let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output.data).unwrap();
-        assert!(update.rectangles.len() > 1);
-        let mut pixel_count = 0;
-        for rectangle in update.rectangles {
-            assert_eq!(rectangle.bits_per_pixel, 32);
-            let header: ironrdp_pdu::bitmap::rdp6::BitmapStreamHeader =
-                ironrdp_core::decode(rectangle.bitmap_data).unwrap();
-            assert_eq!(header.use_alpha, !skip_alpha);
-            assert!(header.enable_rle_compression);
-            assert_eq!(
-                header.color_plane_definition,
-                ironrdp_pdu::bitmap::rdp6::ColorPlaneDefinition::Argb
-            );
-            let mut rgb = Vec::new();
-            BitmapStreamDecoder::default()
-                .decode_bitmap_stream_to_rgb24(
-                    rectangle.bitmap_data,
-                    &mut rgb,
-                    usize::from(rectangle.width),
-                    usize::from(rectangle.height),
-                )
-                .unwrap();
-            for row in 0..usize::from(rectangle.height) {
-                let source_row = usize::from(rectangle.rectangle.bottom - bitmap.y) - row;
-                for column in 0..usize::from(rectangle.width) {
-                    let source = source_row * bitmap.stride.get() + column * 4;
-                    let dest = (row * usize::from(rectangle.width) + column) * 3;
-                    assert_eq!(
-                        &rgb[dest..dest + 3],
-                        &[
-                            bitmap.data[source + 2],
-                            bitmap.data[source + 1],
-                            bitmap.data[source]
-                        ]
-                    );
-                    pixel_count += 1;
-                }
+        let mut covered =
+            vec![0u8; usize::from(bitmap.width.get()) * usize::from(bitmap.height.get())];
+        let mut logical_updates = 0;
+        let mut updates = encoder.update(DisplayUpdate::Bitmap(bitmap.clone()));
+        while let Some(output) = updates.next().await {
+            let output = output.unwrap();
+            let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output.data).unwrap();
+            assert_eq!(update.rectangles.len(), 1);
+            logical_updates += 1;
+            for rectangle in &update.rectangles {
+                check_lossless_rectangle(rectangle, &bitmap, skip_alpha, &mut covered);
             }
         }
-        assert_eq!(
-            pixel_count,
-            usize::from(bitmap.width.get()) * usize::from(bitmap.height.get())
+        assert!(
+            logical_updates > 1,
+            "fixture must exercise multiple logical updates"
         );
+        assert!(covered.iter().all(|count| *count == 1));
     }
 }
 
-#[test]
-fn alpha_plane_for_narrow_tall_updates_stays_within_wire_length_limits() {
+#[tokio::test]
+async fn alpha_plane_for_narrow_tall_updates_stays_within_wire_length_limits() {
     let bitmap = fixture(1, 8192, true);
     for skip_alpha in [false, true] {
-        let mut handler = BitmapHandler::new();
-        handler.bitmap.set_skip_alpha(skip_alpha);
-        let output = handler.handle(&bitmap).unwrap();
-        let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output.data).unwrap();
-        let rows: usize = update
-            .rectangles
-            .iter()
-            .map(|rect| usize::from(rect.height))
-            .sum();
-        assert_eq!(rows, 8192);
-        if !skip_alpha {
-            assert!(update.rectangles.len() > 1);
-        }
-        for rectangle in update.rectangles {
-            let mut rgb = Vec::new();
-            BitmapStreamDecoder::default()
-                .decode_bitmap_stream_to_rgb24(
-                    rectangle.bitmap_data,
-                    &mut rgb,
-                    1,
-                    usize::from(rectangle.height),
-                )
-                .unwrap();
-            for (row, pixel) in rgb.chunks_exact(3).enumerate() {
-                let source_row = usize::from(rectangle.rectangle.bottom - bitmap.y) - row;
-                let source = source_row * bitmap.stride.get();
-                assert_eq!(
-                    pixel,
-                    [
-                        bitmap.data[source + 2],
-                        bitmap.data[source + 1],
-                        bitmap.data[source]
-                    ]
-                );
+        let mut codecs = UpdateEncoderCodecs::new();
+        codecs.set_quality(BitmapQuality::Lossless);
+        codecs.set_allow_skip_alpha(skip_alpha);
+        // Do not let a small spatial budget conceal the compressed-u16 row
+        // bound. Alpha needs two strips; negotiated alpha omission fits one.
+        codecs.set_max_request_size(16_777_215);
+        let mut encoder = UpdateEncoder::new(
+            DesktopSize {
+                width: bitmap.x + bitmap.width.get(),
+                height: bitmap.y + bitmap.height.get(),
+            },
+            CmdFlags::empty(),
+            codecs,
+        )
+        .unwrap();
+        assert_eq!(encoder.bitmap_codec(), "rdp6-rle");
+        let mut covered = vec![0u8; usize::from(bitmap.height.get())];
+        let mut logical_updates = 0;
+        let mut rows = 0;
+        let mut updates = encoder.update(DisplayUpdate::Bitmap(bitmap.clone()));
+        while let Some(output) = updates.next().await {
+            let output = output.unwrap();
+            let update: BitmapUpdateData<'_> = ironrdp_core::decode(&output.data).unwrap();
+            assert_eq!(update.rectangles.len(), 1);
+            logical_updates += 1;
+            for rectangle in &update.rectangles {
+                rows += usize::from(rectangle.height);
+                check_lossless_rectangle(rectangle, &bitmap, skip_alpha, &mut covered);
             }
         }
+        assert_eq!(rows, 8192);
+        assert_eq!(logical_updates, if skip_alpha { 1 } else { 2 });
+        assert!(covered.iter().all(|count| *count == 1));
     }
 }
 

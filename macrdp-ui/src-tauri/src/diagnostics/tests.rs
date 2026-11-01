@@ -52,6 +52,7 @@ fn startup_events_preserve_typed_evidence_without_capture_or_cache_payloads() {
                 "phase":"activation", "state":"configured", "worker_pid":42,
                 "bitmap_codec":"remotefx", "surface_command_id":6,
                 "remotefx_image_mode":false, "surface_frame_markers":true,
+                "bitmap_single_rectangle_updates":false,
                 "max_bitmap_update_bytes":65536, "bitmap_wire_depth":32,
                 "client_preferred_depth":32, "payload":secret,
             }),
@@ -117,6 +118,7 @@ fn bitmap_transport_export_rejects_payloads_and_free_form_codec_names() {
         &json!({
             "phase":"activation", "state":"configured", "bitmap_codec":"private-canary",
             "surface_command_id":"private-canary", "remotefx_image_mode":"private-canary",
+            "bitmap_single_rectangle_updates":"private-canary",
             "surface_frame_markers":true, "max_bitmap_update_bytes":-1,
             "bitmap_wire_depth":32, "client_preferred_depth":null, "payload":"private-canary",
         }),
@@ -128,6 +130,7 @@ fn bitmap_transport_export_rejects_payloads_and_free_form_codec_names() {
     for field in [
         "surface_command_id",
         "remotefx_image_mode",
+        "bitmap_single_rectangle_updates",
         "max_bitmap_update_bytes",
         "client_preferred_depth",
         "payload",

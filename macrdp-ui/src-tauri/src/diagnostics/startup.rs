@@ -167,7 +167,11 @@ pub(super) fn safe_fields(category: &str, source: &Value) -> Option<Map<String, 
             ] {
                 unsigned(source, &mut fields, key);
             }
-            for key in ["remotefx_image_mode", "surface_frame_markers"] {
+            for key in [
+                "remotefx_image_mode",
+                "surface_frame_markers",
+                "bitmap_single_rectangle_updates",
+            ] {
                 boolean(source, &mut fields, key);
             }
             fields.insert(

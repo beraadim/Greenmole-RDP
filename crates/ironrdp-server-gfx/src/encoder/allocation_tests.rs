@@ -60,6 +60,20 @@ fn legacy_encode_with(encoder: &mut BitmapEncoder, bitmap: &BitmapUpdate) -> Vec
     }
 }
 
+/// Direct codec calls operate on one row strip. Full-desktop partitioning and
+/// reconstruction are exercised through UpdateEncoder by rdp6_transport_tests.
+fn first_strip(bitmap: &BitmapUpdate) -> BitmapUpdate {
+    let rows = BitmapEncoder::new().max_rows(bitmap).unwrap();
+    bitmap
+        .sub(
+            0,
+            0,
+            bitmap.width,
+            NonZeroU16::new(bitmap.height.get().min(rows)).unwrap(),
+        )
+        .unwrap()
+}
+
 #[test]
 fn tighter_output_preserves_wire_bytes_for_small_noisy_and_padded_regions() {
     for bitmap in [
@@ -68,11 +82,13 @@ fn tighter_output_preserves_wire_bytes_for_small_noisy_and_padded_regions() {
         fixture(417, 123, 12, true),
         fixture(1920, 1080, 0, false),
     ] {
+        let bitmap = first_strip(&bitmap);
         let expected = legacy_encode(&bitmap);
         let actual = BitmapHandler::new().handle(&bitmap).unwrap();
         assert_eq!(actual.data, expected);
         let decoded: ironrdp_pdu::bitmap::BitmapUpdateData<'_> =
             ironrdp_core::decode(&actual.data).unwrap();
+        assert_eq!(decoded.rectangles.len(), 1);
         assert_eq!(
             decoded
                 .rectangles
@@ -105,12 +121,13 @@ fn oversized_bitmap_rows_are_rejected_before_allocating_output() {
 
 #[test]
 #[ignore = "manual release microbenchmark; timings depend on machine and load"]
-fn bitmap_allocation_benchmark() {
+fn bitmap_strip_allocation_benchmark() {
     for (name, bitmap) in [
-        ("solid-1080p", fixture(1920, 1080, 0, false)),
-        ("noise-720p", fixture(1280, 720, 0, true)),
-        ("narrow-dirty-region", fixture(32, 720, 7552, true)),
+        ("solid-1080p-row-strip", fixture(1920, 1080, 0, false)),
+        ("noise-720p-row-strip", fixture(1280, 720, 0, true)),
+        ("narrow-dirty-row-strip", fixture(32, 720, 7552, true)),
     ] {
+        let bitmap = first_strip(&bitmap);
         let mut handler = BitmapHandler::new();
         let mut legacy_encoder = BitmapEncoder::new();
         let start = std::time::Instant::now();
@@ -128,6 +145,6 @@ fn bitmap_allocation_benchmark() {
             capacity = frame.data.capacity();
             std::hint::black_box(frame);
         }
-        println!("{name}: legacy_ms={legacy_ms:.2} current_ms={:.2} legacy_output_capacity={legacy_capacity} current_output_capacity={capacity} iterations=20", start.elapsed().as_secs_f64()*1000.0);
+        println!("{name}: width={} height={} legacy_ms={legacy_ms:.2} current_ms={:.2} legacy_output_capacity={legacy_capacity} current_output_capacity={capacity} iterations=20", bitmap.width, bitmap.height, start.elapsed().as_secs_f64()*1000.0);
     }
 }

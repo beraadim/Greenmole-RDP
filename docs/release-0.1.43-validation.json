@@ -1,0 +1,89 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.43",
+  "purpose": "Use one rectangle per logical RDP6 BitmapUpdate for Windows interoperability; native Windows symptom resolution remains unconfirmed.",
+  "observation_on_0_1_42": {
+    "resolution": [
+      1920,
+      1200
+    ],
+    "bitmap_codec": "rdp6-rle",
+    "high_quality": {
+      "user_result": "some tiles update; most screen remains black",
+      "capture_frames": 2591,
+      "bitmap_region_writes": 1962,
+      "bytes_written": 38260360,
+      "native_button_down_posts": 6,
+      "native_button_up_posts": 6,
+      "native_drag_posts": 46,
+      "post_errors": 0,
+      "capture_health_samples": 56,
+      "capture_near_black_sample_points": 0
+    },
+    "lossless_desktop": {
+      "user_result": "still black or missing areas",
+      "capture_frames": 1100,
+      "bitmap_region_writes": 3104,
+      "bytes_written": 100713192,
+      "native_button_down_posts": 8,
+      "native_button_up_posts": 8,
+      "native_drag_posts": 0,
+      "post_errors": 0,
+      "capture_health_samples": 38,
+      "capture_near_black_sample_points": 0
+    },
+    "correct_full_image_presentation_proven": false,
+    "windows_client": {
+      "version": "Windows 11 25H2",
+      "build": "26200.9711",
+      "source": "user winver report"
+    }
+  },
+  "changes": {
+    "one_rectangle_per_logical_rdp6_update": true,
+    "normal_fastpath_fragmentation_preserved": true,
+    "compression_and_bottom_up_pixel_order_preserved": true,
+    "bounded_lazy_partitioning_preserved": true,
+    "framebuffer_committed_after_complete_batch": true,
+    "typed_bitmap_single_rectangle_diagnostic": true,
+    "diagnostic_schema": 8,
+    "native_capture_or_input_policy_changed": false,
+    "gfx_channel_policy_changed": false,
+    "root_cause_conclusively_claimed": false
+  },
+  "manual_acceptance": "User installs Desktop DMG. Keep Bitmap fallback and Lossless desktop. Test three consecutive 1920x1200 connections, dragging a window on each. No automatic installation or driver reinstall.",
+  "status": "source checks passed; package verification pending",
+  "tests": {
+    "full_standard_check_passed": true,
+    "rust_passed": 1069,
+    "existing_manual_rust_ignored": 7,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "native_driver_tests_passed": true,
+    "frontend_production_build_passed": true,
+    "old_multi_rectangle_behavior_reproduced": true,
+    "independent_fullscreen_rdp6_receiver_passed": true,
+    "actual_server_dispatch_with_pointer_interleaving_passed": true,
+    "single_rectangle_fastpath_fragmentation_verified": true,
+    "alpha_row_bound_and_lossless_override_verified": true,
+    "direct_oversized_strip_guard_verified": true,
+    "new_tests_capture_screen_or_inject_input": false,
+    "native_windows_new_build_acceptance": false
+  },
+  "checks": {
+    "whitespace_passed": true,
+    "added_lines_secret_pattern_check_passed": true,
+    "cargo_and_npm_dependency_pins_preserved": true,
+    "independent_review": "No blocking findings. Verified codec-aware row partition, strict count-one guard, geometry, stride, short final row, size bounds, normal fragmentation, cache commit and exact pixel coverage. Per-strip scheduler overhead recorded."
+  },
+  "browser_comparison_on_0_1_42": {
+    "client": "Guacamole browser on same Windows machine",
+    "user_result": "drawing issue not visible; possible performance regression remains uncertain",
+    "video_transport": "AVC",
+    "duration_secs": 83,
+    "capture_frames": 4432,
+    "bytes_written": 14031048,
+    "regression_established": false
+  }
+}

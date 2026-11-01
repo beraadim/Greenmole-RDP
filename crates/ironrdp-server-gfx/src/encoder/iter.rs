@@ -165,6 +165,34 @@ impl EncoderIter<'_> {
                         warn!("Failed to extract bitmap subregion");
                         return None;
                     };
+                    let row_limit = match encoder.bitmap_max_rows(&sub) {
+                        Ok(limit) => limit,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    if let Some(rows) = row_limit.filter(|rows| height.get() > *rows) {
+                        // Preserve the existing RDP6 row strips, but place each
+                        // in its own logical update. The pending stack still
+                        // drains completely before committing the framebuffer.
+                        pending.push(Rect {
+                            x: usize::from(x),
+                            y: usize::from(y) + usize::from(rows),
+                            width: usize::from(width.get()),
+                            height: usize::from(height.get() - rows),
+                        });
+                        pending.push(Rect {
+                            x: usize::from(x),
+                            y: usize::from(y),
+                            width: usize::from(width.get()),
+                            height: usize::from(rows),
+                        });
+                        self.state = State::BitmapDiffs {
+                            diffs,
+                            bitmap,
+                            pos,
+                            pending,
+                        };
+                        continue;
+                    }
                     match encoder.bitmap(sub).await {
                         Ok(Some(output)) => {
                             self.state = State::BitmapDiffs {

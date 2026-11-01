@@ -38,6 +38,8 @@ mod limits_tests;
 mod quality_tests;
 #[cfg(test)]
 mod remotefx_transport_tests;
+#[cfg(test)]
+pub(crate) mod rdp6_transport_tests;
 pub(crate) mod rfx;
 mod rfx_rlgr;
 mod surface_bits;
@@ -464,6 +466,15 @@ impl UpdateEncoder {
             }
         } else if let Some(fb) = self.framebuffer.as_mut() {
             fb.update_diffs(&bitmap, diffs);
+        }
+    }
+
+    /// Classic RDP6 keeps one bounded row strip per logical BitmapUpdate.
+    /// Other codecs retain their existing spatial partition and size policy.
+    fn bitmap_max_rows(&self, bitmap: &BitmapUpdate) -> Result<Option<u16>> {
+        match self.bitmap_updater.as_ref() {
+            Some(BitmapUpdater::Bitmap(handler)) => Ok(Some(handler.bitmap.max_rows(bitmap)?)),
+            _ => Ok(None),
         }
     }
 
