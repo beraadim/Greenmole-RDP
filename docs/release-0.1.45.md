@@ -95,3 +95,15 @@ updated bitmap-crop documentation test passes. Independent review found no
 blocking issues in forced repair, cache suppression, crops, codec-specific
 limits, preserved fragmentation or diagnostic privacy. Whitespace and added-lines
 secret-pattern checks passed; dependency pins remain unchanged.
+
+Smaller complete messages can increase encoding-task and message counts; this
+release claims no measured client performance improvement. The two 0.1.44
+session timing snapshots are retained for later comparison with a comparable
+workload, alongside the correctness observations.
+
+The ARM64 DMG was mounted read-only and verified for strict deep application
+and driver signatures, version/revision, architecture, licenses, packaged
+repaint/payload-limit diagnostics, unchanged microphone payload and checksum.
+The verified DMG and checksum/build-info sidecars are on the Desktop. Active
+application hashes, GUI/helper processes and Core Audio were preserved. Nothing
+was installed or restarted. See the [package validation record](release-0.1.45-validation.json).

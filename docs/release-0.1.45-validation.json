@@ -34,7 +34,67 @@
     "source_changed_comparisons": 52,
     "max_changed_sample_points": 179,
     "capture_cleanup_succeeded_between_connections": true,
-    "exact_client_rendering_cause_proven": false
+    "exact_client_rendering_cause_proven": false,
+    "timing_baseline": [
+      {
+        "disconnected_at": "2026-11-01T14:31:10.456281+00:00",
+        "duration_secs": 70,
+        "bytes_total": 71085381,
+        "capture_frames_delivered": 565,
+        "display_updates_sent": 1344,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 83.05425,
+          "p50_ms": 0.021583,
+          "p95_ms": 1.839417,
+          "p99_ms": 46.817792,
+          "samples": 565
+        },
+        "encode_timings": {
+          "max_ms": 56.50470500000004,
+          "p50_ms": 0.452083,
+          "p95_ms": 10.316625,
+          "p99_ms": 30.519195999999997,
+          "samples": 1024
+        },
+        "write_timings": {
+          "max_ms": 167.07923900000006,
+          "p50_ms": 0.06858299999999999,
+          "p95_ms": 9.531665999999998,
+          "p99_ms": 78.68333299999999,
+          "samples": 1024
+        }
+      },
+      {
+        "disconnected_at": "2026-11-01T14:34:17.749265+00:00",
+        "duration_secs": 35,
+        "bytes_total": 44865421,
+        "capture_frames_delivered": 287,
+        "display_updates_sent": 722,
+        "bitmap_codec": "rdp6-rle",
+        "capture_timings": {
+          "max_ms": 89.34025,
+          "p50_ms": 0.026125,
+          "p95_ms": 16.95325,
+          "p99_ms": 66.345042,
+          "samples": 287
+        },
+        "encode_timings": {
+          "max_ms": 56.839331999999985,
+          "p50_ms": 0.459041,
+          "p95_ms": 5.717872999999999,
+          "p99_ms": 36.601836999999975,
+          "samples": 742
+        },
+        "write_timings": {
+          "max_ms": 191.8635,
+          "p50_ms": 0.098375,
+          "p95_ms": 16.230128,
+          "p99_ms": 83.825832,
+          "samples": 722
+        }
+      }
+    ]
   },
   "changes": {
     "explicit_force_refresh_before_hints_and_cached_diffs": true,
@@ -55,7 +115,7 @@
     "root_cause_conclusively_claimed": false
   },
   "manual_acceptance": "User installs Desktop DMG. Bitmap fallback + Lossless desktop; three consecutive 1920x1200 connections, observe initial full picture before a fullscreen-window workaround, then drag a window. Compare Guacamole. No automatic installation or driver reinstall.",
-  "status": "source checks passed; package verification pending",
+  "status": "committed, built, verified and copied to Desktop; not installed",
   "tests": {
     "full_standard_check_passed": true,
     "rust_passed": 1084,
@@ -85,5 +145,38 @@
     "added_lines_secret_pattern_check_passed": true,
     "exact_lockfile_package_and_npm_json_comparison_preserves_dependency_pins": true,
     "independent_review": "No blockers: explicit supplied-region repair, ordinary cache suppression, checked crops, invalid-layout error, exact classic-only packet cap and smaller limits, unchanged generic/RemoteFX fragmentation and typed bounded diagnostics."
+  },
+  "source_revision": "39d5f051d520f16b53b88e3302bcdf709863262a",
+  "verified_at_utc": "2026-11-01T14:56:17.252320+00:00",
+  "package_verification": {
+    "version": "0.1.45",
+    "source_revision": "39d5f051d520f16b53b88e3302bcdf709863262a",
+    "package": "Greenmole_RDP_0.1.45_aarch64_39d5f051d520.dmg",
+    "bytes": 15181433,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "arm64_binary_architecture_verified": true,
+    "authentication_and_rdp_licenses_bundled": true,
+    "driver_signature_verified": true,
+    "input_and_graphics_startup_diagnostics_present_in_packaged_binary": true,
+    "input_categories_capture_changes_and_geometry_markers_present": true,
+    "bitmap_transport_diagnostic_markers_present": true,
+    "bitmap_header_and_alpha_diagnostic_markers_present": true,
+    "bitmap_recovery_and_payload_limit_markers_present": true,
+    "microphone_payload_matches_0_1_34": true,
+    "microphone_installer_digest_and_text_verified": true,
+    "mounted_read_only_and_removed": true,
+    "sha256": "bf8e20c7514de046369e7ab6b0c0bf3b26690e8f66837f71316ee1408f2fa67d",
+    "desktop_copy_and_sidecars_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.45_aarch64_39d5f051d520.dmg",
+    "active_app_hashes_and_processes_preserved": true,
+    "core_audio_process_preserved": true,
+    "credentials_changed": false,
+    "app_installed": false,
+    "driver_reinstalled": false,
+    "service_restarted": false
   }
 }
