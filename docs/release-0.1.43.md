@@ -72,3 +72,17 @@ after startup. Its 83-second session delivered 4,432 captures and wrote
 14,031,048 bytes. This is a useful reference for further performance comparison;
 it does not establish a regression or end-to-end network/browser latency. No
 capture, AVC or GFX policy change is included in this release.
+
+The browser comparison overlapped local compilation/tests and used a gateway
+and Wi-Fi route. Its server encode p95 was 9.26 ms, write p95 0.174 ms and
+capture-queue p95 0.138 ms. The bounded ACK-history count is not an exact client
+backlog; its latency estimate stopped updating after timestamp eviction, so it
+cannot identify current network RTT. An idle-host comparison is needed before
+attributing the user's possible slowdown to either a regression or the network.
+
+The ARM64 DMG was mounted read-only and verified for strict deep application
+and driver signatures, version/revision, architecture, licenses, packaged
+compatibility and diagnostic markers, unchanged microphone payload and checksum.
+The verified DMG and checksum/build-info sidecars are on the Desktop. Active
+application hashes, app/helper processes and Core Audio were preserved. Nothing
+was installed or restarted. See the [package validation record](release-0.1.43-validation.json).
