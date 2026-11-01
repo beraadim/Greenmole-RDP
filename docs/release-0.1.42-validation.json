@@ -1,0 +1,136 @@
+{
+  "schema": "macrdp-release-validation-v1",
+  "product_name": "Greenmole RDP",
+  "version": "0.1.42",
+  "purpose": "Correct RemoteFX Surface Bits carrier and independent capability gate in the bitmap path used by all three failed0.1.41 tests. Windows symptom resolution remains unconfirmed.",
+  "observation_on_0_1_41": {
+    "all_three_negotiated_bitmap_codec": "remotefx",
+    "user_results": [
+      "drawn but frozen",
+      "black",
+      "brief picture then black; cursor shapes update"
+    ],
+    "capture_frames": [
+      584,
+      30,
+      213
+    ],
+    "bitmap_region_writes": [
+      1316,
+      54,
+      353
+    ],
+    "bytes_written": [
+      58586816,
+      1904942,
+      6004212
+    ],
+    "native_button_down_posts": [
+      7,
+      0,
+      1
+    ],
+    "native_button_up_posts": [
+      7,
+      0,
+      1
+    ],
+    "native_drag_posts": [
+      463,
+      0,
+      17
+    ],
+    "post_errors": [
+      0,
+      0,
+      0
+    ],
+    "capture_health_samples": 52,
+    "capture_near_black_sample_points": 0,
+    "max_first_session_changed_sample_points": 250,
+    "points_per_observation": 256,
+    "all_eligible_source_timestamps_advanced": true,
+    "final_capture_geometry": [
+      1920,
+      1200
+    ],
+    "capture_scale_factors": [
+      1,
+      1
+    ],
+    "capture_and_display_cleanup_confirmed": true,
+    "correct_full_image_presentation_proven": false
+  },
+  "changes": {
+    "remotefx_surface_command_id": 6,
+    "requires_stream_surface_bits": true,
+    "supports_stream_without_set_capability": true,
+    "missing_stream_uses_compressed_bitmap_fallback": true,
+    "other_set_codecs_remain_set_gated": true,
+    "video_and_image_modes_preserved": true,
+    "entropy_codec_id_geometry_and_limits_preserved": true,
+    "frame_markers_and_quality_transitions_preserved": true,
+    "shared_surface_payload_layout_extracted": true,
+    "bounded_normal_level_bitmap_transport_diagnostics": true,
+    "typed_export_allowlist_extended": true,
+    "diagnostic_schema": 8,
+    "native_capture_or_input_policy_changed": false,
+    "gfx_channel_policy_changed": false,
+    "root_cause_conclusively_claimed": false
+  },
+  "tests": {
+    "full_standard_check_passed": true,
+    "rust_passed": 1066,
+    "existing_manual_rust_ignored": 7,
+    "python_passed": 39,
+    "javascript_passed": 11,
+    "native_driver_tests_passed": true,
+    "frontend_production_build_passed": true,
+    "old_command_and_capability_regressions_reproduced": true,
+    "literal_command_ids_checked_on_actual_fastpath_wire": true,
+    "fullscreen_fragmented_update_reassembly_test_passed": true,
+    "fullscreen_exact_coverage_and_fresh_frame_numbering_verified": true,
+    "fallback_compressed_pixel_decode_verified": true,
+    "new_tests_capture_screen_or_inject_input": false,
+    "native_windows_new_build_acceptance": false
+  },
+  "checks": {
+    "whitespace_passed": true,
+    "staged_secret_scan_passed": true,
+    "cargo_and_npm_dependency_pins_preserved": true,
+    "independent_review": "No blocking findings; verified independent command/capability selection, payload layout, compressed fallback, image/video mode, quality and marker behavior, privacy and typed export."
+  },
+  "manual_acceptance": "User deploys package. Keep Bitmap fallback and test three consecutive1920x1200 connections; click and drag15seconds each, disconnect, reportworking/frozen/black order. Test Auto later if Bitmap is consistent. No driver reinstall or automatic installation.",
+  "source_revision": "531d7db9e3da87b17ad6d274212dde18b1eb2b9f",
+  "status": "committed, built, verified and copied to Desktop; not installed",
+  "verified_at_utc": "2026-11-01T10:35:47.837404+00:00",
+  "package_verification": {
+    "version": "0.1.42",
+    "source_revision": "531d7db9e3da87b17ad6d274212dde18b1eb2b9f",
+    "package": "Greenmole_RDP_0.1.42_aarch64_531d7db9e3da.dmg",
+    "bytes": 15184682,
+    "signing": "ad-hoc",
+    "dmg_verified": true,
+    "app_deep_strict_signature_verified": true,
+    "version_and_build_info_match": true,
+    "architecture": "aarch64",
+    "arm64_binary_architecture_verified": true,
+    "authentication_and_rdp_licenses_bundled": true,
+    "driver_signature_verified": true,
+    "input_and_graphics_startup_diagnostics_present_in_packaged_binary": true,
+    "input_categories_capture_changes_and_geometry_markers_present": true,
+    "bitmap_transport_diagnostic_markers_present": true,
+    "microphone_payload_matches_0_1_34": true,
+    "microphone_installer_digest_and_text_verified": true,
+    "mounted_read_only_and_removed": true,
+    "sha256": "ed3a6bafe94c6a99008f1ec02fb79893b4e6804444e7de7d9a003a79a21f06a8",
+    "desktop_copy_and_sidecars_verified": true,
+    "desktop_path": "/Users/beraadim/Desktop/Greenmole_RDP_0.1.42_aarch64_531d7db9e3da.dmg",
+    "active_app_hashes_and_processes_preserved": true,
+    "core_audio_process_preserved": true,
+    "credentials_changed": false,
+    "app_installed": false,
+    "driver_reinstalled": false,
+    "service_restarted": false
+  }
+}

@@ -78,3 +78,10 @@ compressed fallback pixels, both RemoteFX modes, quality changes, complete
 Independent review found no blocking protocol or diagnostic-export issues.
 The shared Set/Stream payload layout lives in a separate module. Whitespace
 and staged secret checks passed; dependency pins remain unchanged.
+
+The ARM64 DMG was mounted read-only and verified for deep strict application
+and driver signatures, version/revision, architecture, licenses, packaged
+diagnostic markers, unchanged microphone payload and checksum. The DMG and
+checksum/build-info sidecars are on the Desktop. Active app hashes and app,
+helper and Core Audio processes were preserved. Nothing was installed or
+restarted. See the [package validation record](release-0.1.42-validation.json).
